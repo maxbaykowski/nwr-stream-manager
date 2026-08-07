@@ -46,6 +46,22 @@ class RtlDeviceError(RtlError):
     """Raised when a configured RTL-SDR cannot be opened or resolved."""
 
 
+class RtlDeviceResolutionRetryableError(RtlDeviceError):
+    """Raised when the configured RTL-SDR may appear on a later retry."""
+
+
+class RtlDeviceResolutionFatalError(RtlDeviceError):
+    """Raised when the configured RTL-SDR setting cannot recover by retrying."""
+
+
+class RtlDeviceAccessFatalError(RtlDeviceError):
+    """Raised when the process does not have permission to use RTL-SDR devices."""
+
+
+class RtlDeviceBusyRetryableError(RtlDeviceError):
+    """Raised when the configured RTL-SDR is present but opened elsewhere."""
+
+
 class RtlReadError(RtlError):
     """Raised when an active RTL-SDR capture stops unexpectedly."""
 
@@ -98,8 +114,7 @@ class UsbDeviceInfo:
 
 @dataclass(frozen=True)
 class RtlConfig:
-    device_index: int = 0
-    serial: str | None = None
+    serial: str
     sample_rate: int = DEFAULT_RTL_SAMPLE_RATE
     center_frequency_hz: int = NWR_CENTER_FREQUENCY_HZ
     ppm_correction: int = 0
@@ -389,7 +404,7 @@ except Exception as exc:
 class RtlCaptureSource:
     """Recovering RTL-SDR byte source for one physical dongle."""
 
-    def __init__(self, config: RtlConfig = RtlConfig()) -> None:
+    def __init__(self, config: RtlConfig) -> None:
         self.config = config
         self.sdr: BaseRtlSdr | None = None
         self.sdr_lock = threading.Lock()
@@ -398,6 +413,8 @@ class RtlCaptureSource:
         )
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.device_wait_logged = False
+        self.device_busy_logged = False
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -436,6 +453,20 @@ class RtlCaptureSource:
                 with self.sdr_lock:
                     self.sdr = sdr
                 self._reader_loop(sdr)
+            except RtlDeviceResolutionRetryableError as exc:
+                if not self.device_wait_logged:
+                    LOG.warning("%s", exc)
+                    self.device_wait_logged = True
+                self.stop_event.wait(self.config.retry_delay_seconds)
+            except RtlDeviceBusyRetryableError as exc:
+                if not self.device_busy_logged:
+                    LOG.warning("%s", exc)
+                    self.device_busy_logged = True
+                self.stop_event.wait(self.config.retry_delay_seconds)
+            except (RtlDeviceResolutionFatalError, RtlDeviceAccessFatalError) as exc:
+                LOG.error("%s", exc)
+                self._offer(exc)
+                self.stop_event.set()
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
@@ -448,15 +479,22 @@ class RtlCaptureSource:
     def _open_configured_sdr(self, *, quiet: bool) -> BaseRtlSdr:
         if BaseRtlSdr is None or rtlsdr_lib is None:
             raise RtlDependencyError(str(RTLSDR_IMPORT_ERROR))
-        device_index = self._resolve_device_index(self.config)
+        device_index = self._resolve_serial_to_device_index(self.config.serial)
         try:
             with _suppress_native_stderr(quiet):
                 sdr = BaseRtlSdr(device_index=device_index, dithering_enabled=False)
         except LibUSBError as exc:
             if getattr(exc, "errno", None) == -3:
-                raise RtlDeviceError("access denied while opening RTL-SDR") from exc
+                raise RtlDeviceAccessFatalError(
+                    "Access denied while opening RTL-SDR. Check udev permissions "
+                    "or run with sufficient access."
+                ) from exc
             if getattr(exc, "errno", None) == -6:
-                raise RtlDeviceError("configured RTL-SDR is busy") from exc
+                raise RtlDeviceBusyRetryableError(
+                    f"Configured RTL-SDR serial {self.config.serial} is busy "
+                    f"at current librtlsdr index {device_index}. "
+                    "Waiting for it to become available."
+                ) from exc
             raise
         try:
             sdr.sample_rate = self.config.sample_rate
@@ -472,6 +510,12 @@ class RtlCaptureSource:
                 self.config.center_frequency_hz,
                 self.config.sample_rate,
             )
+            if self.device_wait_logged:
+                LOG.info("Configured RTL-SDR is now available.")
+                self.device_wait_logged = False
+            if self.device_busy_logged:
+                LOG.info("Configured RTL-SDR is no longer busy.")
+                self.device_busy_logged = False
             return sdr
         except Exception:
             sdr.close()
@@ -609,19 +653,60 @@ class RtlCaptureSource:
         return max(512, target_size)
 
     @staticmethod
-    def _resolve_device_index(config: RtlConfig) -> int:
-        if not config.serial:
-            devices = list_rtl_devices()
-            if not any(device.index == config.device_index for device in devices):
-                raise RtlDeviceError(f"configured RTL-SDR device index {config.device_index} was not found")
-            return config.device_index
+    def _resolve_serial_to_device_index(serial: str) -> int:
+        if not serial:
+            raise RtlDeviceResolutionFatalError(
+                "RTL-SDR serial is required. Device indexes are intentionally unsupported "
+                "because librtlsdr indexes can change after reconnects."
+            )
+        usb_confirmed = RtlCaptureSource._wait_for_unique_usb_serial(serial)
         devices = list_rtl_devices()
-        matches = [device for device in devices if device.serial == config.serial]
+        matches = [device for device in devices if device.serial == serial]
         if not matches:
-            raise RtlDeviceError(f"configured RTL-SDR serial {config.serial} was not found")
+            if not usb_confirmed:
+                raise RtlDeviceResolutionRetryableError(
+                    f"Configured RTL-SDR serial {serial} was not visible to librtlsdr. "
+                    "Waiting for that device to appear."
+                )
+            raise RtlDeviceResolutionRetryableError(
+                f"Configured RTL-SDR serial {serial} is present on USB but was not yet "
+                "visible to librtlsdr. Waiting for librtlsdr to detect that device."
+            )
         if len(matches) > 1:
-            raise RtlDeviceError(f"multiple RTL-SDR devices use serial {config.serial}")
+            raise RtlDeviceResolutionFatalError(
+                f"Multiple RTL-SDR devices were found by librtlsdr with serial {serial}. "
+                "Assign unique serial numbers to each device using rtl_eeprom."
+            )
+        LOG.debug(
+            "resolved RTL-SDR serial %s to device index %s",
+            serial,
+            matches[0].index,
+        )
         return matches[0].index
+
+    @staticmethod
+    def _wait_for_unique_usb_serial(serial: str) -> bool:
+        try:
+            usb_devices = list_usb_rtl_devices()
+        except OSError as exc:
+            LOG.warning(
+                "USB probe failed (%s); falling back to librtlsdr-only serial detection",
+                exc,
+            )
+            return False
+
+        matches = [device for device in usb_devices if device.serial == serial]
+        if not matches:
+            raise RtlDeviceResolutionRetryableError(
+                f"Configured RTL-SDR serial {serial} was not found on USB. "
+                "Waiting for that device to appear."
+            )
+        if len(matches) > 1:
+            raise RtlDeviceResolutionFatalError(
+                f"Multiple USB RTL-SDR devices were found with serial {serial}. "
+                "Assign unique serial numbers to each device using rtl_eeprom."
+            )
+        return True
 
 
 class ProcessedIqSource:
@@ -713,6 +798,11 @@ def list_rtl_devices() -> list[RtlDeviceInfo]:
         serial = (c_ubyte * 256)()
         result = rtlsdr_lib.rtlsdr_get_device_usb_strings(index, manufacturer, product, serial)
         if result != 0:
+            if result == -3:
+                raise RtlDeviceAccessFatalError(
+                    f"Access denied while reading USB strings for RTL-SDR {index}. "
+                    "Check udev permissions or run with sufficient access."
+                )
             raise LibUSBError(result, f"while reading USB strings for RTL-SDR {index}")
         manufacturer_text = "".join(chr(value) for value in manufacturer if value > 0)
         product_text = "".join(chr(value) for value in product if value > 0)
@@ -761,7 +851,7 @@ def list_usb_rtl_devices() -> list[UsbDeviceInfo]:
 def run_processed_iq_loop(
     callback: Callable,
     *,
-    config: RtlConfig = RtlConfig(),
+    config: RtlConfig,
     target_frequency_hz: int = NWR_CENTER_FREQUENCY_HZ,
     output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
 ) -> None:
