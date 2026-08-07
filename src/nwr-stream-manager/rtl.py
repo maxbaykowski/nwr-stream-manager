@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .dsp import DEFAULT_OUTPUT_SAMPLE_RATE, IqChannelizer
+from .dsp import DEFAULT_OUTPUT_SAMPLE_RATE, IqChannelizer, IqDcBlocker, rtl_u8_to_complex64
 
 
 LOG = logging.getLogger(__name__)
@@ -719,6 +719,7 @@ class ProcessedIqSource:
         output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
     ) -> None:
         self.rtl_source = rtl_source
+        self.dc_blocker = IqDcBlocker()
         self.channelizer = IqChannelizer(
             input_rate=rtl_source.config.sample_rate,
             center_frequency_hz=rtl_source.config.center_frequency_hz,
@@ -728,7 +729,9 @@ class ProcessedIqSource:
 
     def read(self, timeout: float | None = None):
         batch = self.rtl_source.read(timeout=timeout)
-        return self.channelizer.process_u8(batch.data)
+        centered_iq = rtl_u8_to_complex64(batch.data)
+        dc_blocked_iq = self.dc_blocker.process(centered_iq)
+        return self.channelizer.process_complex(dc_blocked_iq)
 
 
 class IqFanout:

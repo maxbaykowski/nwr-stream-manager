@@ -15,6 +15,7 @@ FloatArray = NDArray[np.float32]
 DEFAULT_OUTPUT_SAMPLE_RATE = 24_000
 DEFAULT_ALIAS_TRANSITION_HZ = 2_000.0
 DEFAULT_ALIAS_ATTENUATION_DB = 80.0
+DEFAULT_DC_BLOCK_ALPHA = 0.995
 
 
 def rtl_u8_to_complex64(chunk: bytes | bytearray | memoryview) -> ComplexArray:
@@ -34,6 +35,33 @@ def complex64_to_interleaved_f32(samples: ComplexArray) -> bytes:
     interleaved[0::2] = samples.real
     interleaved[1::2] = samples.imag
     return interleaved.tobytes()
+
+
+@dataclass
+class IqDcBlocker:
+    alpha: float = DEFAULT_DC_BLOCK_ALPHA
+    _previous_input: np.complex64 = np.complex64(0.0)
+    _previous_output: np.complex64 = np.complex64(0.0)
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.alpha < 1.0:
+            raise ValueError("alpha must be greater than or equal to 0 and less than 1")
+
+    def process(self, samples: ComplexArray) -> ComplexArray:
+        if samples.size == 0:
+            return np.array([], dtype=np.complex64)
+        samples = samples.astype(np.complex64, copy=False)
+        output = np.empty_like(samples)
+        previous_input = self._previous_input
+        previous_output = self._previous_output
+        for index, sample in enumerate(samples):
+            current = sample - previous_input + self.alpha * previous_output
+            output[index] = current
+            previous_input = sample
+            previous_output = current
+        self._previous_input = np.complex64(previous_input)
+        self._previous_output = np.complex64(previous_output)
+        return output
 
 
 def design_lowpass_taps(
