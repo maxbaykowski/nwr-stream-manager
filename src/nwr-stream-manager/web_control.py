@@ -9,7 +9,6 @@ import socket
 import sys
 import threading
 import time
-import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, replace
 from http import HTTPStatus
@@ -50,6 +49,12 @@ else:
     list_usb_rtl_devices = rtl.list_usb_rtl_devices
     validate_ppm_correction = rtl.validate_ppm_correction
     validate_rtl_sample_rate = rtl.validate_rtl_sample_rate
+
+repo_root = Path(__file__).resolve().parents[2]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from icecastauth import IcecastSettings, normalize_server, test_mountpoint_authentication
 
 
 LOG = logging.getLogger(__name__)
@@ -225,18 +230,15 @@ class RtlControlService:
         station_key = str(payload.get("station_key", "")).strip()
         station = self._station_by_key(station_key)
         icecast = validate_icecast_payload(payload.get("icecast"))
-        stream = {
-            "id": uuid.uuid4().hex,
-            "enabled": True,
-            "station": station,
-            "icecast": icecast,
-            "created_at": time.time(),
-        }
-        with self.lock:
-            self.streams.append(stream)
-            save_streams(self.streams_state_path, self.streams)
+        settings = IcecastSettings(
+            server=normalize_server(icecast["host"]),
+            port=str(icecast["port"]),
+            username=icecast["username"],
+            password=icecast["password"],
+            mountpoint=icecast["mount"],
+        )
         LOG.info(
-            "saved Icecast stream for %s at %s MHz to %s@%s:%s%s as %s",
+            "testing Icecast authentication for %s at %s MHz to %s@%s:%s%s as %s",
             station["callsign"],
             station["frequency"],
             icecast["username"],
@@ -245,7 +247,16 @@ class RtlControlService:
             icecast["mount"],
             icecast["format"],
         )
-        return self.stream_status()
+        result = test_mountpoint_authentication(settings)
+        if result.success:
+            LOG.info("Icecast authentication succeeded for %s:%s%s", icecast["host"], icecast["port"], icecast["mount"])
+        else:
+            LOG.warning("Icecast authentication failed for %s:%s%s: %s", icecast["host"], icecast["port"], icecast["mount"], result.message)
+        return {
+            "success": result.success,
+            "message": result.message,
+            "streams": list(self.streams),
+        }
 
     def remove_stream(self, stream_id: str) -> dict[str, Any]:
         stream_id = stream_id.strip()
@@ -461,7 +472,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
-        self._send_json(response, status=HTTPStatus.CREATED)
+        self._send_json(response)
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -775,6 +786,8 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .stream-actions-menu button { width: 100%; text-align: left; border: 0; }
 pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; background: #10151d; color: #d8f3dc; padding: 12px; border-radius: 6px; font-size: 13px; }
 .error { color: #a40000; font-weight: 600; }
+.message { font-weight: 600; }
+.success { color: #0f7a34; }
 .hint { color: #526070; font-size: 13px; margin-top: -8px; }
 @media (prefers-color-scheme: dark) {
   body { background: #101318; color: #eef2f7; }
@@ -783,6 +796,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .metric b, .hint, th { color: #9aa8ba; }
   .status-enabled { color: #5fd27a; }
   .status-needs-attention { color: #ff6b7a; }
+  .success { color: #5fd27a; }
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
 }
 </style>
@@ -916,10 +930,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </label>
         </div>
         <div class="actions">
-          <button id="add_stream" type="button">Add Icecast Stream</button>
+          <button id="add_stream" type="button">Add Icecast Output</button>
         </div>
       </fieldset>
-      <div id="stream-errors" class="error"></div>
+      <div id="stream-result" class="message"></div>
       <div id="streams-list" class="stream-list" aria-live="off"></div>
     </section>
   </div>
@@ -1247,6 +1261,14 @@ function setText(id, value) {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setStreamResult(message, kind = "") {
+  const element = document.getElementById("stream-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
 function showView(name) {
   for (const view of document.querySelectorAll(".view")) {
     view.hidden = view.id !== `view_${name}`;
@@ -1380,12 +1402,12 @@ document.getElementById("active-streams-body").addEventListener("click", event =
   if (target.dataset.action === "edit-active-stream") {
     closeStreamActionMenus();
     showView("add_stream");
-    setText("stream-errors", "Stream editing will be connected when stream runtime settings are implemented.");
+    setStreamResult("Stream editing will be connected when stream runtime settings are implemented.");
     return;
   }
   if (target.dataset.action === "remove-active-stream") {
     closeStreamActionMenus();
-    setText("stream-errors", "Active stream removal will be connected when stream workers are implemented.");
+    setStreamResult("Active stream removal will be connected when stream workers are implemented.");
   }
 });
 
@@ -1410,9 +1432,9 @@ document.getElementById("rescan_devices").addEventListener("click", async () => 
 document.getElementById("station_search_button").addEventListener("click", async () => {
   try {
     await searchStations();
-    setText("stream-errors", "");
+    setStreamResult("");
   } catch (error) {
-    setText("stream-errors", error.message);
+    setStreamResult(error.message, "error");
   }
 });
 
@@ -1421,9 +1443,9 @@ document.getElementById("station_search").addEventListener("keydown", async even
   event.preventDefault();
   try {
     await searchStations();
-    setText("stream-errors", "");
+    setStreamResult("");
   } catch (error) {
-    setText("stream-errors", error.message);
+    setStreamResult(error.message, "error");
   }
 });
 
@@ -1438,6 +1460,9 @@ document.getElementById("icecast_format").addEventListener("change", () => {
 });
 
 document.getElementById("add_stream").addEventListener("click", async () => {
+  const button = document.getElementById("add_stream");
+  setDisabled(button, true);
+  setStreamResult("Testing Icecast authentication...");
   try {
     const data = await request("/api/streams", {
       method: "POST",
@@ -1445,10 +1470,11 @@ document.getElementById("add_stream").addEventListener("click", async () => {
       body: JSON.stringify(streamPayload())
     });
     renderStreams(data.streams || []);
-    showView("streams");
-    setText("stream-errors", "");
+    setStreamResult(data.message, data.success ? "success" : "error");
   } catch (error) {
-    setText("stream-errors", error.message);
+    setStreamResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
   }
 });
 
@@ -1460,9 +1486,9 @@ document.getElementById("streams-list").addEventListener("click", async event =>
       method: "DELETE"
     });
     renderStreams(data.streams || []);
-    setText("stream-errors", "");
+    setStreamResult("");
   } catch (error) {
-    setText("stream-errors", error.message);
+    setStreamResult(error.message, "error");
   }
 });
 
