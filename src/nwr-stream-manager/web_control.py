@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, replace
 from http import HTTPStatus
@@ -18,15 +19,25 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 if __package__:
+    from .audio_effects import AudioEffectsProcessor
+    from .config import AudioConfig, FallbackConfig, IcecastConfig, IQ_SAMPLE_RATE
+    from .dsp import IqChannelizer
+    from .encoder import create_audio_encoder
+    from .fallback_audio import load_fallback_audio
+    from .icecast import IcecastSource
+    from .nfm import float_to_s16
     from .rtl import (
         DEFAULT_RTL_SAMPLE_RATE,
         NWR_CENTER_FREQUENCY_HZ,
         RTL_SAMPLE_RATE_RANGES,
+        IqDcBlocker,
         RtlConfig,
         RtlConfigError,
         RtlCaptureSource,
+        RtlSampleBatch,
         list_rtl_devices,
         list_usb_rtl_devices,
+        rtl_u8_to_complex64,
         validate_ppm_correction,
         validate_rtl_sample_rate,
     )
@@ -37,16 +48,37 @@ else:
     package_name = "nwr_stream_manager_runtime"
     package = types.ModuleType(package_name)
     package.__path__ = [str(Path(__file__).resolve().parent)]  # type: ignore[attr-defined]
+    package.__version__ = "0.0.0"  # type: ignore[attr-defined]
     sys.modules.setdefault(package_name, package)
+    audio_effects = importlib.import_module(f"{package_name}.audio_effects")
+    config_module = importlib.import_module(f"{package_name}.config")
+    dsp = importlib.import_module(f"{package_name}.dsp")
+    encoder = importlib.import_module(f"{package_name}.encoder")
+    fallback_audio = importlib.import_module(f"{package_name}.fallback_audio")
+    icecast_module = importlib.import_module(f"{package_name}.icecast")
+    nfm = importlib.import_module(f"{package_name}.nfm")
     rtl = importlib.import_module(f"{package_name}.rtl")
+    AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
+    AudioConfig = config_module.AudioConfig
+    FallbackConfig = config_module.FallbackConfig
+    IcecastConfig = config_module.IcecastConfig
+    IQ_SAMPLE_RATE = config_module.IQ_SAMPLE_RATE
+    IqChannelizer = dsp.IqChannelizer
+    create_audio_encoder = encoder.create_audio_encoder
+    load_fallback_audio = fallback_audio.load_fallback_audio
+    IcecastSource = icecast_module.IcecastSource
+    float_to_s16 = nfm.float_to_s16
     DEFAULT_RTL_SAMPLE_RATE = rtl.DEFAULT_RTL_SAMPLE_RATE
     NWR_CENTER_FREQUENCY_HZ = rtl.NWR_CENTER_FREQUENCY_HZ
     RTL_SAMPLE_RATE_RANGES = rtl.RTL_SAMPLE_RATE_RANGES
+    IqDcBlocker = rtl.IqDcBlocker
     RtlConfig = rtl.RtlConfig
     RtlConfigError = rtl.RtlConfigError
     RtlCaptureSource = rtl.RtlCaptureSource
+    RtlSampleBatch = rtl.RtlSampleBatch
     list_rtl_devices = rtl.list_rtl_devices
     list_usb_rtl_devices = rtl.list_usb_rtl_devices
+    rtl_u8_to_complex64 = rtl.rtl_u8_to_complex64
     validate_ppm_correction = rtl.validate_ppm_correction
     validate_rtl_sample_rate = rtl.validate_rtl_sample_rate
 
@@ -55,6 +87,8 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from icecastauth import IcecastSettings, normalize_server, test_mountpoint_authentication
+
+import numpy as np
 
 
 LOG = logging.getLogger(__name__)
@@ -70,6 +104,10 @@ DEFAULT_STREAM_BITRATES = {
     "mp3": 64,
     "ogg": 48,
 }
+STREAM_FRAME_SECONDS = 0.02
+STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
+STREAM_RECONNECT_SECONDS = 5.0
+ICECAST_AUTH_CACHE_SECONDS = 600.0
 
 
 @dataclass(frozen=True)
@@ -110,6 +148,235 @@ class RingLogHandler(logging.Handler):
             return list(self.records)
 
 
+class RawRtlFanout:
+    def __init__(self, source: RtlCaptureSource) -> None:
+        self.source = source
+        self.subscribers: set[queue.Queue] = set()
+        self.subscribers_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def subscribe(self, max_chunks: int = 32) -> queue.Queue:
+        subscriber: queue.Queue = queue.Queue(maxsize=max_chunks)
+        with self.subscribers_lock:
+            self.subscribers.add(subscriber)
+        return subscriber
+
+    def unsubscribe(self, subscriber: queue.Queue) -> None:
+        with self.subscribers_lock:
+            self.subscribers.discard(subscriber)
+
+    def start(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, name="rtl-raw-fanout", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                batch = self.source.read(timeout=0.5)
+            except queue.Empty:
+                continue
+            except EOFError:
+                return
+            except Exception as exc:
+                LOG.warning("RTL-SDR raw fanout read failed: %s", exc)
+                continue
+            with self.subscribers_lock:
+                subscribers = list(self.subscribers)
+            for subscriber in subscribers:
+                try:
+                    subscriber.put_nowait(batch)
+                except queue.Full:
+                    try:
+                        subscriber.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        subscriber.put_nowait(batch)
+                    except queue.Full:
+                        pass
+
+
+class ComplexNfmDemodulator:
+    def __init__(self) -> None:
+        self.previous_sample: np.complex64 | None = None
+
+    def process(self, iq: np.ndarray) -> np.ndarray:
+        if len(iq) < 2 and self.previous_sample is None:
+            if len(iq) == 1:
+                self.previous_sample = iq[-1]
+            return np.array([], dtype=np.float32)
+        if self.previous_sample is None:
+            previous = iq[:-1]
+            current = iq[1:]
+        else:
+            previous = np.concatenate((np.array([self.previous_sample], dtype=np.complex64), iq[:-1]))
+            current = iq
+        self.previous_sample = iq[-1]
+        demodulated = np.angle(current * np.conj(previous)).astype(np.float32)
+        return (demodulated / np.pi * 1.5).astype(np.float32, copy=False)
+
+
+class IcecastStreamWorker:
+    def __init__(
+        self,
+        *,
+        stream: dict[str, Any],
+        output: dict[str, Any],
+        fanout: RawRtlFanout,
+    ) -> None:
+        self.stream = stream
+        self.output = output
+        self.fanout = fanout
+        self.queue = fanout.subscribe(max_chunks=64)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name=f"icecast-stream-{stream['id']}", daemon=True)
+        self.status = "disabled"
+        self.error: str | None = None
+        self.started_at: float | None = None
+        self.last_audio_at: float | None = None
+        self.lock = threading.Lock()
+
+    @property
+    def id(self) -> str:
+        return str(self.stream["id"])
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.fanout.unsubscribe(self.queue)
+        if self.thread.ident is not None:
+            self.thread.join(timeout=2.0)
+        with self.lock:
+            self.status = "disabled"
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            status = self.status
+            error = self.error
+            started_at = self.started_at
+            last_audio_at = self.last_audio_at
+        return {
+            "id": self.id,
+            "station": self.stream["station"],
+            "outputs": [self.output],
+            "status": status,
+            "error": error,
+            "started_at": started_at,
+            "last_audio_at": last_audio_at,
+        }
+
+    def _set_status(self, status: str, error: str | None = None) -> None:
+        with self.lock:
+            self.status = status
+            self.error = error
+            if status == "enabled" and self.started_at is None:
+                self.started_at = time.time()
+
+    def _run(self) -> None:
+        station = self.stream["station"]
+        while not self.stop_event.is_set():
+            sink = None
+            source = None
+            encoder = None
+            try:
+                config = icecast_config_from_output(self.output)
+                source = IcecastSource(config, config.content_type)
+                sink = source.connect()
+                encoder = create_audio_encoder(config)
+                self._set_status("enabled")
+                self._produce_encoded_audio(sink, encoder, float(station["frequency"]) * 1_000_000)
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    break
+                self._set_status("needs-attention", friendly_stream_error(exc))
+                LOG.warning("Icecast stream worker failed for %s: %s", station.get("callsign"), exc)
+                self.stop_event.wait(STREAM_RECONNECT_SECONDS)
+            finally:
+                if encoder is not None:
+                    try:
+                        encoder.close()
+                    except Exception:
+                        pass
+                if sink is not None:
+                    try:
+                        sink.close()
+                    except Exception:
+                        pass
+                if source is not None:
+                    source.close()
+        self._set_status("disabled")
+
+    def _produce_encoded_audio(self, sink, encoder, target_frequency_hz: float) -> None:
+        dc_blocker = IqDcBlocker()
+        channelizer: IqChannelizer | None = None
+        channelizer_key: tuple[int, int, int] | None = None
+        demodulator = ComplexNfmDemodulator()
+        effects = AudioEffectsProcessor(AudioConfig())
+        pending = np.array([], dtype=np.float32)
+        header = getattr(encoder, "header", b"")
+        if header:
+            sink.write(header)
+        fallback = load_fallback_audio(FallbackConfig().path)
+        fallback_pcm = fallback.pcm
+        fallback_position = 0
+        last_real_audio = time.monotonic()
+        while not self.stop_event.is_set():
+            try:
+                batch: RtlSampleBatch = self.queue.get(timeout=0.5)
+            except queue.Empty:
+                if time.monotonic() - last_real_audio < FallbackConfig().silence_timeout_seconds:
+                    continue
+                if fallback_pcm:
+                    chunk_size = STREAM_FRAME_SAMPLES * 2
+                    frame = fallback_pcm[fallback_position : fallback_position + chunk_size]
+                    fallback_position += len(frame)
+                    if len(frame) < chunk_size:
+                        fallback_position = 0
+                        frame += fallback_pcm[: chunk_size - len(frame)]
+                    sink.write(encoder.encode(frame))
+                continue
+            next_channelizer_key = (
+                batch.sample_rate,
+                batch.center_frequency_hz,
+                int(round(target_frequency_hz)),
+            )
+            if channelizer is None or channelizer_key != next_channelizer_key:
+                channelizer = IqChannelizer(
+                    input_rate=batch.sample_rate,
+                    center_frequency_hz=batch.center_frequency_hz,
+                    target_frequency_hz=int(round(target_frequency_hz)),
+                    output_rate=IQ_SAMPLE_RATE,
+                )
+                channelizer_key = next_channelizer_key
+                demodulator = ComplexNfmDemodulator()
+            iq = rtl_u8_to_complex64(batch.data)
+            audio = demodulator.process(channelizer.process_complex(dc_blocker.process(iq)))
+            if len(audio) == 0:
+                continue
+            last_real_audio = time.monotonic()
+            with self.lock:
+                self.last_audio_at = time.time()
+            pending = np.concatenate((pending, audio.astype(np.float32, copy=False)))
+            while len(pending) >= STREAM_FRAME_SAMPLES:
+                frame = pending[:STREAM_FRAME_SAMPLES]
+                pending = pending[STREAM_FRAME_SAMPLES:]
+                pcm = float_to_s16(effects.process(frame))
+                encoded = encoder.encode(pcm)
+                if encoded:
+                    sink.write(encoded)
+
+
 class RtlControlService:
     def __init__(self, state_path: Path, log_handler: RingLogHandler) -> None:
         self.state_path = state_path
@@ -120,8 +387,12 @@ class RtlControlService:
         self.streams = load_streams(self.streams_state_path)
         self.stations = load_station_database()
         self.capture: RtlCaptureSource | None = None
+        self.raw_fanout: RawRtlFanout | None = None
+        self.monitor_queue: queue.Queue | None = None
         self.drain_thread: threading.Thread | None = None
         self.drain_stop = threading.Event()
+        self.stream_workers: dict[str, IcecastStreamWorker] = {}
+        self.icecast_auth_cache: dict[str, float] = {}
         self.capture_error: str | None = None
         self.last_batch_at: float | None = None
         self.received_chunks = 0
@@ -151,7 +422,7 @@ class RtlControlService:
                 "received_bytes": self.received_bytes,
                 "sample_rate_ranges": RTL_SAMPLE_RATE_RANGES,
                 "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
-                "active_streams": [],
+                "active_streams": self._active_streams_locked(),
                 "logs": self.log_handler.snapshot()[-80:],
             }
 
@@ -230,6 +501,54 @@ class RtlControlService:
         station_key = str(payload.get("station_key", "")).strip()
         station = self._station_by_key(station_key)
         icecast = validate_icecast_payload(payload.get("icecast"))
+        auth_cache_key = icecast_auth_cache_key(icecast)
+        with self.lock:
+            auth_is_cached = self._icecast_auth_cached_locked(auth_cache_key)
+        if auth_is_cached:
+            LOG.info(
+                "using cached Icecast authentication for %s:%s%s",
+                icecast["host"],
+                icecast["port"],
+                icecast["mount"],
+            )
+        else:
+            result = self.test_icecast_auth(icecast)
+            if not result["success"]:
+                return {
+                    "success": False,
+                    "message": result["message"],
+                    "streams": list(self.streams),
+                }
+            with self.lock:
+                self.icecast_auth_cache[auth_cache_key] = time.time()
+        stream = {
+            "id": uuid.uuid4().hex,
+            "enabled": True,
+            "station": station,
+            "outputs": [
+                {
+                    "id": uuid.uuid4().hex,
+                    "enabled": True,
+                    "type": "icecast",
+                    "icecast": icecast,
+                    "auth_validated_at": time.time(),
+                    "auth_signature": icecast_auth_signature(icecast),
+                }
+            ],
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        with self.lock:
+            self.streams.append(stream)
+            save_streams(self.streams_state_path, self.streams)
+            self._sync_stream_workers_locked()
+        return {
+            "success": True,
+            "message": "Stream created.",
+            "streams": list(self.streams),
+        }
+
+    def test_icecast_auth(self, icecast: dict[str, Any]) -> dict[str, Any]:
         settings = IcecastSettings(
             server=normalize_server(icecast["host"]),
             port=str(icecast["port"]),
@@ -238,9 +557,7 @@ class RtlControlService:
             mountpoint=icecast["mount"],
         )
         LOG.info(
-            "testing Icecast authentication for %s at %s MHz to %s@%s:%s%s as %s",
-            station["callsign"],
-            station["frequency"],
+            "testing Icecast authentication to %s@%s:%s%s as %s",
             icecast["username"],
             icecast["host"],
             icecast["port"],
@@ -250,13 +567,23 @@ class RtlControlService:
         result = test_mountpoint_authentication(settings)
         if result.success:
             LOG.info("Icecast authentication succeeded for %s:%s%s", icecast["host"], icecast["port"], icecast["mount"])
+            with self.lock:
+                self.icecast_auth_cache[icecast_auth_cache_key(icecast)] = time.time()
         else:
             LOG.warning("Icecast authentication failed for %s:%s%s: %s", icecast["host"], icecast["port"], icecast["mount"], result.message)
-        return {
-            "success": result.success,
-            "message": result.message,
-            "streams": list(self.streams),
-        }
+        return {"success": bool(result.success), "message": result.message}
+
+    def test_icecast_auth_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        icecast = validate_icecast_payload(payload.get("icecast"))
+        return self.test_icecast_auth(icecast)
+
+    def _icecast_auth_cached_locked(self, cache_key: str) -> bool:
+        now = time.time()
+        for key, timestamp in list(self.icecast_auth_cache.items()):
+            if now - timestamp > ICECAST_AUTH_CACHE_SECONDS:
+                self.icecast_auth_cache.pop(key, None)
+        timestamp = self.icecast_auth_cache.get(cache_key)
+        return timestamp is not None and now - timestamp <= ICECAST_AUTH_CACHE_SECONDS
 
     def remove_stream(self, stream_id: str) -> dict[str, Any]:
         stream_id = stream_id.strip()
@@ -266,8 +593,61 @@ class RtlControlService:
             if len(self.streams) == before:
                 raise ValueError("stream was not found")
             save_streams(self.streams_state_path, self.streams)
+            self._sync_stream_workers_locked()
         LOG.info("removed stream %s", stream_id)
         return self.stream_status()
+
+    def update_stream_output(self, payload: dict[str, Any]) -> dict[str, Any]:
+        stream_id = str(payload.get("stream_id", "")).strip()
+        output_id = str(payload.get("output_id", "")).strip()
+        enabled = bool(payload.get("enabled", True))
+        icecast = validate_icecast_payload(payload.get("icecast"))
+        with self.lock:
+            stream, output = self._stream_output_locked(stream_id, output_id)
+            outputs = stream_outputs(stream)
+            if not enabled and len(outputs) <= 1:
+                raise ValueError("A stream with one output cannot have that output disabled.")
+            must_test_auth = icecast_auth_changed(output, icecast)
+            if must_test_auth:
+                settings = IcecastSettings(
+                    server=normalize_server(icecast["host"]),
+                    port=str(icecast["port"]),
+                    username=icecast["username"],
+                    password=icecast["password"],
+                    mountpoint=icecast["mount"],
+                )
+                result = test_mountpoint_authentication(settings)
+                if not result.success:
+                    return {
+                        "success": False,
+                        "message": result.message,
+                        "streams": list(self.streams),
+                    }
+                output["auth_validated_at"] = time.time()
+                output["auth_signature"] = icecast_auth_signature(icecast)
+            output["enabled"] = enabled
+            output["icecast"] = icecast
+            stream["updated_at"] = time.time()
+            save_streams(self.streams_state_path, self.streams)
+            key = stream_worker_key(stream, output)
+            worker = self.stream_workers.pop(key, None)
+            if worker is not None:
+                worker.stop()
+            self._sync_stream_workers_locked()
+        return {
+            "success": True,
+            "message": "Stream output settings saved.",
+            "streams": list(self.streams),
+        }
+
+    def _stream_output_locked(self, stream_id: str, output_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        for stream in self.streams:
+            if stream.get("id") != stream_id:
+                continue
+            for output in stream_outputs(stream):
+                if output.get("id") == output_id:
+                    return stream, output
+        raise ValueError("stream output was not found")
 
     def _station_by_key(self, key: str) -> dict[str, str]:
         for station in self.stations:
@@ -335,6 +715,9 @@ class RtlControlService:
             self.capture_error = None
             self.capture = RtlCaptureSource(config)
             self.capture.start()
+            self.raw_fanout = RawRtlFanout(self.capture)
+            self.monitor_queue = self.raw_fanout.subscribe(max_chunks=64)
+            self.raw_fanout.start()
             self.drain_stop.clear()
             self.drain_thread = threading.Thread(
                 target=self._drain_capture,
@@ -342,11 +725,13 @@ class RtlControlService:
                 daemon=True,
             )
             self.drain_thread.start()
+            self._sync_stream_workers_locked()
             LOG.info("started RTL-SDR control capture for serial %s", config.serial)
             return
         self.capture.apply_config(config)
         self.settings = self._effective_settings_locked()
         save_settings(self.state_path, self.settings)
+        self._sync_stream_workers_locked()
 
     def _effective_settings_locked(self) -> RtlControlSettings:
         if self.capture is None:
@@ -363,11 +748,17 @@ class RtlControlService:
 
     def _detach_capture_locked(self) -> None:
         self.drain_stop.set()
+        self._stop_stream_workers_locked()
+        fanout = self.raw_fanout
+        self.raw_fanout = None
+        self.monitor_queue = None
         capture = self.capture
         self.capture = None
         drain_thread = self.drain_thread
         self.drain_thread = None
         LOG.info("stopped RTL-SDR control capture")
+        if fanout is not None:
+            fanout.stop()
         if capture is not None:
             threading.Thread(
                 target=self._stop_detached_capture,
@@ -379,10 +770,16 @@ class RtlControlService:
     def stop_capture(self) -> None:
         with self.lock:
             self.drain_stop.set()
+            self._stop_stream_workers_locked()
+            fanout = self.raw_fanout
+            self.raw_fanout = None
+            self.monitor_queue = None
             capture = self.capture
             self.capture = None
             drain_thread = self.drain_thread
             self.drain_thread = None
+        if fanout is not None:
+            fanout.stop()
         if capture is not None:
             capture.stop()
         if drain_thread is not None:
@@ -401,15 +798,13 @@ class RtlControlService:
     def _drain_capture(self) -> None:
         while not self.drain_stop.is_set():
             with self.lock:
-                capture = self.capture
-            if capture is None:
+                monitor_queue = self.monitor_queue
+            if monitor_queue is None:
                 return
             try:
-                batch = capture.read(timeout=0.5)
+                batch = monitor_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            except EOFError:
-                return
             except Exception as exc:
                 with self.lock:
                     self.capture_error = str(exc)
@@ -431,6 +826,47 @@ class RtlControlService:
                     total_bytes,
                     batch.sample_rate,
                 )
+
+    def _sync_stream_workers_locked(self) -> None:
+        fanout = self.raw_fanout
+        desired: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        if fanout is not None:
+            for stream in self.streams:
+                if not stream.get("enabled", True):
+                    continue
+                for output in stream_outputs(stream):
+                    if not output.get("enabled", True):
+                        continue
+                    key = stream_worker_key(stream, output)
+                    desired[key] = (stream, output)
+
+        for key in list(self.stream_workers):
+            if key not in desired:
+                worker = self.stream_workers.pop(key)
+                worker.stop()
+
+        if fanout is None:
+            return
+
+        for key, (stream, output) in desired.items():
+            if key in self.stream_workers:
+                continue
+            worker = IcecastStreamWorker(stream=stream, output=output, fanout=fanout)
+            self.stream_workers[key] = worker
+            worker.start()
+            LOG.info(
+                "started stream worker for %s output %s",
+                stream.get("station", {}).get("callsign", "unknown"),
+                output.get("id"),
+            )
+
+    def _stop_stream_workers_locked(self) -> None:
+        for worker in list(self.stream_workers.values()):
+            worker.stop()
+        self.stream_workers = {}
+
+    def _active_streams_locked(self) -> list[dict[str, Any]]:
+        return [worker.snapshot() for worker in self.stream_workers.values()]
 
 
 class RtlControlHandler(BaseHTTPRequestHandler):
@@ -463,6 +899,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/icecast-auth":
+            try:
+                payload = self._read_json()
+                response = self.service.test_icecast_auth_payload(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path != "/api/streams":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -489,6 +934,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/stream-output":
+            try:
+                payload = self._read_json()
+                response = self.service.update_stream_output(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path != "/api/settings":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -628,6 +1082,73 @@ def save_streams(path: Path, streams: list[dict[str, Any]]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def stream_outputs(stream: dict[str, Any]) -> list[dict[str, Any]]:
+    outputs = stream.get("outputs")
+    if isinstance(outputs, list):
+        return [output for output in outputs if isinstance(output, dict)]
+    icecast = stream.get("icecast")
+    if isinstance(icecast, dict):
+        output = {
+            "id": stream.get("id", uuid.uuid4().hex),
+            "enabled": stream.get("enabled", True),
+            "type": "icecast",
+            "icecast": icecast,
+        }
+        stream["outputs"] = [output]
+        return [output]
+    return []
+
+
+def stream_worker_key(stream: dict[str, Any], output: dict[str, Any]) -> str:
+    return f"{stream.get('id')}:{output.get('id')}"
+
+
+def icecast_auth_signature(icecast: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "host": icecast.get("host"),
+        "port": icecast.get("port"),
+        "username": icecast.get("username"),
+        "password": icecast.get("password"),
+        "mount": icecast.get("mount"),
+    }
+
+
+def icecast_auth_cache_key(icecast: dict[str, Any]) -> str:
+    return json.dumps(icecast_auth_signature(icecast), sort_keys=True, separators=(",", ":"))
+
+
+def icecast_auth_changed(output: dict[str, Any], icecast: dict[str, Any]) -> bool:
+    return output.get("auth_signature") != icecast_auth_signature(icecast)
+
+
+def icecast_config_from_output(output: dict[str, Any]) -> IcecastConfig:
+    icecast = output["icecast"]
+    return IcecastConfig(
+        host=icecast["host"],
+        port=int(icecast["port"]),
+        mount=icecast["mount"],
+        username=icecast["username"],
+        password=icecast["password"],
+        format=icecast["format"],
+        sample_rate=int(icecast.get("sample_rate", DEFAULT_STREAM_SAMPLE_RATE)),
+        bitrate=int(icecast.get("bitrate", DEFAULT_STREAM_BITRATES[icecast["format"]])),
+        enabled=bool(output.get("enabled", True)),
+    )
+
+
+def friendly_stream_error(exc: Exception) -> str:
+    message = str(exc)
+    if "401" in message:
+        return "Invalid Icecast username or password."
+    if "403" in message:
+        return "The Icecast mountpoint is already occupied."
+    if "404" in message:
+        return "The Icecast server or mountpoint does not exist."
+    if isinstance(exc, TimeoutError) or "timed out" in message.lower():
+        return "The Icecast server took too long to respond."
+    return message or "Stream needs attention."
+
+
 def validate_icecast_payload(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("icecast settings are required")
@@ -656,6 +1177,12 @@ def validate_icecast_payload(raw: Any) -> dict[str, Any]:
     stream_format = str(raw.get("format", "ogg")).strip().lower()
     if stream_format not in {"ogg", "mp3"}:
         raise ValueError("Icecast streaming format must be OGG or MP3")
+    sample_rate = int(raw.get("sample_rate", DEFAULT_STREAM_SAMPLE_RATE))
+    if sample_rate not in {8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000}:
+        raise ValueError("Icecast sample rate is not supported")
+    bitrate = int(raw.get("bitrate", DEFAULT_STREAM_BITRATES[stream_format]))
+    if bitrate < 8 or bitrate > 320 or bitrate % 8 != 0:
+        raise ValueError("Icecast bitrate must be from 8 through 320 Kbps in 8 Kbps steps")
     return {
         "host": host,
         "port": port,
@@ -663,8 +1190,8 @@ def validate_icecast_payload(raw: Any) -> dict[str, Any]:
         "password": password,
         "mount": mount,
         "format": stream_format,
-        "sample_rate": DEFAULT_STREAM_SAMPLE_RATE,
-        "bitrate": DEFAULT_STREAM_BITRATES[stream_format],
+        "sample_rate": sample_rate,
+        "bitrate": bitrate,
     }
 
 
@@ -893,46 +1420,87 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 
   <div id="view_add_stream" class="view" hidden>
     <section>
-      <h2>Add Stream</h2>
-      <label>Station Lookup
-        <input id="station_search" type="search" placeholder="Callsign, city, state, or frequency" autocomplete="off">
-      </label>
-      <div class="actions">
-        <button id="station_search_button" type="button">Search</button>
+      <h2 id="stream_wizard_title">Add Stream</h2>
+      <div id="wizard_step_station" class="wizard-step">
+        <p>Let's get your stream set up and running! What station would you like to stream?</p>
+        <label>Station Lookup
+          <input id="station_search" type="search" placeholder="Callsign, city, state, or frequency" autocomplete="off">
+        </label>
+        <div class="actions">
+          <button id="station_search_button" type="button">Search</button>
+        </div>
+        <label>Matching Stations
+          <select id="station_results" size="8"></select>
+        </label>
+        <div id="selected_station" class="hint">Select a station to continue.</div>
       </div>
-      <label>Matching Stations
-        <select id="station_results" size="8"></select>
-      </label>
-      <div id="selected_station" class="hint">Select a station before configuring Icecast.</div>
-      <fieldset id="icecast_fields" disabled>
-        <legend>Icecast</legend>
+      <div id="wizard_step_credentials" class="wizard-step" hidden>
+        <p>The next step is to enter your icecast credentials for the service you want to stream to. Enter them below, then click next.</p>
+        <fieldset id="icecast_fields">
+          <legend>Icecast Credentials</legend>
+          <div class="grid">
+            <label>Host
+              <input id="icecast_host" type="text" autocomplete="off">
+            </label>
+            <label>Port
+              <input id="icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000">
+            </label>
+            <label>Username
+              <input id="icecast_username" type="text" autocomplete="username">
+            </label>
+            <label>Password
+              <input id="icecast_password" type="password" autocomplete="current-password">
+            </label>
+            <label class="checkbox-row">
+              <input id="show_icecast_password" type="checkbox">
+              Show password
+            </label>
+            <label>Mountpoint
+              <input id="icecast_mount" type="text" placeholder="/station.mp3">
+            </label>
+          </div>
+        </fieldset>
+      </div>
+      <div id="wizard_step_codec" class="wizard-step" hidden>
+        <p>What audio codec would you like to use for the stream format? MP3 is generally more compatible, while OGG may give better audio quality at lower internet usage.</p>
+        <fieldset>
+          <legend>Stream Format</legend>
+          <label><input id="icecast_format_mp3" name="icecast_format" type="radio" value="mp3" checked> MP3</label>
+          <label><input id="icecast_format_ogg" name="icecast_format" type="radio" value="ogg"> OGG</label>
+        </fieldset>
+      </div>
+      <div id="wizard_step_quality" class="wizard-step" hidden>
+        <p>Adjust bitrate and sample rate to optimize audio quality and network usage. If you don't know what any of this means, click the finish button.</p>
+        <fieldset>
+          <legend>Audio Settings</legend>
         <div class="grid">
-          <label>Host
-            <input id="icecast_host" type="text" autocomplete="off">
-          </label>
-          <label>Port
-            <input id="icecast_port" type="number" min="1" max="65535" step="1" value="8000">
-          </label>
-          <label>Username
-            <input id="icecast_username" type="text" autocomplete="username" value="source">
-          </label>
-          <label>Password
-            <input id="icecast_password" type="password" autocomplete="current-password">
-          </label>
-          <label>Mountpoint
-            <input id="icecast_mount" type="text" placeholder="/station.ogg">
-          </label>
-          <label>Streaming Format
-            <select id="icecast_format">
-              <option value="ogg">OGG</option>
-              <option value="mp3">MP3</option>
+          <label>Sample Rate
+            <select id="icecast_sample_rate">
+              <option value="8000">8000 Hz</option>
+              <option value="11025">11025 Hz</option>
+              <option value="16000">16000 Hz</option>
+              <option value="22050">22050 Hz</option>
+              <option value="24000" selected>24000 Hz</option>
+              <option value="32000">32000 Hz</option>
+              <option value="44100">44100 Hz</option>
+              <option value="48000">48000 Hz</option>
             </select>
           </label>
-        </div>
-        <div class="actions">
-          <button id="add_stream" type="button">Add Icecast Output</button>
+          <label>Bitrate
+            <select id="icecast_bitrate"></select>
+          </label>
+          <label id="output_enabled_label"><input id="output_enabled" type="checkbox" checked> Output enabled</label>
         </div>
       </fieldset>
+      </div>
+      <div class="actions">
+        <button id="cancel_wizard" type="button">Cancel</button>
+        <button id="wizard_back" type="button" hidden>Back</button>
+        <button id="wizard_next" type="button">Next</button>
+        <button id="wizard_finish" type="button" hidden>Finish</button>
+        <button id="save_output" type="button" hidden>Save Changes</button>
+        <button id="cancel_output_edit" type="button" hidden>Cancel</button>
+      </div>
       <div id="stream-result" class="message"></div>
       <div id="streams-list" class="stream-list" aria-live="off"></div>
     </section>
@@ -952,6 +1520,14 @@ let lastControlSignature = "";
 let stationResults = [];
 let selectedStationKey = "";
 let configuredStreams = [];
+let editingStreamId = "";
+let editingOutputId = "";
+let wizardStep = 0;
+let wizardMode = "add";
+let wizardDirty = false;
+let icecastAuthPassed = false;
+let icecastAuthSignature = "";
+let activeStreamsSignature = "";
 
 async function request(path, options = {}) {
   const response = await fetch(path, options);
@@ -1030,8 +1606,8 @@ async function searchStations() {
     select.appendChild(option);
   }
   selectedStationKey = "";
-  setDisabled(document.getElementById("icecast_fields"), true);
-  setText("selected_station", "Select a station before configuring Icecast.");
+  setText("selected_station", "Select a station to continue.");
+  renderWizard();
 }
 
 function selectedStation() {
@@ -1041,17 +1617,18 @@ function selectedStation() {
 function chooseStation() {
   selectedStationKey = document.getElementById("station_results").value;
   const station = selectedStation();
-  setDisabled(document.getElementById("icecast_fields"), !station);
   if (!station) {
-    setText("selected_station", "Select a station before configuring Icecast.");
+    setText("selected_station", "Select a station to continue.");
+    renderWizard();
     return;
   }
   setText("selected_station", `Selected ${stationLabel(station)}`);
-  const mount = document.getElementById("icecast_mount");
-  if (!mount.value) mount.value = `/${station.callsign.toLowerCase()}.ogg`;
+  wizardDirty = true;
+  renderWizard();
 }
 
 function streamPayload() {
+  const selectedFormat = document.querySelector("input[name='icecast_format']:checked");
   return {
     station_key: selectedStationKey,
     icecast: {
@@ -1060,14 +1637,27 @@ function streamPayload() {
       username: document.getElementById("icecast_username").value,
       password: document.getElementById("icecast_password").value,
       mount: document.getElementById("icecast_mount").value,
-      format: document.getElementById("icecast_format").value
+      format: selectedFormat ? selectedFormat.value : "mp3",
+      sample_rate: Number(document.getElementById("icecast_sample_rate").value),
+      bitrate: Number(document.getElementById("icecast_bitrate").value)
     }
+  };
+}
+
+function outputEditPayload() {
+  return {
+    stream_id: editingStreamId,
+    output_id: editingOutputId,
+    enabled: document.getElementById("output_enabled").checked,
+    icecast: streamPayload().icecast
   };
 }
 
 function streamLabel(stream) {
   const station = stream.station;
-  const icecast = stream.icecast;
+  const output = streamOutputs(stream)[0] || {};
+  const icecast = output.icecast || stream.icecast || {};
+  if (!station || !icecast.host) return "Incomplete stream";
   return `${station.callsign} ${station.frequency} MHz to ${icecast.username}@${icecast.host}:${icecast.port}${icecast.mount} (${icecast.format.toUpperCase()})`;
 }
 
@@ -1094,10 +1684,228 @@ function streamOutputCount(stream) {
   return 0;
 }
 
-function renderActiveStreams(streams) {
+function populateBitrates() {
+  const select = document.getElementById("icecast_bitrate");
+  if (select.options.length) return;
+  for (let bitrate = 8; bitrate <= 320; bitrate += 8) {
+    const option = document.createElement("option");
+    option.value = String(bitrate);
+    option.textContent = `${bitrate} Kbps`;
+    if (bitrate === 48) option.selected = true;
+    select.appendChild(option);
+  }
+}
+
+function streamOutputs(stream) {
+  if (Array.isArray(stream.outputs)) return stream.outputs;
+  if (stream.icecast) return [{id: stream.id, enabled: stream.enabled !== false, icecast: stream.icecast}];
+  return [];
+}
+
+function findConfiguredOutput(streamId, outputId) {
+  const stream = configuredStreams.find(item => item.id === streamId);
+  if (!stream) return null;
+  const outputs = streamOutputs(stream);
+  const output = outputs.find(item => item.id === outputId);
+  if (!output) return null;
+  return {stream, output, outputs};
+}
+
+function setIcecastForm(icecast, enabled = true) {
+  setValue("icecast_host", icecast.host || "");
+  setValue("icecast_port", icecast.port || "");
+  setValue("icecast_username", icecast.username || "");
+  setValue("icecast_password", icecast.password || "");
+  setValue("icecast_mount", icecast.mount || "");
+  const format = icecast.format || "mp3";
+  setChecked("icecast_format_mp3", format === "mp3");
+  setChecked("icecast_format_ogg", format === "ogg");
+  setValue("icecast_sample_rate", icecast.sample_rate || 24000);
+  setValue("icecast_bitrate", icecast.bitrate || (format === "mp3" ? 64 : 48));
+  setChecked("output_enabled", enabled);
+}
+
+function clearIcecastForm() {
+  setIcecastForm({format: "mp3", sample_rate: 24000, bitrate: 64}, true);
+  setChecked("show_icecast_password", false);
+  document.getElementById("icecast_password").type = "password";
+}
+
+function icecastCredentialSignature() {
+  const payload = streamPayload().icecast;
+  return JSON.stringify({
+    host: payload.host,
+    port: payload.port,
+    username: payload.username,
+    password: payload.password,
+    mount: payload.mount
+  });
+}
+
+function credentialsComplete() {
+  const payload = streamPayload().icecast;
+  return Boolean(
+    payload.host.trim() &&
+    payload.port >= 1 &&
+    payload.port <= 65535 &&
+    payload.username.trim() &&
+    payload.password &&
+    payload.mount.trim()
+  );
+}
+
+function setWizardStep(step) {
+  wizardStep = Math.max(0, Math.min(3, step));
+  renderWizard();
+}
+
+function setWizardPanel(id, visible) {
+  document.getElementById(id).hidden = !visible;
+}
+
+function renderWizard() {
+  const editMode = wizardMode === "edit";
+  setText("stream_wizard_title", editMode ? "Edit Stream Output" : "Add Stream");
+  setWizardPanel("wizard_step_station", !editMode && wizardStep === 0);
+  setWizardPanel("wizard_step_credentials", editMode || wizardStep === 1);
+  setWizardPanel("wizard_step_codec", editMode || wizardStep === 2);
+  setWizardPanel("wizard_step_quality", editMode || wizardStep === 3);
+  document.getElementById("cancel_wizard").hidden = editMode;
+  document.getElementById("wizard_back").hidden = editMode || wizardStep === 0;
+  document.getElementById("wizard_next").hidden = editMode || wizardStep === 3;
+  document.getElementById("wizard_finish").hidden = editMode || wizardStep !== 3;
+  document.getElementById("save_output").hidden = !editMode;
+  document.getElementById("cancel_output_edit").hidden = !editMode;
+  const next = document.getElementById("wizard_next");
+  if (wizardStep === 0) {
+    setDisabled(next, !selectedStation());
+  } else if (wizardStep === 1) {
+    setDisabled(next, !credentialsComplete());
+  } else {
+    setDisabled(next, false);
+  }
+}
+
+function beginStreamWizard() {
+  wizardMode = "add";
+  wizardStep = 0;
+  wizardDirty = true;
+  icecastAuthPassed = false;
+  icecastAuthSignature = "";
+  editingStreamId = "";
+  editingOutputId = "";
+  selectedStationKey = "";
+  const stationResultsElement = document.getElementById("station_results");
+  if (stationResultsElement) stationResultsElement.value = "";
+  clearIcecastForm();
+  setText("selected_station", "Select a station to continue.");
+  setStreamResult("");
+  renderWizard();
+  showView("add_stream");
+}
+
+function finishWizard() {
+  wizardDirty = false;
+  icecastAuthPassed = false;
+  icecastAuthSignature = "";
+  setStreamResult("");
+  showView("streams");
+}
+
+function setOutputEditMode(enabled, selected = null) {
+  wizardMode = enabled ? "edit" : "add";
+  editingStreamId = enabled && selected ? selected.stream.id : "";
+  editingOutputId = enabled && selected ? selected.output.id : "";
+  const enabledLabel = document.getElementById("output_enabled_label");
+  enabledLabel.hidden = !enabled || !selected || selected.outputs.length <= 1;
+  if (!enabled) {
+    setChecked("output_enabled", true);
+  }
+  renderWizard();
+}
+
+function editOutput(streamId, outputId) {
+  const selected = findConfiguredOutput(streamId, outputId);
+  if (!selected) {
+    setStreamResult("Stream output was not found.", "error");
+    return;
+  }
+  selectedStationKey = selected.stream.station.key || "";
+  setIcecastForm(selected.output.icecast || {}, selected.output.enabled !== false);
+  setOutputEditMode(true, selected);
+  setText("selected_station", `Editing ${selected.stream.station.callsign} ${selected.stream.station.frequency} MHz`);
+  wizardDirty = true;
+  setStreamResult("");
+  showView("add_stream");
+}
+
+function editStreamSettings(streamId, outputId = "") {
+  const stream = configuredStreams.find(item => item.id === streamId);
+  const outputs = stream ? streamOutputs(stream) : [];
+  if (outputs.length === 1) {
+    editOutput(streamId, outputs[0].id);
+    return;
+  }
+  if (outputId) {
+    editOutput(streamId, outputId);
+    return;
+  }
+  setOutputEditMode(false);
+  setStreamResult("Select an Icecast output to edit.");
+  showView("add_stream");
+}
+
+function activeStreamRows(activeStreams, configured = configuredStreams) {
+  const rows = [];
+  const activeById = new Map((activeStreams || []).map(stream => [stream.id, stream]));
+  for (const stream of configured || []) {
+    const active = activeById.get(stream.id);
+    if (active) {
+      rows.push(active);
+      activeById.delete(stream.id);
+    } else {
+      rows.push({
+        id: stream.id,
+        station: stream.station,
+        outputs: streamOutputs(stream),
+        status: stream.enabled === false ? "disabled" : "disabled"
+      });
+    }
+  }
+  for (const stream of activeById.values()) rows.push(stream);
+  return rows;
+}
+
+function activeStreamSignature(rows) {
+  return JSON.stringify(rows.map(stream => {
+    const station = stream.station || {};
+    return {
+      id: stream.id || "",
+      callsign: station.callsign || "",
+      frequency: station.frequency || "",
+      outputs: streamOutputs(stream).map(output => ({
+        id: output.id || "",
+        enabled: output.enabled !== false,
+        type: output.type || "icecast"
+      })),
+      status: normalizeStreamStatus(stream.status)
+    };
+  }));
+}
+
+function renderActiveStreams(activeStreams, configured = configuredStreams) {
   const tbody = document.getElementById("active-streams-body");
+  const rows = activeStreamRows(activeStreams, configured);
+  const nextSignature = activeStreamSignature(rows);
+  const enabledCount = rows.filter(stream => normalizeStreamStatus(stream.status) === "enabled").length;
+  setText("summary_stream_count", enabledCount);
+  if (nextSignature === activeStreamsSignature) {
+    return;
+  }
+  activeStreamsSignature = nextSignature;
   tbody.innerHTML = "";
-  if (!streams || streams.length === 0) {
+
+  if (rows.length === 0) {
     const row = document.createElement("tr");
     row.id = "active-streams-empty";
     const cell = document.createElement("td");
@@ -1106,11 +1914,9 @@ function renderActiveStreams(streams) {
     cell.textContent = "No active streams.";
     row.appendChild(cell);
     tbody.appendChild(row);
-    setText("summary_stream_count", "0");
     return;
   }
-  setText("summary_stream_count", streams.length);
-  for (const stream of streams) {
+  for (const stream of rows) {
     tbody.appendChild(activeStreamRow(stream));
   }
 }
@@ -1138,12 +1944,15 @@ function tableCell(value) {
 function streamActionsCell(stream) {
   const cell = document.createElement("td");
   cell.className = "menu-cell";
+  const output = stream.outputs && stream.outputs.length ? stream.outputs[0] : {};
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = "More actions";
   button.setAttribute("aria-haspopup", "menu");
   button.setAttribute("aria-expanded", "false");
+  button.setAttribute("aria-label", `More actions for ${stationLabelForActionMenu(stream)}`);
   button.dataset.activeStreamMenu = stream.id || "";
+  button.dataset.outputId = output.id || "";
   const menu = document.createElement("div");
   menu.className = "stream-actions-menu";
   menu.hidden = true;
@@ -1154,12 +1963,14 @@ function streamActionsCell(stream) {
   edit.setAttribute("role", "menuitem");
   edit.dataset.action = "edit-active-stream";
   edit.dataset.streamId = stream.id || "";
+  edit.dataset.outputId = output.id || "";
   const remove = document.createElement("button");
   remove.type = "button";
   remove.textContent = "Remove stream";
   remove.setAttribute("role", "menuitem");
   remove.dataset.action = "remove-active-stream";
   remove.dataset.streamId = stream.id || "";
+  remove.dataset.outputId = output.id || "";
   menu.appendChild(edit);
   menu.appendChild(remove);
   cell.appendChild(button);
@@ -1167,16 +1978,47 @@ function streamActionsCell(stream) {
   return cell;
 }
 
+function stationLabelForActionMenu(stream) {
+  const station = stream.station || {};
+  if (station.callsign && station.frequency) return `${station.callsign} ${station.frequency} MHz`;
+  return station.callsign || "stream";
+}
+
+function menuItems(menu) {
+  return Array.from(menu.querySelectorAll("[role='menuitem']"));
+}
+
+function openStreamActionMenu(button, focus = "first") {
+  const menu = button.nextElementSibling;
+  if (!menu) return;
+  closeStreamActionMenus();
+  menu.hidden = false;
+  button.setAttribute("aria-expanded", "true");
+  if (focus) {
+    const items = menuItems(menu);
+    const target = focus === "last" ? items[items.length - 1] : items[0];
+    if (target) target.focus();
+  }
+}
+
+function closeStreamActionMenu(menu, restoreFocus = true) {
+  menu.hidden = true;
+  const button = menu.parentElement.querySelector("button[aria-haspopup='menu']");
+  if (button) {
+    button.setAttribute("aria-expanded", "false");
+    if (restoreFocus) button.focus();
+  }
+}
+
 function closeStreamActionMenus() {
   for (const menu of document.querySelectorAll(".stream-actions-menu")) {
-    menu.hidden = true;
-    const button = menu.parentElement.querySelector("button[aria-haspopup='menu']");
-    if (button) button.setAttribute("aria-expanded", "false");
+    closeStreamActionMenu(menu, false);
   }
 }
 
 function renderStreams(streams) {
   configuredStreams = streams || [];
+  renderActiveStreams([], configuredStreams);
   const list = document.getElementById("streams-list");
   list.innerHTML = "";
   if (configuredStreams.length === 0) {
@@ -1193,13 +2035,27 @@ function renderStreams(streams) {
     title.textContent = streamLabel(stream);
     const details = document.createElement("div");
     details.className = "hint";
-    details.textContent = "Configured only; streaming workers will be connected in the next plumbing step.";
+    details.textContent = `${streamOutputCount(stream)} Icecast output${streamOutputCount(stream) === 1 ? "" : "s"}.`;
+    const outputs = document.createElement("div");
+    outputs.className = "actions";
+    for (const output of streamOutputs(stream)) {
+      const icecast = output.icecast || {};
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.textContent = `Edit ${icecast.mount || "Icecast output"}`;
+      edit.dataset.action = "edit-output";
+      edit.dataset.streamId = stream.id;
+      edit.dataset.outputId = output.id;
+      outputs.appendChild(edit);
+    }
     const remove = document.createElement("button");
     remove.type = "button";
     remove.textContent = "Remove";
+    remove.dataset.action = "remove-stream";
     remove.dataset.streamId = stream.id;
     item.appendChild(title);
     item.appendChild(details);
+    item.appendChild(outputs);
     item.appendChild(remove);
     list.appendChild(item);
   }
@@ -1294,7 +2150,7 @@ function updateDashboard(data) {
   setText("summary_sdr", activeSdrLabel(settings));
   setText("summary_sample_rate", `${settings.sample_rate} S/s`);
   setText("summary_gain", settings.gain === null ? "automatic" : `${settings.gain} dB`);
-  renderActiveStreams(data.active_streams || []);
+  renderActiveStreams(data.active_streams || [], configuredStreams);
 }
 
 function syncControls(data) {
@@ -1385,34 +2241,100 @@ for (const button of document.querySelectorAll("nav button[data-view]")) {
 }
 
 document.getElementById("open_add_stream").addEventListener("click", () => {
-  showView("add_stream");
+  beginStreamWizard();
 });
 
-document.getElementById("active-streams-body").addEventListener("click", event => {
+document.getElementById("active-streams-body").addEventListener("click", async event => {
   const target = event.target;
   if (!target || !target.dataset) return;
   if (target.dataset.activeStreamMenu !== undefined) {
     const menu = target.nextElementSibling;
     const shouldOpen = menu.hidden;
-    closeStreamActionMenus();
-    menu.hidden = !shouldOpen;
-    target.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+    if (shouldOpen) {
+      openStreamActionMenu(target, null);
+    } else {
+      closeStreamActionMenu(menu, false);
+    }
     return;
   }
   if (target.dataset.action === "edit-active-stream") {
     closeStreamActionMenus();
-    showView("add_stream");
-    setStreamResult("Stream editing will be connected when stream runtime settings are implemented.");
+    editStreamSettings(target.dataset.streamId, target.dataset.outputId);
     return;
   }
   if (target.dataset.action === "remove-active-stream") {
     closeStreamActionMenus();
-    setStreamResult("Active stream removal will be connected when stream workers are implemented.");
+    try {
+      const data = await request(`/api/streams?id=${encodeURIComponent(target.dataset.streamId)}`, {
+        method: "DELETE"
+      });
+      renderStreams(data.streams || []);
+      setStreamResult("");
+    } catch (error) {
+      setStreamResult(error.message, "error");
+    }
+  }
+});
+
+document.getElementById("active-streams-body").addEventListener("keydown", event => {
+  const target = event.target;
+  if (!target || !target.dataset) return;
+  if (target.dataset.activeStreamMenu !== undefined) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openStreamActionMenu(target, "first");
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      openStreamActionMenu(target, "first");
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      openStreamActionMenu(target, "last");
+      return;
+    }
+  }
+  if (target.getAttribute("role") === "menuitem") {
+    const menu = target.closest(".stream-actions-menu");
+    if (!menu) return;
+    const items = menuItems(menu);
+    const index = items.indexOf(target);
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      items[(index + 1) % items.length].focus();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      items[(index - 1 + items.length) % items.length].focus();
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      items[0].focus();
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      items[items.length - 1].focus();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeStreamActionMenu(menu, true);
+    }
   }
 });
 
 document.addEventListener("click", event => {
   if (!event.target || event.target.closest(".menu-cell")) return;
+  closeStreamActionMenus();
+});
+
+document.addEventListener("focusin", event => {
+  if (event.target && event.target.closest(".menu-cell")) return;
   closeStreamActionMenus();
 });
 
@@ -1451,19 +2373,84 @@ document.getElementById("station_search").addEventListener("keydown", async even
 
 document.getElementById("station_results").addEventListener("change", chooseStation);
 
-document.getElementById("icecast_format").addEventListener("change", () => {
-  const station = selectedStation();
-  const mount = document.getElementById("icecast_mount");
-  if (!station || !mount.value) return;
-  const extension = document.getElementById("icecast_format").value === "mp3" ? ".mp3" : ".ogg";
-  mount.value = mount.value.replace(/\\.(ogg|mp3)$/i, extension);
+for (const formatControl of document.querySelectorAll("input[name='icecast_format']")) {
+  formatControl.addEventListener("change", () => {
+    wizardDirty = true;
+    icecastAuthPassed = false;
+    renderWizard();
+  });
+}
+
+for (const id of ["icecast_host", "icecast_port", "icecast_username", "icecast_password", "icecast_mount"]) {
+  document.getElementById(id).addEventListener("input", () => {
+    wizardDirty = true;
+    icecastAuthPassed = false;
+    icecastAuthSignature = "";
+    renderWizard();
+  });
+}
+
+for (const id of ["icecast_sample_rate", "icecast_bitrate", "output_enabled"]) {
+  document.getElementById(id).addEventListener("change", () => {
+    wizardDirty = true;
+    renderWizard();
+  });
+}
+
+document.getElementById("show_icecast_password").addEventListener("change", event => {
+  document.getElementById("icecast_password").type = event.target.checked ? "text" : "password";
 });
 
-document.getElementById("add_stream").addEventListener("click", async () => {
-  const button = document.getElementById("add_stream");
+document.getElementById("cancel_wizard").addEventListener("click", () => {
+  finishWizard();
+});
+
+document.getElementById("wizard_back").addEventListener("click", () => {
+  setWizardStep(wizardStep - 1);
+});
+
+document.getElementById("wizard_next").addEventListener("click", async () => {
+  if (wizardStep === 0) {
+    setWizardStep(1);
+    return;
+  }
+  if (wizardStep === 1) {
+    const button = document.getElementById("wizard_next");
+    setDisabled(button, true);
+    setStreamResult("Testing Icecast authentication...");
+    try {
+      const signature = icecastCredentialSignature();
+      const data = await request("/api/icecast-auth", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({icecast: streamPayload().icecast})
+      });
+      setStreamResult(data.message, data.success ? "success" : "error");
+      if (data.success) {
+        icecastAuthPassed = true;
+        icecastAuthSignature = signature;
+        setWizardStep(2);
+      }
+    } catch (error) {
+      setStreamResult(error.message, "error");
+    } finally {
+      renderWizard();
+    }
+    return;
+  }
+  if (wizardStep === 2) {
+    setWizardStep(3);
+  }
+});
+
+document.getElementById("wizard_finish").addEventListener("click", async () => {
+  const button = document.getElementById("wizard_finish");
   setDisabled(button, true);
-  setStreamResult("Testing Icecast authentication...");
+  setStreamResult("Creating stream...");
   try {
+    if (!icecastAuthPassed || icecastAuthSignature !== icecastCredentialSignature()) {
+      throw new Error("Icecast credentials must be tested before creating the stream.");
+    }
     const data = await request("/api/streams", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
@@ -1471,6 +2458,47 @@ document.getElementById("add_stream").addEventListener("click", async () => {
     });
     renderStreams(data.streams || []);
     setStreamResult(data.message, data.success ? "success" : "error");
+    if (data.success) {
+      finishWizard();
+    }
+  } catch (error) {
+    setStreamResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
+    renderWizard();
+  }
+});
+
+window.addEventListener("beforeunload", event => {
+  if (!wizardDirty) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
+
+document.getElementById("cancel_output_edit").addEventListener("click", () => {
+  setOutputEditMode(false);
+  wizardDirty = false;
+  setStreamResult("");
+  showView("streams");
+});
+
+document.getElementById("save_output").addEventListener("click", async () => {
+  const button = document.getElementById("save_output");
+  setDisabled(button, true);
+  setStreamResult("Saving stream output settings...");
+  try {
+    const data = await request("/api/stream-output", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(outputEditPayload())
+    });
+    renderStreams(data.streams || []);
+    setStreamResult(data.message, data.success ? "success" : "error");
+    if (data.success) {
+      wizardDirty = false;
+      setOutputEditMode(false);
+      showView("streams");
+    }
   } catch (error) {
     setStreamResult(error.message, "error");
   } finally {
@@ -1481,6 +2509,11 @@ document.getElementById("add_stream").addEventListener("click", async () => {
 document.getElementById("streams-list").addEventListener("click", async event => {
   const button = event.target;
   if (!button || !button.dataset || !button.dataset.streamId) return;
+  if (button.dataset.action === "edit-output") {
+    editOutput(button.dataset.streamId, button.dataset.outputId);
+    return;
+  }
+  if (button.dataset.action !== "remove-stream") return;
   try {
     const data = await request(`/api/streams?id=${encodeURIComponent(button.dataset.streamId)}`, {
       method: "DELETE"
@@ -1498,6 +2531,7 @@ async function refresh() {
 }
 
 (async function init() {
+  populateBitrates();
   const data = await request("/api/status");
   await loadDevices(data.settings.serial);
   await searchStations();
