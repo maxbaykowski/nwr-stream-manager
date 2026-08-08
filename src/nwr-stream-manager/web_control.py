@@ -54,6 +54,9 @@ else:
 LOG = logging.getLogger(__name__)
 STATE_DIRECTORY_NAME = "nwr-stream-manager"
 STATE_FILE_NAME = "rtl-control.json"
+USB_VENDOR_NAMES = {
+    "0bda": "Realtek",
+}
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,8 @@ class RtlControlService:
         self._last_rate_log_at = 0.0
         if self.settings.serial:
             self._start_or_update_capture_locked()
+        else:
+            self._select_only_connected_device()
 
     def close(self) -> None:
         self.stop_capture()
@@ -153,6 +158,7 @@ class RtlControlService:
             by_serial[device.serial] = {
                 "serial": device.serial,
                 "name": device.description,
+                "vendor": USB_VENDOR_NAMES.get(device.vendor_id.lower(), device.vendor_id),
                 "vendor_id": device.vendor_id,
                 "product_id": device.product_id,
                 "source": "usb",
@@ -165,6 +171,7 @@ class RtlControlService:
                 {
                     "serial": device.serial,
                     "name": device.description,
+                    "vendor": "",
                     "vendor_id": "",
                     "product_id": "",
                     "source": "librtlsdr",
@@ -174,6 +181,25 @@ class RtlControlService:
             entry["librtlsdr_index"] = device.index
         devices = sorted(by_serial.values(), key=lambda item: (item["name"], item["serial"]))
         return {"devices": devices, "errors": errors}
+
+    def _select_only_connected_device(self) -> None:
+        try:
+            devices = self.devices()["devices"]
+        except Exception as exc:
+            LOG.debug("initial RTL-SDR auto-selection failed: %s", exc)
+            return
+        if len(devices) != 1:
+            return
+        with self.lock:
+            if self.settings.serial:
+                return
+            serial = str(devices[0]["serial"]).strip()
+            if not serial:
+                return
+            self.settings = replace(self.settings, serial=serial)
+            save_settings(self.state_path, self.settings)
+            LOG.info("selected the only connected RTL-SDR: serial=%s", serial)
+            self._start_or_update_capture_locked()
 
     def update(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
@@ -356,6 +382,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -491,7 +518,9 @@ main { max-width: 980px; margin: 0 auto; padding: 24px; }
 h1 { font-size: 24px; margin: 0 0 20px; }
 section { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
 label { display: grid; gap: 6px; font-weight: 600; margin-bottom: 14px; }
-select, input { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; }
+select, input, button { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; }
+button { cursor: pointer; }
+button:disabled { cursor: default; opacity: 0.65; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
 .row { display: flex; align-items: center; gap: 10px; }
 .row label { margin: 0; display: flex; align-items: center; gap: 8px; }
@@ -503,7 +532,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 .hint { color: #526070; font-size: 13px; margin-top: -8px; }
 @media (prefers-color-scheme: dark) {
   body { background: #101318; color: #eef2f7; }
-  section, select, input { background: #181d24; color: #eef2f7; border-color: #333b48; }
+  section, select, input, button { background: #181d24; color: #eef2f7; border-color: #333b48; }
   .metric { border-color: #333b48; }
   .metric b, .hint { color: #9aa8ba; }
 }
@@ -516,6 +545,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <label>Active SDR
       <select id="serial"></select>
     </label>
+    <button id="rescan_devices" type="button">Rescan</button>
     <div id="device-errors" class="error"></div>
   </section>
   <section>
@@ -565,17 +595,37 @@ async function request(path, options = {}) {
 }
 
 function deviceLabel(device) {
-  const vendor = [device.vendor_id, device.product_id].filter(Boolean).join(":");
-  const suffix = vendor ? ` (${vendor}, serial ${device.serial})` : ` (serial ${device.serial})`;
-  return `${device.name || "RTL-SDR"}${suffix}`;
+  const parts = [device.vendor, device.name || "RTL-SDR", `serial ${device.serial}`].filter(Boolean);
+  return parts.join(", ");
 }
 
-async function loadDevices(selected) {
+function configuredDeviceLabel(serial) {
+  return `Configured SDR, serial ${serial} (disconnected)`;
+}
+
+async function loadDevices(selected, options = {}) {
   const data = await request("/api/devices");
   const select = document.getElementById("serial");
-  const signature = JSON.stringify(data.devices.map(device => [device.serial, deviceLabel(device)]));
-  if (select.dataset.signature !== signature) {
-    select.innerHTML = '<option value="">Select an RTL-SDR...</option>';
+  const selectedDevice = data.devices.find(device => device.serial === selected);
+  const optionSignature = data.devices.map(device => [device.serial, deviceLabel(device)]);
+  if (selected && !selectedDevice) {
+    optionSignature.unshift([selected, configuredDeviceLabel(selected)]);
+  }
+  const needsChoice = !selected && data.devices.length !== 1;
+  const signature = JSON.stringify({options: optionSignature, needsChoice});
+  if (options.force || select.dataset.signature !== signature) {
+    select.innerHTML = "";
+    if (selected && !selectedDevice) {
+      const option = document.createElement("option");
+      option.value = selected;
+      option.textContent = configuredDeviceLabel(selected);
+      select.appendChild(option);
+    } else if (needsChoice) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = data.devices.length === 0 ? "No RTL-SDR devices found" : "Select an RTL-SDR...";
+      select.appendChild(option);
+    }
     for (const device of data.devices) {
       const option = document.createElement("option");
       option.value = device.serial;
@@ -584,7 +634,8 @@ async function loadDevices(selected) {
     }
     select.dataset.signature = signature;
   }
-  setValue("serial", selected || "");
+  const fallback = !selected && data.devices.length === 1 ? data.devices[0].serial : "";
+  setValue("serial", selected || fallback);
   setText("device-errors", data.errors.join(" | "));
 }
 
@@ -721,6 +772,19 @@ for (const id of controls) {
   });
 }
 
+document.getElementById("rescan_devices").addEventListener("click", async () => {
+  const button = document.getElementById("rescan_devices");
+  setDisabled(button, true);
+  try {
+    const status = await request("/api/status");
+    await loadDevices(status.settings.serial, {force: true});
+  } catch (error) {
+    setText("device-errors", error.message);
+  } finally {
+    setDisabled(button, false);
+  }
+});
+
 async function refresh() {
   const data = await request("/api/status");
   applyStatus(data, {syncControls: false});
@@ -732,9 +796,11 @@ async function refresh() {
   applyStatus(data, {syncControls: true});
   setInterval(refresh, 1000);
   setInterval(async () => {
-    const status = await request("/api/status");
-    if (document.activeElement.id !== "serial") {
+    try {
+      const status = await request("/api/status");
       await loadDevices(status.settings.serial);
+    } catch (error) {
+      setText("device-errors", error.message);
     }
   }, 5000);
 })();
