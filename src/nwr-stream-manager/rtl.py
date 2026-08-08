@@ -10,7 +10,7 @@ import queue
 import threading
 import time
 from ctypes import c_ubyte
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -25,6 +25,10 @@ DEFAULT_READ_CHUNK_BYTES = 131_072
 DEFAULT_READ_TIMEOUT_SECONDS = 5.0
 RTL_ASYNC_BUFFER_COUNT = 15
 MAX_RTL_ASYNC_BUFFER_SECONDS = 0.05
+RTL_SAMPLE_RATE_RANGES = (
+    (225_001, 300_000),
+    (900_001, 3_200_000),
+)
 
 RTLSDR_READ_ASYNC_CALLBACK = ctypes.CFUNCTYPE(
     None,
@@ -60,6 +64,10 @@ class RtlDeviceAccessFatalError(RtlDeviceError):
 
 class RtlDeviceBusyRetryableError(RtlDeviceError):
     """Raised when the configured RTL-SDR is present but opened elsewhere."""
+
+
+class RtlConfigError(RtlError):
+    """Raised when requested RTL-SDR settings are invalid."""
 
 
 class RtlReadError(RtlError):
@@ -123,6 +131,21 @@ class RtlConfig:
     read_chunk_bytes: int = DEFAULT_READ_CHUNK_BYTES
     read_timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS
     retry_delay_seconds: float = 0.5
+
+
+def validate_rtl_sample_rate(sample_rate: int) -> int:
+    sample_rate = int(sample_rate)
+    if any(minimum <= sample_rate <= maximum for minimum, maximum in RTL_SAMPLE_RATE_RANGES):
+        return sample_rate
+    ranges = ", ".join(f"{minimum}-{maximum} S/s" for minimum, maximum in RTL_SAMPLE_RATE_RANGES)
+    raise RtlConfigError(f"RTL-SDR sample rate must be in one of these ranges: {ranges}")
+
+
+def validate_ppm_correction(ppm: int) -> int:
+    ppm = int(ppm)
+    if -200 <= ppm <= 200:
+        return ppm
+    raise RtlConfigError("RTL-SDR PPM correction must be between -200 and 200")
 
 
 @dataclass
@@ -415,6 +438,7 @@ class RtlCaptureSource:
         self.thread: threading.Thread | None = None
         self.device_wait_logged = False
         self.device_busy_logged = False
+        self.gain_values_db: list[float] = []
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -476,9 +500,62 @@ class RtlCaptureSource:
             finally:
                 self._close_sdr()
 
+    def apply_config(self, config: RtlConfig) -> None:
+        validate_rtl_sample_rate(config.sample_rate)
+        validate_ppm_correction(config.ppm_correction)
+        current = self.config
+        restart_required = (
+            config.serial != current.serial
+            or config.sample_rate != current.sample_rate
+            or config.center_frequency_hz != current.center_frequency_hz
+            or config.read_chunk_bytes != current.read_chunk_bytes
+            or config.read_timeout_seconds != current.read_timeout_seconds
+        )
+        if restart_required:
+            self.config = config
+            LOG.info(
+                "RTL-SDR capture restart requested: serial=%s sample_rate=%s center=%s",
+                config.serial,
+                config.sample_rate,
+                config.center_frequency_hz,
+            )
+            self._cancel_sdr_async()
+            return
+
+        with self.sdr_lock:
+            sdr = self.sdr
+            if sdr is None:
+                self.config = config
+                return
+            config = replace(config, gain=self._nearest_supported_gain(config.gain))
+            self.config = config
+            if config.bias_tee != current.bias_tee:
+                self._set_bias_tee(sdr, config.bias_tee)
+                LOG.info("RTL-SDR bias tee %s", "enabled" if config.bias_tee else "disabled")
+            if config.ppm_correction != current.ppm_correction:
+                sdr.freq_correction = config.ppm_correction
+                LOG.info("RTL-SDR PPM correction set to %s", config.ppm_correction)
+            if config.gain != current.gain:
+                sdr.gain = "auto" if config.gain is None else config.gain
+                LOG.info(
+                    "RTL-SDR gain set to %s",
+                    "auto" if config.gain is None else f"{config.gain:g} dB",
+                )
+
+    def update_config(self, **changes) -> RtlConfig:
+        config = replace(self.config, **changes)
+        self.apply_config(config)
+        return self.config
+
+    def get_gain_values(self) -> list[float]:
+        with self.sdr_lock:
+            return list(self.gain_values_db)
+
     def _open_configured_sdr(self, *, quiet: bool) -> BaseRtlSdr:
         if BaseRtlSdr is None or rtlsdr_lib is None:
             raise RtlDependencyError(str(RTLSDR_IMPORT_ERROR))
+        validate_rtl_sample_rate(self.config.sample_rate)
+        validate_ppm_correction(self.config.ppm_correction)
         device_index = self._resolve_serial_to_device_index(self.config.serial)
         try:
             with _suppress_native_stderr(quiet):
@@ -502,13 +579,19 @@ class RtlCaptureSource:
             if self.config.ppm_correction:
                 sdr.freq_correction = self.config.ppm_correction
             self._set_bias_tee(sdr, self.config.bias_tee)
+            gain_values = self._read_tuner_gains(sdr)
+            with self.sdr_lock:
+                self.gain_values_db = gain_values
+                selected_gain = self._nearest_supported_gain(self.config.gain)
+                self.config = replace(self.config, gain=selected_gain)
             sdr.gain = "auto" if self.config.gain is None else self.config.gain
             self._reset_sdr_buffer(sdr)
             LOG.info(
-                "RTL-SDR capture started on index %s at %s Hz, sample_rate=%s",
+                "RTL-SDR capture started on index %s at %s Hz, sample_rate=%s gains=%s",
                 device_index,
                 self.config.center_frequency_hz,
                 self.config.sample_rate,
+                gain_values,
             )
             if self.device_wait_logged:
                 LOG.info("Configured RTL-SDR is now available.")
@@ -644,6 +727,22 @@ class RtlCaptureSource:
                 raise RtlDeviceError("this RTL-SDR stack does not support bias tee control")
             return
         set_bias_tee(enabled)
+
+    def _nearest_supported_gain(self, gain: float | None) -> float | None:
+        if gain is None:
+            return None
+        if not self.gain_values_db:
+            return float(gain)
+        return min(self.gain_values_db, key=lambda value: abs(value - float(gain)))
+
+    @staticmethod
+    def _read_tuner_gains(sdr: BaseRtlSdr) -> list[float]:
+        assert rtlsdr_lib is not None
+        buffer = (ctypes.c_int * 256)()
+        result = rtlsdr_lib.rtlsdr_get_tuner_gains(sdr.dev_p, buffer)
+        if result <= 0:
+            return []
+        return [round(buffer[index] / 10.0, 1) for index in range(result)]
 
     @staticmethod
     def _rtl_async_buffer_size(config: RtlConfig) -> int:
