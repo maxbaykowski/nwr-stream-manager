@@ -107,6 +107,8 @@ DEFAULT_STREAM_BITRATES = {
 STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
+STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
+STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
 FALLBACK_STATE_FILE_NAME = "fallback.json"
@@ -262,7 +264,7 @@ def load_web_fallback_audio():
 
 def next_web_fallback_frame(audio, state: WebFallbackPlaybackState, loop_delay_seconds: float) -> bytes:
     if not audio.pcm:
-        return b"\x00" * STREAM_FRAME_BYTES
+        return STREAM_SILENCE_FRAME
     output = bytearray()
     delay_samples = round(max(0.0, loop_delay_seconds) * IQ_SAMPLE_RATE)
     while len(output) < STREAM_FRAME_BYTES:
@@ -378,6 +380,7 @@ class IcecastStreamWorker:
         self._set_status("disabled")
 
     def _produce_encoded_audio(self, sink, encoder, target_frequency_hz: float) -> None:
+        station = self.stream["station"]
         dc_blocker = IqDcBlocker()
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int, int] | None = None
@@ -390,10 +393,14 @@ class IcecastStreamWorker:
         fallback = load_web_fallback_audio()
         fallback_state = WebFallbackPlaybackState()
         last_real_audio = time.monotonic()
+        idle_output_active = False
         while not self.stop_event.is_set():
             try:
-                batch: RtlSampleBatch = self.queue.get(timeout=0.5)
+                batch: RtlSampleBatch = self.queue.get(
+                    timeout=STREAM_FRAME_SECONDS if idle_output_active else STREAM_IDLE_DETECTION_SECONDS
+                )
             except queue.Empty:
+                idle_output_active = True
                 fallback_settings = self.fallback_settings_provider()
                 idle_seconds = time.monotonic() - last_real_audio
                 if not fallback_settings.enabled:
@@ -401,12 +408,18 @@ class IcecastStreamWorker:
                     continue
                 if not fallback_state.active and idle_seconds < fallback_settings.silence_timeout_seconds:
                     fallback_state.reset()
+                    encoded = encoder.encode(STREAM_SILENCE_FRAME)
+                    if encoded:
+                        sink.write(encoded)
                     continue
                 if not fallback_state.active:
                     fallback_state.active = True
                     LOG.info("starting fallback audio for %s after %.1f seconds without IQ", station.get("callsign"), idle_seconds)
-                sink.write(encoder.encode(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds)))
+                encoded = encoder.encode(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds))
+                if encoded:
+                    sink.write(encoded)
                 continue
+            idle_output_active = False
             next_channelizer_key = (
                 batch.sample_rate,
                 batch.center_frequency_hz,
@@ -681,6 +694,20 @@ class RtlControlService:
             save_streams(self.streams_state_path, self.streams)
             self._sync_stream_workers_locked()
         LOG.info("removed stream %s", stream_id)
+        return self.stream_status()
+
+    def update_stream(self, payload: dict[str, Any]) -> dict[str, Any]:
+        stream_id = str(payload.get("stream_id", "")).strip()
+        if "enabled" not in payload:
+            raise ValueError("stream enabled state is required")
+        enabled = bool(payload.get("enabled"))
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            stream["enabled"] = enabled
+            stream["updated_at"] = time.time()
+            save_streams(self.streams_state_path, self.streams)
+            self._sync_stream_workers_locked()
+        LOG.info("%s stream %s", "started" if enabled else "stopped", stream_id)
         return self.stream_status()
 
     def update_stream_output(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1126,6 +1153,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json()
                 response = self.service.update_fallback_settings(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/streams":
+            try:
+                payload = self._read_json()
+                response = self.service.update_stream(payload)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -1633,8 +1669,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div class="actions">
         <button id="open_add_stream" type="button">Add stream</button>
       </div>
-      <h3>Active streams</h3>
-      <table aria-label="Active streams">
+      <table aria-label="Manage streams">
         <thead>
           <tr>
             <th>Callsign</th>
@@ -1745,6 +1780,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <section>
       <h2>Stream Settings</h2>
       <div id="stream_settings_station" class="hint"></div>
+      <label class="checkbox-row">
+        <input id="stream_enabled" type="checkbox">
+        Stream enabled
+      </label>
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
         <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
         <button id="tab_fallback" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback" tabindex="-1">Fallback Audio</button>
@@ -2000,6 +2039,17 @@ function outputEditPayload() {
     enabled: document.getElementById("output_enabled").checked,
     icecast: streamPayload().icecast
   };
+}
+
+async function setStreamEnabled(streamId, enabled, resultHandler = setStreamResult) {
+  const data = await request("/api/streams", {
+    method: "PATCH",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({stream_id: streamId, enabled})
+  });
+  renderStreams(data.streams || []);
+  resultHandler(enabled ? "Stream started." : "Stream stopped.", "success");
+  return data;
 }
 
 function streamLabel(stream) {
@@ -2385,10 +2435,13 @@ function renderStreamSettings() {
   const stream = currentSettingsStream();
   const addButton = document.getElementById("open_add_output");
   setDisabled(addButton, !stream);
+  setDisabled(document.getElementById("stream_enabled"), !stream);
+  if (stream) setChecked("stream_enabled", stream.enabled !== false);
   renderIcecastOutputsTable(stream);
 }
 
 function outputStatusFor(stream, output) {
+  if (!stream || stream.enabled === false) return "disabled";
   if (!output || output.enabled === false) return "disabled";
   const active = activeStreamSnapshots.find(snapshot =>
     snapshot.id === stream.id && streamOutputs(snapshot).some(activeOutput => activeOutput.id === output.id)
@@ -2512,22 +2565,38 @@ function outputActionsCell(stream, output) {
 
 function activeStreamRows(activeStreams, configured = configuredStreams) {
   const rows = [];
-  const activeById = new Map((activeStreams || []).map(stream => [stream.id, stream]));
+  const activeById = new Map();
+  for (const stream of activeStreams || []) {
+    const items = activeById.get(stream.id) || [];
+    items.push(stream);
+    activeById.set(stream.id, items);
+  }
   for (const stream of configured || []) {
-    const active = activeById.get(stream.id);
-    if (active) {
-      rows.push(active);
+    const activeItems = activeById.get(stream.id) || [];
+    if (activeItems.length) {
+      const statuses = activeItems.map(item => normalizeStreamStatus(item.status));
+      const status = statuses.includes("needs-attention") ? "needs-attention" : statuses.includes("enabled") ? "enabled" : "disabled";
+      rows.push({
+        id: stream.id,
+        enabled: stream.enabled !== false,
+        station: stream.station,
+        outputs: streamOutputs(stream),
+        status
+      });
       activeById.delete(stream.id);
     } else {
       rows.push({
         id: stream.id,
+        enabled: stream.enabled !== false,
         station: stream.station,
         outputs: streamOutputs(stream),
         status: stream.enabled === false ? "disabled" : "disabled"
       });
     }
   }
-  for (const stream of activeById.values()) rows.push(stream);
+  for (const streams of activeById.values()) {
+    for (const stream of streams) rows.push(stream);
+  }
   return rows;
 }
 
@@ -2536,6 +2605,7 @@ function activeStreamSignature(rows) {
     const station = stream.station || {};
     return {
       id: stream.id || "",
+      enabled: stream.enabled !== false,
       callsign: station.callsign || "",
       frequency: station.frequency || "",
       outputs: streamOutputs(stream).map(output => ({
@@ -2612,6 +2682,12 @@ function streamActionsCell(stream) {
   menu.className = "stream-actions-menu";
   menu.hidden = true;
   menu.setAttribute("role", "menu");
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.textContent = stream.enabled === false ? "Start stream" : "Stop stream";
+  toggle.setAttribute("role", "menuitem");
+  toggle.dataset.action = "toggle-active-stream";
+  toggle.dataset.streamId = stream.id || "";
   const edit = document.createElement("button");
   edit.type = "button";
   edit.textContent = "Edit stream settings";
@@ -2626,6 +2702,7 @@ function streamActionsCell(stream) {
   remove.dataset.action = "remove-active-stream";
   remove.dataset.streamId = stream.id || "";
   remove.dataset.outputId = output.id || "";
+  menu.appendChild(toggle);
   menu.appendChild(edit);
   menu.appendChild(remove);
   cell.appendChild(button);
@@ -3047,6 +3124,20 @@ document.getElementById("active-streams-body").addEventListener("click", async e
     editStreamSettings(target.dataset.streamId, target.dataset.outputId);
     return;
   }
+  if (target.dataset.action === "toggle-active-stream") {
+    closeStreamActionMenus();
+    const stream = configuredStreams.find(item => item.id === target.dataset.streamId);
+    if (!stream) {
+      setStreamResult("Stream was not found.", "error");
+      return;
+    }
+    try {
+      await setStreamEnabled(target.dataset.streamId, stream.enabled === false, setStreamResult);
+    } catch (error) {
+      setStreamResult(error.message, "error");
+    }
+    return;
+  }
   if (target.dataset.action === "remove-active-stream") {
     closeStreamActionMenus();
     try {
@@ -3210,6 +3301,21 @@ for (const formatControl of document.querySelectorAll("input[name='settings_icec
 document.getElementById("open_add_output").addEventListener("click", beginAddOutput);
 
 document.getElementById("cancel_output_form").addEventListener("click", cancelOutputForm);
+
+document.getElementById("stream_enabled").addEventListener("change", async event => {
+  if (!settingsStreamId || applying) return;
+  const enabled = event.target.checked;
+  setDisabled(event.target, true);
+  try {
+    await setStreamEnabled(settingsStreamId, enabled, setOutputResult);
+  } catch (error) {
+    setOutputResult(error.message, "error");
+    const stream = currentSettingsStream();
+    if (stream) setChecked("stream_enabled", stream.enabled !== false);
+  } finally {
+    setDisabled(event.target, false);
+  }
+});
 
 document.getElementById("add_output").addEventListener("click", async () => {
   const button = document.getElementById("add_output");
