@@ -2126,7 +2126,7 @@ function beginStreamWizard() {
   setText("selected_station", "Select a station to continue.");
   setStreamResult("");
   renderWizard();
-  showView("add_stream");
+  navigateTo("add_stream", {}, false, true);
 }
 
 function finishWizard() {
@@ -2134,7 +2134,7 @@ function finishWizard() {
   icecastAuthPassed = false;
   icecastAuthSignature = "";
   setStreamResult("");
-  showView("streams");
+  navigateTo("streams");
 }
 
 function setOutputEditMode(enabled, selected = null) {
@@ -2161,7 +2161,7 @@ function editOutput(streamId, outputId) {
   setText("selected_station", `Editing ${selected.stream.station.callsign} ${selected.stream.station.frequency} MHz`);
   wizardDirty = true;
   setStreamResult("");
-  showView("add_stream");
+  navigateTo("add_stream", {}, false, true);
 }
 
 function editStreamSettings(streamId, outputId = "") {
@@ -2181,7 +2181,7 @@ function showStreamSettings(streamId) {
   const station = stream.station || {};
   setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
   renderStreamSettings();
-  showView("stream_settings");
+  navigateTo("stream_settings", {streamId});
 }
 
 function renderStreamSettings() {
@@ -2589,12 +2589,86 @@ function showView(name) {
     view.hidden = view.id !== `view_${name}`;
   }
   for (const button of document.querySelectorAll("nav button[data-view]")) {
-    if (button.dataset.view === name) {
+    if (button.dataset.view === name || (button.dataset.view === "streams" && name === "stream_settings")) {
       button.setAttribute("aria-current", "page");
     } else {
       button.removeAttribute("aria-current");
     }
   }
+}
+
+function currentViewName() {
+  const visible = Array.from(document.querySelectorAll(".view")).find(view => !view.hidden);
+  return visible ? visible.id.replace(/^view_/, "") : "dashboard";
+}
+
+function routeForView(name, params = {}) {
+  const query = new URLSearchParams();
+  if (name === "dashboard") return "/";
+  if (name === "rtl") query.set("view", "rtl");
+  if (name === "streams") query.set("view", "streams");
+  if (name === "add_stream") query.set("view", "add_stream");
+  if (name === "stream_settings") {
+    query.set("view", "stream_settings");
+    if (params.streamId) query.set("stream", params.streamId);
+  }
+  const text = query.toString();
+  return text ? `/?${text}` : "/";
+}
+
+function routeFromLocation() {
+  const query = new URLSearchParams(window.location.search);
+  const view = query.get("view") || "dashboard";
+  if (["dashboard", "rtl", "streams", "add_stream", "stream_settings"].includes(view)) {
+    return {view, streamId: query.get("stream") || ""};
+  }
+  return {view: "dashboard", streamId: ""};
+}
+
+function routeState(view, params = {}) {
+  return {view, streamId: params.streamId || ""};
+}
+
+function applyRoute(route) {
+  if (route.view === "stream_settings") {
+    const streamId = route.streamId || settingsStreamId;
+    const stream = configuredStreams.find(item => item.id === streamId);
+    if (stream) {
+      settingsStreamId = streamId;
+      outputTableSignature = "";
+      cancelOutputForm();
+      const station = stream.station || {};
+      setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
+      renderStreamSettings();
+      showView("stream_settings");
+      return;
+    }
+    showView("streams");
+    return;
+  }
+  if (route.view !== "stream_settings") settingsStreamId = "";
+  showView(route.view);
+}
+
+function hasUnsavedNavigationState() {
+  return Boolean(wizardDirty || outputFormIsOpen());
+}
+
+function confirmDiscardNavigation() {
+  if (!hasUnsavedNavigationState()) return true;
+  return window.confirm("Discard the current setup changes?");
+}
+
+function navigateTo(view, params = {}, replace = false, force = false) {
+  if (!replace && !force && !confirmDiscardNavigation()) return;
+  const url = routeForView(view, params);
+  const state = routeState(view, params);
+  if (replace) {
+    history.replaceState(state, "", url);
+  } else {
+    history.pushState(state, "", url);
+  }
+  applyRoute(state);
 }
 
 function activeSdrLabel(settings) {
@@ -2698,8 +2772,16 @@ for (const id of controls) {
 }
 
 for (const button of document.querySelectorAll("nav button[data-view]")) {
-  button.addEventListener("click", () => showView(button.dataset.view));
+  button.addEventListener("click", () => navigateTo(button.dataset.view));
 }
+
+window.addEventListener("popstate", event => {
+  if (!confirmDiscardNavigation()) {
+    history.pushState(routeState(currentViewName(), {streamId: settingsStreamId}), "", routeForView(currentViewName(), {streamId: settingsStreamId}));
+    return;
+  }
+  applyRoute(event.state || routeFromLocation());
+});
 
 document.getElementById("open_add_stream").addEventListener("click", () => {
   beginStreamWizard();
@@ -3133,7 +3215,7 @@ document.getElementById("cancel_output_edit").addEventListener("click", () => {
   setOutputEditMode(false);
   wizardDirty = false;
   setStreamResult("");
-  showView("streams");
+  navigateTo("streams");
 });
 
 document.getElementById("save_output").addEventListener("click", async () => {
@@ -3151,7 +3233,7 @@ document.getElementById("save_output").addEventListener("click", async () => {
     if (data.success) {
       wizardDirty = false;
       setOutputEditMode(false);
-      showView("streams");
+      navigateTo("streams");
     }
   } catch (error) {
     setStreamResult(error.message, "error");
@@ -3191,6 +3273,8 @@ async function refresh() {
   await searchStations();
   await loadStreams();
   applyStatus(data, {syncControls: true});
+  const initialRoute = routeFromLocation();
+  navigateTo(initialRoute.view, {streamId: initialRoute.streamId}, true);
   setInterval(refresh, 1000);
   setInterval(async () => {
     try {
