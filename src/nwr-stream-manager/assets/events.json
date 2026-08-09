@@ -1,0 +1,214 @@
+{
+  "ADR": {
+    "code": "ADR",
+    "name": "Administrative Message"
+  },
+  "AVA": {
+    "code": "AVA",
+    "name": "Avalanche Watch"
+  },
+  "AVW": {
+    "code": "AVW",
+    "name": "Avalanche Warning"
+  },
+  "BLU": {
+    "code": "BLU",
+    "name": "Blue Alert"
+  },
+  "BZW": {
+    "code": "BZW",
+    "name": "Blizzard Warning"
+  },
+  "CAE": {
+    "code": "CAE",
+    "name": "Child Abduction Emergency"
+  },
+  "CDW": {
+    "code": "CDW",
+    "name": "Civil Danger Warning"
+  },
+  "CEM": {
+    "code": "CEM",
+    "name": "Civil Emergency Message"
+  },
+  "CFA": {
+    "code": "CFA",
+    "name": "Coastal Flood Watch"
+  },
+  "CFW": {
+    "code": "CFW",
+    "name": "Coastal Flood Warning"
+  },
+  "DMO": {
+    "code": "DMO",
+    "name": "Practice/Demo Warning"
+  },
+  "DSW": {
+    "code": "DSW",
+    "name": "Dust Storm Warning"
+  },
+  "EQW": {
+    "code": "EQW",
+    "name": "Earthquake Warning"
+  },
+  "EVI": {
+    "code": "EVI",
+    "name": "Evacuation Immediate"
+  },
+  "EWW": {
+    "code": "EWW",
+    "name": "Extreme Wind Warning"
+  },
+  "FFA": {
+    "code": "FFA",
+    "name": "Flash Flood Watch"
+  },
+  "FFS": {
+    "code": "FFS",
+    "name": "Flash Flood Statement"
+  },
+  "FFW": {
+    "code": "FFW",
+    "name": "Flash Flood Warning"
+  },
+  "FLA": {
+    "code": "FLA",
+    "name": "Flood Watch"
+  },
+  "FLS": {
+    "code": "FLS",
+    "name": "Flood Statement"
+  },
+  "FLW": {
+    "code": "FLW",
+    "name": "Flood Warning"
+  },
+  "FRW": {
+    "code": "FRW",
+    "name": "Fire Warning"
+  },
+  "HLS": {
+    "code": "HLS",
+    "name": "Hurricane Statement"
+  },
+  "HMW": {
+    "code": "HMW",
+    "name": "Hazardous Materials Warning"
+  },
+  "HUA": {
+    "code": "HUA",
+    "name": "Hurricane Watch"
+  },
+  "HUW": {
+    "code": "HUW",
+    "name": "Hurricane Warning"
+  },
+  "HWA": {
+    "code": "HWA",
+    "name": "High Wind Watch"
+  },
+  "HWW": {
+    "code": "HWW",
+    "name": "High Wind Warning"
+  },
+  "LAE": {
+    "code": "LAE",
+    "name": "Local Area Emergency"
+  },
+  "LEW": {
+    "code": "LEW",
+    "name": "Law Enforcement Warning"
+  },
+  "NUW": {
+    "code": "NUW",
+    "name": "Nuclear Power Plant Warning"
+  },
+  "RHW": {
+    "code": "RHW",
+    "name": "Radiological Hazard Warning"
+  },
+  "RMT": {
+    "code": "RMT",
+    "name": "Required Monthly Test"
+  },
+  "RWT": {
+    "code": "RWT",
+    "name": "Required Weekly Test"
+  },
+  "SMW": {
+    "code": "SMW",
+    "name": "Special Marine Warning"
+  },
+  "SPS": {
+    "code": "SPS",
+    "name": "Special Weather Statement"
+  },
+  "SPW": {
+    "code": "SPW",
+    "name": "Shelter in Place Warning"
+  },
+  "SQW": {
+    "code": "SQW",
+    "name": "Snow Squall Warning"
+  },
+  "SSA": {
+    "code": "SSA",
+    "name": "Storm Surge Watch"
+  },
+  "SSW": {
+    "code": "SSW",
+    "name": "Storm Surge Warning"
+  },
+  "SVA": {
+    "code": "SVA",
+    "name": "Severe Thunderstorm Watch"
+  },
+  "SVR": {
+    "code": "SVR",
+    "name": "Severe Thunderstorm Warning"
+  },
+  "SVS": {
+    "code": "SVS",
+    "name": "Severe Weather Statement"
+  },
+  "TOA": {
+    "code": "TOA",
+    "name": "Tornado Watch"
+  },
+  "TOE": {
+    "code": "TOE",
+    "name": "911 Telephone Outage Emergency"
+  },
+  "TOR": {
+    "code": "TOR",
+    "name": "Tornado Warning"
+  },
+  "TRA": {
+    "code": "TRA",
+    "name": "Tropical Storm Watch"
+  },
+  "TRW": {
+    "code": "TRW",
+    "name": "Tropical Storm Warning"
+  },
+  "TSA": {
+    "code": "TSA",
+    "name": "Tsunami Watch"
+  },
+  "TSW": {
+    "code": "TSW",
+    "name": "Tsunami Warning"
+  },
+  "VOW": {
+    "code": "VOW",
+    "name": "Volcano Warning"
+  },
+  "WSA": {
+    "code": "WSA",
+    "name": "Winter Storm Watch"
+  },
+  "WSW": {
+    "code": "WSW",
+    "name": "Winter Storm Warning"
+  }
+}

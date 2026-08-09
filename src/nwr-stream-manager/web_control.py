@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import queue
 import re
 import socket
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +47,7 @@ if __package__:
         validate_ppm_correction,
         validate_rtl_sample_rate,
     )
+    from .same_data import lookup_event, lookup_location
 else:
     import importlib
     import types
@@ -61,6 +66,7 @@ else:
     icecast_module = importlib.import_module(f"{package_name}.icecast")
     nfm = importlib.import_module(f"{package_name}.nfm")
     rtl = importlib.import_module(f"{package_name}.rtl")
+    same_data = importlib.import_module(f"{package_name}.same_data")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
     AudioConfig = config_module.AudioConfig
     EasRecordingConfig = config_module.EasRecordingConfig
@@ -86,6 +92,8 @@ else:
     rtl_u8_to_complex64 = rtl.rtl_u8_to_complex64
     validate_ppm_correction = rtl.validate_ppm_correction
     validate_rtl_sample_rate = rtl.validate_rtl_sample_rate
+    lookup_event = same_data.lookup_event
+    lookup_location = same_data.lookup_location
 
 repo_root = Path(__file__).resolve().parents[2]
 if str(repo_root) not in sys.path:
@@ -730,6 +738,97 @@ class RtlControlService:
         with self.lock:
             return {"streams": list(self.streams)}
 
+    def eas_alert_streams(self) -> dict[str, Any]:
+        with self.lock:
+            streams = [self._eas_alert_stream_summary(stream) for stream in self.streams if self._stream_has_eas_alert_index(stream)]
+        return {"streams": streams}
+
+    def eas_alerts(self, stream_id: str, page: int = 1, per_page: int = 25) -> dict[str, Any]:
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            stream_summary = self._eas_alert_stream_summary(stream)
+        alerts = load_eas_alert_entries(eas_alert_index_path(self.streams_directory, stream))
+        page = max(1, int(page))
+        per_page = max(1, min(int(per_page), 100))
+        ordered_alerts = sorted(
+            enumerate(alerts),
+            key=lambda item: parse_utc_datetime(str(item[1].get("start_time_utc", ""))),
+            reverse=True,
+        )
+        total = len(ordered_alerts)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, total_pages)
+        start = (page - 1) * per_page
+        page_alerts = [
+            eas_alert_summary(stream, alert, original_index)
+            for original_index, alert in ordered_alerts[start : start + per_page]
+        ]
+        return {
+            "stream": stream_summary,
+            "alerts": page_alerts,
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "total_pages": total_pages,
+        }
+
+    def eas_alert_detail(self, stream_id: str, alert_id: str) -> dict[str, Any]:
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            stream_summary = self._eas_alert_stream_summary(stream)
+        alert, index, _index_path = self._eas_alert_by_id(stream, alert_id)
+        return {"stream": stream_summary, "alert": eas_alert_detail(stream, alert, index)}
+
+    def eas_alert_audio_path(self, stream_id: str, alert_id: str) -> tuple[Path, str]:
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+        alert, _index, _index_path = self._eas_alert_by_id(stream, alert_id)
+        return safe_eas_alert_file_path(self.streams_directory, stream, alert), alert_download_name(stream, alert)
+
+    def remove_eas_alert(self, stream_id: str, alert_id: str) -> dict[str, Any]:
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+        alert, _index, index_path = self._eas_alert_by_id(stream, alert_id)
+        audio_path = safe_eas_alert_file_path(self.streams_directory, stream, alert, require_exists=False)
+        try:
+            audio_path.unlink()
+        except FileNotFoundError:
+            pass
+        data = load_eas_alert_index(index_path)
+        alerts = data["alerts"]
+        data["alerts"] = [
+            entry for position, entry in enumerate(alerts)
+            if eas_alert_id(entry, position) != alert_id
+        ]
+        atomic_write_json(index_path, data)
+        LOG.info("removed EAS alert %s for stream %s", alert_id, stream_id)
+        return {"success": True}
+
+    def _stream_has_eas_alert_index(self, stream: dict[str, Any]) -> bool:
+        return (
+            eas_recording_settings_from_stream(stream).enabled
+            and eas_alert_index_path(self.streams_directory, stream).exists()
+        )
+
+    def _eas_alert_stream_summary(self, stream: dict[str, Any]) -> dict[str, Any]:
+        station = stream.get("station", {})
+        index_path = eas_alert_index_path(self.streams_directory, stream)
+        count = len(load_eas_alert_entries(index_path)) if index_path.exists() else 0
+        return {
+            "id": stream.get("id", ""),
+            "callsign": station.get("callsign", "Unknown"),
+            "frequency": station.get("frequency", ""),
+            "alert_count": count,
+        }
+
+    def _eas_alert_by_id(self, stream: dict[str, Any], alert_id: str) -> tuple[dict[str, Any], int, Path]:
+        index_path = eas_alert_index_path(self.streams_directory, stream)
+        alerts = load_eas_alert_entries(index_path)
+        for index, alert in enumerate(alerts):
+            if eas_alert_id(alert, index) == alert_id:
+                return alert, index, index_path
+        raise ValueError("EAS alert was not found")
+
     def add_stream(self, payload: dict[str, Any]) -> dict[str, Any]:
         station_key = str(payload.get("station_key", "")).strip()
         station = self._station_by_key(station_key)
@@ -1294,6 +1393,42 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_json(self.service.search_stations(search, limit))
         elif path == "/api/streams":
             self._send_json(self.service.stream_status())
+        elif path == "/api/eas-alert-streams":
+            self._send_json(self.service.eas_alert_streams())
+        elif path == "/api/eas-alerts":
+            query = parse_qs(parsed.query)
+            try:
+                response = self.service.eas_alerts(
+                    query.get("stream_id", [""])[0],
+                    int(query.get("page", ["1"])[0]),
+                    int(query.get("per_page", ["25"])[0]),
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+        elif path == "/api/eas-alert":
+            query = parse_qs(parsed.query)
+            try:
+                response = self.service.eas_alert_detail(
+                    query.get("stream_id", [""])[0],
+                    query.get("alert_id", [""])[0],
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+        elif path == "/api/eas-alert-audio":
+            query = parse_qs(parsed.query)
+            try:
+                audio_path, download_name = self.service.eas_alert_audio_path(
+                    query.get("stream_id", [""])[0],
+                    query.get("alert_id", [""])[0],
+                )
+                self._send_file(audio_path, download_name, query.get("download", ["0"])[0] == "1")
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -1330,6 +1465,18 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/eas-alert":
+            try:
+                query = parse_qs(parsed.query)
+                response = self.service.remove_eas_alert(
+                    query.get("stream_id", [""])[0],
+                    query.get("alert_id", [""])[0],
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if parsed.path == "/api/stream-output":
             try:
                 query = parse_qs(parsed.query)
@@ -1425,6 +1572,23 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_file(self, path: Path, download_name: str, download: bool) -> None:
+        content_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
+        disposition = "attachment" if download else "inline"
+        data_length = path.stat().st_size
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(data_length))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition", f'{disposition}; filename="{http_header_filename(download_name)}"')
+        self.end_headers()
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
 
 def default_state_path() -> Path:
@@ -1545,6 +1709,171 @@ def stream_alerts_directory(state_directory: Path, stream: dict[str, Any]) -> Pa
     station = stream.get("station", {})
     callsign = sanitize_path_component(str(station.get("callsign", "")).strip() or str(stream.get("id", "stream")))
     return state_directory / "streams" / callsign / "alerts"
+
+
+def eas_alert_index_path(streams_directory: Path, stream: dict[str, Any]) -> Path:
+    return stream_alerts_directory(streams_directory.parent, stream) / "index.json"
+
+
+def load_eas_alert_index(index_path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"version": 1, "alerts": []}
+    if isinstance(data, list):
+        data = {"version": 1, "alerts": data}
+    if not isinstance(data, dict) or not isinstance(data.get("alerts"), list):
+        raise ValueError("EAS alert index must contain an alerts array")
+    if not all(isinstance(alert, dict) for alert in data["alerts"]):
+        raise ValueError("Every EAS alert index entry must be an object")
+    data["version"] = int(data.get("version", 1))
+    return data
+
+
+def load_eas_alert_entries(index_path: Path) -> list[dict[str, Any]]:
+    return list(load_eas_alert_index(index_path)["alerts"])
+
+
+def eas_alert_id(alert: dict[str, Any], index: int) -> str:
+    digest = hashlib.sha256(
+        "\0".join(
+            [
+                str(index),
+                str(alert.get("raw_same_header", "")),
+                str(alert.get("start_time_utc", "")),
+                str(alert.get("file_path", "")),
+            ]
+        ).encode("utf-8", errors="replace")
+    ).hexdigest()
+    return digest[:24]
+
+
+def eas_alert_summary(stream: dict[str, Any], alert: dict[str, Any], index: int) -> dict[str, Any]:
+    event = lookup_event(str(alert.get("event_type", "")))
+    issued_at = parse_utc_datetime(str(alert.get("start_time_utc", "")))
+    return {
+        "id": eas_alert_id(alert, index),
+        "summary": f"{sentence_case_event(event.display_name)} issued {format_local_datetime(issued_at, separator='at')}",
+        "event_name": event.display_name,
+        "issued_at": format_local_datetime(issued_at),
+    }
+
+
+def eas_alert_detail(stream: dict[str, Any], alert: dict[str, Any], index: int) -> dict[str, Any]:
+    event = lookup_event(str(alert.get("event_type", "")))
+    issued_at = parse_utc_datetime(str(alert.get("start_time_utc", "")))
+    expires_at = parse_utc_datetime(str(alert.get("expires_at_utc", "")))
+    areas = [
+        format_same_location_for_alert(str(code))
+        for code in alert.get("fips_codes", [])
+        if isinstance(code, str)
+    ]
+    return {
+        "id": eas_alert_id(alert, index),
+        "event_type": event.display_name,
+        "areas": areas,
+        "issued_at": format_local_datetime(issued_at),
+        "expires_at": format_local_datetime(expires_at),
+        "audio_url": f"/api/eas-alert-audio?stream_id={stream.get('id', '')}&alert_id={eas_alert_id(alert, index)}",
+        "download_url": f"/api/eas-alert-audio?stream_id={stream.get('id', '')}&alert_id={eas_alert_id(alert, index)}&download=1",
+    }
+
+
+def format_same_location_for_alert(same_code: str) -> str:
+    raw_code = str(same_code).strip()
+    location = lookup_location(raw_code)
+    subdivision_digit = ""
+    if not location.known and re.fullmatch(r"\d{6}", raw_code) and raw_code[0] != "0":
+        location = lookup_location(f"0{raw_code[1:]}")
+        subdivision_digit = raw_code[0] if location.known else ""
+    if not location.known:
+        return location.display_name
+    if location.location_type == "marine":
+        text = location.name
+    elif location.state and location.state not in location.name:
+        text = f"{location.name}, {location.state}"
+    else:
+        text = location.display_name
+    if subdivision_digit:
+        return f"{text}, subdivision {subdivision_digit}"
+    return text
+
+
+def safe_eas_alert_file_path(
+    streams_directory: Path,
+    stream: dict[str, Any],
+    alert: dict[str, Any],
+    *,
+    require_exists: bool = True,
+) -> Path:
+    alerts_directory = stream_alerts_directory(streams_directory.parent, stream).resolve()
+    raw_path = alert.get("file_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("EAS alert audio file is missing")
+    path = Path(raw_path).expanduser().resolve()
+    if require_exists and not path.is_file():
+        raise ValueError("EAS alert audio file was not found")
+    if path != alerts_directory and alerts_directory not in path.parents:
+        raise ValueError("EAS alert audio path is outside the alert directory")
+    return path
+
+
+def alert_download_name(stream: dict[str, Any], alert: dict[str, Any]) -> str:
+    station = stream.get("station", {})
+    callsign = sanitize_path_component(str(station.get("callsign", "alert")))
+    event = sanitize_path_component(str(alert.get("event_type", "EAS")))
+    issued = sanitize_path_component(str(alert.get("start_time_utc", "")).replace(":", ""))
+    suffix = Path(str(alert.get("file_path", ""))).suffix.lower()
+    if suffix not in {".wav", ".mp3", ".ogg"}:
+        suffix = ".wav"
+    return f"{callsign}-{event}-{issued or 'alert'}{suffix}"
+
+
+def parse_utc_datetime(value: str) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def format_local_datetime(value: datetime, *, separator: str = ",") -> str:
+    local = value.astimezone()
+    time_text = local.strftime("%I:%M %p %Z")
+    if time_text.startswith("0"):
+        time_text = time_text[1:]
+    date_text = f"{local.strftime('%B')} {local.day}, {local.year}"
+    if separator == ",":
+        return f"{date_text}, {time_text}"
+    return f"{date_text} {separator} {time_text}"
+
+
+def sentence_case_event(name: str) -> str:
+    if not name:
+        return "Unknown event"
+    return name[:1].upper() + name[1:].lower()
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as fp:
+        fp.write(data)
+        temp_path = Path(fp.name)
+    try:
+        temp_path.replace(path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def http_header_filename(value: str) -> str:
+    return re.sub(r'[^A-Za-z0-9._ -]+', "_", value).replace('"', "_")
 
 
 def sanitize_path_component(value: str) -> str:
@@ -1990,6 +2319,9 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .stream-actions-menu { position: absolute; right: 10px; z-index: 10; display: grid; gap: 4px; min-width: 190px; margin-top: 6px; padding: 6px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; box-shadow: 0 8px 18px rgb(20 24 31 / 18%); }
 .stream-actions-menu[hidden] { display: none; }
 .stream-actions-menu button { width: 100%; text-align: left; border: 0; }
+.details-list { display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; margin: 0 0 16px; }
+.details-list dt { font-weight: 700; }
+.details-list dd { margin: 0; }
 .tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #d8dde6; margin: 16px 0; }
 .tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: -1px; }
 .tabs button[aria-selected="true"] { border-color: #2557a7; border-bottom-color: #fff; box-shadow: inset 0 2px 0 #2557a7; }
@@ -2023,6 +2355,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <button id="nav_dashboard" type="button" data-view="dashboard" aria-current="page">Dashboard</button>
       <button id="nav_rtl" type="button" data-view="rtl">Configure RTL-SDR</button>
       <button id="nav_streams" type="button" data-view="streams">Manage Streams</button>
+      <button id="nav_eas_alerts" type="button" data-view="eas_alerts" hidden>EAS alerts</button>
     </nav>
   </div>
 </header>
@@ -2326,6 +2659,42 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
+  <div id="view_eas_alerts" class="view" hidden>
+    <section>
+      <h2>EAS alerts</h2>
+      <p>View and manage recorded EAS alerts.</p>
+      <label>Stream
+        <select id="eas_alert_stream"></select>
+      </label>
+      <div id="eas-alert-list" class="stream-list" aria-live="off"></div>
+      <div class="actions">
+        <button id="eas_alert_prev" type="button">Previous</button>
+        <span id="eas_alert_page" class="hint">Page 1 of 1</span>
+        <button id="eas_alert_next" type="button">Next</button>
+      </div>
+      <div id="eas-alert-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_eas_alert_detail" class="view" hidden>
+    <section>
+      <h2 id="eas_alert_detail_title">EAS alert</h2>
+      <dl class="details-list">
+        <dt>Event type</dt><dd id="eas_detail_event">Unknown</dd>
+        <dt>Areas impacted</dt><dd id="eas_detail_areas">Unknown</dd>
+        <dt>Issued</dt><dd id="eas_detail_issued">Unknown</dd>
+        <dt>Expires</dt><dd id="eas_detail_expires">Unknown</dd>
+      </dl>
+      <audio id="eas_alert_audio" controls preload="metadata"></audio>
+      <div class="actions">
+        <a id="eas_alert_download" role="button" href="#">Download alert</a>
+        <button id="remove_eas_alert" type="button">Remove alert</button>
+        <button id="back_to_eas_alerts" type="button">Back</button>
+      </div>
+      <div id="eas-alert-detail-result" class="message"></div>
+    </section>
+  </div>
+
   <section>
     <h2>Logs</h2>
     <pre id="logs" aria-live="off" aria-label="RTL-SDR log output"></pre>
@@ -2360,6 +2729,16 @@ let wizardDirty = false;
 let icecastAuthPassed = false;
 let icecastAuthSignature = "";
 let activeStreamsSignature = "";
+let easAlertStreams = [];
+let easAlertStreamsSignature = "";
+let easAlertListSignature = "";
+let easAlertStreamId = "";
+let easAlertDetailId = "";
+let easAlertPage = 1;
+let easAlertTotalPages = 1;
+let easAlertReturnPage = 1;
+let lastEasAlertRefreshAt = 0;
+const EAS_ALERTS_PER_PAGE = 25;
 
 async function request(path, options = {}) {
   const response = await fetch(path, options);
@@ -3320,6 +3699,7 @@ function renderStreams(streams) {
 async function loadStreams() {
   const data = await request("/api/streams");
   renderStreams(data.streams || []);
+  await loadEasAlertStreams({preserve: true, quiet: true});
 }
 
 function gainIndexFor(value) {
@@ -3381,12 +3761,198 @@ function setStreamResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setEasAlertResult(message, kind = "") {
+  const element = document.getElementById("eas-alert-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setEasAlertDetailResult(message, kind = "") {
+  const element = document.getElementById("eas-alert-detail-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function easAlertStreamLabel(stream) {
+  const frequency = stream.frequency ? ` ${stream.frequency} MHz` : "";
+  const count = Number(stream.alert_count || 0);
+  return `${stream.callsign || "Unknown"}${frequency} (${count} alert${count === 1 ? "" : "s"})`;
+}
+
+function easAlertStreamsNextSignature(streams) {
+  return JSON.stringify((streams || []).map(stream => ({
+    id: stream.id || "",
+    callsign: stream.callsign || "",
+    frequency: stream.frequency || "",
+    alert_count: stream.alert_count || 0
+  })));
+}
+
+function renderEasAlertStreamSelector(streams, preserve = true) {
+  const select = document.getElementById("eas_alert_stream");
+  const nextSignature = easAlertStreamsNextSignature(streams);
+  if (select.dataset.signature !== nextSignature) {
+    select.innerHTML = "";
+    for (const stream of streams) {
+      const option = document.createElement("option");
+      option.value = stream.id || "";
+      option.textContent = easAlertStreamLabel(stream);
+      select.appendChild(option);
+    }
+    select.dataset.signature = nextSignature;
+  }
+  if (!streams.length) {
+    easAlertStreamId = "";
+    return;
+  }
+  const currentExists = streams.some(stream => stream.id === easAlertStreamId);
+  if (!preserve || !currentExists) {
+    easAlertStreamId = streams[0].id || "";
+  }
+  setValue("eas_alert_stream", easAlertStreamId);
+}
+
+async function loadEasAlertStreams(options = {}) {
+  let data;
+  try {
+    data = await request("/api/eas-alert-streams");
+  } catch (error) {
+    if (!options.quiet) setEasAlertResult(error.message, "error");
+    return;
+  }
+  easAlertStreams = data.streams || [];
+  const hasAlerts = easAlertStreams.length > 0;
+  document.getElementById("nav_eas_alerts").hidden = !hasAlerts;
+  renderEasAlertStreamSelector(easAlertStreams, options.preserve !== false);
+  const nextSignature = easAlertStreamsNextSignature(easAlertStreams);
+  const streamListChanged = nextSignature !== easAlertStreamsSignature;
+  easAlertStreamsSignature = nextSignature;
+  if (!hasAlerts) {
+    easAlertListSignature = "";
+    document.getElementById("eas-alert-list").innerHTML = "";
+    setText("eas_alert_page", "Page 1 of 1");
+    setDisabled(document.getElementById("eas_alert_prev"), true);
+    setDisabled(document.getElementById("eas_alert_next"), true);
+    if (["eas_alerts", "eas_alert_detail"].includes(currentViewName())) {
+      navigateTo("dashboard", {}, true, true);
+    }
+    return;
+  }
+  if (currentViewName() === "eas_alerts" && (streamListChanged || options.forceList)) {
+    await loadEasAlerts({quiet: options.quiet});
+  }
+}
+
+function easAlertListNextSignature(data) {
+  return JSON.stringify({
+    stream: data.stream && data.stream.id || "",
+    page: data.page || 1,
+    total_pages: data.total_pages || 1,
+    alerts: (data.alerts || []).map(alert => [alert.id, alert.summary])
+  });
+}
+
+function renderEasAlertList(data) {
+  const list = document.getElementById("eas-alert-list");
+  const nextSignature = easAlertListNextSignature(data);
+  easAlertPage = Number(data.page || 1);
+  easAlertTotalPages = Number(data.total_pages || 1);
+  setText("eas_alert_page", `Page ${easAlertPage} of ${easAlertTotalPages}`);
+  setDisabled(document.getElementById("eas_alert_prev"), easAlertPage <= 1);
+  setDisabled(document.getElementById("eas_alert_next"), easAlertPage >= easAlertTotalPages);
+  if (nextSignature === easAlertListSignature) return;
+  easAlertListSignature = nextSignature;
+  list.innerHTML = "";
+  const alerts = data.alerts || [];
+  if (alerts.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "hint";
+    empty.textContent = "No EAS alerts recorded for this stream.";
+    list.appendChild(empty);
+    return;
+  }
+  for (const alert of alerts) {
+    const item = document.createElement("a");
+    item.href = routeForView("eas_alert_detail", {
+      streamId: easAlertStreamId,
+      alertId: alert.id || "",
+      page: easAlertPage
+    });
+    item.className = "stream-item";
+    item.textContent = alert.summary || "Unknown EAS alert";
+    item.dataset.alertId = alert.id || "";
+    list.appendChild(item);
+  }
+}
+
+async function loadEasAlerts(options = {}) {
+  if (!easAlertStreamId) {
+    renderEasAlertList({alerts: [], page: 1, total_pages: 1});
+    return;
+  }
+  try {
+    const data = await request(`/api/eas-alerts?stream_id=${encodeURIComponent(easAlertStreamId)}&page=${encodeURIComponent(easAlertPage)}&per_page=${EAS_ALERTS_PER_PAGE}`);
+    renderEasAlertList(data);
+    setEasAlertResult("");
+  } catch (error) {
+    if (!options.quiet) setEasAlertResult(error.message, "error");
+  }
+}
+
+async function loadEasAlertDetail() {
+  if (!easAlertStreamId || !easAlertDetailId) {
+    setEasAlertDetailResult("EAS alert was not found.", "error");
+    return;
+  }
+  try {
+    const data = await request(`/api/eas-alert?stream_id=${encodeURIComponent(easAlertStreamId)}&alert_id=${encodeURIComponent(easAlertDetailId)}`);
+    const alert = data.alert || {};
+    setText("eas_alert_detail_title", alert.event_type || "EAS alert");
+    setText("eas_detail_event", alert.event_type || "Unknown event");
+    setText("eas_detail_areas", Array.isArray(alert.areas) && alert.areas.length ? alert.areas.join(", ") : "Unknown area");
+    setText("eas_detail_issued", alert.issued_at || "Unknown");
+    setText("eas_detail_expires", alert.expires_at || "Unknown");
+    document.getElementById("eas_alert_audio").src = alert.audio_url || "";
+    document.getElementById("eas_alert_download").href = alert.download_url || "#";
+    setEasAlertDetailResult("");
+  } catch (error) {
+    setEasAlertDetailResult(error.message, "error");
+  }
+}
+
+async function removeCurrentEasAlert() {
+  if (!easAlertStreamId || !easAlertDetailId) return;
+  const button = document.getElementById("remove_eas_alert");
+  setDisabled(button, true);
+  try {
+    await request(`/api/eas-alert?stream_id=${encodeURIComponent(easAlertStreamId)}&alert_id=${encodeURIComponent(easAlertDetailId)}`, {
+      method: "DELETE"
+    });
+    easAlertDetailId = "";
+    easAlertListSignature = "";
+    await loadEasAlertStreams({preserve: true, forceList: true, quiet: true});
+    navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertReturnPage}, true, true);
+  } catch (error) {
+    setEasAlertDetailResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
+  }
+}
+
 function showView(name) {
   for (const view of document.querySelectorAll(".view")) {
     view.hidden = view.id !== `view_${name}`;
   }
   for (const button of document.querySelectorAll("nav button[data-view]")) {
-    if (button.dataset.view === name || (button.dataset.view === "streams" && name === "stream_settings")) {
+    if (
+      button.dataset.view === name ||
+      (button.dataset.view === "streams" && name === "stream_settings") ||
+      (button.dataset.view === "eas_alerts" && name === "eas_alert_detail")
+    ) {
       button.setAttribute("aria-current", "page");
     } else {
       button.removeAttribute("aria-current");
@@ -3409,6 +3975,17 @@ function routeForView(name, params = {}) {
     query.set("view", "stream_settings");
     if (params.streamId) query.set("stream", params.streamId);
   }
+  if (name === "eas_alerts") {
+    query.set("view", "eas_alerts");
+    if (params.streamId) query.set("stream", params.streamId);
+    if (params.page) query.set("page", params.page);
+  }
+  if (name === "eas_alert_detail") {
+    query.set("view", "eas_alert_detail");
+    if (params.streamId) query.set("stream", params.streamId);
+    if (params.alertId) query.set("alert", params.alertId);
+    if (params.page) query.set("page", params.page);
+  }
   const text = query.toString();
   return text ? `/?${text}` : "/";
 }
@@ -3416,14 +3993,24 @@ function routeForView(name, params = {}) {
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
-  if (["dashboard", "rtl", "streams", "add_stream", "stream_settings"].includes(view)) {
-    return {view, streamId: query.get("stream") || ""};
+  if (["dashboard", "rtl", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_detail"].includes(view)) {
+    return {
+      view,
+      streamId: query.get("stream") || "",
+      alertId: query.get("alert") || "",
+      page: Math.max(1, Number(query.get("page") || 1))
+    };
   }
-  return {view: "dashboard", streamId: ""};
+  return {view: "dashboard", streamId: "", alertId: "", page: 1};
 }
 
 function routeState(view, params = {}) {
-  return {view, streamId: params.streamId || ""};
+  return {
+    view,
+    streamId: params.streamId || "",
+    alertId: params.alertId || "",
+    page: Math.max(1, Number(params.page || 1))
+  };
 }
 
 function applyRoute(route) {
@@ -3442,6 +4029,21 @@ function applyRoute(route) {
       return;
     }
     showView("streams");
+    return;
+  }
+  if (route.view === "eas_alerts") {
+    easAlertStreamId = route.streamId || easAlertStreamId;
+    easAlertPage = Math.max(1, Number(route.page || 1));
+    showView("eas_alerts");
+    loadEasAlertStreams({preserve: true, forceList: true});
+    return;
+  }
+  if (route.view === "eas_alert_detail") {
+    easAlertStreamId = route.streamId || easAlertStreamId;
+    easAlertDetailId = route.alertId || "";
+    easAlertReturnPage = Math.max(1, Number(route.page || 1));
+    showView("eas_alert_detail");
+    loadEasAlertDetail();
     return;
   }
   if (route.view !== "stream_settings") settingsStreamId = "";
@@ -3467,6 +4069,14 @@ function navigateTo(view, params = {}, replace = false, force = false) {
     history.pushState(state, "", url);
   }
   applyRoute(state);
+}
+
+function currentRouteParams() {
+  const view = currentViewName();
+  if (view === "stream_settings") return {streamId: settingsStreamId};
+  if (view === "eas_alerts") return {streamId: easAlertStreamId, page: easAlertPage};
+  if (view === "eas_alert_detail") return {streamId: easAlertStreamId, alertId: easAlertDetailId, page: easAlertReturnPage};
+  return {};
 }
 
 function activeSdrLabel(settings) {
@@ -3529,6 +4139,11 @@ function applyStatus(data, options = {}) {
   setText("logs", data.logs.join("\\n"));
   setFallbackControls(data.fallback);
   updateDashboard(data);
+  const now = Date.now();
+  if (now - lastEasAlertRefreshAt > 10000) {
+    lastEasAlertRefreshAt = now;
+    loadEasAlertStreams({preserve: true, quiet: true});
+  }
   applying = false;
 }
 
@@ -3601,6 +4216,7 @@ function scheduleEasUpdate() {
       });
       renderStreams(data.streams || []);
       setEasResult("EAS recording settings saved.", "success");
+      loadEasAlertStreams({preserve: true, quiet: true});
     } catch (error) {
       setEasResult(error.message, "error");
     }
@@ -3662,7 +4278,9 @@ document.querySelector(".tabs").addEventListener("keydown", event => {
 
 window.addEventListener("popstate", event => {
   if (!confirmDiscardNavigation()) {
-    history.pushState(routeState(currentViewName(), {streamId: settingsStreamId}), "", routeForView(currentViewName(), {streamId: settingsStreamId}));
+    const currentView = currentViewName();
+    const currentParams = currentRouteParams();
+    history.pushState(routeState(currentView, currentParams), "", routeForView(currentView, currentParams));
     return;
   }
   applyRoute(event.state || routeFromLocation());
@@ -4189,6 +4807,48 @@ document.getElementById("streams-list").addEventListener("click", async event =>
   }
 });
 
+document.getElementById("eas_alert_stream").addEventListener("change", event => {
+  easAlertStreamId = event.target.value;
+  easAlertPage = 1;
+  easAlertListSignature = "";
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+});
+
+document.getElementById("eas_alert_prev").addEventListener("click", () => {
+  if (easAlertPage <= 1) return;
+  easAlertPage -= 1;
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+});
+
+document.getElementById("eas_alert_next").addEventListener("click", () => {
+  if (easAlertPage >= easAlertTotalPages) return;
+  easAlertPage += 1;
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+});
+
+document.getElementById("eas-alert-list").addEventListener("click", event => {
+  const link = event.target && event.target.closest ? event.target.closest("a[data-alert-id]") : null;
+  if (!link) return;
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  easAlertDetailId = link.dataset.alertId;
+  easAlertReturnPage = easAlertPage;
+  navigateTo("eas_alert_detail", {
+    streamId: easAlertStreamId,
+    alertId: easAlertDetailId,
+    page: easAlertReturnPage
+  });
+});
+
+document.getElementById("back_to_eas_alerts").addEventListener("click", () => {
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertReturnPage});
+});
+
+document.getElementById("remove_eas_alert").addEventListener("click", async () => {
+  if (!window.confirm("Remove this EAS alert and its audio file?")) return;
+  await removeCurrentEasAlert();
+});
+
 async function refresh() {
   const data = await request("/api/status");
   applyStatus(data, {syncControls: false});
@@ -4200,9 +4860,14 @@ async function refresh() {
   await loadDevices(data.settings.serial);
   await searchStations();
   await loadStreams();
+  await loadEasAlertStreams({preserve: true, quiet: true});
   applyStatus(data, {syncControls: true});
   const initialRoute = routeFromLocation();
-  navigateTo(initialRoute.view, {streamId: initialRoute.streamId}, true);
+  navigateTo(initialRoute.view, {
+    streamId: initialRoute.streamId,
+    alertId: initialRoute.alertId,
+    page: initialRoute.page
+  }, true);
   setInterval(refresh, 1000);
   setInterval(async () => {
     try {
