@@ -1197,8 +1197,8 @@ def validate_icecast_payload(raw: Any) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="nwr-stream-manager-rtl-control",
-        description="Run the local RTL-SDR control web interface.",
+        prog="nwr-stream-manager",
+        description="Run the NWR Stream Manager web interface.",
     )
     parser.add_argument(
         "--host",

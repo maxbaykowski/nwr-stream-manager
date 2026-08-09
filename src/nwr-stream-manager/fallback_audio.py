@@ -22,8 +22,12 @@ class FallbackAudio:
 
 def load_fallback_audio(path: str | None) -> FallbackAudio:
     if path is None:
-        resource = files("rtl_weatherband").joinpath(DEFAULT_FALLBACK_AUDIO)
-        with as_file(resource) as fallback_path:
+        try:
+            resource = files(__package__).joinpath(DEFAULT_FALLBACK_AUDIO)
+            with as_file(resource) as fallback_path:
+                return _load_wave_path(fallback_path, "packaged fallback.wav")
+        except (AttributeError, TypeError):
+            fallback_path = Path(__file__).resolve().parent / DEFAULT_FALLBACK_AUDIO
             return _load_wave_path(fallback_path, "packaged fallback.wav")
     return _load_wave_path(Path(path), path)
 

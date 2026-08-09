@@ -10,8 +10,8 @@ from .runner import run
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="rtl_weatherband",
-        description="Stream NOAA Weather Radio from csdr_server to Icecast.",
+        prog="rtl-weatherband",
+        description="Run the legacy JSON5-configured NOAA Weather Radio streamer.",
     )
     parser.add_argument("config", help="path to a JSON5 configuration file")
     parser.add_argument(

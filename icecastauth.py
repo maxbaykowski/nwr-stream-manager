@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import argparse
 import http.client
 import os
 import select
@@ -445,9 +446,18 @@ def menu_loop() -> int:
             print("That selection is not available.")
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="icecastauth",
+        description="Interactively test Icecast source authentication.",
+    )
+    parser.parse_args(argv)
     try:
-        raise SystemExit(menu_loop())
+        return menu_loop()
     except KeyboardInterrupt:
         print()
-        raise SystemExit(130)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

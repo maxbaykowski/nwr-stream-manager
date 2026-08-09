@@ -1,9 +1,9 @@
-"""NOAA Weather Radio streaming from csdr_server to Icecast."""
+"""NOAA Weather Radio streaming from RTL-SDR devices to Icecast."""
 
 from importlib.metadata import PackageNotFoundError, version
 
 
 try:
-    __version__ = version("rtl_weatherband")
+    __version__ = version("nwr-stream-manager")
 except PackageNotFoundError:
     __version__ = "0.0.0"

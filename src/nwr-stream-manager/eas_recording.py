@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib.resources import as_file, files
+from pathlib import Path
 import wave
 
 import numpy as np
@@ -130,24 +131,32 @@ def _same_test_header(origin_time: datetime | None = None) -> str:
 
 @lru_cache(maxsize=4)
 def _load_same_test_message_audio(sample_rate: int) -> np.ndarray:
-    resource = files("rtl_weatherband").joinpath(SAME_TEST_MESSAGE_AUDIO)
-    with as_file(resource) as path:
-        with wave.open(str(path), "rb") as wav:
-            channels = wav.getnchannels()
-            sample_width = wav.getsampwidth()
-            rate = wav.getframerate()
-            frame_count = wav.getnframes()
-            compression = wav.getcomptype()
-            if channels != 1 or sample_width != 2 or compression != "NONE":
-                raise EasRecordingError(
-                    "packaged SAME test audio must be mono PCM S16_LE WAV"
-                )
-            pcm = wav.readframes(frame_count)
+    try:
+        resource = files(__package__).joinpath(SAME_TEST_MESSAGE_AUDIO)
+        with as_file(resource) as path:
+            pcm, rate = _read_same_test_message_audio(path)
+    except (AttributeError, TypeError):
+        path = Path(__file__).resolve().parent / SAME_TEST_MESSAGE_AUDIO
+        pcm, rate = _read_same_test_message_audio(path)
     if rate != sample_rate:
         resampler = PcmResampler(rate, sample_rate)
         pcm = resampler.process(pcm) + resampler.flush()
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
     return samples.astype(np.float32, copy=False)
+
+
+def _read_same_test_message_audio(path: Path) -> tuple[bytes, int]:
+    with wave.open(str(path), "rb") as wav:
+        channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        rate = wav.getframerate()
+        frame_count = wav.getnframes()
+        compression = wav.getcomptype()
+        if channels != 1 or sample_width != 2 or compression != "NONE":
+            raise EasRecordingError(
+                "packaged SAME test audio must be mono PCM S16_LE WAV"
+            )
+        return wav.readframes(frame_count), rate
 
 
 def _tone(

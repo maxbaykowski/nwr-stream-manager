@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nwr-stream-manager"
+version = "0.1.0"
+description = "Web-managed NOAA Weather Radio streaming from RTL-SDR devices to Icecast."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+  {name = "Max Baykowski"}
+]
+keywords = ["noaa", "weather-radio", "rtl-sdr", "icecast", "nwr"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Communications :: Ham Radio",
+  "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+]
+dependencies = [
+  "json5",
+  "numpy",
+  "sounddevice",
+  "pyrtlsdr",
+  "soxr",
+  "lameenc",
+  "PyOgg",
+  "easrecorder @ git+https://github.com/maxbaykowski/easrecorder.git@main",
+]
+
+[project.urls]
+Homepage = "https://github.com/maxbaykowski/nwr-stream-manager"
+Repository = "https://github.com/maxbaykowski/nwr-stream-manager"
+Issues = "https://github.com/maxbaykowski/nwr-stream-manager/issues"
+
+[project.scripts]
+nwr-stream-manager = "nwr_stream_manager.web_control:main"
+nwr-stream-manager-web = "nwr_stream_manager.web_control:main"
+rtl-weatherband = "nwr_stream_manager.cli:main"
+icecastauth = "icecastauth:main"
+
+[tool.setuptools]
+packages = ["nwr_stream_manager", "nwr_stream_manager.assets"]
+py-modules = ["icecastauth"]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+nwr_stream_manager = "src/nwr-stream-manager"
+"nwr_stream_manager.assets" = "src/nwr-stream-manager/assets"
+
+[tool.setuptools.package-data]
+nwr_stream_manager = ["assets/*.json", "assets/*.wav"]
