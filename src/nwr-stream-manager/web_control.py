@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import queue
+import re
 import socket
 import sys
 import threading
@@ -20,8 +21,9 @@ from urllib.parse import parse_qs, urlparse
 
 if __package__:
     from .audio_effects import AudioEffectsProcessor
-    from .config import AudioConfig, IcecastConfig, IQ_SAMPLE_RATE
+    from .config import AudioConfig, EasRecordingConfig, IcecastConfig, IQ_SAMPLE_RATE
     from .dsp import IqChannelizer
+    from .eas_recording import EasRecorderOutput
     from .encoder import PcmResampler, create_audio_encoder
     from .fallback_audio import load_fallback_audio
     from .icecast import IcecastSource
@@ -53,6 +55,7 @@ else:
     audio_effects = importlib.import_module(f"{package_name}.audio_effects")
     config_module = importlib.import_module(f"{package_name}.config")
     dsp = importlib.import_module(f"{package_name}.dsp")
+    eas_recording = importlib.import_module(f"{package_name}.eas_recording")
     encoder = importlib.import_module(f"{package_name}.encoder")
     fallback_audio = importlib.import_module(f"{package_name}.fallback_audio")
     icecast_module = importlib.import_module(f"{package_name}.icecast")
@@ -60,9 +63,11 @@ else:
     rtl = importlib.import_module(f"{package_name}.rtl")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
     AudioConfig = config_module.AudioConfig
+    EasRecordingConfig = config_module.EasRecordingConfig
     IcecastConfig = config_module.IcecastConfig
     IQ_SAMPLE_RATE = config_module.IQ_SAMPLE_RATE
     IqChannelizer = dsp.IqChannelizer
+    EasRecorderOutput = eas_recording.EasRecorderOutput
     PcmResampler = encoder.PcmResampler
     create_audio_encoder = encoder.create_audio_encoder
     load_fallback_audio = fallback_audio.load_fallback_audio
@@ -152,6 +157,15 @@ class WebFallbackPlaybackState:
         self.position = 0
         self.delay_samples_remaining = 0
         self.active = False
+
+
+@dataclass(frozen=True)
+class WebEasRecordingSettings:
+    enabled: bool = False
+    pre_seconds: float = 2.0
+    post_seconds: float = 5.0
+    max_seconds: int = 120
+    format: str = "wav"
 
 
 class RingLogHandler(logging.Handler):
@@ -454,6 +468,139 @@ class IcecastStreamWorker:
                     sink.write(encoded)
 
 
+class EasStreamWorker:
+    def __init__(
+        self,
+        *,
+        stream: dict[str, Any],
+        config: EasRecordingConfig,
+        fanout: RawRtlFanout,
+        fallback_settings_provider,
+    ) -> None:
+        self.stream = stream
+        self.config = config
+        self.fanout = fanout
+        self.fallback_settings_provider = fallback_settings_provider
+        self.queue = fanout.subscribe(max_chunks=64)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name=f"eas-recorder-{stream['id']}", daemon=True)
+        self.status = "disabled"
+        self.error: str | None = None
+        self.lock = threading.Lock()
+
+    @property
+    def id(self) -> str:
+        return str(self.stream["id"])
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.fanout.unsubscribe(self.queue)
+        if self.thread.ident is not None:
+            self.thread.join(timeout=2.0)
+        with self.lock:
+            self.status = "disabled"
+
+    def _set_status(self, status: str, error: str | None = None) -> None:
+        with self.lock:
+            self.status = status
+            self.error = error
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            status = self.status
+            error = self.error
+        return {
+            "id": self.id,
+            "status": status,
+            "error": error,
+            "directory": self.config.directory,
+        }
+
+    def _run(self) -> None:
+        recorder = None
+        try:
+            recorder = EasRecorderOutput(self.config)
+            self._set_status("enabled")
+            self._produce_pcm(recorder)
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self._set_status("needs-attention", str(exc))
+                LOG.warning("EAS recorder failed for %s: %s", self.stream.get("station", {}).get("callsign"), exc)
+        finally:
+            if recorder is not None:
+                try:
+                    recorder.close()
+                except Exception as exc:
+                    LOG.debug("EAS recorder close failed: %s", exc)
+            self._set_status("disabled")
+
+    def _produce_pcm(self, recorder: EasRecorderOutput) -> None:
+        station = self.stream["station"]
+        target_frequency_hz = float(station["frequency"]) * 1_000_000
+        dc_blocker = IqDcBlocker()
+        channelizer: IqChannelizer | None = None
+        channelizer_key: tuple[int, int, int] | None = None
+        demodulator = ComplexNfmDemodulator()
+        effects = AudioEffectsProcessor(AudioConfig())
+        pending = np.array([], dtype=np.float32)
+        fallback = load_web_fallback_audio()
+        fallback_state = WebFallbackPlaybackState()
+        last_real_audio = time.monotonic()
+        idle_output_active = False
+        while not self.stop_event.is_set():
+            try:
+                batch: RtlSampleBatch = self.queue.get(
+                    timeout=STREAM_FRAME_SECONDS if idle_output_active else STREAM_IDLE_DETECTION_SECONDS
+                )
+            except queue.Empty:
+                idle_output_active = True
+                fallback_settings = self.fallback_settings_provider()
+                idle_seconds = time.monotonic() - last_real_audio
+                if not fallback_settings.enabled:
+                    fallback_state.reset()
+                    continue
+                if not fallback_state.active and idle_seconds < fallback_settings.silence_timeout_seconds:
+                    fallback_state.reset()
+                    recorder.write(STREAM_SILENCE_FRAME)
+                    continue
+                if not fallback_state.active:
+                    fallback_state.active = True
+                    LOG.info("starting EAS fallback audio for %s after %.1f seconds without IQ", station.get("callsign"), idle_seconds)
+                recorder.write(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds))
+                continue
+            idle_output_active = False
+            next_channelizer_key = (
+                batch.sample_rate,
+                batch.center_frequency_hz,
+                int(round(target_frequency_hz)),
+            )
+            if channelizer is None or channelizer_key != next_channelizer_key:
+                channelizer = IqChannelizer(
+                    input_rate=batch.sample_rate,
+                    center_frequency_hz=batch.center_frequency_hz,
+                    target_frequency_hz=int(round(target_frequency_hz)),
+                    output_rate=IQ_SAMPLE_RATE,
+                )
+                channelizer_key = next_channelizer_key
+                demodulator = ComplexNfmDemodulator()
+            iq = rtl_u8_to_complex64(batch.data)
+            audio = demodulator.process(channelizer.process_complex(dc_blocker.process(iq)))
+            if len(audio) == 0:
+                continue
+            last_real_audio = time.monotonic()
+            if fallback_state.active:
+                LOG.info("stopping EAS fallback audio for %s", station.get("callsign"))
+            fallback_state.reset()
+            pending = np.concatenate((pending, audio.astype(np.float32, copy=False)))
+            while len(pending) >= STREAM_FRAME_SAMPLES:
+                frame = pending[:STREAM_FRAME_SAMPLES]
+                pending = pending[STREAM_FRAME_SAMPLES:]
+                recorder.write(float_to_s16(effects.process(frame)))
+
+
 class RtlControlService:
     def __init__(self, state_path: Path, log_handler: RingLogHandler) -> None:
         self.state_path = state_path
@@ -471,6 +618,7 @@ class RtlControlService:
         self.drain_thread: threading.Thread | None = None
         self.drain_stop = threading.Event()
         self.stream_workers: dict[str, IcecastStreamWorker] = {}
+        self.eas_workers: dict[str, EasStreamWorker] = {}
         self.icecast_auth_cache: dict[str, float] = {}
         self.capture_error: str | None = None
         self.last_batch_at: float | None = None
@@ -503,6 +651,7 @@ class RtlControlService:
                 "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
                 "fallback": asdict(self.fallback_settings),
                 "active_streams": self._active_streams_locked(),
+                "active_eas_recorders": self._active_eas_recorders_locked(),
                 "logs": self.log_handler.snapshot()[-80:],
             }
 
@@ -708,6 +857,18 @@ class RtlControlService:
             save_streams(self.streams_state_path, self.streams)
             self._sync_stream_workers_locked()
         LOG.info("%s stream %s", "started" if enabled else "stopped", stream_id)
+        return self.stream_status()
+
+    def update_eas_recording(self, payload: dict[str, Any]) -> dict[str, Any]:
+        stream_id = str(payload.get("stream_id", "")).strip()
+        settings = validate_eas_recording_payload(payload.get("eas_recording", payload))
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            stream["eas_recording"] = asdict(settings)
+            stream["updated_at"] = time.time()
+            save_streams(self.streams_state_path, self.streams)
+            self._sync_stream_workers_locked()
+        LOG.info("updated EAS recording settings for stream %s", stream_id)
         return self.stream_status()
 
     def update_stream_output(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1011,6 +1172,7 @@ class RtlControlService:
     def _sync_stream_workers_locked(self) -> None:
         fanout = self.raw_fanout
         desired: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        desired_eas: dict[str, tuple[dict[str, Any], EasRecordingConfig]] = {}
         if fanout is not None:
             for stream in self.streams:
                 if not stream.get("enabled", True):
@@ -1020,10 +1182,22 @@ class RtlControlService:
                         continue
                     key = stream_worker_key(stream, output)
                     desired[key] = (stream, output)
+                eas_settings = eas_recording_settings_from_stream(stream)
+                if eas_settings.enabled:
+                    desired_eas[str(stream.get("id", ""))] = (
+                        stream,
+                        eas_config_from_stream(stream, self.state_path.parent, eas_settings),
+                    )
 
         for key in list(self.stream_workers):
             if key not in desired:
                 worker = self.stream_workers.pop(key)
+                worker.stop()
+        for key in list(self.eas_workers):
+            current = self.eas_workers[key]
+            desired_item = desired_eas.get(key)
+            if desired_item is None or current.config != desired_item[1]:
+                worker = self.eas_workers.pop(key)
                 worker.stop()
 
         if fanout is None:
@@ -1045,14 +1219,36 @@ class RtlControlService:
                 stream.get("station", {}).get("callsign", "unknown"),
                 output.get("id"),
             )
+        for key, (stream, config) in desired_eas.items():
+            if key in self.eas_workers:
+                continue
+            worker = EasStreamWorker(
+                stream=stream,
+                config=config,
+                fanout=fanout,
+                fallback_settings_provider=self.fallback_settings_snapshot,
+            )
+            self.eas_workers[key] = worker
+            worker.start()
+            LOG.info(
+                "started EAS recorder for %s in %s",
+                stream.get("station", {}).get("callsign", "unknown"),
+                config.directory,
+            )
 
     def _stop_stream_workers_locked(self) -> None:
         for worker in list(self.stream_workers.values()):
             worker.stop()
         self.stream_workers = {}
+        for worker in list(self.eas_workers.values()):
+            worker.stop()
+        self.eas_workers = {}
 
     def _active_streams_locked(self) -> list[dict[str, Any]]:
         return [worker.snapshot() for worker in self.stream_workers.values()]
+
+    def _active_eas_recorders_locked(self) -> list[dict[str, Any]]:
+        return [worker.snapshot() for worker in self.eas_workers.values()]
 
 
 class RtlControlHandler(BaseHTTPRequestHandler):
@@ -1153,6 +1349,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json()
                 response = self.service.update_fallback_settings(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/eas-recording":
+            try:
+                payload = self._read_json()
+                response = self.service.update_eas_recording(payload)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -1263,6 +1468,70 @@ def load_fallback_settings(path: Path) -> WebFallbackSettings:
 def save_fallback_settings(path: Path, settings: WebFallbackSettings) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(settings), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def eas_recording_settings_from_stream(stream: dict[str, Any]) -> WebEasRecordingSettings:
+    raw = stream.get("eas_recording")
+    if not isinstance(raw, dict):
+        return WebEasRecordingSettings()
+    try:
+        return validate_eas_recording_payload(raw)
+    except Exception as exc:
+        LOG.warning("EAS recording settings for stream %s are invalid: %s", stream.get("id"), exc)
+        return WebEasRecordingSettings()
+
+
+def validate_eas_recording_payload(raw: Any) -> WebEasRecordingSettings:
+    if not isinstance(raw, dict):
+        raise ValueError("EAS recording settings are required")
+    enabled = bool(raw.get("enabled", False))
+    pre_seconds = float(raw.get("pre_seconds", 2.0))
+    post_seconds = float(raw.get("post_seconds", 5.0))
+    max_seconds = raw.get("max_seconds", 120)
+    if not isinstance(max_seconds, int) or isinstance(max_seconds, bool):
+        raise ValueError("Maximum recording time must be a whole number of seconds")
+    if not 0 <= pre_seconds <= 10:
+        raise ValueError("Pre-recording time must be from 0 through 10 seconds")
+    if not 0 <= post_seconds <= 10:
+        raise ValueError("Post-recording time must be from 0 through 10 seconds")
+    if max_seconds <= 0:
+        raise ValueError("Maximum recording time must be greater than 0 seconds")
+    format_value = str(raw.get("format", "wav")).strip().lower()
+    if format_value not in {"mp3", "wav"}:
+        raise ValueError("EAS recording format must be MP3 or WAV")
+    return WebEasRecordingSettings(
+        enabled=enabled,
+        pre_seconds=pre_seconds,
+        post_seconds=post_seconds,
+        max_seconds=max_seconds,
+        format=format_value,
+    )
+
+
+def eas_config_from_stream(stream: dict[str, Any], state_directory: Path, settings: WebEasRecordingSettings) -> EasRecordingConfig:
+    directory = stream_alerts_directory(state_directory, stream)
+    if settings.enabled:
+        directory.mkdir(parents=True, exist_ok=True)
+    return EasRecordingConfig(
+        enabled=settings.enabled,
+        pre_seconds=settings.pre_seconds,
+        post_seconds=settings.post_seconds,
+        max_seconds=settings.max_seconds,
+        directory=str(directory),
+        format=settings.format,
+        local_time=False,
+    )
+
+
+def stream_alerts_directory(state_directory: Path, stream: dict[str, Any]) -> Path:
+    station = stream.get("station", {})
+    callsign = sanitize_path_component(str(station.get("callsign", "")).strip() or str(stream.get("id", "stream")))
+    return state_directory / "streams" / callsign / "alerts"
+
+
+def sanitize_path_component(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
+    return sanitized or "stream"
 
 
 def validate_fallback_settings_payload(raw: Any) -> WebFallbackSettings:
@@ -1786,6 +2055,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       </label>
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
         <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
+        <button id="tab_eas" type="button" role="tab" aria-selected="false" aria-controls="panel_eas" tabindex="-1">EAS Recording</button>
         <button id="tab_fallback" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback" tabindex="-1">Fallback Audio</button>
       </div>
       <div id="panel_outputs" class="tabpanel" role="tabpanel" aria-labelledby="tab_outputs">
@@ -1864,6 +2134,31 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </div>
         <div id="output-result" class="message"></div>
       </div>
+      <div id="panel_eas" class="tabpanel" role="tabpanel" aria-labelledby="tab_eas" hidden>
+        <h3>EAS recording</h3>
+        <div class="grid">
+          <label class="checkbox-row">
+            <input id="eas_enabled" type="checkbox">
+            Enable EAS recording
+          </label>
+          <label>Pre-recording time
+            <input id="eas_pre_seconds" type="number" min="0" max="10" step="0.1">
+          </label>
+          <label>Post-recording time
+            <input id="eas_post_seconds" type="number" min="0" max="10" step="0.1">
+          </label>
+          <label>Maximum recording time
+            <input id="eas_max_seconds" type="number" min="1" max="3600" step="1">
+          </label>
+          <fieldset>
+            <legend>Recording format</legend>
+            <label><input id="eas_format_wav" name="eas_format" type="radio" value="wav" checked> WAV</label>
+            <label><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
+          </fieldset>
+        </div>
+        <div class="hint" id="eas_directory_hint"></div>
+        <div id="eas-result" class="message"></div>
+      </div>
       <div id="panel_fallback" class="tabpanel" role="tabpanel" aria-labelledby="tab_fallback" hidden>
         <h3>Fallback audio</h3>
         <div class="grid">
@@ -1910,6 +2205,8 @@ let outputTableSignature = "";
 let activeStreamSnapshots = [];
 let fallbackSignature = "";
 let fallbackUpdateTimer = null;
+let easSignature = "";
+let easUpdateTimer = null;
 let wizardStep = 0;
 let wizardMode = "add";
 let wizardDirty = false;
@@ -2213,12 +2510,55 @@ function setFallbackResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setEasResult(message, kind = "") {
+  const element = document.getElementById("eas-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
 function fallbackPayload() {
   return {
     enabled: document.getElementById("fallback_enabled").checked,
     silence_timeout_seconds: Number(document.getElementById("fallback_delay").value),
     loop_delay_seconds: Number(document.getElementById("fallback_loop_delay").value)
   };
+}
+
+function easPayload() {
+  const selectedFormat = document.querySelector("input[name='eas_format']:checked");
+  return {
+    enabled: document.getElementById("eas_enabled").checked,
+    pre_seconds: Number(document.getElementById("eas_pre_seconds").value),
+    post_seconds: Number(document.getElementById("eas_post_seconds").value),
+    max_seconds: Number(document.getElementById("eas_max_seconds").value),
+    format: selectedFormat ? selectedFormat.value : "wav"
+  };
+}
+
+function defaultEasSettings() {
+  return {enabled: false, pre_seconds: 2, post_seconds: 5, max_seconds: 120, format: "wav"};
+}
+
+function easSettingsForStream(stream) {
+  return Object.assign(defaultEasSettings(), stream && stream.eas_recording ? stream.eas_recording : {});
+}
+
+function setEasControls(stream) {
+  const settings = easSettingsForStream(stream);
+  const station = stream && stream.station ? stream.station : {};
+  const directory = station.callsign ? `~/.local/state/nwr-stream-manager/streams/${station.callsign}/alerts` : "";
+  const nextSignature = JSON.stringify({settings, directory});
+  if (nextSignature === easSignature) return;
+  setChecked("eas_enabled", settings.enabled);
+  setValue("eas_pre_seconds", settings.pre_seconds);
+  setValue("eas_post_seconds", settings.post_seconds);
+  setValue("eas_max_seconds", settings.max_seconds);
+  setChecked("eas_format_wav", settings.format !== "mp3");
+  setChecked("eas_format_mp3", settings.format === "mp3");
+  setText("eas_directory_hint", directory ? `Alerts and index.json will be stored in ${directory}.` : "");
+  easSignature = nextSignature;
 }
 
 function setFallbackControls(fallback) {
@@ -2232,17 +2572,22 @@ function setFallbackControls(fallback) {
 }
 
 function activeSettingsTab() {
-  return document.getElementById("tab_fallback").getAttribute("aria-selected") === "true" ? "fallback" : "outputs";
+  if (document.getElementById("tab_fallback").getAttribute("aria-selected") === "true") return "fallback";
+  if (document.getElementById("tab_eas").getAttribute("aria-selected") === "true") return "eas";
+  return "outputs";
 }
 
 function showSettingsTab(name) {
-  const fallback = name === "fallback";
-  document.getElementById("tab_outputs").setAttribute("aria-selected", fallback ? "false" : "true");
-  document.getElementById("tab_fallback").setAttribute("aria-selected", fallback ? "true" : "false");
-  document.getElementById("tab_outputs").setAttribute("tabindex", fallback ? "-1" : "0");
-  document.getElementById("tab_fallback").setAttribute("tabindex", fallback ? "0" : "-1");
-  document.getElementById("panel_outputs").hidden = fallback;
-  document.getElementById("panel_fallback").hidden = !fallback;
+  for (const tab of [
+    {name: "outputs", button: "tab_outputs", panel: "panel_outputs"},
+    {name: "eas", button: "tab_eas", panel: "panel_eas"},
+    {name: "fallback", button: "tab_fallback", panel: "panel_fallback"}
+  ]) {
+    const selected = tab.name === name;
+    document.getElementById(tab.button).setAttribute("aria-selected", selected ? "true" : "false");
+    document.getElementById(tab.button).setAttribute("tabindex", selected ? "0" : "-1");
+    document.getElementById(tab.panel).hidden = !selected;
+  }
 }
 
 function updateOutputFormButtons() {
@@ -2424,6 +2769,7 @@ function showStreamSettings(streamId) {
   }
   settingsStreamId = streamId;
   outputTableSignature = "";
+  easSignature = "";
   cancelOutputForm();
   const station = stream.station || {};
   setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
@@ -2437,6 +2783,7 @@ function renderStreamSettings() {
   setDisabled(addButton, !stream);
   setDisabled(document.getElementById("stream_enabled"), !stream);
   if (stream) setChecked("stream_enabled", stream.enabled !== false);
+  setEasControls(stream);
   renderIcecastOutputsTable(stream);
 }
 
@@ -2910,6 +3257,7 @@ function applyRoute(route) {
     if (stream) {
       settingsStreamId = streamId;
       outputTableSignature = "";
+      easSignature = "";
       cancelOutputForm();
       const station = stream.station || {};
       setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
@@ -3055,6 +3403,27 @@ function scheduleFallbackUpdate() {
   }, 250);
 }
 
+function scheduleEasUpdate() {
+  if (applying || !settingsStreamId) return;
+  clearTimeout(easUpdateTimer);
+  easUpdateTimer = setTimeout(async () => {
+    try {
+      const data = await request("/api/eas-recording", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          stream_id: settingsStreamId,
+          eas_recording: easPayload()
+        })
+      });
+      renderStreams(data.streams || []);
+      setEasResult("EAS recording settings saved.", "success");
+    } catch (error) {
+      setEasResult(error.message, "error");
+    }
+  }, 250);
+}
+
 for (const id of controls) {
   document.addEventListener("input", event => {
     if (event.target && event.target.id === id) scheduleUpdate();
@@ -3073,14 +3442,28 @@ for (const id of ["fallback_enabled", "fallback_delay", "fallback_loop_delay"]) 
   });
 }
 
+for (const id of ["eas_enabled", "eas_pre_seconds", "eas_post_seconds", "eas_max_seconds"]) {
+  document.addEventListener("input", event => {
+    if (event.target && event.target.id === id) scheduleEasUpdate();
+  });
+  document.addEventListener("change", event => {
+    if (event.target && event.target.id === id) scheduleEasUpdate();
+  });
+}
+
+for (const formatControl of document.querySelectorAll("input[name='eas_format']")) {
+  formatControl.addEventListener("change", scheduleEasUpdate);
+}
+
 for (const button of document.querySelectorAll("nav button[data-view]")) {
   button.addEventListener("click", () => navigateTo(button.dataset.view));
 }
 
 document.getElementById("tab_outputs").addEventListener("click", () => showSettingsTab("outputs"));
+document.getElementById("tab_eas").addEventListener("click", () => showSettingsTab("eas"));
 document.getElementById("tab_fallback").addEventListener("click", () => showSettingsTab("fallback"));
 document.querySelector(".tabs").addEventListener("keydown", event => {
-  const tabs = [document.getElementById("tab_outputs"), document.getElementById("tab_fallback")];
+  const tabs = [document.getElementById("tab_outputs"), document.getElementById("tab_eas"), document.getElementById("tab_fallback")];
   const index = tabs.indexOf(event.target);
   if (index < 0) return;
   let nextIndex = index;
@@ -3091,7 +3474,7 @@ document.querySelector(".tabs").addEventListener("keydown", event => {
   else return;
   event.preventDefault();
   tabs[nextIndex].focus();
-  showSettingsTab(tabs[nextIndex].id === "tab_fallback" ? "fallback" : "outputs");
+  showSettingsTab(tabs[nextIndex].id.replace(/^tab_/, ""));
 });
 
 window.addEventListener("popstate", event => {
