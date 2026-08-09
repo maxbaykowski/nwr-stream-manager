@@ -867,8 +867,8 @@ class StreamPipeline:
                 next_audio_config = self._audio_config()
                 if next_audio_config != audio_config:
                     audio_config = next_audio_config
-                    effects = AudioEffectsProcessor(audio_config)
-                    LOG.info("updated audio effects")
+                    changed_effects = effects.update_config(audio_config)
+                    LOG.info("updated audio effects: %s", ", ".join(changed_effects) or "none")
                 audio = np.frombuffer(audio_frame, dtype="<f4")
                 pcm_frame = float_to_s16(effects.process(audio))
                 self._mark_pcm_output()

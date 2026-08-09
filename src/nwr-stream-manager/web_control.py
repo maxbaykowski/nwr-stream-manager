@@ -26,7 +26,14 @@ from urllib.parse import parse_qs, urlparse
 
 if __package__:
     from .audio_effects import AudioEffectsProcessor
-    from .config import AudioConfig, EasRecordingConfig, IcecastConfig, IQ_SAMPLE_RATE
+    from .config import (
+        AUDIO_NYQUIST_HZ,
+        AudioConfig,
+        EasRecordingConfig,
+        IcecastConfig,
+        IQ_SAMPLE_RATE,
+        parse_audio_config,
+    )
     from .dsp import IqChannelizer
     from .eas_recording import EasRecorderOutput
     from .encoder import PcmResampler, create_audio_encoder
@@ -69,10 +76,12 @@ else:
     rtl = importlib.import_module(f"{package_name}.rtl")
     same_data = importlib.import_module(f"{package_name}.same_data")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
+    AUDIO_NYQUIST_HZ = config_module.AUDIO_NYQUIST_HZ
     AudioConfig = config_module.AudioConfig
     EasRecordingConfig = config_module.EasRecordingConfig
     IcecastConfig = config_module.IcecastConfig
     IQ_SAMPLE_RATE = config_module.IQ_SAMPLE_RATE
+    parse_audio_config = config_module.parse_audio_config
     IqChannelizer = dsp.IqChannelizer
     EasRecorderOutput = eas_recording.EasRecorderOutput
     PcmResampler = encoder.PcmResampler
@@ -411,7 +420,8 @@ class IcecastStreamWorker:
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int, int] | None = None
         demodulator = ComplexNfmDemodulator()
-        effects = AudioEffectsProcessor(AudioConfig())
+        audio_config = audio_config_from_stream(self.stream)
+        effects = AudioEffectsProcessor(audio_config)
         pending = np.array([], dtype=np.float32)
         header = getattr(encoder, "header", b"")
         if header:
@@ -474,6 +484,15 @@ class IcecastStreamWorker:
             while len(pending) >= STREAM_FRAME_SAMPLES:
                 frame = pending[:STREAM_FRAME_SAMPLES]
                 pending = pending[STREAM_FRAME_SAMPLES:]
+                next_audio_config = audio_config_from_stream(self.stream)
+                if next_audio_config != audio_config:
+                    audio_config = next_audio_config
+                    changed_effects = effects.update_config(audio_config)
+                    LOG.info(
+                        "applied audio effects update for %s without reconnecting Icecast: %s",
+                        station.get("callsign"),
+                        ", ".join(changed_effects) or "none",
+                    )
                 pcm = float_to_s16(effects.process(frame))
                 encoded = encoder.encode(pcm)
                 if encoded:
@@ -556,7 +575,8 @@ class EasStreamWorker:
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int, int] | None = None
         demodulator = ComplexNfmDemodulator()
-        effects = AudioEffectsProcessor(AudioConfig())
+        audio_config = audio_config_from_stream(self.stream)
+        effects = AudioEffectsProcessor(audio_config)
         pending = np.array([], dtype=np.float32)
         fallback = load_web_fallback_audio()
         fallback_state = WebFallbackPlaybackState()
@@ -610,6 +630,15 @@ class EasStreamWorker:
             while len(pending) >= STREAM_FRAME_SAMPLES:
                 frame = pending[:STREAM_FRAME_SAMPLES]
                 pending = pending[STREAM_FRAME_SAMPLES:]
+                next_audio_config = audio_config_from_stream(self.stream)
+                if next_audio_config != audio_config:
+                    audio_config = next_audio_config
+                    changed_effects = effects.update_config(audio_config)
+                    LOG.info(
+                        "applied EAS recorder audio effects update for %s: %s",
+                        station.get("callsign"),
+                        ", ".join(changed_effects) or "none",
+                    )
                 recorder.write(float_to_s16(effects.process(frame)))
 
 
@@ -1060,6 +1089,17 @@ class RtlControlService:
             save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         LOG.info("updated EAS recording settings for stream %s", stream_id)
+        return self.stream_status()
+
+    def update_audio_effects(self, payload: dict[str, Any]) -> dict[str, Any]:
+        stream_id = str(payload.get("stream_id", "")).strip()
+        audio = validate_audio_payload(payload.get("audio", payload))
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            stream["audio"] = audio
+            stream["updated_at"] = time.time()
+            save_streams(self.streams_directory, self.streams)
+        LOG.info("updated audio effects for stream %s", stream_id)
         return self.stream_status()
 
     def update_stream_output(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1661,6 +1701,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(response)
             return
+        if path == "/api/audio-effects":
+            try:
+                payload = self._read_json()
+                response = self.service.update_audio_effects(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path == "/api/streams":
             try:
                 payload = self._read_json()
@@ -1840,6 +1889,26 @@ def eas_config_from_stream(stream: dict[str, Any], state_directory: Path, settin
         format=settings.format,
         local_time=False,
     )
+
+
+def audio_config_from_stream(stream: dict[str, Any]) -> AudioConfig:
+    raw = stream.get("audio")
+    if not isinstance(raw, dict):
+        return AudioConfig()
+    try:
+        return parse_audio_config(raw)
+    except Exception as exc:
+        LOG.warning("audio effects settings for stream %s are invalid: %s", stream.get("id"), exc)
+        return AudioConfig()
+
+
+def validate_audio_payload(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("audio effects settings are required")
+    try:
+        return asdict(parse_audio_config(raw))
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def stream_alerts_directory(state_directory: Path, stream: dict[str, Any]) -> Path:
@@ -2573,6 +2642,13 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: -1px; }
 .tabs button[aria-selected="true"] { border-color: #2557a7; border-bottom-color: #fff; box-shadow: inset 0 2px 0 #2557a7; }
 .tabpanel[hidden] { display: none; }
+.effects-layout { display: grid; grid-template-columns: minmax(180px, 240px) 1fr; gap: 16px; align-items: start; }
+.effects-list { display: grid; gap: 8px; }
+.effects-list button { text-align: left; }
+.effects-list button[aria-current="true"] { border-color: #2557a7; box-shadow: inset 3px 0 0 #2557a7; }
+.effects-detail { min-width: 0; }
+.audio-effect-panel[hidden] { display: none; }
+.audio-effects-back { display: none; }
 pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; background: #10151d; color: #d8f3dc; padding: 12px; border-radius: 6px; font-size: 13px; }
 .error { color: #a40000; font-weight: 600; }
 .message { font-weight: 600; }
@@ -2591,6 +2667,12 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
   .tabs { border-color: #333b48; }
   .tabs button[aria-selected="true"] { border-bottom-color: #181d24; }
+}
+@media (max-width: 680px) {
+  .effects-layout { display: block; }
+  .effects-layout.effect-detail-active .effects-list { display: none; }
+  .effects-layout:not(.effect-detail-active) .effects-detail { display: none; }
+  .audio-effects-back { display: inline-block; margin-bottom: 12px; }
 }
 </style>
 </head>
@@ -2782,6 +2864,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       </label>
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
         <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
+        <button id="tab_audio" type="button" role="tab" aria-selected="false" aria-controls="panel_audio" tabindex="-1">Audio Effects</button>
         <button id="tab_eas" type="button" role="tab" aria-selected="false" aria-controls="panel_eas" tabindex="-1">EAS Recording</button>
         <button id="tab_fallback" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback" tabindex="-1">Fallback Audio</button>
       </div>
@@ -2860,6 +2943,92 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </div>
         </div>
         <div id="output-result" class="message"></div>
+      </div>
+      <div id="panel_audio" class="tabpanel" role="tabpanel" aria-labelledby="tab_audio" hidden>
+        <h3>Audio effects</h3>
+        <div id="audio_effects_layout" class="effects-layout">
+          <div id="audio_effects_list" class="effects-list" aria-label="Audio effects">
+            <button type="button" data-audio-effect="volume">Volume multiplier</button>
+            <button type="button" data-audio-effect="comfort_noise">Comfort noise</button>
+            <button type="button" data-audio-effect="deemphasis">NFM deemphasis</button>
+            <button type="button" data-audio-effect="highpass">Highpass</button>
+            <button type="button" data-audio-effect="lowpass">Lowpass</button>
+            <button type="button" data-audio-effect="notch">Notch filter</button>
+          </div>
+          <div class="effects-detail">
+            <button id="audio_effects_back" class="audio-effects-back" type="button">Back to effects</button>
+            <div id="audio_effect_volume" class="audio-effect-panel">
+              <h4>Volume multiplier</h4>
+              <label class="checkbox-row">
+                <input id="audio_volume_enabled" type="checkbox">
+                Enable volume multiplier
+              </label>
+              <label>Multiplier
+                <input id="audio_volume_multiplier" type="number" min="0" step="0.1">
+              </label>
+            </div>
+            <div id="audio_effect_comfort_noise" class="audio-effect-panel" hidden>
+              <h4>Comfort noise</h4>
+              <label class="checkbox-row">
+                <input id="audio_comfort_noise_enabled" type="checkbox">
+                Enable comfort noise
+              </label>
+              <label>Level
+                <input id="audio_comfort_noise_level" type="number" min="-80" max="-20" step="1">
+              </label>
+            </div>
+            <div id="audio_effect_deemphasis" class="audio-effect-panel" hidden>
+              <h4>NFM deemphasis</h4>
+              <label class="checkbox-row">
+                <input id="audio_deemphasis_enabled" type="checkbox">
+                Enable NFM deemphasis
+              </label>
+              <label>Time constant
+                <input id="audio_deemphasis_tau" type="number" min="0" max="530" step="1">
+              </label>
+            </div>
+            <div id="audio_effect_highpass" class="audio-effect-panel" hidden>
+              <h4>Highpass</h4>
+              <label class="checkbox-row">
+                <input id="audio_highpass_enabled" type="checkbox">
+                Enable highpass
+              </label>
+              <label>Frequency
+                <input id="audio_highpass_frequency" type="number" min="1" max="900" step="1">
+              </label>
+              <label>Sharpness
+                <input id="audio_highpass_sharpness" type="number" min="0" max="10" step="0.1">
+              </label>
+            </div>
+            <div id="audio_effect_lowpass" class="audio-effect-panel" hidden>
+              <h4>Lowpass</h4>
+              <label class="checkbox-row">
+                <input id="audio_lowpass_enabled" type="checkbox">
+                Enable lowpass
+              </label>
+              <label>Frequency
+                <input id="audio_lowpass_frequency" type="number" min="2200" max="12000" step="1">
+              </label>
+              <label>Sharpness
+                <input id="audio_lowpass_sharpness" type="number" min="0" max="10" step="0.1">
+              </label>
+            </div>
+            <div id="audio_effect_notch" class="audio-effect-panel" hidden>
+              <h4>Notch filter</h4>
+              <label class="checkbox-row">
+                <input id="audio_notch_enabled" type="checkbox">
+                Enable notch filter
+              </label>
+              <label>Frequency
+                <input id="audio_notch_frequency" type="number" min="1" max="12000" step="1">
+              </label>
+              <label>Sharpness
+                <input id="audio_notch_sharpness" type="number" min="0" max="10" step="0.1">
+              </label>
+            </div>
+          </div>
+        </div>
+        <div id="audio-effects-result" class="message"></div>
       </div>
       <div id="panel_eas" class="tabpanel" role="tabpanel" aria-labelledby="tab_eas" hidden>
         <h3>EAS recording</h3>
@@ -3008,6 +3177,9 @@ let fallbackSignature = "";
 let fallbackUpdateTimer = null;
 let easSignature = "";
 let easUpdateTimer = null;
+let audioEffectsSignature = "";
+let audioEffectsUpdateTimer = null;
+let selectedAudioEffect = "volume";
 let wizardStep = 0;
 let wizardMode = "add";
 let wizardDirty = false;
@@ -3026,6 +3198,11 @@ let lastEasAlertRefreshAt = 0;
 let easBulkOptionsSignature = "";
 let easBulkServerNow = null;
 const EAS_ALERTS_PER_PAGE = 25;
+const PROTECTED_AUDIO_BANDS = [
+  {min: 900, max: 1100},
+  {min: 1400, max: 1600},
+  {min: 2000, max: 2200}
+];
 
 async function request(path, options = {}) {
   const response = await fetch(path, options);
@@ -3354,11 +3531,129 @@ function setEasResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setAudioEffectsResult(message, kind = "") {
+  const element = document.getElementById("audio-effects-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
 function fallbackPayload() {
   return {
     enabled: document.getElementById("fallback_enabled").checked,
     silence_timeout_seconds: Number(document.getElementById("fallback_delay").value),
     loop_delay_seconds: Number(document.getElementById("fallback_loop_delay").value)
+  };
+}
+
+function filterPayload(name) {
+  const frequencyElement = document.getElementById(`audio_${name}_frequency`);
+  const frequencyValue = frequencyElement.dataset.userEditing === "1"
+    ? Number(frequencyElement.dataset.previousValue || frequencyElement.defaultValue || frequencyElement.value)
+    : Number(frequencyElement.value);
+  return {
+    enabled: document.getElementById(`audio_${name}_enabled`).checked,
+    frequency: frequencyValue,
+    sharpness: Number(document.getElementById(`audio_${name}_sharpness`).value)
+  };
+}
+
+function clampNumber(value, minimum, maximum) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return minimum;
+  return Math.min(maximum, Math.max(minimum, number));
+}
+
+function previousNumberValue(element) {
+  const previous = Number(element.dataset.previousValue || element.defaultValue || element.min || 0);
+  return Number.isFinite(previous) ? previous : 0;
+}
+
+function normalizeAudioFrequencyControl(name) {
+  const element = document.getElementById(`audio_${name}_frequency`);
+  if (!element || element.value === "") return;
+  const previous = previousNumberValue(element);
+  let value = Number(element.value);
+  if (!Number.isFinite(value)) return;
+  if (name === "highpass") {
+    value = clampNumber(value, 1, 900);
+  } else if (name === "lowpass") {
+    value = clampNumber(value, 2200, 12000);
+  } else if (name === "notch") {
+    value = clampNumber(value, 1, 12000);
+    value = skipProtectedAudioBands(value, previous);
+  }
+  const normalized = String(Math.round(value));
+  if (element.value !== normalized) element.value = normalized;
+  element.dataset.previousValue = normalized;
+}
+
+function skipProtectedAudioBands(value, previous) {
+  for (const band of PROTECTED_AUDIO_BANDS) {
+    if (value < band.min || value > band.max) continue;
+    if (previous < band.min) return band.max + 1;
+    if (previous > band.max) return band.min - 1;
+    const downDistance = Math.abs(value - (band.min - 1));
+    const upDistance = Math.abs((band.max + 1) - value);
+    return upDistance <= downDistance ? band.max + 1 : band.min - 1;
+  }
+  return value;
+}
+
+function normalizeAudioFrequencyInput(event) {
+  const target = event.target;
+  if (!target || !target.id) return false;
+  const match = target.id.match(/^audio_(highpass|lowpass|notch)_frequency$/);
+  if (!match) return false;
+  normalizeAudioFrequencyControl(match[1]);
+  return true;
+}
+
+function audioFrequencyNameForElement(element) {
+  if (!element || !element.id) return "";
+  const match = element.id.match(/^audio_(highpass|lowpass|notch)_frequency$/);
+  return match ? match[1] : "";
+}
+
+function isTextEditingInputEvent(event) {
+  return event && typeof event.inputType === "string" && (
+    event.inputType.startsWith("insert") ||
+    event.inputType.startsWith("delete")
+  );
+}
+
+function isTextEditingKey(event) {
+  if (!event || event.ctrlKey || event.altKey || event.metaKey) return false;
+  return event.key.length === 1 || ["Backspace", "Delete"].includes(event.key);
+}
+
+function commitAudioFrequencyElement(element, save = true) {
+  const name = audioFrequencyNameForElement(element);
+  if (!name) return false;
+  normalizeAudioFrequencyControl(name);
+  delete element.dataset.userEditing;
+  if (save) scheduleAudioEffectsUpdate();
+  return true;
+}
+
+function audioEffectsPayload() {
+  return {
+    volume: {
+      enabled: document.getElementById("audio_volume_enabled").checked,
+      multiplier: Number(document.getElementById("audio_volume_multiplier").value)
+    },
+    comfort_noise: {
+      enabled: document.getElementById("audio_comfort_noise_enabled").checked,
+      level_db: Number(document.getElementById("audio_comfort_noise_level").value)
+    },
+    deemphasis: {
+      enabled: document.getElementById("audio_deemphasis_enabled").checked,
+      tau: Number(document.getElementById("audio_deemphasis_tau").value)
+    },
+    highpass: filterPayload("highpass"),
+    lowpass: filterPayload("lowpass"),
+    notch: filterPayload("notch")
   };
 }
 
@@ -3377,8 +3672,74 @@ function defaultEasSettings() {
   return {enabled: false, pre_seconds: 2, post_seconds: 5, max_seconds: 120, format: "wav"};
 }
 
+function defaultAudioEffectsSettings() {
+  return {
+    volume: {enabled: false, multiplier: 1.0},
+    comfort_noise: {enabled: false, level_db: -40.0},
+    deemphasis: {enabled: true, tau: 530.0},
+    highpass: {enabled: false, frequency: 300.0, sharpness: 0.0},
+    lowpass: {enabled: false, frequency: 4000.0, sharpness: 0.0},
+    notch: {enabled: false, frequency: 3000.0, sharpness: 0.0}
+  };
+}
+
+function audioEffectsSettingsForStream(stream) {
+  const defaults = defaultAudioEffectsSettings();
+  const audio = stream && stream.audio ? stream.audio : {};
+  return {
+    volume: Object.assign(defaults.volume, audio.volume || {}),
+    comfort_noise: Object.assign(defaults.comfort_noise, audio.comfort_noise || {}),
+    deemphasis: Object.assign(defaults.deemphasis, audio.deemphasis || {}),
+    highpass: normalizeAudioFilterSettings(defaults.highpass, audio.highpass),
+    lowpass: normalizeAudioFilterSettings(defaults.lowpass, audio.lowpass),
+    notch: normalizeAudioFilterSettings(defaults.notch, audio.notch)
+  };
+}
+
+function normalizeAudioFilterSettings(defaults, raw) {
+  const settings = Object.assign({}, defaults, raw || {});
+  if (!Number(settings.frequency)) settings.frequency = defaults.frequency;
+  return settings;
+}
+
 function easSettingsForStream(stream) {
   return Object.assign(defaultEasSettings(), stream && stream.eas_recording ? stream.eas_recording : {});
+}
+
+function setAudioEffectsControls(stream) {
+  const settings = audioEffectsSettingsForStream(stream);
+  const nextSignature = JSON.stringify(settings);
+  if (nextSignature === audioEffectsSignature) return;
+  setChecked("audio_volume_enabled", settings.volume.enabled);
+  setValue("audio_volume_multiplier", settings.volume.multiplier);
+  setChecked("audio_comfort_noise_enabled", settings.comfort_noise.enabled);
+  setValue("audio_comfort_noise_level", settings.comfort_noise.level_db);
+  setChecked("audio_deemphasis_enabled", settings.deemphasis.enabled);
+  setValue("audio_deemphasis_tau", settings.deemphasis.tau);
+  setAudioFilterControls("highpass", settings.highpass);
+  setAudioFilterControls("lowpass", settings.lowpass);
+  setAudioFilterControls("notch", settings.notch);
+  audioEffectsSignature = nextSignature;
+}
+
+function setAudioFilterControls(name, settings) {
+  setChecked(`audio_${name}_enabled`, settings.enabled);
+  setValue(`audio_${name}_frequency`, settings.frequency);
+  setValue(`audio_${name}_sharpness`, settings.sharpness);
+  const frequency = document.getElementById(`audio_${name}_frequency`);
+  frequency.dataset.previousValue = String(settings.frequency);
+}
+
+function selectAudioEffect(name, showDetail = true) {
+  selectedAudioEffect = name;
+  for (const button of document.querySelectorAll("[data-audio-effect]")) {
+    const selected = button.dataset.audioEffect === name;
+    button.setAttribute("aria-current", selected ? "true" : "false");
+  }
+  for (const panel of document.querySelectorAll(".audio-effect-panel")) {
+    panel.hidden = panel.id !== `audio_effect_${name}`;
+  }
+  document.getElementById("audio_effects_layout").classList.toggle("effect-detail-active", showDetail);
 }
 
 function setEasControls(stream) {
@@ -3412,12 +3773,14 @@ function setFallbackControls(fallback) {
 function activeSettingsTab() {
   if (document.getElementById("tab_fallback").getAttribute("aria-selected") === "true") return "fallback";
   if (document.getElementById("tab_eas").getAttribute("aria-selected") === "true") return "eas";
+  if (document.getElementById("tab_audio").getAttribute("aria-selected") === "true") return "audio";
   return "outputs";
 }
 
 function showSettingsTab(name) {
   for (const tab of [
     {name: "outputs", button: "tab_outputs", panel: "panel_outputs"},
+    {name: "audio", button: "tab_audio", panel: "panel_audio"},
     {name: "eas", button: "tab_eas", panel: "panel_eas"},
     {name: "fallback", button: "tab_fallback", panel: "panel_fallback"}
   ]) {
@@ -3608,6 +3971,8 @@ function showStreamSettings(streamId) {
   settingsStreamId = streamId;
   outputTableSignature = "";
   easSignature = "";
+  audioEffectsSignature = "";
+  selectAudioEffect(selectedAudioEffect, false);
   cancelOutputForm();
   const station = stream.station || {};
   setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
@@ -3621,6 +3986,7 @@ function renderStreamSettings() {
   setDisabled(addButton, !stream);
   setDisabled(document.getElementById("stream_enabled"), !stream);
   if (stream) setChecked("stream_enabled", stream.enabled !== false);
+  setAudioEffectsControls(stream);
   setEasControls(stream);
   renderIcecastOutputsTable(stream);
 }
@@ -4555,6 +4921,7 @@ function applyRoute(route) {
       settingsStreamId = streamId;
       outputTableSignature = "";
       easSignature = "";
+      audioEffectsSignature = "";
       cancelOutputForm();
       const station = stream.station || {};
       setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
@@ -4766,6 +5133,27 @@ function scheduleEasUpdate() {
   }, 250);
 }
 
+function scheduleAudioEffectsUpdate() {
+  if (applying || !settingsStreamId) return;
+  clearTimeout(audioEffectsUpdateTimer);
+  audioEffectsUpdateTimer = setTimeout(async () => {
+    try {
+      const data = await request("/api/audio-effects", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          stream_id: settingsStreamId,
+          audio: audioEffectsPayload()
+        })
+      });
+      renderStreams(data.streams || []);
+      setAudioEffectsResult("Audio effects saved.", "success");
+    } catch (error) {
+      setAudioEffectsResult(error.message, "error");
+    }
+  }, 250);
+}
+
 for (const id of controls) {
   document.addEventListener("input", event => {
     if (event.target && event.target.id === id) scheduleUpdate();
@@ -4797,15 +5185,70 @@ for (const formatControl of document.querySelectorAll("input[name='eas_format']"
   formatControl.addEventListener("change", scheduleEasUpdate);
 }
 
+for (const id of [
+  "audio_volume_enabled",
+  "audio_volume_multiplier",
+  "audio_comfort_noise_enabled",
+  "audio_comfort_noise_level",
+  "audio_deemphasis_enabled",
+  "audio_deemphasis_tau",
+  "audio_highpass_enabled",
+  "audio_highpass_frequency",
+  "audio_highpass_sharpness",
+  "audio_lowpass_enabled",
+  "audio_lowpass_frequency",
+  "audio_lowpass_sharpness",
+  "audio_notch_enabled",
+  "audio_notch_frequency",
+  "audio_notch_sharpness"
+]) {
+  document.addEventListener("input", event => {
+    if (event.target && event.target.id === id) {
+      if (audioFrequencyNameForElement(event.target)) {
+        if (isTextEditingInputEvent(event) || event.target.dataset.userEditing === "1") return;
+        commitAudioFrequencyElement(event.target, false);
+      }
+      scheduleAudioEffectsUpdate();
+    }
+  });
+  document.addEventListener("change", event => {
+    if (event.target && event.target.id === id) {
+      commitAudioFrequencyElement(event.target, false);
+      scheduleAudioEffectsUpdate();
+    }
+  });
+}
+
+document.addEventListener("keydown", event => {
+  if (!audioFrequencyNameForElement(event.target)) return;
+  if (isTextEditingKey(event)) {
+    event.target.dataset.userEditing = "1";
+    return;
+  }
+  if (event.key === "Enter") {
+    event.preventDefault();
+    commitAudioFrequencyElement(event.target, true);
+    return;
+  }
+  if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) {
+    setTimeout(() => commitAudioFrequencyElement(event.target, true), 0);
+  }
+});
+
+document.addEventListener("blur", event => {
+  commitAudioFrequencyElement(event.target, true);
+}, true);
+
 for (const button of document.querySelectorAll("nav button[data-view]")) {
   button.addEventListener("click", () => navigateTo(button.dataset.view));
 }
 
 document.getElementById("tab_outputs").addEventListener("click", () => showSettingsTab("outputs"));
+document.getElementById("tab_audio").addEventListener("click", () => showSettingsTab("audio"));
 document.getElementById("tab_eas").addEventListener("click", () => showSettingsTab("eas"));
 document.getElementById("tab_fallback").addEventListener("click", () => showSettingsTab("fallback"));
 document.querySelector(".tabs").addEventListener("keydown", event => {
-  const tabs = [document.getElementById("tab_outputs"), document.getElementById("tab_eas"), document.getElementById("tab_fallback")];
+  const tabs = [document.getElementById("tab_outputs"), document.getElementById("tab_audio"), document.getElementById("tab_eas"), document.getElementById("tab_fallback")];
   const index = tabs.indexOf(event.target);
   if (index < 0) return;
   let nextIndex = index;
@@ -4817,6 +5260,33 @@ document.querySelector(".tabs").addEventListener("keydown", event => {
   event.preventDefault();
   tabs[nextIndex].focus();
   showSettingsTab(tabs[nextIndex].id.replace(/^tab_/, ""));
+});
+
+document.getElementById("audio_effects_list").addEventListener("click", event => {
+  const button = event.target && event.target.closest ? event.target.closest("[data-audio-effect]") : null;
+  if (!button) return;
+  selectAudioEffect(button.dataset.audioEffect, true);
+});
+
+document.getElementById("audio_effects_list").addEventListener("keydown", event => {
+  const buttons = Array.from(document.querySelectorAll("[data-audio-effect]"));
+  const index = buttons.indexOf(event.target);
+  if (index < 0) return;
+  let nextIndex = index;
+  if (event.key === "ArrowDown" || event.key === "ArrowRight") nextIndex = (index + 1) % buttons.length;
+  else if (event.key === "ArrowUp" || event.key === "ArrowLeft") nextIndex = (index - 1 + buttons.length) % buttons.length;
+  else if (event.key === "Home") nextIndex = 0;
+  else if (event.key === "End") nextIndex = buttons.length - 1;
+  else return;
+  event.preventDefault();
+  buttons[nextIndex].focus();
+  selectAudioEffect(buttons[nextIndex].dataset.audioEffect, false);
+});
+
+document.getElementById("audio_effects_back").addEventListener("click", () => {
+  document.getElementById("audio_effects_layout").classList.remove("effect-detail-active");
+  const selected = document.querySelector(`[data-audio-effect='${selectedAudioEffect}']`);
+  if (selected) selected.focus();
 });
 
 window.addEventListener("popstate", event => {
@@ -5430,6 +5900,7 @@ async function refresh() {
 
 (async function init() {
   populateBitrates();
+  selectAudioEffect("volume", false);
   const data = await request("/api/status");
   await loadDevices(data.settings.serial);
   await searchStations();

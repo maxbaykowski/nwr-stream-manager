@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from numpy.typing import NDArray
@@ -106,6 +106,45 @@ class AudioEffectsProcessor:
         if self.config.volume.enabled:
             audio = audio * self.config.volume.multiplier
         return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
+
+    def update_config(self, config: AudioConfig) -> tuple[str, ...]:
+        changed: list[str] = []
+        if config == self.config:
+            return ()
+
+        if config.comfort_noise != self.config.comfort_noise:
+            self.comfort_noise.config = config.comfort_noise
+            changed.append("comfort_noise")
+
+        if config.deemphasis != self.config.deemphasis:
+            self.deemphasis = DeemphasisFilter(self.sample_rate, config.deemphasis_tau)
+            changed.append("deemphasis")
+
+        if config.highpass != self.config.highpass:
+            self.highpass = _build_filter("highpass", config.highpass, self.sample_rate)
+            changed.append("highpass")
+
+        if config.lowpass != self.config.lowpass:
+            self.lowpass = _build_filter("lowpass", config.lowpass, self.sample_rate)
+            changed.append("lowpass")
+
+        if config.notch != self.config.notch:
+            self.notch = _build_filter("notch", config.notch, self.sample_rate)
+            changed.append("notch")
+
+        if config.volume != self.config.volume:
+            changed.append("volume")
+
+        self.config = replace(
+            self.config,
+            deemphasis=config.deemphasis,
+            comfort_noise=config.comfort_noise,
+            volume=config.volume,
+            highpass=config.highpass,
+            lowpass=config.lowpass,
+            notch=config.notch,
+        )
+        return tuple(changed)
 
 
 def tap_count_for_sharpness(sharpness: float) -> int:

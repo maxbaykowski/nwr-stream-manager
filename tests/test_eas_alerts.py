@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import json
 import sys
 import tempfile
@@ -34,6 +35,7 @@ class EasAlertTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.web_control = load_web_control_module()
+        cls.config = importlib.import_module("nwr_stream_manager.config")
 
     def test_alert_summary_uses_same_event_lookup(self) -> None:
         alert = {
@@ -348,6 +350,140 @@ class EasAlertTests(unittest.TestCase):
             self.assertTrue(keep_audio.exists())
             rewritten = json.loads((alert_dir / "index.json").read_text(encoding="utf-8"))
             self.assertEqual([alert["raw_same_header"] for alert in rewritten["alerts"]], ["keep"])
+
+    def test_audio_effects_reject_highpass_above_1050_protection(self) -> None:
+        with self.assertRaisesRegex(ValueError, "highpass.frequency"):
+            self.web_control.validate_audio_payload({
+                "deemphasis": {"enabled": True, "tau": 530},
+                "comfort_noise": {"enabled": False, "level_db": -40},
+                "volume": {"enabled": False, "multiplier": 1},
+                "highpass": {"enabled": True, "frequency": 950, "sharpness": 5},
+                "lowpass": {"enabled": False, "frequency": 4000, "sharpness": 0},
+                "notch": {"enabled": False, "frequency": 3000, "sharpness": 0},
+            })
+
+    def test_audio_effects_reject_lowpass_below_same_mark_tone(self) -> None:
+        with self.assertRaisesRegex(ValueError, "lowpass.frequency"):
+            self.web_control.validate_audio_payload({
+                "deemphasis": {"enabled": True, "tau": 530},
+                "comfort_noise": {"enabled": False, "level_db": -40},
+                "volume": {"enabled": False, "multiplier": 1},
+                "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
+                "lowpass": {"enabled": True, "frequency": 1800, "sharpness": 5},
+                "notch": {"enabled": False, "frequency": 3000, "sharpness": 0},
+            })
+
+    def test_audio_effects_reject_notch_inside_protected_same_band(self) -> None:
+        with self.assertRaisesRegex(ValueError, "protected"):
+            self.web_control.validate_audio_payload({
+                "deemphasis": {"enabled": True, "tau": 530},
+                "comfort_noise": {"enabled": False, "level_db": -40},
+                "volume": {"enabled": False, "multiplier": 1},
+                "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
+                "lowpass": {"enabled": False, "frequency": 4000, "sharpness": 0},
+                "notch": {"enabled": True, "frequency": 1500, "sharpness": 5},
+            })
+
+    def test_audio_effects_update_does_not_stop_active_workers(self) -> None:
+        class Worker:
+            stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            stream = {
+                "id": "stream-1",
+                "station": {"callsign": "WXN99"},
+                "outputs": [
+                    {
+                        "id": "output-1",
+                        "enabled": True,
+                        "type": "icecast",
+                        "icecast": {
+                            "host": "example.com",
+                            "port": 8000,
+                            "username": "source",
+                            "password": "secret",
+                            "mount": "/wxn99",
+                            "format": "mp3",
+                            "sample_rate": 22050,
+                            "bitrate": 64,
+                        },
+                    }
+                ],
+            }
+            icecast_worker = Worker()
+            eas_worker = Worker()
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+            service.stream_workers = {"stream-1:output-1": icecast_worker}
+            service.eas_workers = {"stream-1": eas_worker}
+
+            response = service.update_audio_effects({
+                "stream_id": "stream-1",
+                "audio": {
+                    "deemphasis": {"enabled": True, "tau": 530},
+                    "comfort_noise": {"enabled": False, "level_db": -40},
+                    "volume": {"enabled": True, "multiplier": 1.2},
+                    "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
+                    "lowpass": {"enabled": False, "frequency": 4000, "sharpness": 0},
+                    "notch": {"enabled": False, "frequency": 3000, "sharpness": 0},
+                },
+            })
+
+            self.assertFalse(icecast_worker.stopped)
+            self.assertFalse(eas_worker.stopped)
+            self.assertEqual(response["streams"][0]["audio"]["volume"]["multiplier"], 1.2)
+
+    def test_audio_effects_processor_volume_update_reuses_effect_objects(self) -> None:
+        config = self.config
+        processor = self.web_control.AudioEffectsProcessor(config.AudioConfig())
+        comfort_noise = processor.comfort_noise
+        deemphasis = processor.deemphasis
+        highpass = processor.highpass
+        lowpass = processor.lowpass
+        notch = processor.notch
+
+        changed = processor.update_config(config.AudioConfig(
+            volume=config.VolumeConfig(enabled=True, multiplier=1.5)
+        ))
+
+        self.assertEqual(changed, ("volume",))
+        self.assertIs(processor.comfort_noise, comfort_noise)
+        self.assertIs(processor.deemphasis, deemphasis)
+        self.assertIs(processor.highpass, highpass)
+        self.assertIs(processor.lowpass, lowpass)
+        self.assertIs(processor.notch, notch)
+
+    def test_audio_effects_processor_rebuilds_only_changed_fir_filter(self) -> None:
+        config = self.config
+        processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
+            highpass=config.FilterConfig(enabled=True, frequency=300, sharpness=1),
+            lowpass=config.FilterConfig(enabled=True, frequency=4000, sharpness=1),
+            notch=config.FilterConfig(enabled=True, frequency=3000, sharpness=1),
+        ))
+        highpass = processor.highpass
+        lowpass = processor.lowpass
+        notch = processor.notch
+        comfort_noise = processor.comfort_noise
+        deemphasis = processor.deemphasis
+
+        changed = processor.update_config(config.AudioConfig(
+            highpass=config.FilterConfig(enabled=True, frequency=350, sharpness=1),
+            lowpass=config.FilterConfig(enabled=True, frequency=4000, sharpness=1),
+            notch=config.FilterConfig(enabled=True, frequency=3000, sharpness=1),
+        ))
+
+        self.assertEqual(changed, ("highpass",))
+        self.assertIsNot(processor.highpass, highpass)
+        self.assertIs(processor.lowpass, lowpass)
+        self.assertIs(processor.notch, notch)
+        self.assertIs(processor.comfort_noise, comfort_noise)
+        self.assertIs(processor.deemphasis, deemphasis)
 
 
 if __name__ == "__main__":
