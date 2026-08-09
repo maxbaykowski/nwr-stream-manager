@@ -100,6 +100,9 @@ LOG = logging.getLogger(__name__)
 STATE_DIRECTORY_NAME = "nwr-stream-manager"
 STATE_FILE_NAME = "rtl-control.json"
 STREAMS_STATE_FILE_NAME = "streams.json"
+STREAMS_DIRECTORY_NAME = "streams"
+STREAM_CONFIG_FILE_NAME = "config.json"
+STREAMS_DIRECTORY_MARKER_FILE_NAME = ".per-stream-configs"
 STATIONS_ASSET_PATH = Path(__file__).resolve().parent / "assets" / "nwr_stations.json"
 USB_VENDOR_NAMES = {
     "0bda": "Realtek",
@@ -605,11 +608,12 @@ class RtlControlService:
     def __init__(self, state_path: Path, log_handler: RingLogHandler) -> None:
         self.state_path = state_path
         self.streams_state_path = state_path.with_name(STREAMS_STATE_FILE_NAME)
+        self.streams_directory = state_path.parent / STREAMS_DIRECTORY_NAME
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.log_handler = log_handler
         self.lock = threading.RLock()
         self.settings = load_settings(state_path)
-        self.streams = load_streams(self.streams_state_path)
+        self.streams = load_streams(self.streams_directory, self.streams_state_path)
         self.fallback_settings = load_fallback_settings(self.fallback_state_path)
         self.stations = load_station_database()
         self.capture: RtlCaptureSource | None = None
@@ -771,7 +775,7 @@ class RtlControlService:
         }
         with self.lock:
             self.streams.append(stream)
-            save_streams(self.streams_state_path, self.streams)
+            save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         return {
             "success": True,
@@ -836,11 +840,11 @@ class RtlControlService:
     def remove_stream(self, stream_id: str) -> dict[str, Any]:
         stream_id = stream_id.strip()
         with self.lock:
-            before = len(self.streams)
+            removed = [stream for stream in self.streams if stream.get("id") == stream_id]
             self.streams = [stream for stream in self.streams if stream.get("id") != stream_id]
-            if len(self.streams) == before:
+            if not removed:
                 raise ValueError("stream was not found")
-            save_streams(self.streams_state_path, self.streams)
+            remove_stream_configs(self.streams_directory, removed)
             self._sync_stream_workers_locked()
         LOG.info("removed stream %s", stream_id)
         return self.stream_status()
@@ -854,7 +858,7 @@ class RtlControlService:
             stream = self._stream_locked(stream_id)
             stream["enabled"] = enabled
             stream["updated_at"] = time.time()
-            save_streams(self.streams_state_path, self.streams)
+            save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         LOG.info("%s stream %s", "started" if enabled else "stopped", stream_id)
         return self.stream_status()
@@ -864,9 +868,12 @@ class RtlControlService:
         settings = validate_eas_recording_payload(payload.get("eas_recording", payload))
         with self.lock:
             stream = self._stream_locked(stream_id)
+            current_settings = eas_recording_settings_from_stream(stream)
+            if current_settings.enabled and not settings.enabled:
+                self._ensure_can_disable_eas_recording_locked(stream)
             stream["eas_recording"] = asdict(settings)
             stream["updated_at"] = time.time()
-            save_streams(self.streams_state_path, self.streams)
+            save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         LOG.info("updated EAS recording settings for stream %s", stream_id)
         return self.stream_status()
@@ -878,6 +885,8 @@ class RtlControlService:
         icecast = validate_icecast_payload(payload.get("icecast"))
         with self.lock:
             stream, output = self._stream_output_locked(stream_id, output_id)
+            if output.get("enabled", True) and not enabled:
+                self._ensure_can_disable_icecast_output_locked(stream, output_id)
             self._reject_duplicate_icecast_locked(icecast, ignore_output_id=output_id)
             must_test_auth = icecast_auth_changed(output, icecast)
             if must_test_auth:
@@ -900,7 +909,7 @@ class RtlControlService:
             output["enabled"] = enabled
             output["icecast"] = icecast
             stream["updated_at"] = time.time()
-            save_streams(self.streams_state_path, self.streams)
+            save_streams(self.streams_directory, self.streams)
             key = stream_worker_key(stream, output)
             worker = self.stream_workers.pop(key, None)
             if worker is not None:
@@ -939,7 +948,7 @@ class RtlControlService:
                 }
             )
             stream["updated_at"] = time.time()
-            save_streams(self.streams_state_path, self.streams)
+            save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         return {
             "success": True,
@@ -953,6 +962,7 @@ class RtlControlService:
         with self.lock:
             stream = self._stream_locked(stream_id)
             outputs = stream_outputs(stream)
+            self._ensure_can_disable_icecast_output_locked(stream, output_id)
             before = len(outputs)
             stream["outputs"] = [output for output in outputs if output.get("id") != output_id]
             if len(stream["outputs"]) == before:
@@ -962,7 +972,7 @@ class RtlControlService:
             worker = self.stream_workers.pop(key, None)
             if worker is not None:
                 worker.stop()
-            save_streams(self.streams_state_path, self.streams)
+            save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         LOG.info("removed stream output %s from stream %s", output_id, stream_id)
         return self.stream_status()
@@ -979,6 +989,14 @@ class RtlControlService:
             if output.get("id") == output_id:
                 return stream, output
         raise ValueError("stream output was not found")
+
+    def _ensure_can_disable_icecast_output_locked(self, stream: dict[str, Any], output_id: str) -> None:
+        if enabled_output_count(stream, disabled_icecast_output_id=output_id) <= 0:
+            raise ValueError("At least one output must remain enabled for each stream.")
+
+    def _ensure_can_disable_eas_recording_locked(self, stream: dict[str, Any]) -> None:
+        if enabled_output_count(stream, eas_enabled=False) <= 0:
+            raise ValueError("At least one output must remain enabled for each stream.")
 
     def _reject_duplicate_icecast_locked(self, icecast: dict[str, Any], ignore_output_id: str | None = None) -> None:
         signature = icecast_auth_signature(icecast)
@@ -1591,7 +1609,38 @@ def load_station_database(path: Path = STATIONS_ASSET_PATH) -> list[dict[str, st
     return loaded
 
 
-def load_streams(path: Path) -> list[dict[str, Any]]:
+def load_streams(streams_directory: Path, legacy_path: Path) -> list[dict[str, Any]]:
+    streams = load_stream_configs(streams_directory)
+    if streams:
+        return streams
+    if (streams_directory / STREAMS_DIRECTORY_MARKER_FILE_NAME).exists():
+        return []
+    streams = load_legacy_streams(legacy_path)
+    if streams:
+        LOG.info("migrating %s stream configuration(s) from %s to %s", len(streams), legacy_path, streams_directory)
+        save_streams(streams_directory, streams)
+    return streams
+
+
+def load_stream_configs(streams_directory: Path) -> list[dict[str, Any]]:
+    if not streams_directory.exists():
+        return []
+    streams = []
+    for config_path in sorted(streams_directory.glob(f"*/{STREAM_CONFIG_FILE_NAME}")):
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOG.warning("failed to load stream configuration from %s: %s", config_path, exc)
+            continue
+        if not isinstance(raw, dict):
+            LOG.warning("stream configuration in %s is not a JSON object", config_path)
+            continue
+        streams.append(raw)
+    streams.sort(key=stream_sort_key)
+    return streams
+
+
+def load_legacy_streams(path: Path) -> list[dict[str, Any]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -1605,13 +1654,92 @@ def load_streams(path: Path) -> list[dict[str, Any]]:
     for stream in raw["streams"]:
         if isinstance(stream, dict):
             streams.append(stream)
+    streams.sort(key=stream_sort_key)
     return streams
 
 
-def save_streams(path: Path, streams: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"streams": streams}
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+def save_streams(streams_directory: Path, streams: list[dict[str, Any]]) -> None:
+    streams_directory.mkdir(parents=True, exist_ok=True)
+    (streams_directory / STREAMS_DIRECTORY_MARKER_FILE_NAME).write_text("per-stream JSON configs\n", encoding="utf-8")
+    desired_paths: set[Path] = set()
+    used_names: set[str] = set()
+    for stream in streams:
+        if not isinstance(stream, dict):
+            continue
+        config_path = stream_config_path(streams_directory, stream, used_names)
+        desired_paths.add(config_path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(stream, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    for config_path in streams_directory.glob(f"*/{STREAM_CONFIG_FILE_NAME}"):
+        if config_path not in desired_paths:
+            try:
+                config_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def remove_stream_configs(streams_directory: Path, streams: list[dict[str, Any]]) -> None:
+    streams_directory.mkdir(parents=True, exist_ok=True)
+    (streams_directory / STREAMS_DIRECTORY_MARKER_FILE_NAME).write_text("per-stream JSON configs\n", encoding="utf-8")
+    for stream in streams:
+        for config_path in stream_config_candidates(streams_directory, stream):
+            try:
+                config_path.unlink()
+            except FileNotFoundError:
+                continue
+            try:
+                config_path.parent.rmdir()
+            except OSError:
+                pass
+
+
+def stream_config_path(streams_directory: Path, stream: dict[str, Any], used_names: set[str] | None = None) -> Path:
+    used_names = used_names if used_names is not None else set()
+    preferred = stream_directory_name(stream)
+    name = preferred
+    if name in used_names:
+        stream_id = str(stream.get("id", "")).strip()
+        suffix = sanitize_path_component(stream_id[:8]) if stream_id else uuid.uuid4().hex[:8]
+        name = f"{preferred}-{suffix}"
+        counter = 2
+        while name in used_names:
+            name = f"{preferred}-{suffix}-{counter}"
+            counter += 1
+    used_names.add(name)
+    return streams_directory / name / STREAM_CONFIG_FILE_NAME
+
+
+def stream_config_candidates(streams_directory: Path, stream: dict[str, Any]) -> list[Path]:
+    stream_id = str(stream.get("id", "")).strip()
+    candidates: list[Path] = []
+    if stream_id:
+        for config_path in streams_directory.glob(f"*/{STREAM_CONFIG_FILE_NAME}"):
+            try:
+                raw = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(raw, dict) and raw.get("id") == stream_id and config_path not in candidates:
+                candidates.append(config_path)
+        return candidates
+    candidates.append(streams_directory / stream_directory_name(stream) / STREAM_CONFIG_FILE_NAME)
+    return candidates
+
+
+def stream_directory_name(stream: dict[str, Any]) -> str:
+    station = stream.get("station", {})
+    callsign = str(station.get("callsign", "")).strip() if isinstance(station, dict) else ""
+    return sanitize_path_component(callsign or str(stream.get("id", "stream")))
+
+
+def stream_sort_key(stream: dict[str, Any]) -> tuple[str, str, str]:
+    station = stream.get("station", {})
+    if not isinstance(station, dict):
+        station = {}
+    return (
+        str(station.get("callsign", "")),
+        str(station.get("frequency", "")),
+        str(stream.get("id", "")),
+    )
 
 
 def stream_outputs(stream: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1629,6 +1757,25 @@ def stream_outputs(stream: dict[str, Any]) -> list[dict[str, Any]]:
         stream["outputs"] = [output]
         return [output]
     return []
+
+
+def enabled_output_count(
+    stream: dict[str, Any],
+    *,
+    disabled_icecast_output_id: str | None = None,
+    eas_enabled: bool | None = None,
+) -> int:
+    count = 0
+    for output in stream_outputs(stream):
+        if disabled_icecast_output_id and output.get("id") == disabled_icecast_output_id:
+            continue
+        if output.get("enabled", True):
+            count += 1
+    if eas_enabled is None:
+        eas_enabled = eas_recording_settings_from_stream(stream).enabled
+    if eas_enabled:
+        count += 1
+    return count
 
 
 def stream_worker_key(stream: dict[str, Any], output: dict[str, Any]) -> str:
@@ -2137,7 +2284,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div id="panel_eas" class="tabpanel" role="tabpanel" aria-labelledby="tab_eas" hidden>
         <h3>EAS recording</h3>
         <div class="grid">
-          <label class="checkbox-row">
+          <label id="eas_enabled_label" class="checkbox-row">
             <input id="eas_enabled" type="checkbox">
             Enable EAS recording
           </label>
@@ -2373,11 +2520,34 @@ function streamStatusLabel(status) {
 }
 
 function streamOutputCount(stream) {
-  if (Array.isArray(stream.outputs)) return stream.outputs.length;
-  if (Array.isArray(stream.icecast_outputs)) return stream.icecast_outputs.length;
-  if (Array.isArray(stream.icecast)) return stream.icecast.length;
-  if (stream.icecast) return 1;
-  return 0;
+  return enabledStreamOutputCount(stream);
+}
+
+function enabledIcecastOutputCount(stream) {
+  return streamOutputs(stream).filter(output => output.enabled !== false).length;
+}
+
+function easRecordingEnabled(stream) {
+  return Boolean(stream && stream.eas_recording && stream.eas_recording.enabled);
+}
+
+function enabledStreamOutputCount(stream) {
+  return enabledIcecastOutputCount(stream) + (easRecordingEnabled(stream) ? 1 : 0);
+}
+
+function canDisableIcecastOutput(stream, output) {
+  if (!output || output.enabled === false) return true;
+  return enabledStreamOutputCount(stream) > 1;
+}
+
+function canRemoveIcecastOutput(stream, output) {
+  if (!output || output.enabled === false) return true;
+  return enabledStreamOutputCount(stream) > 1;
+}
+
+function canDisableEasRecording(stream) {
+  if (!easRecordingEnabled(stream)) return true;
+  return enabledStreamOutputCount(stream) > 1;
 }
 
 function populateBitrates() {
@@ -2549,9 +2719,11 @@ function setEasControls(stream) {
   const settings = easSettingsForStream(stream);
   const station = stream && stream.station ? stream.station : {};
   const directory = station.callsign ? `~/.local/state/nwr-stream-manager/streams/${station.callsign}/alerts` : "";
-  const nextSignature = JSON.stringify({settings, directory});
+  const showEnabledControl = !settings.enabled || canDisableEasRecording(stream);
+  const nextSignature = JSON.stringify({settings, directory, showEnabledControl});
   if (nextSignature === easSignature) return;
   setChecked("eas_enabled", settings.enabled);
+  document.getElementById("eas_enabled_label").hidden = !showEnabledControl;
   setValue("eas_pre_seconds", settings.pre_seconds);
   setValue("eas_post_seconds", settings.post_seconds);
   setValue("eas_max_seconds", settings.max_seconds);
@@ -2902,9 +3074,13 @@ function outputActionsCell(stream, output) {
   remove.dataset.action = "remove-output";
   remove.dataset.streamId = stream.id || "";
   remove.dataset.outputId = output.id || "";
-  menu.appendChild(toggle);
+  if (output.enabled === false || canDisableIcecastOutput(stream, output)) {
+    menu.appendChild(toggle);
+  }
   menu.appendChild(edit);
-  menu.appendChild(remove);
+  if (canRemoveIcecastOutput(stream, output)) {
+    menu.appendChild(remove);
+  }
   cell.appendChild(button);
   cell.appendChild(menu);
   return cell;
@@ -3115,7 +3291,7 @@ function renderStreams(streams) {
     title.textContent = streamLabel(stream);
     const details = document.createElement("div");
     details.className = "hint";
-    details.textContent = `${streamOutputCount(stream)} Icecast output${streamOutputCount(stream) === 1 ? "" : "s"}.`;
+    details.textContent = `${streamOutputCount(stream)} output${streamOutputCount(stream) === 1 ? "" : "s"}.`;
     const outputs = document.createElement("div");
     outputs.className = "actions";
     for (const output of streamOutputs(stream)) {
@@ -3407,13 +3583,20 @@ function scheduleEasUpdate() {
   if (applying || !settingsStreamId) return;
   clearTimeout(easUpdateTimer);
   easUpdateTimer = setTimeout(async () => {
+    const stream = currentSettingsStream();
+    const payload = easPayload();
+    if (stream && easRecordingEnabled(stream) && !payload.enabled && !canDisableEasRecording(stream)) {
+      setChecked("eas_enabled", true);
+      setEasResult("At least one output must remain enabled for each stream.", "error");
+      return;
+    }
     try {
       const data = await request("/api/eas-recording", {
         method: "PATCH",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
           stream_id: settingsStreamId,
-          eas_recording: easPayload()
+          eas_recording: payload
         })
       });
       renderStreams(data.streams || []);
@@ -3787,6 +3970,11 @@ document.getElementById("icecast-outputs-body").addEventListener("click", async 
       setOutputResult("Stream output was not found.", "error");
       return;
     }
+    const nextEnabled = selected.output.enabled === false;
+    if (!nextEnabled && !canDisableIcecastOutput(selected.stream, selected.output)) {
+      setOutputResult("At least one output must remain enabled for each stream.", "error");
+      return;
+    }
     try {
       const data = await request("/api/stream-output", {
         method: "PATCH",
@@ -3794,7 +3982,7 @@ document.getElementById("icecast-outputs-body").addEventListener("click", async 
         body: JSON.stringify({
           stream_id: target.dataset.streamId,
           output_id: target.dataset.outputId,
-          enabled: selected.output.enabled === false,
+          enabled: nextEnabled,
           icecast: selected.output.icecast
         })
       });
@@ -3807,6 +3995,15 @@ document.getElementById("icecast-outputs-body").addEventListener("click", async 
   }
   if (target.dataset.action === "remove-output") {
     closeStreamActionMenus();
+    const selected = findConfiguredOutput(target.dataset.streamId, target.dataset.outputId);
+    if (!selected) {
+      setOutputResult("Stream output was not found.", "error");
+      return;
+    }
+    if (!canRemoveIcecastOutput(selected.stream, selected.output)) {
+      setOutputResult("At least one output must remain enabled for each stream.", "error");
+      return;
+    }
     try {
       const data = await request(
         `/api/stream-output?stream_id=${encodeURIComponent(target.dataset.streamId)}&output_id=${encodeURIComponent(target.dataset.outputId)}`,
