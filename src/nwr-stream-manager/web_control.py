@@ -501,6 +501,8 @@ class RtlControlService:
         station_key = str(payload.get("station_key", "")).strip()
         station = self._station_by_key(station_key)
         icecast = validate_icecast_payload(payload.get("icecast"))
+        with self.lock:
+            self._reject_duplicate_icecast_locked(icecast)
         auth_cache_key = icecast_auth_cache_key(icecast)
         with self.lock:
             auth_is_cached = self._icecast_auth_cached_locked(auth_cache_key)
@@ -604,9 +606,7 @@ class RtlControlService:
         icecast = validate_icecast_payload(payload.get("icecast"))
         with self.lock:
             stream, output = self._stream_output_locked(stream_id, output_id)
-            outputs = stream_outputs(stream)
-            if not enabled and len(outputs) <= 1:
-                raise ValueError("A stream with one output cannot have that output disabled.")
+            self._reject_duplicate_icecast_locked(icecast, ignore_output_id=output_id)
             must_test_auth = icecast_auth_changed(output, icecast)
             if must_test_auth:
                 settings = IcecastSettings(
@@ -640,14 +640,84 @@ class RtlControlService:
             "streams": list(self.streams),
         }
 
-    def _stream_output_locked(self, stream_id: str, output_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    def add_stream_output(self, payload: dict[str, Any]) -> dict[str, Any]:
+        stream_id = str(payload.get("stream_id", "")).strip()
+        icecast = validate_icecast_payload(payload.get("icecast"))
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            self._reject_duplicate_icecast_locked(icecast)
+        result = self.test_icecast_auth(icecast)
+        if not result["success"]:
+            return {
+                "success": False,
+                "message": result["message"],
+                "streams": list(self.streams),
+            }
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            self._reject_duplicate_icecast_locked(icecast)
+            stream_outputs(stream).append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "enabled": True,
+                    "type": "icecast",
+                    "icecast": icecast,
+                    "auth_validated_at": time.time(),
+                    "auth_signature": icecast_auth_signature(icecast),
+                }
+            )
+            stream["updated_at"] = time.time()
+            save_streams(self.streams_state_path, self.streams)
+            self._sync_stream_workers_locked()
+        return {
+            "success": True,
+            "message": "Icecast output added.",
+            "streams": list(self.streams),
+        }
+
+    def remove_stream_output(self, stream_id: str, output_id: str) -> dict[str, Any]:
+        stream_id = stream_id.strip()
+        output_id = output_id.strip()
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            outputs = stream_outputs(stream)
+            before = len(outputs)
+            stream["outputs"] = [output for output in outputs if output.get("id") != output_id]
+            if len(stream["outputs"]) == before:
+                raise ValueError("stream output was not found")
+            stream["updated_at"] = time.time()
+            key = f"{stream_id}:{output_id}"
+            worker = self.stream_workers.pop(key, None)
+            if worker is not None:
+                worker.stop()
+            save_streams(self.streams_state_path, self.streams)
+            self._sync_stream_workers_locked()
+        LOG.info("removed stream output %s from stream %s", output_id, stream_id)
+        return self.stream_status()
+
+    def _stream_locked(self, stream_id: str) -> dict[str, Any]:
         for stream in self.streams:
-            if stream.get("id") != stream_id:
-                continue
-            for output in stream_outputs(stream):
-                if output.get("id") == output_id:
-                    return stream, output
+            if stream.get("id") == stream_id:
+                return stream
+        raise ValueError("stream was not found")
+
+    def _stream_output_locked(self, stream_id: str, output_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        stream = self._stream_locked(stream_id)
+        for output in stream_outputs(stream):
+            if output.get("id") == output_id:
+                return stream, output
         raise ValueError("stream output was not found")
+
+    def _reject_duplicate_icecast_locked(self, icecast: dict[str, Any], ignore_output_id: str | None = None) -> None:
+        signature = icecast_auth_signature(icecast)
+        for stream in self.streams:
+            for output in stream_outputs(stream):
+                if ignore_output_id and output.get("id") == ignore_output_id:
+                    continue
+                if output.get("type", "icecast") != "icecast":
+                    continue
+                if icecast_auth_signature(output.get("icecast", {})) == signature:
+                    raise ValueError("An output with these credentials already exists.")
 
     def _station_by_key(self, key: str) -> dict[str, str]:
         for station in self.stations:
@@ -908,6 +978,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(response)
             return
+        if path == "/api/stream-output":
+            try:
+                payload = self._read_json()
+                response = self.service.add_stream_output(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path != "/api/streams":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -921,6 +1000,17 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/stream-output":
+            try:
+                query = parse_qs(parsed.query)
+                stream_id = query.get("stream_id", [""])[0]
+                output_id = query.get("output_id", [""])[0]
+                response = self.service.remove_stream_output(stream_id, output_id)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if parsed.path != "/api/streams":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -1311,10 +1401,15 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .stream-actions-menu { position: absolute; right: 10px; z-index: 10; display: grid; gap: 4px; min-width: 190px; margin-top: 6px; padding: 6px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; box-shadow: 0 8px 18px rgb(20 24 31 / 18%); }
 .stream-actions-menu[hidden] { display: none; }
 .stream-actions-menu button { width: 100%; text-align: left; border: 0; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #d8dde6; margin: 16px 0; }
+.tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: -1px; }
+.tabs button[aria-selected="true"] { border-color: #2557a7; border-bottom-color: #fff; box-shadow: inset 0 2px 0 #2557a7; }
+.tabpanel[hidden] { display: none; }
 pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; background: #10151d; color: #d8f3dc; padding: 12px; border-radius: 6px; font-size: 13px; }
 .error { color: #a40000; font-weight: 600; }
 .message { font-weight: 600; }
 .success { color: #0f7a34; }
+.status-connected { color: #0f7a34; }
 .hint { color: #526070; font-size: 13px; margin-top: -8px; }
 @media (prefers-color-scheme: dark) {
   body { background: #101318; color: #eef2f7; }
@@ -1322,9 +1417,12 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   fieldset, .metric, .stream-item, th, td { border-color: #333b48; }
   .metric b, .hint, th { color: #9aa8ba; }
   .status-enabled { color: #5fd27a; }
+  .status-connected { color: #5fd27a; }
   .status-needs-attention { color: #ff6b7a; }
   .success { color: #5fd27a; }
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
+  .tabs { border-color: #333b48; }
+  .tabs button[aria-selected="true"] { border-bottom-color: #181d24; }
 }
 </style>
 </head>
@@ -1506,6 +1604,92 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
+  <div id="view_stream_settings" class="view" hidden>
+    <section>
+      <h2>Stream Settings</h2>
+      <div id="stream_settings_station" class="hint"></div>
+      <div class="tabs" role="tablist" aria-label="Stream settings sections">
+        <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs">Outputs</button>
+      </div>
+      <div id="panel_outputs" class="tabpanel" role="tabpanel" aria-labelledby="tab_outputs">
+        <div class="actions">
+          <button id="open_add_output" type="button">Add output</button>
+        </div>
+        <h3>Icecast outputs</h3>
+        <table aria-label="Icecast outputs">
+          <thead>
+            <tr>
+              <th>Destination</th>
+              <th>Format</th>
+              <th>Sample rate</th>
+              <th>Bitrate</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="icecast-outputs-body" aria-live="off">
+            <tr>
+              <td colspan="6" class="hint">No Icecast outputs configured.</td>
+            </tr>
+          </tbody>
+        </table>
+        <div id="output_form_panel" hidden>
+          <h3 id="output_form_title">Add output</h3>
+          <fieldset>
+            <legend>Icecast output</legend>
+            <div class="grid">
+              <label>Host
+                <input id="settings_icecast_host" type="text" autocomplete="off">
+              </label>
+              <label>Port
+                <input id="settings_icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000">
+              </label>
+              <label>Username
+                <input id="settings_icecast_username" type="text" autocomplete="username">
+              </label>
+              <label>Password
+                <input id="settings_icecast_password" type="password" autocomplete="current-password">
+              </label>
+              <label class="checkbox-row">
+                <input id="settings_show_icecast_password" type="checkbox">
+                Show password
+              </label>
+              <label>Mountpoint
+                <input id="settings_icecast_mount" type="text" placeholder="/station.mp3">
+              </label>
+              <fieldset>
+                <legend>Format</legend>
+                <label><input id="settings_icecast_format_mp3" name="settings_icecast_format" type="radio" value="mp3" checked> MP3</label>
+                <label><input id="settings_icecast_format_ogg" name="settings_icecast_format" type="radio" value="ogg"> OGG</label>
+              </fieldset>
+              <label>Sample rate
+                <select id="settings_icecast_sample_rate">
+                  <option value="8000">8000 Hz</option>
+                  <option value="11025">11025 Hz</option>
+                  <option value="16000">16000 Hz</option>
+                  <option value="22050">22050 Hz</option>
+                  <option value="24000" selected>24000 Hz</option>
+                  <option value="32000">32000 Hz</option>
+                  <option value="44100">44100 Hz</option>
+                  <option value="48000">48000 Hz</option>
+                </select>
+              </label>
+              <label>Bitrate
+                <select id="settings_icecast_bitrate"></select>
+              </label>
+            </div>
+          </fieldset>
+          <div class="actions">
+            <button id="cancel_output_form" type="button">Cancel</button>
+            <button id="add_output" type="button">Add output</button>
+            <button id="save_output_settings" type="button" hidden>Save changes</button>
+          </div>
+        </div>
+        <div id="output-result" class="message"></div>
+      </div>
+    </section>
+  </div>
+
   <section>
     <h2>Logs</h2>
     <pre id="logs" aria-live="off" aria-label="RTL-SDR log output"></pre>
@@ -1513,6 +1697,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 </main>
 <script>
 const controls = ["serial", "sample_rate", "gain", "ppm_correction", "bias_tee", "gain_auto"];
+const DEFAULT_STREAM_SAMPLE_RATE = 24000;
+const DEFAULT_STREAM_BITRATES = {mp3: 64, ogg: 48};
 let applying = false;
 let timer = null;
 let gainValues = [];
@@ -1522,6 +1708,12 @@ let selectedStationKey = "";
 let configuredStreams = [];
 let editingStreamId = "";
 let editingOutputId = "";
+let settingsStreamId = "";
+let outputFormMode = "add";
+let outputFormDirty = false;
+let outputFormOriginalSignature = "";
+let outputTableSignature = "";
+let activeStreamSnapshots = [];
 let wizardStep = 0;
 let wizardMode = "add";
 let wizardDirty = false;
@@ -1685,14 +1877,15 @@ function streamOutputCount(stream) {
 }
 
 function populateBitrates() {
-  const select = document.getElementById("icecast_bitrate");
-  if (select.options.length) return;
-  for (let bitrate = 8; bitrate <= 320; bitrate += 8) {
-    const option = document.createElement("option");
-    option.value = String(bitrate);
-    option.textContent = `${bitrate} Kbps`;
-    if (bitrate === 48) option.selected = true;
-    select.appendChild(option);
+  for (const select of [document.getElementById("icecast_bitrate"), document.getElementById("settings_icecast_bitrate")]) {
+    if (!select || select.options.length) continue;
+    for (let bitrate = 8; bitrate <= 320; bitrate += 8) {
+      const option = document.createElement("option");
+      option.value = String(bitrate);
+      option.textContent = `${bitrate} Kbps`;
+      if (bitrate === 48) option.selected = true;
+      select.appendChild(option);
+    }
   }
 }
 
@@ -1723,6 +1916,138 @@ function setIcecastForm(icecast, enabled = true) {
   setValue("icecast_sample_rate", icecast.sample_rate || 24000);
   setValue("icecast_bitrate", icecast.bitrate || (format === "mp3" ? 64 : 48));
   setChecked("output_enabled", enabled);
+}
+
+function settingsIcecastPayload() {
+  const selectedFormat = document.querySelector("input[name='settings_icecast_format']:checked");
+  return {
+    host: document.getElementById("settings_icecast_host").value,
+    port: Number(document.getElementById("settings_icecast_port").value),
+    username: document.getElementById("settings_icecast_username").value,
+    password: document.getElementById("settings_icecast_password").value,
+    mount: document.getElementById("settings_icecast_mount").value,
+    format: selectedFormat ? selectedFormat.value : "mp3",
+    sample_rate: Number(document.getElementById("settings_icecast_sample_rate").value),
+    bitrate: Number(document.getElementById("settings_icecast_bitrate").value)
+  };
+}
+
+function outputFormSignature() {
+  return JSON.stringify(settingsIcecastPayload());
+}
+
+function outputCredentialSignature(icecast) {
+  return JSON.stringify({
+    host: icecast.host,
+    port: Number(icecast.port),
+    username: icecast.username,
+    password: icecast.password,
+    mount: icecast.mount
+  });
+}
+
+function duplicateOutputExists(icecast, ignoreOutputId = "") {
+  const signature = outputCredentialSignature(icecast);
+  for (const stream of configuredStreams) {
+    for (const output of streamOutputs(stream)) {
+      if (ignoreOutputId && output.id === ignoreOutputId) continue;
+      if (outputCredentialSignature(output.icecast || {}) === signature) return true;
+    }
+  }
+  return false;
+}
+
+function settingsCredentialsComplete() {
+  const payload = settingsIcecastPayload();
+  return Boolean(
+    payload.host.trim() &&
+    payload.port >= 1 &&
+    payload.port <= 65535 &&
+    payload.username.trim() &&
+    payload.password &&
+    payload.mount.trim()
+  );
+}
+
+function setSettingsIcecastForm(icecast) {
+  setValue("settings_icecast_host", icecast.host || "");
+  setValue("settings_icecast_port", icecast.port || "");
+  setValue("settings_icecast_username", icecast.username || "");
+  setValue("settings_icecast_password", icecast.password || "");
+  setValue("settings_icecast_mount", icecast.mount || "");
+  const format = icecast.format || "mp3";
+  setChecked("settings_icecast_format_mp3", format === "mp3");
+  setChecked("settings_icecast_format_ogg", format === "ogg");
+  setValue("settings_icecast_sample_rate", icecast.sample_rate || 24000);
+  setValue("settings_icecast_bitrate", icecast.bitrate || (format === "mp3" ? 64 : 48));
+}
+
+function clearSettingsIcecastForm() {
+  setSettingsIcecastForm({format: "mp3", sample_rate: 24000, bitrate: 64});
+  setChecked("settings_show_icecast_password", false);
+  document.getElementById("settings_icecast_password").type = "password";
+  outputFormOriginalSignature = outputFormSignature();
+  outputFormDirty = false;
+}
+
+function setOutputResult(message, kind = "") {
+  const element = document.getElementById("output-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function updateOutputFormButtons() {
+  const changed = outputFormSignature() !== outputFormOriginalSignature;
+  outputFormDirty = !document.getElementById("output_form_panel").hidden && changed;
+  setDisabled(document.getElementById("add_output"), !settingsCredentialsComplete());
+  document.getElementById("add_output").hidden = outputFormMode !== "add";
+  document.getElementById("save_output_settings").hidden = outputFormMode !== "edit" || !changed;
+  setDisabled(document.getElementById("save_output_settings"), !settingsCredentialsComplete());
+}
+
+function outputFormIsOpen() {
+  return !document.getElementById("output_form_panel").hidden;
+}
+
+function currentSettingsStream() {
+  return configuredStreams.find(stream => stream.id === settingsStreamId) || null;
+}
+
+function beginAddOutput() {
+  outputFormMode = "add";
+  editingOutputId = "";
+  clearSettingsIcecastForm();
+  setText("output_form_title", "Add output");
+  document.getElementById("output_form_panel").hidden = false;
+  setOutputResult("");
+  updateOutputFormButtons();
+}
+
+function beginEditOutput(outputId) {
+  const selected = findConfiguredOutput(settingsStreamId, outputId);
+  if (!selected) {
+    setOutputResult("Stream output was not found.", "error");
+    return;
+  }
+  outputFormMode = "edit";
+  editingOutputId = outputId;
+  setSettingsIcecastForm(selected.output.icecast || {});
+  outputFormOriginalSignature = outputFormSignature();
+  outputFormDirty = false;
+  setText("output_form_title", "Edit output");
+  document.getElementById("output_form_panel").hidden = false;
+  setOutputResult("");
+  updateOutputFormButtons();
+}
+
+function cancelOutputForm() {
+  document.getElementById("output_form_panel").hidden = true;
+  outputFormDirty = false;
+  outputFormOriginalSignature = "";
+  editingOutputId = "";
+  setOutputResult("");
 }
 
 function clearIcecastForm() {
@@ -1840,19 +2165,152 @@ function editOutput(streamId, outputId) {
 }
 
 function editStreamSettings(streamId, outputId = "") {
+  showStreamSettings(streamId);
+  if (outputId) beginEditOutput(outputId);
+}
+
+function showStreamSettings(streamId) {
   const stream = configuredStreams.find(item => item.id === streamId);
-  const outputs = stream ? streamOutputs(stream) : [];
-  if (outputs.length === 1) {
-    editOutput(streamId, outputs[0].id);
+  if (!stream) {
+    setStreamResult("Stream was not found.", "error");
     return;
   }
-  if (outputId) {
-    editOutput(streamId, outputId);
+  settingsStreamId = streamId;
+  outputTableSignature = "";
+  cancelOutputForm();
+  const station = stream.station || {};
+  setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
+  renderStreamSettings();
+  showView("stream_settings");
+}
+
+function renderStreamSettings() {
+  const stream = currentSettingsStream();
+  const addButton = document.getElementById("open_add_output");
+  setDisabled(addButton, !stream);
+  renderIcecastOutputsTable(stream);
+}
+
+function outputStatusFor(stream, output) {
+  if (!output || output.enabled === false) return "disabled";
+  const active = activeStreamSnapshots.find(snapshot =>
+    snapshot.id === stream.id && streamOutputs(snapshot).some(activeOutput => activeOutput.id === output.id)
+  );
+  const status = normalizeStreamStatus(active ? active.status : "");
+  if (status === "enabled") return "connected";
+  return "needs-attention";
+}
+
+function outputStatusLabel(status) {
+  if (status === "connected") return "Connected";
+  if (status === "needs-attention") return "Needs attention";
+  return "Disabled";
+}
+
+function outputDestination(icecast) {
+  if (!icecast || !icecast.host) return "Unknown";
+  return `${icecast.host}:${icecast.port}${icecast.mount}`;
+}
+
+function outputRows(stream) {
+  if (!stream) return [];
+  return streamOutputs(stream).map(output => ({
+    stream,
+    output,
+    icecast: output.icecast || {},
+    status: outputStatusFor(stream, output)
+  }));
+}
+
+function outputTableNextSignature(rows) {
+  return JSON.stringify(rows.map(row => ({
+    id: row.output.id || "",
+    enabled: row.output.enabled !== false,
+    destination: outputDestination(row.icecast),
+    format: row.icecast.format || "",
+    sample_rate: row.icecast.sample_rate || "",
+    bitrate: row.icecast.bitrate || "",
+    status: row.status
+  })));
+}
+
+function renderIcecastOutputsTable(stream) {
+  const tbody = document.getElementById("icecast-outputs-body");
+  const rows = outputRows(stream);
+  const nextSignature = outputTableNextSignature(rows);
+  if (nextSignature === outputTableSignature) return;
+  outputTableSignature = nextSignature;
+  tbody.innerHTML = "";
+  if (rows.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 6;
+    cell.className = "hint";
+    cell.textContent = "No Icecast outputs configured.";
+    row.appendChild(cell);
+    tbody.appendChild(row);
     return;
   }
-  setOutputEditMode(false);
-  setStreamResult("Select an Icecast output to edit.");
-  showView("add_stream");
+  for (const row of rows) {
+    tbody.appendChild(icecastOutputRow(row));
+  }
+}
+
+function icecastOutputRow(row) {
+  const tr = document.createElement("tr");
+  const icecast = row.icecast;
+  tr.appendChild(tableCell(outputDestination(icecast)));
+  tr.appendChild(tableCell(String(icecast.format || "mp3").toUpperCase()));
+  tr.appendChild(tableCell(`${icecast.sample_rate || DEFAULT_STREAM_SAMPLE_RATE} Hz`));
+  tr.appendChild(tableCell(`${icecast.bitrate || DEFAULT_STREAM_BITRATES[icecast.format || "mp3"]} Kbps`));
+  const statusCell = tableCell(outputStatusLabel(row.status));
+  statusCell.className = `status-text status-${row.status}`;
+  tr.appendChild(statusCell);
+  tr.appendChild(outputActionsCell(row.stream, row.output, row.status));
+  return tr;
+}
+
+function outputActionsCell(stream, output) {
+  const cell = document.createElement("td");
+  cell.className = "menu-cell";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "More actions";
+  button.setAttribute("aria-haspopup", "menu");
+  button.setAttribute("aria-expanded", "false");
+  button.setAttribute("aria-label", `More actions for ${outputDestination(output.icecast || {})}`);
+  button.dataset.outputMenu = output.id || "";
+  const menu = document.createElement("div");
+  menu.className = "stream-actions-menu";
+  menu.hidden = true;
+  menu.setAttribute("role", "menu");
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.textContent = output.enabled === false ? "Enable" : "Disable";
+  toggle.setAttribute("role", "menuitem");
+  toggle.dataset.action = "toggle-output";
+  toggle.dataset.streamId = stream.id || "";
+  toggle.dataset.outputId = output.id || "";
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.textContent = "Edit output";
+  edit.setAttribute("role", "menuitem");
+  edit.dataset.action = "edit-settings-output";
+  edit.dataset.streamId = stream.id || "";
+  edit.dataset.outputId = output.id || "";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "Remove";
+  remove.setAttribute("role", "menuitem");
+  remove.dataset.action = "remove-output";
+  remove.dataset.streamId = stream.id || "";
+  remove.dataset.outputId = output.id || "";
+  menu.appendChild(toggle);
+  menu.appendChild(edit);
+  menu.appendChild(remove);
+  cell.appendChild(button);
+  cell.appendChild(menu);
+  return cell;
 }
 
 function activeStreamRows(activeStreams, configured = configuredStreams) {
@@ -2019,6 +2477,7 @@ function closeStreamActionMenus() {
 function renderStreams(streams) {
   configuredStreams = streams || [];
   renderActiveStreams([], configuredStreams);
+  if (settingsStreamId) renderStreamSettings();
   const list = document.getElementById("streams-list");
   list.innerHTML = "";
   if (configuredStreams.length === 0) {
@@ -2150,7 +2609,9 @@ function updateDashboard(data) {
   setText("summary_sdr", activeSdrLabel(settings));
   setText("summary_sample_rate", `${settings.sample_rate} S/s`);
   setText("summary_gain", settings.gain === null ? "automatic" : `${settings.gain} dB`);
+  activeStreamSnapshots = data.active_streams || [];
   renderActiveStreams(data.active_streams || [], configuredStreams);
+  if (settingsStreamId) renderStreamSettings();
 }
 
 function syncControls(data) {
@@ -2401,6 +2862,199 @@ document.getElementById("show_icecast_password").addEventListener("change", even
   document.getElementById("icecast_password").type = event.target.checked ? "text" : "password";
 });
 
+document.getElementById("settings_show_icecast_password").addEventListener("change", event => {
+  document.getElementById("settings_icecast_password").type = event.target.checked ? "text" : "password";
+});
+
+for (const id of [
+  "settings_icecast_host",
+  "settings_icecast_port",
+  "settings_icecast_username",
+  "settings_icecast_password",
+  "settings_icecast_mount",
+  "settings_icecast_sample_rate",
+  "settings_icecast_bitrate"
+]) {
+  document.getElementById(id).addEventListener("input", updateOutputFormButtons);
+  document.getElementById(id).addEventListener("change", updateOutputFormButtons);
+}
+
+for (const formatControl of document.querySelectorAll("input[name='settings_icecast_format']")) {
+  formatControl.addEventListener("change", updateOutputFormButtons);
+}
+
+document.getElementById("open_add_output").addEventListener("click", beginAddOutput);
+
+document.getElementById("cancel_output_form").addEventListener("click", cancelOutputForm);
+
+document.getElementById("add_output").addEventListener("click", async () => {
+  const button = document.getElementById("add_output");
+  const icecast = settingsIcecastPayload();
+  if (duplicateOutputExists(icecast)) {
+    setOutputResult("An output with these credentials already exists.", "error");
+    return;
+  }
+  setDisabled(button, true);
+  setOutputResult("Testing Icecast authentication...");
+  try {
+    const data = await request("/api/stream-output", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({stream_id: settingsStreamId, icecast})
+    });
+    renderStreams(data.streams || []);
+    setOutputResult(data.message, data.success ? "success" : "error");
+    if (data.success) cancelOutputForm();
+  } catch (error) {
+    setOutputResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
+    updateOutputFormButtons();
+  }
+});
+
+document.getElementById("save_output_settings").addEventListener("click", async () => {
+  const button = document.getElementById("save_output_settings");
+  const selected = findConfiguredOutput(settingsStreamId, editingOutputId);
+  if (!selected) {
+    setOutputResult("Stream output was not found.", "error");
+    return;
+  }
+  const icecast = settingsIcecastPayload();
+  if (duplicateOutputExists(icecast, editingOutputId)) {
+    setOutputResult("An output with these credentials already exists.", "error");
+    return;
+  }
+  setDisabled(button, true);
+  setOutputResult("Saving output settings...");
+  try {
+    const data = await request("/api/stream-output", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        stream_id: settingsStreamId,
+        output_id: editingOutputId,
+        enabled: selected.output.enabled !== false,
+        icecast
+      })
+    });
+    renderStreams(data.streams || []);
+    setOutputResult(data.message, data.success ? "success" : "error");
+    if (data.success) cancelOutputForm();
+  } catch (error) {
+    setOutputResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
+    updateOutputFormButtons();
+  }
+});
+
+document.getElementById("icecast-outputs-body").addEventListener("click", async event => {
+  const target = event.target;
+  if (!target || !target.dataset) return;
+  if (target.dataset.outputMenu !== undefined) {
+    const menu = target.nextElementSibling;
+    const shouldOpen = menu.hidden;
+    if (shouldOpen) {
+      openStreamActionMenu(target, null);
+    } else {
+      closeStreamActionMenu(menu, false);
+    }
+    return;
+  }
+  if (target.dataset.action === "edit-settings-output") {
+    closeStreamActionMenus();
+    beginEditOutput(target.dataset.outputId);
+    return;
+  }
+  if (target.dataset.action === "toggle-output") {
+    closeStreamActionMenus();
+    const selected = findConfiguredOutput(target.dataset.streamId, target.dataset.outputId);
+    if (!selected) {
+      setOutputResult("Stream output was not found.", "error");
+      return;
+    }
+    try {
+      const data = await request("/api/stream-output", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          stream_id: target.dataset.streamId,
+          output_id: target.dataset.outputId,
+          enabled: selected.output.enabled === false,
+          icecast: selected.output.icecast
+        })
+      });
+      renderStreams(data.streams || []);
+      setOutputResult(data.message, data.success ? "success" : "error");
+    } catch (error) {
+      setOutputResult(error.message, "error");
+    }
+    return;
+  }
+  if (target.dataset.action === "remove-output") {
+    closeStreamActionMenus();
+    try {
+      const data = await request(
+        `/api/stream-output?stream_id=${encodeURIComponent(target.dataset.streamId)}&output_id=${encodeURIComponent(target.dataset.outputId)}`,
+        {method: "DELETE"}
+      );
+      renderStreams(data.streams || []);
+      cancelOutputForm();
+      setOutputResult("");
+    } catch (error) {
+      setOutputResult(error.message, "error");
+    }
+  }
+});
+
+document.getElementById("icecast-outputs-body").addEventListener("keydown", event => {
+  const target = event.target;
+  if (!target || !target.dataset) return;
+  if (target.dataset.outputMenu !== undefined) {
+    if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
+      event.preventDefault();
+      openStreamActionMenu(target, "first");
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      openStreamActionMenu(target, "last");
+      return;
+    }
+  }
+  if (target.getAttribute("role") === "menuitem") {
+    const menu = target.closest(".stream-actions-menu");
+    if (!menu) return;
+    const items = menuItems(menu);
+    const index = items.indexOf(target);
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      items[(index + 1) % items.length].focus();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      items[(index - 1 + items.length) % items.length].focus();
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      items[0].focus();
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      items[items.length - 1].focus();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeStreamActionMenu(menu, true);
+    }
+  }
+});
+
 document.getElementById("cancel_wizard").addEventListener("click", () => {
   finishWizard();
 });
@@ -2470,7 +3124,7 @@ document.getElementById("wizard_finish").addEventListener("click", async () => {
 });
 
 window.addEventListener("beforeunload", event => {
-  if (!wizardDirty) return;
+  if (!wizardDirty && !outputFormIsOpen()) return;
   event.preventDefault();
   event.returnValue = "";
 });
