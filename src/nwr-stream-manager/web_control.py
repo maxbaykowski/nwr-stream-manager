@@ -20,9 +20,9 @@ from urllib.parse import parse_qs, urlparse
 
 if __package__:
     from .audio_effects import AudioEffectsProcessor
-    from .config import AudioConfig, FallbackConfig, IcecastConfig, IQ_SAMPLE_RATE
+    from .config import AudioConfig, IcecastConfig, IQ_SAMPLE_RATE
     from .dsp import IqChannelizer
-    from .encoder import create_audio_encoder
+    from .encoder import PcmResampler, create_audio_encoder
     from .fallback_audio import load_fallback_audio
     from .icecast import IcecastSource
     from .nfm import float_to_s16
@@ -60,10 +60,10 @@ else:
     rtl = importlib.import_module(f"{package_name}.rtl")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
     AudioConfig = config_module.AudioConfig
-    FallbackConfig = config_module.FallbackConfig
     IcecastConfig = config_module.IcecastConfig
     IQ_SAMPLE_RATE = config_module.IQ_SAMPLE_RATE
     IqChannelizer = dsp.IqChannelizer
+    PcmResampler = encoder.PcmResampler
     create_audio_encoder = encoder.create_audio_encoder
     load_fallback_audio = fallback_audio.load_fallback_audio
     IcecastSource = icecast_module.IcecastSource
@@ -106,8 +106,10 @@ DEFAULT_STREAM_BITRATES = {
 }
 STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
+STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
+FALLBACK_STATE_FILE_NAME = "fallback.json"
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,25 @@ class RtlControlSettings:
             gain=self.gain,
             bias_tee=bool(self.bias_tee),
         )
+
+
+@dataclass(frozen=True)
+class WebFallbackSettings:
+    enabled: bool = True
+    silence_timeout_seconds: float = 30.0
+    loop_delay_seconds: float = 5.0
+
+
+@dataclass
+class WebFallbackPlaybackState:
+    position: int = 0
+    delay_samples_remaining: int = 0
+    active: bool = False
+
+    def reset(self) -> None:
+        self.position = 0
+        self.delay_samples_remaining = 0
+        self.active = False
 
 
 class RingLogHandler(logging.Handler):
@@ -225,6 +246,43 @@ class ComplexNfmDemodulator:
         return (demodulated / np.pi * 1.5).astype(np.float32, copy=False)
 
 
+def load_web_fallback_audio():
+    audio = load_fallback_audio(None)
+    if audio.sample_rate == IQ_SAMPLE_RATE:
+        return audio
+    resampler = PcmResampler(audio.sample_rate, IQ_SAMPLE_RATE)
+    pcm = resampler.process(audio.pcm) + resampler.flush()
+    return replace(
+        audio,
+        sample_rate=IQ_SAMPLE_RATE,
+        pcm=pcm,
+        duration_seconds=len(pcm) / 2 / IQ_SAMPLE_RATE,
+    )
+
+
+def next_web_fallback_frame(audio, state: WebFallbackPlaybackState, loop_delay_seconds: float) -> bytes:
+    if not audio.pcm:
+        return b"\x00" * STREAM_FRAME_BYTES
+    output = bytearray()
+    delay_samples = round(max(0.0, loop_delay_seconds) * IQ_SAMPLE_RATE)
+    while len(output) < STREAM_FRAME_BYTES:
+        if state.delay_samples_remaining > 0:
+            remaining_samples = (STREAM_FRAME_BYTES - len(output)) // 2
+            silence_samples = min(remaining_samples, state.delay_samples_remaining)
+            output.extend(b"\x00\x00" * silence_samples)
+            state.delay_samples_remaining -= silence_samples
+            continue
+        if state.position >= len(audio.pcm):
+            state.position = 0
+            if delay_samples > 0:
+                state.delay_samples_remaining = delay_samples
+                continue
+        chunk_size = min(STREAM_FRAME_BYTES - len(output), len(audio.pcm) - state.position)
+        output.extend(audio.pcm[state.position : state.position + chunk_size])
+        state.position += chunk_size
+    return bytes(output)
+
+
 class IcecastStreamWorker:
     def __init__(
         self,
@@ -232,10 +290,12 @@ class IcecastStreamWorker:
         stream: dict[str, Any],
         output: dict[str, Any],
         fanout: RawRtlFanout,
+        fallback_settings_provider,
     ) -> None:
         self.stream = stream
         self.output = output
         self.fanout = fanout
+        self.fallback_settings_provider = fallback_settings_provider
         self.queue = fanout.subscribe(max_chunks=64)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name=f"icecast-stream-{stream['id']}", daemon=True)
@@ -327,24 +387,25 @@ class IcecastStreamWorker:
         header = getattr(encoder, "header", b"")
         if header:
             sink.write(header)
-        fallback = load_fallback_audio(FallbackConfig().path)
-        fallback_pcm = fallback.pcm
-        fallback_position = 0
+        fallback = load_web_fallback_audio()
+        fallback_state = WebFallbackPlaybackState()
         last_real_audio = time.monotonic()
         while not self.stop_event.is_set():
             try:
                 batch: RtlSampleBatch = self.queue.get(timeout=0.5)
             except queue.Empty:
-                if time.monotonic() - last_real_audio < FallbackConfig().silence_timeout_seconds:
+                fallback_settings = self.fallback_settings_provider()
+                idle_seconds = time.monotonic() - last_real_audio
+                if not fallback_settings.enabled:
+                    fallback_state.reset()
                     continue
-                if fallback_pcm:
-                    chunk_size = STREAM_FRAME_SAMPLES * 2
-                    frame = fallback_pcm[fallback_position : fallback_position + chunk_size]
-                    fallback_position += len(frame)
-                    if len(frame) < chunk_size:
-                        fallback_position = 0
-                        frame += fallback_pcm[: chunk_size - len(frame)]
-                    sink.write(encoder.encode(frame))
+                if not fallback_state.active and idle_seconds < fallback_settings.silence_timeout_seconds:
+                    fallback_state.reset()
+                    continue
+                if not fallback_state.active:
+                    fallback_state.active = True
+                    LOG.info("starting fallback audio for %s after %.1f seconds without IQ", station.get("callsign"), idle_seconds)
+                sink.write(encoder.encode(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds)))
                 continue
             next_channelizer_key = (
                 batch.sample_rate,
@@ -365,6 +426,9 @@ class IcecastStreamWorker:
             if len(audio) == 0:
                 continue
             last_real_audio = time.monotonic()
+            if fallback_state.active:
+                LOG.info("stopping fallback audio for %s", station.get("callsign"))
+            fallback_state.reset()
             with self.lock:
                 self.last_audio_at = time.time()
             pending = np.concatenate((pending, audio.astype(np.float32, copy=False)))
@@ -381,10 +445,12 @@ class RtlControlService:
     def __init__(self, state_path: Path, log_handler: RingLogHandler) -> None:
         self.state_path = state_path
         self.streams_state_path = state_path.with_name(STREAMS_STATE_FILE_NAME)
+        self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.log_handler = log_handler
         self.lock = threading.RLock()
         self.settings = load_settings(state_path)
         self.streams = load_streams(self.streams_state_path)
+        self.fallback_settings = load_fallback_settings(self.fallback_state_path)
         self.stations = load_station_database()
         self.capture: RtlCaptureSource | None = None
         self.raw_fanout: RawRtlFanout | None = None
@@ -422,6 +488,7 @@ class RtlControlService:
                 "received_bytes": self.received_bytes,
                 "sample_rate_ranges": RTL_SAMPLE_RATE_RANGES,
                 "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
+                "fallback": asdict(self.fallback_settings),
                 "active_streams": self._active_streams_locked(),
                 "logs": self.log_handler.snapshot()[-80:],
             }
@@ -578,6 +645,23 @@ class RtlControlService:
     def test_icecast_auth_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         icecast = validate_icecast_payload(payload.get("icecast"))
         return self.test_icecast_auth(icecast)
+
+    def update_fallback_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        settings = validate_fallback_settings_payload(payload)
+        with self.lock:
+            self.fallback_settings = settings
+            save_fallback_settings(self.fallback_state_path, settings)
+        LOG.info(
+            "updated fallback audio settings: enabled=%s delay=%.1fs loop_delay=%.1fs",
+            settings.enabled,
+            settings.silence_timeout_seconds,
+            settings.loop_delay_seconds,
+        )
+        return self.status()
+
+    def fallback_settings_snapshot(self) -> WebFallbackSettings:
+        with self.lock:
+            return self.fallback_settings
 
     def _icecast_auth_cached_locked(self, cache_key: str) -> bool:
         now = time.time()
@@ -921,7 +1005,12 @@ class RtlControlService:
         for key, (stream, output) in desired.items():
             if key in self.stream_workers:
                 continue
-            worker = IcecastStreamWorker(stream=stream, output=output, fanout=fanout)
+            worker = IcecastStreamWorker(
+                stream=stream,
+                output=output,
+                fanout=fanout,
+                fallback_settings_provider=self.fallback_settings_snapshot,
+            )
             self.stream_workers[key] = worker
             worker.start()
             LOG.info(
@@ -1033,6 +1122,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(response)
             return
+        if path == "/api/fallback-settings":
+            try:
+                payload = self._read_json()
+                response = self.service.update_fallback_settings(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path != "/api/settings":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -1107,6 +1205,45 @@ def load_settings(path: Path) -> RtlControlSettings:
 def save_settings(path: Path, settings: RtlControlSettings) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(settings), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def load_fallback_settings(path: Path) -> WebFallbackSettings:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return WebFallbackSettings()
+    except Exception as exc:
+        LOG.warning("failed to load fallback audio settings from %s: %s", path, exc)
+        return WebFallbackSettings()
+    if not isinstance(raw, dict):
+        return WebFallbackSettings()
+    try:
+        return validate_fallback_settings_payload(raw)
+    except Exception as exc:
+        LOG.warning("fallback audio settings in %s are invalid: %s", path, exc)
+        return WebFallbackSettings()
+
+
+def save_fallback_settings(path: Path, settings: WebFallbackSettings) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(settings), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def validate_fallback_settings_payload(raw: Any) -> WebFallbackSettings:
+    if not isinstance(raw, dict):
+        raise ValueError("fallback audio settings are required")
+    enabled = bool(raw.get("enabled", False))
+    silence_timeout_seconds = float(raw.get("silence_timeout_seconds", 30.0))
+    loop_delay_seconds = float(raw.get("loop_delay_seconds", 5.0))
+    if not 30 <= silence_timeout_seconds <= 120:
+        raise ValueError("Fallback delay must be from 30 through 120 seconds")
+    if not 0 <= loop_delay_seconds <= 10:
+        raise ValueError("Seconds before restart must be from 0 through 10 seconds")
+    return WebFallbackSettings(
+        enabled=enabled,
+        silence_timeout_seconds=silence_timeout_seconds,
+        loop_delay_seconds=loop_delay_seconds,
+    )
 
 
 def station_key(station: dict[str, Any]) -> str:
@@ -1609,7 +1746,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <h2>Stream Settings</h2>
       <div id="stream_settings_station" class="hint"></div>
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
-        <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs">Outputs</button>
+        <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
+        <button id="tab_fallback" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback" tabindex="-1">Fallback Audio</button>
       </div>
       <div id="panel_outputs" class="tabpanel" role="tabpanel" aria-labelledby="tab_outputs">
         <div class="actions">
@@ -1687,6 +1825,23 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </div>
         <div id="output-result" class="message"></div>
       </div>
+      <div id="panel_fallback" class="tabpanel" role="tabpanel" aria-labelledby="tab_fallback" hidden>
+        <h3>Fallback audio</h3>
+        <div class="grid">
+          <label class="checkbox-row">
+            <input id="fallback_enabled" type="checkbox">
+            Enable fallback audio
+          </label>
+          <label>Fallback delay
+            <input id="fallback_delay" type="number" min="30" max="120" step="0.1">
+          </label>
+          <label>Seconds before restart
+            <input id="fallback_loop_delay" type="number" min="0" max="10" step="0.1">
+          </label>
+        </div>
+        <div class="hint">Uses the packaged default fallback.wav audio file.</div>
+        <div id="fallback-result" class="message"></div>
+      </div>
     </section>
   </div>
 
@@ -1714,6 +1869,8 @@ let outputFormDirty = false;
 let outputFormOriginalSignature = "";
 let outputTableSignature = "";
 let activeStreamSnapshots = [];
+let fallbackSignature = "";
+let fallbackUpdateTimer = null;
 let wizardStep = 0;
 let wizardMode = "add";
 let wizardDirty = false;
@@ -1996,6 +2153,46 @@ function setOutputResult(message, kind = "") {
   if (element.className !== className) element.className = className;
   const text = String(message || "");
   if (element.textContent !== text) element.textContent = text;
+}
+
+function setFallbackResult(message, kind = "") {
+  const element = document.getElementById("fallback-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function fallbackPayload() {
+  return {
+    enabled: document.getElementById("fallback_enabled").checked,
+    silence_timeout_seconds: Number(document.getElementById("fallback_delay").value),
+    loop_delay_seconds: Number(document.getElementById("fallback_loop_delay").value)
+  };
+}
+
+function setFallbackControls(fallback) {
+  if (!fallback) return;
+  const nextSignature = JSON.stringify(fallback);
+  if (nextSignature === fallbackSignature) return;
+  setChecked("fallback_enabled", fallback.enabled);
+  setValue("fallback_delay", fallback.silence_timeout_seconds);
+  setValue("fallback_loop_delay", fallback.loop_delay_seconds);
+  fallbackSignature = nextSignature;
+}
+
+function activeSettingsTab() {
+  return document.getElementById("tab_fallback").getAttribute("aria-selected") === "true" ? "fallback" : "outputs";
+}
+
+function showSettingsTab(name) {
+  const fallback = name === "fallback";
+  document.getElementById("tab_outputs").setAttribute("aria-selected", fallback ? "false" : "true");
+  document.getElementById("tab_fallback").setAttribute("aria-selected", fallback ? "true" : "false");
+  document.getElementById("tab_outputs").setAttribute("tabindex", fallback ? "-1" : "0");
+  document.getElementById("tab_fallback").setAttribute("tabindex", fallback ? "0" : "-1");
+  document.getElementById("panel_outputs").hidden = fallback;
+  document.getElementById("panel_fallback").hidden = !fallback;
 }
 
 function updateOutputFormButtons() {
@@ -2729,6 +2926,7 @@ function applyStatus(data, options = {}) {
   setText("last", data.last_batch_at ? `${data.last_batch_at.toFixed(3)}s` : "never");
   setText("capture-error", data.capture_error || "");
   setText("logs", data.logs.join("\\n"));
+  setFallbackControls(data.fallback);
   updateDashboard(data);
   applying = false;
 }
@@ -2762,6 +2960,24 @@ function scheduleUpdate() {
   }, 250);
 }
 
+function scheduleFallbackUpdate() {
+  if (applying) return;
+  clearTimeout(fallbackUpdateTimer);
+  fallbackUpdateTimer = setTimeout(async () => {
+    try {
+      const data = await request("/api/fallback-settings", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(fallbackPayload())
+      });
+      setFallbackResult("Fallback audio settings saved.", "success");
+      applyStatus(data, {syncControls: false});
+    } catch (error) {
+      setFallbackResult(error.message, "error");
+    }
+  }, 250);
+}
+
 for (const id of controls) {
   document.addEventListener("input", event => {
     if (event.target && event.target.id === id) scheduleUpdate();
@@ -2771,9 +2987,35 @@ for (const id of controls) {
   });
 }
 
+for (const id of ["fallback_enabled", "fallback_delay", "fallback_loop_delay"]) {
+  document.addEventListener("input", event => {
+    if (event.target && event.target.id === id) scheduleFallbackUpdate();
+  });
+  document.addEventListener("change", event => {
+    if (event.target && event.target.id === id) scheduleFallbackUpdate();
+  });
+}
+
 for (const button of document.querySelectorAll("nav button[data-view]")) {
   button.addEventListener("click", () => navigateTo(button.dataset.view));
 }
+
+document.getElementById("tab_outputs").addEventListener("click", () => showSettingsTab("outputs"));
+document.getElementById("tab_fallback").addEventListener("click", () => showSettingsTab("fallback"));
+document.querySelector(".tabs").addEventListener("keydown", event => {
+  const tabs = [document.getElementById("tab_outputs"), document.getElementById("tab_fallback")];
+  const index = tabs.indexOf(event.target);
+  if (index < 0) return;
+  let nextIndex = index;
+  if (event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
+  else if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
+  else if (event.key === "Home") nextIndex = 0;
+  else if (event.key === "End") nextIndex = tabs.length - 1;
+  else return;
+  event.preventDefault();
+  tabs[nextIndex].focus();
+  showSettingsTab(tabs[nextIndex].id === "tab_fallback" ? "fallback" : "outputs");
+});
 
 window.addEventListener("popstate", event => {
   if (!confirmDiscardNavigation()) {
