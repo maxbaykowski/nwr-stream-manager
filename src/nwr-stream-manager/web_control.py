@@ -14,9 +14,10 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from collections import deque
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -772,6 +773,65 @@ class RtlControlService:
             "total_pages": total_pages,
         }
 
+    def eas_alert_bulk_options(self, stream_id: str) -> dict[str, Any]:
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+        indexed_alerts = indexed_eas_alert_entries(eas_alert_index_path(self.streams_directory, stream))
+        now = datetime.now(timezone.utc)
+        export_presets = []
+        for preset in EXPORT_ALERT_PRESETS:
+            selected = filter_indexed_alerts(indexed_alerts, preset_range_bounds(preset["id"], now))
+            if selected:
+                export_presets.append({"id": preset["id"], "label": preset["label"], "count": len(selected)})
+        delete_presets = []
+        for preset in DELETE_ALERT_PRESETS:
+            selected = filter_indexed_alerts(indexed_alerts, preset_range_bounds(preset["id"], now))
+            if selected:
+                delete_presets.append({"id": preset["id"], "label": preset["label"], "count": len(selected)})
+        return {
+            "export_presets": export_presets,
+            "delete_presets": delete_presets,
+            "total": len(indexed_alerts),
+            "now": local_datetime_parts(datetime.now().astimezone()),
+        }
+
+    def eas_alert_range_count(self, stream_id: str, mode: str, start: str = "", end: str = "") -> dict[str, Any]:
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+        indexed_alerts = indexed_eas_alert_entries(eas_alert_index_path(self.streams_directory, stream))
+        bounds = alert_range_bounds_from_request(mode, start, end)
+        count = len(filter_indexed_alerts(indexed_alerts, bounds))
+        return {"count": count}
+
+    def eas_alert_export_zip(self, stream_id: str, mode: str, start: str = "", end: str = "") -> tuple[Path, str]:
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+        indexed_alerts = indexed_eas_alert_entries(eas_alert_index_path(self.streams_directory, stream))
+        selected = filter_indexed_alerts(indexed_alerts, alert_range_bounds_from_request(mode, start, end))
+        if not selected:
+            raise ValueError("No alerts were issued during this time.")
+        station = stream.get("station", {})
+        callsign = sanitize_path_component(str(station.get("callsign", "alerts")))
+        fd, raw_path = tempfile.mkstemp(prefix=f"{callsign}-eas-alerts-", suffix=".zip")
+        os.close(fd)
+        zip_path = Path(raw_path)
+        export_index = {"version": 1, "alerts": []}
+        used_names: set[str] = set()
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for _index, alert in selected:
+                    audio_path = safe_eas_alert_file_path(self.streams_directory, stream, alert)
+                    archive_name = unique_archive_name(Path(str(alert.get("file_path", ""))).name, used_names)
+                    archive.write(audio_path, archive_name)
+                    export_entry = dict(alert)
+                    export_entry["file_path"] = archive_name
+                    export_index["alerts"].append(export_entry)
+                archive.writestr("index.json", json.dumps(export_index, indent=2, sort_keys=True) + "\n")
+        except Exception:
+            zip_path.unlink(missing_ok=True)
+            raise
+        return zip_path, f"{callsign}-eas-alerts.zip"
+
     def eas_alert_detail(self, stream_id: str, alert_id: str) -> dict[str, Any]:
         with self.lock:
             stream = self._stream_locked(stream_id)
@@ -803,6 +863,31 @@ class RtlControlService:
         atomic_write_json(index_path, data)
         LOG.info("removed EAS alert %s for stream %s", alert_id, stream_id)
         return {"success": True}
+
+    def remove_eas_alert_range(self, stream_id: str, mode: str, start: str = "", end: str = "") -> dict[str, Any]:
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+        index_path = eas_alert_index_path(self.streams_directory, stream)
+        data = load_eas_alert_index(index_path)
+        indexed_alerts = [(index, alert) for index, alert in enumerate(data["alerts"])]
+        selected = filter_indexed_alerts(indexed_alerts, alert_range_bounds_from_request(mode, start, end))
+        if not selected:
+            raise ValueError("No alerts were issued during this time.")
+        selected_indexes = {index for index, _alert in selected}
+        for _index, alert in selected:
+            audio_path = safe_eas_alert_file_path(self.streams_directory, stream, alert, require_exists=False)
+            try:
+                audio_path.unlink()
+            except FileNotFoundError:
+                pass
+        data["alerts"] = [
+            alert for index, alert in enumerate(data["alerts"])
+            if index not in selected_indexes
+        ]
+        atomic_write_json(index_path, data)
+        LOG.info("removed %s EAS alerts for stream %s", len(selected), stream_id)
+        return {"success": True, "count": len(selected)}
+
 
     def _stream_has_eas_alert_index(self, stream: dict[str, Any]) -> bool:
         return (
@@ -1407,6 +1492,40 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
+        elif path == "/api/eas-alert-bulk-options":
+            query = parse_qs(parsed.query)
+            try:
+                response = self.service.eas_alert_bulk_options(query.get("stream_id", [""])[0])
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+        elif path == "/api/eas-alert-range-count":
+            query = parse_qs(parsed.query)
+            try:
+                response = self.service.eas_alert_range_count(
+                    query.get("stream_id", [""])[0],
+                    query.get("mode", [""])[0],
+                    query.get("start", [""])[0],
+                    query.get("end", [""])[0],
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+        elif path == "/api/eas-alert-export":
+            query = parse_qs(parsed.query)
+            try:
+                zip_path, download_name = self.service.eas_alert_export_zip(
+                    query.get("stream_id", [""])[0],
+                    query.get("mode", [""])[0],
+                    query.get("start", [""])[0],
+                    query.get("end", [""])[0],
+                )
+                self._send_file(zip_path, download_name, True, delete_after=True)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
         elif path == "/api/eas-alert":
             query = parse_qs(parsed.query)
             try:
@@ -1434,6 +1553,20 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/eas-alert-delete":
+            try:
+                payload = self._read_json()
+                response = self.service.remove_eas_alert_range(
+                    str(payload.get("stream_id", "")),
+                    str(payload.get("mode", "")),
+                    str(payload.get("start", "")),
+                    str(payload.get("end", "")),
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path == "/api/icecast-auth":
             try:
                 payload = self._read_json()
@@ -1573,22 +1706,26 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_file(self, path: Path, download_name: str, download: bool) -> None:
+    def _send_file(self, path: Path, download_name: str, download: bool, *, delete_after: bool = False) -> None:
         content_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
         disposition = "attachment" if download else "inline"
         data_length = path.stat().st_size
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(data_length))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Disposition", f'{disposition}; filename="{http_header_filename(download_name)}"')
-        self.end_headers()
-        with path.open("rb") as source:
-            while True:
-                chunk = source.read(1024 * 1024)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(data_length))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Disposition", f'{disposition}; filename="{http_header_filename(download_name)}"')
+            self.end_headers()
+            with path.open("rb") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        finally:
+            if delete_after:
+                path.unlink(missing_ok=True)
 
 
 def default_state_path() -> Path:
@@ -1711,6 +1848,20 @@ def stream_alerts_directory(state_directory: Path, stream: dict[str, Any]) -> Pa
     return state_directory / "streams" / callsign / "alerts"
 
 
+EXPORT_ALERT_PRESETS = (
+    {"id": "last_24", "label": "Last 24 hours"},
+    {"id": "last_7", "label": "Last 7 days"},
+    {"id": "last_30", "label": "Last 30 days"},
+    {"id": "all", "label": "Export all alerts"},
+)
+DELETE_ALERT_PRESETS = (
+    {"id": "older_24", "label": "Older than 24 hours"},
+    {"id": "older_7", "label": "Older than 7 days"},
+    {"id": "older_30", "label": "Older than 30 days"},
+    {"id": "all", "label": "Delete all alerts"},
+)
+
+
 def eas_alert_index_path(streams_directory: Path, stream: dict[str, Any]) -> Path:
     return stream_alerts_directory(streams_directory.parent, stream) / "index.json"
 
@@ -1732,6 +1883,10 @@ def load_eas_alert_index(index_path: Path) -> dict[str, Any]:
 
 def load_eas_alert_entries(index_path: Path) -> list[dict[str, Any]]:
     return list(load_eas_alert_index(index_path)["alerts"])
+
+
+def indexed_eas_alert_entries(index_path: Path) -> list[tuple[int, dict[str, Any]]]:
+    return list(enumerate(load_eas_alert_entries(index_path)))
 
 
 def eas_alert_id(alert: dict[str, Any], index: int) -> str:
@@ -1797,6 +1952,98 @@ def format_same_location_for_alert(same_code: str) -> str:
     if subdivision_digit:
         return f"{text}, subdivision {subdivision_digit}"
     return text
+
+
+def local_datetime_parts(value: datetime) -> dict[str, int]:
+    return {
+        "year": value.year,
+        "month": value.month,
+        "day": value.day,
+        "hour": value.hour,
+        "minute": value.minute,
+    }
+
+
+def preset_range_bounds(mode: str, now: datetime | None = None) -> tuple[datetime | None, datetime | None]:
+    now = now or datetime.now(timezone.utc)
+    if mode == "last_24":
+        return now - timedelta(hours=24), now
+    if mode == "last_7":
+        return now - timedelta(days=7), now
+    if mode == "last_30":
+        return now - timedelta(days=30), now
+    if mode == "older_24":
+        return None, now - timedelta(hours=24)
+    if mode == "older_7":
+        return None, now - timedelta(days=7)
+    if mode == "older_30":
+        return None, now - timedelta(days=30)
+    if mode == "all":
+        return None, now
+    raise ValueError("Unsupported EAS alert range.")
+
+
+def alert_range_bounds_from_request(mode: str, start: str = "", end: str = "") -> tuple[datetime | None, datetime | None]:
+    mode = str(mode).strip()
+    if mode == "manual":
+        start_time = parse_request_datetime(start, "Start")
+        end_time = parse_request_datetime(end, "End")
+        now = datetime.now(timezone.utc)
+        if start_time > now or end_time > now:
+            raise ValueError("Date ranges cannot be in the future.")
+        if start_time > end_time:
+            raise ValueError("Start date must be before the end date.")
+        return start_time, end_time
+    return preset_range_bounds(mode)
+
+
+def parse_request_datetime(value: str, label: str) -> datetime:
+    if not value:
+        raise ValueError(f"{label} date and time are required.")
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"{label} date and time are invalid.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.astimezone(timezone.utc)
+
+
+def filter_indexed_alerts(
+    indexed_alerts: list[tuple[int, dict[str, Any]]],
+    bounds: tuple[datetime | None, datetime | None],
+) -> list[tuple[int, dict[str, Any]]]:
+    start, end = bounds
+    selected = []
+    for index, alert in indexed_alerts:
+        issued = parse_utc_datetime(str(alert.get("start_time_utc", "")))
+        if start is not None and issued < start:
+            continue
+        if end is not None and issued > end:
+            continue
+        selected.append((index, alert))
+    selected.sort(key=lambda item: parse_utc_datetime(str(item[1].get("start_time_utc", ""))), reverse=True)
+    return selected
+
+
+def unique_archive_name(name: str, used_names: set[str]) -> str:
+    cleaned = sanitize_archive_filename(name)
+    stem = Path(cleaned).stem or "alert"
+    suffix = Path(cleaned).suffix
+    candidate = cleaned
+    counter = 2
+    while candidate in used_names:
+        candidate = f"{stem}-{counter}{suffix}"
+        counter += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def sanitize_archive_filename(value: str) -> str:
+    name = Path(str(value)).name
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" ._")
+    return name or "alert"
 
 
 def safe_eas_alert_file_path(
@@ -2666,6 +2913,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <label>Stream
         <select id="eas_alert_stream"></select>
       </label>
+      <div class="actions">
+        <button id="open_eas_export" type="button">Export alerts</button>
+        <button id="open_eas_delete" type="button">Delete alerts</button>
+      </div>
       <div id="eas-alert-list" class="stream-list" aria-live="off"></div>
       <div class="actions">
         <button id="eas_alert_prev" type="button">Previous</button>
@@ -2673,6 +2924,40 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <button id="eas_alert_next" type="button">Next</button>
       </div>
       <div id="eas-alert-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_eas_alert_export" class="view" hidden>
+    <section>
+      <h2>Export alerts</h2>
+      <p id="eas_export_stream_label" class="hint"></p>
+      <fieldset>
+        <legend>Choose alerts to export</legend>
+        <div id="eas_export_options"></div>
+        <div id="eas_export_manual" hidden></div>
+      </fieldset>
+      <div class="actions">
+        <button id="eas_export_alerts" type="button">Export alerts</button>
+        <button id="cancel_eas_export" type="button">Cancel</button>
+      </div>
+      <div id="eas-export-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_eas_alert_delete" class="view" hidden>
+    <section>
+      <h2>Delete alerts</h2>
+      <p id="eas_delete_stream_label" class="hint"></p>
+      <fieldset>
+        <legend>Choose alerts to delete</legend>
+        <div id="eas_delete_options"></div>
+        <div id="eas_delete_manual" hidden></div>
+      </fieldset>
+      <div class="actions">
+        <button id="eas_delete_alerts" type="button">Delete alerts</button>
+        <button id="cancel_eas_delete" type="button">Cancel</button>
+      </div>
+      <div id="eas-delete-result" class="message"></div>
     </section>
   </div>
 
@@ -2738,6 +3023,8 @@ let easAlertPage = 1;
 let easAlertTotalPages = 1;
 let easAlertReturnPage = 1;
 let lastEasAlertRefreshAt = 0;
+let easBulkOptionsSignature = "";
+let easBulkServerNow = null;
 const EAS_ALERTS_PER_PAGE = 25;
 
 async function request(path, options = {}) {
@@ -3777,6 +4064,15 @@ function setEasAlertDetailResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setEasBulkResult(action, message, kind = "") {
+  const element = document.getElementById(`eas-${action}-result`);
+  if (!element) return;
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
 function easAlertStreamLabel(stream) {
   const frequency = stream.frequency ? ` ${stream.frequency} MHz` : "";
   const count = Number(stream.alert_count || 0);
@@ -3837,13 +4133,241 @@ async function loadEasAlertStreams(options = {}) {
     setText("eas_alert_page", "Page 1 of 1");
     setDisabled(document.getElementById("eas_alert_prev"), true);
     setDisabled(document.getElementById("eas_alert_next"), true);
-    if (["eas_alerts", "eas_alert_detail"].includes(currentViewName())) {
+    if (["eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(currentViewName())) {
       navigateTo("dashboard", {}, true, true);
     }
     return;
   }
   if (currentViewName() === "eas_alerts" && (streamListChanged || options.forceList)) {
     await loadEasAlerts({quiet: options.quiet});
+  }
+}
+
+async function loadEasBulkOptions(options = {}) {
+  if (!easAlertStreamId) return;
+  try {
+    const data = await request(`/api/eas-alert-bulk-options?stream_id=${encodeURIComponent(easAlertStreamId)}`);
+    renderEasBulkOptions(data);
+    updateEasBulkStreamLabels();
+    if (!options.quiet) {
+      setEasBulkResult("export", "");
+      setEasBulkResult("delete", "");
+    }
+  } catch (error) {
+    if (!options.quiet) {
+      setEasBulkResult("export", error.message, "error");
+      setEasBulkResult("delete", error.message, "error");
+    }
+  }
+}
+
+function renderEasBulkOptions(data) {
+  easBulkServerNow = data.now || null;
+  const signature = JSON.stringify(data);
+  if (signature === easBulkOptionsSignature) return;
+  easBulkOptionsSignature = signature;
+  renderBulkOptionGroup("export", data.export_presets || [], "Export all alerts");
+  renderBulkOptionGroup("delete", data.delete_presets || [], "Delete all alerts");
+  setDisabled(document.getElementById("eas_export_alerts"), Number(data.total || 0) === 0);
+  setDisabled(document.getElementById("eas_delete_alerts"), Number(data.total || 0) === 0);
+}
+
+function updateEasBulkStreamLabels() {
+  const stream = easAlertStreams.find(item => item.id === easAlertStreamId);
+  const label = stream ? `Stream: ${easAlertStreamLabel(stream)}` : "";
+  setText("eas_export_stream_label", label);
+  setText("eas_delete_stream_label", label);
+}
+
+function renderBulkOptionGroup(kind, presets) {
+  const container = document.getElementById(`eas_${kind}_options`);
+  const manual = document.getElementById(`eas_${kind}_manual`);
+  container.innerHTML = "";
+  for (const preset of presets) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = `eas_${kind}_mode`;
+    input.value = preset.id;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(` ${preset.label} (${preset.count})`));
+    container.appendChild(label);
+  }
+  const manualLabel = document.createElement("label");
+  const manualInput = document.createElement("input");
+  manualInput.type = "radio";
+  manualInput.name = `eas_${kind}_mode`;
+  manualInput.value = "manual";
+  manualLabel.appendChild(manualInput);
+  manualLabel.appendChild(document.createTextNode(" Manually select date range"));
+  container.appendChild(manualLabel);
+  buildManualRangeControls(kind, manual);
+  const first = container.querySelector(`input[name='eas_${kind}_mode']`);
+  if (first) first.checked = true;
+  updateManualRangeVisibility(kind);
+}
+
+function buildManualRangeControls(kind, container) {
+  container.innerHTML = "";
+  const now = easBulkServerNow || currentDateParts();
+  const start = offsetDateParts(now, -24 * 60);
+  container.appendChild(dateRangeControl(kind, "start", "Start", start, false));
+  container.appendChild(dateRangeControl(kind, "end", "End", now, true));
+}
+
+function dateRangeControl(kind, edge, labelText, value, includeNowButton) {
+  const fieldset = document.createElement("fieldset");
+  const legend = document.createElement("legend");
+  legend.textContent = labelText;
+  fieldset.appendChild(legend);
+  const grid = document.createElement("div");
+  grid.className = "grid";
+  for (const spec of dateControlSpecs(value)) {
+    const label = document.createElement("label");
+    label.textContent = spec.label;
+    const select = document.createElement("select");
+    select.id = `eas_${kind}_${edge}_${spec.name}`;
+    for (const optionSpec of spec.options) {
+      const option = document.createElement("option");
+      option.value = String(optionSpec.value);
+      option.textContent = optionSpec.label;
+      if (optionSpec.value === spec.value) option.selected = true;
+      select.appendChild(option);
+    }
+    label.appendChild(select);
+    grid.appendChild(label);
+  }
+  fieldset.appendChild(grid);
+  if (includeNowButton) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Now";
+    button.dataset.bulkNow = kind;
+    fieldset.appendChild(button);
+  }
+  return fieldset;
+}
+
+function dateControlSpecs(value) {
+  const year = Number(value.year);
+  const years = [];
+  for (let next = year; next >= year - 10; next -= 1) years.push({value: next, label: String(next)});
+  return [
+    {name: "month", label: "Month", value: Number(value.month), options: Array.from({length: 12}, (_, index) => ({value: index + 1, label: String(index + 1)}))},
+    {name: "day", label: "Day", value: Number(value.day), options: Array.from({length: 31}, (_, index) => ({value: index + 1, label: String(index + 1)}))},
+    {name: "year", label: "Year", value: year, options: years},
+    {name: "hour", label: "Hour", value: hour12(value.hour), options: Array.from({length: 12}, (_, index) => ({value: index + 1, label: String(index + 1)}))},
+    {name: "minute", label: "Minute", value: Number(value.minute), options: Array.from({length: 60}, (_, index) => ({value: index, label: String(index).padStart(2, "0")}))},
+    {name: "ampm", label: "AM/PM", value: Number(value.hour) >= 12 ? "PM" : "AM", options: [{value: "AM", label: "AM"}, {value: "PM", label: "PM"}]}
+  ];
+}
+
+function hour12(hour) {
+  const value = Number(hour) % 12;
+  return value === 0 ? 12 : value;
+}
+
+function currentDateParts() {
+  const now = new Date();
+  return {year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate(), hour: now.getHours(), minute: now.getMinutes()};
+}
+
+function offsetDateParts(parts, offsetMinutes) {
+  const date = new Date(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute) + offsetMinutes);
+  return {year: date.getFullYear(), month: date.getMonth() + 1, day: date.getDate(), hour: date.getHours(), minute: date.getMinutes()};
+}
+
+function setEndRangeToNow(kind) {
+  const now = easBulkServerNow || currentDateParts();
+  setRangeControls(kind, "end", now);
+}
+
+function setRangeControls(kind, edge, value) {
+  setValue(`eas_${kind}_${edge}_month`, value.month);
+  setValue(`eas_${kind}_${edge}_day`, value.day);
+  setValue(`eas_${kind}_${edge}_year`, value.year);
+  setValue(`eas_${kind}_${edge}_hour`, hour12(value.hour));
+  setValue(`eas_${kind}_${edge}_minute`, value.minute);
+  setValue(`eas_${kind}_${edge}_ampm`, Number(value.hour) >= 12 ? "PM" : "AM");
+}
+
+function selectedBulkMode(kind) {
+  const selected = document.querySelector(`input[name='eas_${kind}_mode']:checked`);
+  return selected ? selected.value : "";
+}
+
+function updateManualRangeVisibility(kind) {
+  document.getElementById(`eas_${kind}_manual`).hidden = selectedBulkMode(kind) !== "manual";
+}
+
+function bulkRangeParams(kind) {
+  const params = new URLSearchParams({stream_id: easAlertStreamId, mode: selectedBulkMode(kind)});
+  if (selectedBulkMode(kind) === "manual") {
+    params.set("start", localRangeDateTime(kind, "start"));
+    params.set("end", localRangeDateTime(kind, "end"));
+  }
+  return params;
+}
+
+function localRangeDateTime(kind, edge) {
+  const month = String(document.getElementById(`eas_${kind}_${edge}_month`).value).padStart(2, "0");
+  const day = String(document.getElementById(`eas_${kind}_${edge}_day`).value).padStart(2, "0");
+  const year = document.getElementById(`eas_${kind}_${edge}_year`).value;
+  let hour = Number(document.getElementById(`eas_${kind}_${edge}_hour`).value);
+  const minute = String(document.getElementById(`eas_${kind}_${edge}_minute`).value).padStart(2, "0");
+  const ampm = document.getElementById(`eas_${kind}_${edge}_ampm`).value;
+  if (ampm === "AM" && hour === 12) hour = 0;
+  if (ampm === "PM" && hour !== 12) hour += 12;
+  return `${year}-${month}-${day}T${String(hour).padStart(2, "0")}:${minute}:00`;
+}
+
+async function easBulkCount(kind) {
+  return request(`/api/eas-alert-range-count?${bulkRangeParams(kind).toString()}`);
+}
+
+async function exportEasAlerts() {
+  if (!easAlertStreamId) return;
+  try {
+    const count = await easBulkCount("export");
+    if (!count.count) {
+      setEasBulkResult("export", "No alerts were issued during this time.", "error");
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = `/api/eas-alert-export?${bulkRangeParams("export").toString()}`;
+    link.download = "";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+  } catch (error) {
+    setEasBulkResult("export", error.message, "error");
+  }
+}
+
+async function deleteEasAlerts() {
+  if (!easAlertStreamId) return;
+  try {
+    const count = await easBulkCount("delete");
+    if (!count.count) {
+      setEasBulkResult("delete", "No alerts were issued during this time.", "error");
+      return;
+    }
+    const confirmed = window.confirm(`${count.count} alert${count.count === 1 ? "" : "s"} and their audio files will be permanently deleted.`);
+    if (!confirmed) {
+      navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+      return;
+    }
+    const response = await request("/api/eas-alert-delete", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(Object.fromEntries(bulkRangeParams("delete").entries()))
+    });
+    easAlertListSignature = "";
+    await loadEasAlertStreams({preserve: true, forceList: true, quiet: true});
+    navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
+  } catch (error) {
+    setEasBulkResult("delete", error.message, "error");
   }
 }
 
@@ -3951,7 +4475,7 @@ function showView(name) {
     if (
       button.dataset.view === name ||
       (button.dataset.view === "streams" && name === "stream_settings") ||
-      (button.dataset.view === "eas_alerts" && name === "eas_alert_detail")
+      (button.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name))
     ) {
       button.setAttribute("aria-current", "page");
     } else {
@@ -3980,6 +4504,16 @@ function routeForView(name, params = {}) {
     if (params.streamId) query.set("stream", params.streamId);
     if (params.page) query.set("page", params.page);
   }
+  if (name === "eas_alert_export") {
+    query.set("view", "eas_alert_export");
+    if (params.streamId) query.set("stream", params.streamId);
+    if (params.page) query.set("page", params.page);
+  }
+  if (name === "eas_alert_delete") {
+    query.set("view", "eas_alert_delete");
+    if (params.streamId) query.set("stream", params.streamId);
+    if (params.page) query.set("page", params.page);
+  }
   if (name === "eas_alert_detail") {
     query.set("view", "eas_alert_detail");
     if (params.streamId) query.set("stream", params.streamId);
@@ -3993,7 +4527,7 @@ function routeForView(name, params = {}) {
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
-  if (["dashboard", "rtl", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_detail"].includes(view)) {
+  if (["dashboard", "rtl", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
     return {
       view,
       streamId: query.get("stream") || "",
@@ -4038,6 +4572,14 @@ function applyRoute(route) {
     loadEasAlertStreams({preserve: true, forceList: true});
     return;
   }
+  if (route.view === "eas_alert_export" || route.view === "eas_alert_delete") {
+    easAlertStreamId = route.streamId || easAlertStreamId;
+    easAlertPage = Math.max(1, Number(route.page || easAlertPage || 1));
+    easBulkOptionsSignature = "";
+    showView(route.view);
+    loadEasAlertStreams({preserve: true, quiet: true}).then(() => loadEasBulkOptions());
+    return;
+  }
   if (route.view === "eas_alert_detail") {
     easAlertStreamId = route.streamId || easAlertStreamId;
     easAlertDetailId = route.alertId || "";
@@ -4075,6 +4617,7 @@ function currentRouteParams() {
   const view = currentViewName();
   if (view === "stream_settings") return {streamId: settingsStreamId};
   if (view === "eas_alerts") return {streamId: easAlertStreamId, page: easAlertPage};
+  if (view === "eas_alert_export" || view === "eas_alert_delete") return {streamId: easAlertStreamId, page: easAlertPage};
   if (view === "eas_alert_detail") return {streamId: easAlertStreamId, alertId: easAlertDetailId, page: easAlertReturnPage};
   return {};
 }
@@ -4811,6 +5354,37 @@ document.getElementById("eas_alert_stream").addEventListener("change", event => 
   easAlertStreamId = event.target.value;
   easAlertPage = 1;
   easAlertListSignature = "";
+  easBulkOptionsSignature = "";
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+});
+
+document.getElementById("open_eas_export").addEventListener("click", () => {
+  easBulkOptionsSignature = "";
+  navigateTo("eas_alert_export", {streamId: easAlertStreamId, page: easAlertPage});
+});
+
+document.getElementById("open_eas_delete").addEventListener("click", () => {
+  easBulkOptionsSignature = "";
+  navigateTo("eas_alert_delete", {streamId: easAlertStreamId, page: easAlertPage});
+});
+
+document.getElementById("eas_export_options").addEventListener("change", () => updateManualRangeVisibility("export"));
+document.getElementById("eas_delete_options").addEventListener("change", () => updateManualRangeVisibility("delete"));
+
+document.getElementById("eas_export_manual").addEventListener("click", event => {
+  if (event.target && event.target.dataset && event.target.dataset.bulkNow) setEndRangeToNow(event.target.dataset.bulkNow);
+});
+
+document.getElementById("eas_delete_manual").addEventListener("click", event => {
+  if (event.target && event.target.dataset && event.target.dataset.bulkNow) setEndRangeToNow(event.target.dataset.bulkNow);
+});
+
+document.getElementById("eas_export_alerts").addEventListener("click", exportEasAlerts);
+document.getElementById("eas_delete_alerts").addEventListener("click", deleteEasAlerts);
+document.getElementById("cancel_eas_export").addEventListener("click", () => {
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+});
+document.getElementById("cancel_eas_delete").addEventListener("click", () => {
   navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
 });
 

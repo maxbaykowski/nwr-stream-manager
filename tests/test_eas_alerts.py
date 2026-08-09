@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+import zipfile
 from pathlib import Path
 
 
@@ -228,6 +229,125 @@ class EasAlertTests(unittest.TestCase):
             response = service.eas_alerts("stream-1", page=1, per_page=10)
 
             self.assertEqual([alert["event_name"] for alert in response["alerts"]], ["Practice/Demo Warning", "Severe Thunderstorm Warning"])
+
+    def test_export_zip_contains_audio_and_sanitized_index_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            streams_dir = state_dir / "streams"
+            alert_dir = streams_dir / "WXN99" / "alerts"
+            alert_dir.mkdir(parents=True)
+            audio_path = alert_dir / "alert-one.mp3"
+            audio_path.write_bytes(b"audio")
+            stream = {"id": "stream-1", "station": {"callsign": "WXN99"}, "eas_recording": {"enabled": True}}
+            alert = {
+                "raw_same_header": "export",
+                "event_type": "SVR",
+                "fips_codes": ["026139"],
+                "start_time_utc": "2026-08-09T19:07:00Z",
+                "expires_at_utc": "2026-08-09T19:37:00Z",
+                "file_path": str(audio_path),
+            }
+            (alert_dir / "index.json").write_text(json.dumps({"version": 1, "alerts": [alert]}), encoding="utf-8")
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+
+            zip_path, download_name = service.eas_alert_export_zip("stream-1", "all")
+            try:
+                self.assertEqual(download_name, "WXN99-eas-alerts.zip")
+                with zipfile.ZipFile(zip_path) as archive:
+                    self.assertIn("alert-one.mp3", archive.namelist())
+                    exported_index = json.loads(archive.read("index.json").decode("utf-8"))
+                self.assertEqual(exported_index["alerts"][0]["file_path"], "alert-one.mp3")
+            finally:
+                zip_path.unlink(missing_ok=True)
+
+    def test_manual_range_with_no_alerts_returns_zero_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            streams_dir = state_dir / "streams"
+            alert_dir = streams_dir / "WXN99" / "alerts"
+            alert_dir.mkdir(parents=True)
+            stream = {"id": "stream-1", "station": {"callsign": "WXN99"}}
+            alert = {
+                "raw_same_header": "outside-range",
+                "event_type": "SVR",
+                "fips_codes": ["026139"],
+                "start_time_utc": "2026-08-09T19:07:00Z",
+                "expires_at_utc": "2026-08-09T19:37:00Z",
+                "file_path": str(alert_dir / "alert.mp3"),
+            }
+            (alert_dir / "index.json").write_text(json.dumps({"version": 1, "alerts": [alert]}), encoding="utf-8")
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+
+            response = service.eas_alert_range_count(
+                "stream-1",
+                "manual",
+                "2026-08-08T00:00:00",
+                "2026-08-08T23:59:00",
+            )
+
+            self.assertEqual(response["count"], 0)
+
+    def test_future_manual_range_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.web_control.alert_range_bounds_from_request(
+                "manual",
+                "2999-01-01T00:00:00",
+                "2999-01-01T01:00:00",
+            )
+
+    def test_delete_range_removes_audio_and_matching_index_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            streams_dir = state_dir / "streams"
+            alert_dir = streams_dir / "WXN99" / "alerts"
+            alert_dir.mkdir(parents=True)
+            old_audio = alert_dir / "old.mp3"
+            keep_audio = alert_dir / "keep.mp3"
+            old_audio.write_bytes(b"old")
+            keep_audio.write_bytes(b"keep")
+            stream = {"id": "stream-1", "station": {"callsign": "WXN99"}}
+            alerts = [
+                {
+                    "raw_same_header": "delete",
+                    "event_type": "SVR",
+                    "fips_codes": ["026139"],
+                    "start_time_utc": "2026-08-01T19:07:00Z",
+                    "expires_at_utc": "2026-08-01T19:37:00Z",
+                    "file_path": str(old_audio),
+                },
+                {
+                    "raw_same_header": "keep",
+                    "event_type": "SVR",
+                    "fips_codes": ["026139"],
+                    "start_time_utc": "2026-08-09T19:07:00Z",
+                    "expires_at_utc": "2026-08-09T19:37:00Z",
+                    "file_path": str(keep_audio),
+                },
+            ]
+            (alert_dir / "index.json").write_text(json.dumps({"version": 1, "alerts": alerts}), encoding="utf-8")
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+
+            response = service.remove_eas_alert_range(
+                "stream-1",
+                "manual",
+                "2026-08-01T00:00:00",
+                "2026-08-01T23:59:00",
+            )
+
+            self.assertEqual(response["count"], 1)
+            self.assertFalse(old_audio.exists())
+            self.assertTrue(keep_audio.exists())
+            rewritten = json.loads((alert_dir / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual([alert["raw_same_header"] for alert in rewritten["alerts"]], ["keep"])
 
 
 if __name__ == "__main__":
