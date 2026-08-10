@@ -10,6 +10,8 @@ import unittest
 import zipfile
 from pathlib import Path
 
+import numpy as np
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_PATH = REPO_ROOT / "src" / "nwr-stream-manager"
@@ -444,6 +446,7 @@ class EasAlertTests(unittest.TestCase):
         processor = self.web_control.AudioEffectsProcessor(config.AudioConfig())
         comfort_noise = processor.comfort_noise
         deemphasis = processor.deemphasis
+        deemphasis_makeup = processor.deemphasis_makeup
         highpass = processor.highpass
         lowpass = processor.lowpass
         notch = processor.notch
@@ -455,6 +458,7 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(changed, ("volume",))
         self.assertIs(processor.comfort_noise, comfort_noise)
         self.assertIs(processor.deemphasis, deemphasis)
+        self.assertIs(processor.deemphasis_makeup, deemphasis_makeup)
         self.assertIs(processor.highpass, highpass)
         self.assertIs(processor.lowpass, lowpass)
         self.assertIs(processor.notch, notch)
@@ -471,6 +475,7 @@ class EasAlertTests(unittest.TestCase):
         notch = processor.notch
         comfort_noise = processor.comfort_noise
         deemphasis = processor.deemphasis
+        deemphasis_makeup = processor.deemphasis_makeup
 
         changed = processor.update_config(config.AudioConfig(
             highpass=config.FilterConfig(enabled=True, frequency=350, sharpness=1),
@@ -484,6 +489,29 @@ class EasAlertTests(unittest.TestCase):
         self.assertIs(processor.notch, notch)
         self.assertIs(processor.comfort_noise, comfort_noise)
         self.assertIs(processor.deemphasis, deemphasis)
+        self.assertIs(processor.deemphasis_makeup, deemphasis_makeup)
+
+    def test_deemphasis_makeup_gain_increases_with_time_constant(self) -> None:
+        self.assertLess(
+            self.web_control.deemphasis_makeup_gain(0),
+            self.web_control.deemphasis_makeup_gain(500),
+        )
+
+    def test_deemphasis_makeup_uses_fixed_gain_without_auto_normalizing(self) -> None:
+        config = self.config
+        processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
+            deemphasis=config.DeemphasisConfig(enabled=False, tau=0),
+            volume=config.VolumeConfig(enabled=False, multiplier=1.0),
+        ))
+        times = np.arange(2048, dtype=np.float32) / config.IQ_SAMPLE_RATE
+        samples = (0.1 * np.sin(2 * np.pi * 1000.0 * times)).astype(np.float32)
+
+        output = processor.process(samples)
+        second_output = processor.process(samples)
+
+        self.assertLess(float(np.max(np.abs(second_output - output))), 0.01)
+        self.assertGreater(float(np.max(np.abs(output))), 0.07)
+        self.assertLess(float(np.max(np.abs(output))), 0.13)
 
 
 if __name__ == "__main__":

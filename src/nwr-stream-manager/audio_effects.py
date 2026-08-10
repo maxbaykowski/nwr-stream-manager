@@ -13,6 +13,8 @@ MIN_FILTER_TAPS = 5
 MIN_HIGHPASS_FILTER_TAPS = 513
 MAX_FILTER_TAPS = 1025
 DC_BLOCK_CUTOFF_HZ = 20.0
+BASE_DEEMPHASIS_MAKEUP_GAIN = 1.0
+MAX_DEEMPHASIS_MAKEUP_GAIN = 2.2
 
 
 @dataclass
@@ -78,6 +80,16 @@ class DcBlocker:
 
 
 @dataclass
+class DeemphasisMakeupGain:
+    tau: float
+
+    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
+        if len(samples) == 0:
+            return samples
+        return (samples * deemphasis_makeup_gain(self.tau)).astype(np.float32, copy=False)
+
+
+@dataclass
 class AudioEffectsProcessor:
     config: AudioConfig
     sample_rate: int = IQ_SAMPLE_RATE
@@ -88,6 +100,7 @@ class AudioEffectsProcessor:
             self.sample_rate,
             self.config.deemphasis_tau,
         )
+        self.deemphasis_makeup = DeemphasisMakeupGain(self.config.deemphasis_tau)
         self.dc_blocker = DcBlocker(self.sample_rate)
         self.highpass = _build_filter("highpass", self.config.highpass, self.sample_rate)
         self.lowpass = _build_filter("lowpass", self.config.lowpass, self.sample_rate)
@@ -103,6 +116,7 @@ class AudioEffectsProcessor:
             audio = self.lowpass.process(audio)
         if self.notch is not None:
             audio = self.notch.process(audio)
+        audio = self.deemphasis_makeup.process(audio)
         if self.config.volume.enabled:
             audio = audio * self.config.volume.multiplier
         return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
@@ -118,6 +132,7 @@ class AudioEffectsProcessor:
 
         if config.deemphasis != self.config.deemphasis:
             self.deemphasis = DeemphasisFilter(self.sample_rate, config.deemphasis_tau)
+            self.deemphasis_makeup.tau = config.deemphasis_tau
             changed.append("deemphasis")
 
         if config.highpass != self.config.highpass:
@@ -153,6 +168,13 @@ def tap_count_for_sharpness(sharpness: float) -> int:
 
 def comfort_noise_linear_level(level_db: float) -> float:
     return float(10 ** (level_db / 20.0))
+
+
+def deemphasis_makeup_gain(tau: float) -> float:
+    normalized = max(0.0, min(1.0, tau / 530.0))
+    return BASE_DEEMPHASIS_MAKEUP_GAIN + (
+        MAX_DEEMPHASIS_MAKEUP_GAIN - BASE_DEEMPHASIS_MAKEUP_GAIN
+    ) * normalized**0.85
 
 
 def highpass_tap_count_for_sharpness(sharpness: float) -> int:

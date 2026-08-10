@@ -25,7 +25,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 if __package__:
-    from .audio_effects import AudioEffectsProcessor
+    from .audio_effects import AudioEffectsProcessor, deemphasis_makeup_gain
     from .config import (
         AUDIO_NYQUIST_HZ,
         AudioConfig,
@@ -76,6 +76,7 @@ else:
     rtl = importlib.import_module(f"{package_name}.rtl")
     same_data = importlib.import_module(f"{package_name}.same_data")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
+    deemphasis_makeup_gain = audio_effects.deemphasis_makeup_gain
     AUDIO_NYQUIST_HZ = config_module.AUDIO_NYQUIST_HZ
     AudioConfig = config_module.AudioConfig
     EasRecordingConfig = config_module.EasRecordingConfig
