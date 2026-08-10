@@ -386,6 +386,15 @@ class EasAlertTests(unittest.TestCase):
                 "notch": {"enabled": True, "frequency": 1500, "sharpness": 5},
             })
 
+    def test_audio_config_defaults_are_stream_creation_defaults(self) -> None:
+        audio = self.config.AudioConfig()
+
+        self.assertTrue(audio.deemphasis.enabled)
+        self.assertEqual(audio.deemphasis.tau, 300.0)
+        self.assertTrue(audio.lowpass.enabled)
+        self.assertEqual(audio.lowpass.frequency, 3400.0)
+        self.assertEqual(audio.lowpass.sharpness, 2.0)
+
     def test_audio_effects_update_does_not_stop_active_workers(self) -> None:
         class Worker:
             stopped = False
@@ -502,6 +511,7 @@ class EasAlertTests(unittest.TestCase):
         processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
             deemphasis=config.DeemphasisConfig(enabled=False, tau=0),
             volume=config.VolumeConfig(enabled=False, multiplier=1.0),
+            lowpass=config.FilterConfig(enabled=False, frequency=3400, sharpness=0),
         ))
         times = np.arange(2048, dtype=np.float32) / config.IQ_SAMPLE_RATE
         samples = (0.1 * np.sin(2 * np.pi * 1000.0 * times)).astype(np.float32)

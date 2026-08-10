@@ -113,7 +113,7 @@ class IcecastConfig:
 @dataclass(frozen=True)
 class DeemphasisConfig:
     enabled: bool = True
-    tau: float = 530.0
+    tau: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -141,7 +141,9 @@ class AudioConfig:
     comfort_noise: ComfortNoiseConfig = field(default_factory=ComfortNoiseConfig)
     volume: VolumeConfig = field(default_factory=VolumeConfig)
     highpass: FilterConfig = field(default_factory=FilterConfig)
-    lowpass: FilterConfig = field(default_factory=FilterConfig)
+    lowpass: FilterConfig = field(
+        default_factory=lambda: FilterConfig(enabled=True, frequency=3400.0, sharpness=2.0)
+    )
     notch: FilterConfig = field(default_factory=FilterConfig)
 
     @property

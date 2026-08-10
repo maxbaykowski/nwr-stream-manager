@@ -984,6 +984,7 @@ class RtlControlService:
                     "auth_signature": icecast_auth_signature(icecast),
                 }
             ],
+            "audio": asdict(AudioConfig()),
             "created_at": time.time(),
             "updated_at": time.time(),
         }
@@ -3677,9 +3678,9 @@ function defaultAudioEffectsSettings() {
   return {
     volume: {enabled: false, multiplier: 1.0},
     comfort_noise: {enabled: false, level_db: -40.0},
-    deemphasis: {enabled: true, tau: 530.0},
+    deemphasis: {enabled: true, tau: 300.0},
     highpass: {enabled: false, frequency: 300.0, sharpness: 0.0},
-    lowpass: {enabled: false, frequency: 4000.0, sharpness: 0.0},
+    lowpass: {enabled: true, frequency: 3400.0, sharpness: 2.0},
     notch: {enabled: false, frequency: 3000.0, sharpness: 0.0}
   };
 }
