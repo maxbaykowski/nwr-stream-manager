@@ -326,20 +326,17 @@ class IcecastStreamWorker:
         self,
         *,
         stream: dict[str, Any],
-        output: dict[str, Any],
         fanout: RawRtlFanout,
         fallback_settings_provider,
     ) -> None:
         self.stream = stream
-        self.output = output
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
         self.queue = fanout.subscribe(max_chunks=64)
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run, name=f"icecast-stream-{stream['id']}", daemon=True)
-        self.status = "disabled"
-        self.error: str | None = None
-        self.started_at: float | None = None
+        self.thread = threading.Thread(target=self._run_pcm_producer, name=f"icecast-stream-{stream['id']}", daemon=True)
+        self.outputs: dict[str, IcecastOutputWriter] = {}
+        self.encoder_groups: dict[tuple[str, int, int], IcecastEncoderGroup] = {}
         self.last_audio_at: float | None = None
         self.lock = threading.Lock()
 
@@ -348,75 +345,46 @@ class IcecastStreamWorker:
         return str(self.stream["id"])
 
     def start(self) -> None:
+        self.sync_stream(self.stream)
         self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
         self.fanout.unsubscribe(self.queue)
+        for output in list(self.outputs.values()):
+            output.stop()
+        self.outputs = {}
+        for encoder_group in list(self.encoder_groups.values()):
+            encoder_group.stop()
+        self.encoder_groups = {}
         if self.thread.ident is not None:
             self.thread.join(timeout=2.0)
-        with self.lock:
-            self.status = "disabled"
 
-    def snapshot(self) -> dict[str, Any]:
-        with self.lock:
-            status = self.status
-            error = self.error
-            started_at = self.started_at
-            last_audio_at = self.last_audio_at
-        return {
-            "id": self.id,
-            "station": self.stream["station"],
-            "outputs": [self.output],
-            "status": status,
-            "error": error,
-            "started_at": started_at,
-            "last_audio_at": last_audio_at,
+    def sync_stream(self, stream: dict[str, Any]) -> None:
+        self.stream = stream
+        desired = {
+            str(output.get("id", "")): output
+            for output in stream_outputs(stream)
+            if output.get("enabled", True)
         }
+        for output_id in list(self.outputs):
+            writer = self.outputs[output_id]
+            output = desired.get(output_id)
+            if output is None or writer.signature != icecast_output_signature(output):
+                self.outputs.pop(output_id).stop()
+        for output_id, output in desired.items():
+            if output_id in self.outputs:
+                continue
+            writer = IcecastOutputWriter(self, output)
+            self.outputs[output_id] = writer
+            writer.start()
 
-    def _set_status(self, status: str, error: str | None = None) -> None:
-        with self.lock:
-            self.status = status
-            self.error = error
-            if status == "enabled" and self.started_at is None:
-                self.started_at = time.time()
+    def snapshots(self) -> list[dict[str, Any]]:
+        return [output.snapshot() for output in list(self.outputs.values())]
 
-    def _run(self) -> None:
+    def _run_pcm_producer(self) -> None:
         station = self.stream["station"]
-        while not self.stop_event.is_set():
-            sink = None
-            source = None
-            encoder = None
-            try:
-                config = icecast_config_from_output(self.output)
-                source = IcecastSource(config, config.content_type)
-                sink = source.connect()
-                encoder = create_audio_encoder(config)
-                self._set_status("enabled")
-                self._produce_encoded_audio(sink, encoder, float(station["frequency"]) * 1_000_000)
-            except Exception as exc:
-                if self.stop_event.is_set():
-                    break
-                self._set_status("needs-attention", friendly_stream_error(exc))
-                LOG.warning("Icecast stream worker failed for %s: %s", station.get("callsign"), exc)
-                self.stop_event.wait(STREAM_RECONNECT_SECONDS)
-            finally:
-                if encoder is not None:
-                    try:
-                        encoder.close()
-                    except Exception:
-                        pass
-                if sink is not None:
-                    try:
-                        sink.close()
-                    except Exception:
-                        pass
-                if source is not None:
-                    source.close()
-        self._set_status("disabled")
-
-    def _produce_encoded_audio(self, sink, encoder, target_frequency_hz: float) -> None:
-        station = self.stream["station"]
+        target_frequency_hz = float(station["frequency"]) * 1_000_000
         dc_blocker = IqDcBlocker()
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int, int] | None = None
@@ -424,14 +392,19 @@ class IcecastStreamWorker:
         audio_config = audio_config_from_stream(self.stream)
         effects = AudioEffectsProcessor(audio_config)
         pending = np.array([], dtype=np.float32)
-        header = getattr(encoder, "header", b"")
-        if header:
-            sink.write(header)
         fallback = load_web_fallback_audio()
         fallback_state = WebFallbackPlaybackState()
         last_real_audio = time.monotonic()
         idle_output_active = False
         while not self.stop_event.is_set():
+            if not self._has_connected_outputs():
+                try:
+                    self.queue.get(timeout=0.5)
+                except queue.Empty:
+                    pass
+                fallback_state.reset()
+                pending = np.array([], dtype=np.float32)
+                continue
             try:
                 batch: RtlSampleBatch = self.queue.get(
                     timeout=STREAM_FRAME_SECONDS if idle_output_active else STREAM_IDLE_DETECTION_SECONDS
@@ -445,16 +418,12 @@ class IcecastStreamWorker:
                     continue
                 if not fallback_state.active and idle_seconds < fallback_settings.silence_timeout_seconds:
                     fallback_state.reset()
-                    encoded = encoder.encode(STREAM_SILENCE_FRAME)
-                    if encoded:
-                        sink.write(encoded)
+                    self._write_pcm(STREAM_SILENCE_FRAME)
                     continue
                 if not fallback_state.active:
                     fallback_state.active = True
                     LOG.info("starting fallback audio for %s after %.1f seconds without IQ", station.get("callsign"), idle_seconds)
-                encoded = encoder.encode(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds))
-                if encoded:
-                    sink.write(encoded)
+                self._write_pcm(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds))
                 continue
             idle_output_active = False
             next_channelizer_key = (
@@ -495,9 +464,195 @@ class IcecastStreamWorker:
                         ", ".join(changed_effects) or "none",
                     )
                 pcm = float_to_s16(effects.process(frame))
-                encoded = encoder.encode(pcm)
+                self._write_pcm(pcm)
+
+    def encoder_group_for(self, config: IcecastConfig) -> "IcecastEncoderGroup":
+        key = icecast_encoder_key(config)
+        with self.lock:
+            encoder_group = self.encoder_groups.get(key)
+            if encoder_group is not None:
+                return encoder_group
+            encoder_group = IcecastEncoderGroup(key, config)
+            self.encoder_groups[key] = encoder_group
+            encoder_group.start()
+            LOG.info(
+                "created shared Icecast encoder group %s for %s",
+                key,
+                self.stream.get("station", {}).get("callsign", "unknown"),
+            )
+            return encoder_group
+
+    def _write_pcm(self, pcm: bytes) -> None:
+        for encoder_group in list(self.encoder_groups.values()):
+            if encoder_group.has_outputs():
+                queue_latest(encoder_group.pcm_queue, pcm)
+
+    def _has_connected_outputs(self) -> bool:
+        return any(encoder_group.has_outputs() for encoder_group in list(self.encoder_groups.values()))
+
+    def _stop_unused_encoder_groups(self) -> None:
+        for key, encoder_group in list(self.encoder_groups.items()):
+            if encoder_group.has_outputs():
+                continue
+            self.encoder_groups.pop(key, None)
+            encoder_group.stop()
+
+
+class IcecastEncoderGroup:
+    def __init__(self, key: tuple[str, int, int], config: IcecastConfig) -> None:
+        self.key = key
+        self.config = config
+        self.encoder = create_audio_encoder(config)
+        self.pcm_queue: queue.Queue[bytes] = queue.Queue(maxsize=64)
+        self.outputs: list[IcecastOutputWriter] = []
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.error: Exception | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"icecast-encoder-{config.format}-{config.sample_rate}-{config.bitrate}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=2.0)
+        self.encoder.close()
+
+    def add_output(self, output: "IcecastOutputWriter") -> None:
+        with self.lock:
+            self.outputs.append(output)
+
+    def remove_output(self, output: "IcecastOutputWriter") -> None:
+        with self.lock:
+            if output in self.outputs:
+                self.outputs.remove(output)
+
+    def has_outputs(self) -> bool:
+        with self.lock:
+            return bool(self.outputs)
+
+    def header(self) -> bytes:
+        return bytes(getattr(self.encoder, "header", b""))
+
+    def _run(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    pcm = self.pcm_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                encoded = self.encoder.encode(pcm)
                 if encoded:
-                    sink.write(encoded)
+                    self._broadcast(encoded)
+            encoded = self.encoder.flush()
+            if encoded:
+                self._broadcast(encoded)
+        except Exception as exc:
+            self.error = exc
+            LOG.warning("shared Icecast encoder %s failed: %s", self.key, exc)
+
+    def _broadcast(self, encoded: bytes) -> None:
+        with self.lock:
+            outputs = list(self.outputs)
+        for output in outputs:
+            queue_latest(output.encoded_queue, encoded)
+
+
+class IcecastOutputWriter:
+    def __init__(self, runtime: IcecastStreamWorker, output: dict[str, Any]) -> None:
+        self.runtime = runtime
+        self.output = output
+        self.signature = icecast_output_signature(output)
+        self.encoded_queue: queue.Queue[bytes] = queue.Queue(maxsize=64)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"icecast-writer-{runtime.id}-{output.get('id', '')}",
+            daemon=True,
+        )
+        self.status = "disabled"
+        self.error: str | None = None
+        self.started_at: float | None = None
+        self.lock = threading.Lock()
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=2.0)
+        self._set_status("disabled")
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            status = self.status
+            error = self.error
+            started_at = self.started_at
+        with self.runtime.lock:
+            last_audio_at = self.runtime.last_audio_at
+        return {
+            "id": self.runtime.id,
+            "station": self.runtime.stream["station"],
+            "outputs": [self.output],
+            "status": status,
+            "error": error,
+            "started_at": started_at,
+            "last_audio_at": last_audio_at,
+        }
+
+    def _set_status(self, status: str, error: str | None = None) -> None:
+        with self.lock:
+            self.status = status
+            self.error = error
+            if status == "enabled" and self.started_at is None:
+                self.started_at = time.time()
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            source = None
+            sink = None
+            encoder_group = None
+            try:
+                config = icecast_config_from_output(self.output)
+                source = IcecastSource(config, config.content_type)
+                sink = source.connect()
+                encoder_group = self.runtime.encoder_group_for(config)
+                header = encoder_group.header()
+                if header:
+                    sink.write(header)
+                encoder_group.add_output(self)
+                self._set_status("enabled")
+                while not self.stop_event.is_set():
+                    try:
+                        encoded = self.encoded_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    if encoded:
+                        sink.write(encoded)
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    break
+                self._set_status("needs-attention", friendly_stream_error(exc))
+                LOG.warning("Icecast output failed for %s: %s", self.output.get("id"), exc)
+                self.stop_event.wait(STREAM_RECONNECT_SECONDS)
+            finally:
+                if encoder_group is not None:
+                    encoder_group.remove_output(self)
+                    self.runtime._stop_unused_encoder_groups()
+                if sink is not None:
+                    try:
+                        sink.close()
+                    except Exception:
+                        pass
+                if source is not None:
+                    source.close()
+        self._set_status("disabled")
 
 
 class EasStreamWorker:
@@ -1136,10 +1291,6 @@ class RtlControlService:
             output["icecast"] = icecast
             stream["updated_at"] = time.time()
             save_streams(self.streams_directory, self.streams)
-            key = stream_worker_key(stream, output)
-            worker = self.stream_workers.pop(key, None)
-            if worker is not None:
-                worker.stop()
             self._sync_stream_workers_locked()
         return {
             "success": True,
@@ -1194,10 +1345,6 @@ class RtlControlService:
             if len(stream["outputs"]) == before:
                 raise ValueError("stream output was not found")
             stream["updated_at"] = time.time()
-            key = f"{stream_id}:{output_id}"
-            worker = self.stream_workers.pop(key, None)
-            if worker is not None:
-                worker.stop()
             save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         LOG.info("removed stream output %s from stream %s", output_id, stream_id)
@@ -1415,17 +1562,14 @@ class RtlControlService:
 
     def _sync_stream_workers_locked(self) -> None:
         fanout = self.raw_fanout
-        desired: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        desired: dict[str, dict[str, Any]] = {}
         desired_eas: dict[str, tuple[dict[str, Any], EasRecordingConfig]] = {}
         if fanout is not None:
             for stream in self.streams:
                 if not stream.get("enabled", True):
                     continue
-                for output in stream_outputs(stream):
-                    if not output.get("enabled", True):
-                        continue
-                    key = stream_worker_key(stream, output)
-                    desired[key] = (stream, output)
+                if any(output.get("enabled", True) for output in stream_outputs(stream)):
+                    desired[stream_worker_key(stream)] = stream
                 eas_settings = eas_recording_settings_from_stream(stream)
                 if eas_settings.enabled:
                     desired_eas[str(stream.get("id", ""))] = (
@@ -1447,21 +1591,21 @@ class RtlControlService:
         if fanout is None:
             return
 
-        for key, (stream, output) in desired.items():
-            if key in self.stream_workers:
+        for key, stream in desired.items():
+            worker = self.stream_workers.get(key)
+            if worker is not None:
+                worker.sync_stream(stream)
                 continue
             worker = IcecastStreamWorker(
                 stream=stream,
-                output=output,
                 fanout=fanout,
                 fallback_settings_provider=self.fallback_settings_snapshot,
             )
             self.stream_workers[key] = worker
             worker.start()
             LOG.info(
-                "started stream worker for %s output %s",
+                "started stream worker for %s",
                 stream.get("station", {}).get("callsign", "unknown"),
-                output.get("id"),
             )
         for key, (stream, config) in desired_eas.items():
             if key in self.eas_workers:
@@ -1489,7 +1633,13 @@ class RtlControlService:
         self.eas_workers = {}
 
     def _active_streams_locked(self) -> list[dict[str, Any]]:
-        return [worker.snapshot() for worker in self.stream_workers.values()]
+        snapshots: list[dict[str, Any]] = []
+        for worker in self.stream_workers.values():
+            if hasattr(worker, "snapshots"):
+                snapshots.extend(worker.snapshots())
+            else:
+                snapshots.append(worker.snapshot())
+        return snapshots
 
     def _active_eas_recorders_locked(self) -> list[dict[str, Any]]:
         return [worker.snapshot() for worker in self.eas_workers.values()]
@@ -2425,8 +2575,46 @@ def enabled_output_count(
     return count
 
 
-def stream_worker_key(stream: dict[str, Any], output: dict[str, Any]) -> str:
-    return f"{stream.get('id')}:{output.get('id')}"
+def stream_worker_key(stream: dict[str, Any]) -> str:
+    return str(stream.get("id", ""))
+
+
+def icecast_encoder_key(config: IcecastConfig) -> tuple[str, int, int]:
+    return config.format, config.sample_rate, config.bitrate
+
+
+def icecast_output_signature(output: dict[str, Any]) -> str:
+    icecast = output.get("icecast", {})
+    return json.dumps(
+        {
+            "id": output.get("id"),
+            "enabled": output.get("enabled", True),
+            "host": icecast.get("host"),
+            "port": icecast.get("port"),
+            "mount": icecast.get("mount"),
+            "username": icecast.get("username"),
+            "password": icecast.get("password"),
+            "format": icecast.get("format"),
+            "sample_rate": icecast.get("sample_rate", DEFAULT_STREAM_SAMPLE_RATE),
+            "bitrate": icecast.get("bitrate", DEFAULT_STREAM_BITRATES.get(icecast.get("format", "mp3"), 64)),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def queue_latest(target: queue.Queue, item: Any) -> None:
+    try:
+        target.put_nowait(item)
+    except queue.Full:
+        try:
+            target.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            target.put_nowait(item)
+        except queue.Full:
+            pass
 
 
 def icecast_auth_signature(icecast: dict[str, Any]) -> dict[str, Any]:
@@ -2614,7 +2802,8 @@ legend { font-weight: 700; padding: 0 6px; }
 button { cursor: pointer; }
 button:disabled { cursor: default; opacity: 0.65; }
 nav { display: flex; flex-wrap: wrap; gap: 8px; }
-nav button[aria-current="page"] { border-color: #2557a7; box-shadow: inset 0 -2px 0 #2557a7; }
+nav a { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; text-decoration: none; }
+nav a[aria-current="page"] { border-color: #2557a7; box-shadow: inset 0 -2px 0 #2557a7; }
 .view[hidden] { display: none; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
 .row { display: flex; align-items: center; gap: 10px; }
@@ -2683,10 +2872,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div class="topbar">
     <h1>NWR Stream Manager</h1>
     <nav aria-label="Main">
-      <button id="nav_dashboard" type="button" data-view="dashboard" aria-current="page">Dashboard</button>
-      <button id="nav_rtl" type="button" data-view="rtl">Configure RTL-SDR</button>
-      <button id="nav_streams" type="button" data-view="streams">Manage Streams</button>
-      <button id="nav_eas_alerts" type="button" data-view="eas_alerts" hidden>EAS alerts</button>
+      <a id="nav_dashboard" href="/" data-view="dashboard" aria-current="page">Dashboard</a>
+      <a id="nav_rtl" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
+      <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
+      <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" hidden>EAS alerts</a>
     </nav>
   </div>
 </header>
@@ -4839,15 +5028,15 @@ function showView(name) {
   for (const view of document.querySelectorAll(".view")) {
     view.hidden = view.id !== `view_${name}`;
   }
-  for (const button of document.querySelectorAll("nav button[data-view]")) {
+  for (const item of document.querySelectorAll("nav [data-view]")) {
     if (
-      button.dataset.view === name ||
-      (button.dataset.view === "streams" && name === "stream_settings") ||
-      (button.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name))
+      item.dataset.view === name ||
+      (item.dataset.view === "streams" && name === "stream_settings") ||
+      (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name))
     ) {
-      button.setAttribute("aria-current", "page");
+      item.setAttribute("aria-current", "page");
     } else {
-      button.removeAttribute("aria-current");
+      item.removeAttribute("aria-current");
     }
   }
 }
@@ -5241,8 +5430,21 @@ document.addEventListener("blur", event => {
   commitAudioFrequencyElement(event.target, true);
 }, true);
 
-for (const button of document.querySelectorAll("nav button[data-view]")) {
-  button.addEventListener("click", () => navigateTo(button.dataset.view));
+for (const link of document.querySelectorAll("nav a[data-view]")) {
+  link.addEventListener("click", event => {
+    if (
+      event.defaultPrevented ||
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    ) {
+      return;
+    }
+    event.preventDefault();
+    navigateTo(link.dataset.view);
+  });
 }
 
 document.getElementById("tab_outputs").addEventListener("click", () => showSettingsTab("outputs"));

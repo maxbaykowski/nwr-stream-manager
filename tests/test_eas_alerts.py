@@ -523,6 +523,139 @@ class EasAlertTests(unittest.TestCase):
         self.assertGreater(float(np.max(np.abs(output))), 0.07)
         self.assertLess(float(np.max(np.abs(output))), 0.13)
 
+    def test_icecast_outputs_with_same_encoding_share_encoder_group(self) -> None:
+        web_control = self.web_control
+
+        class Fanout:
+            def subscribe(self, max_chunks=64):
+                return web_control.queue.Queue(maxsize=max_chunks)
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        class Encoder:
+            header = b"header"
+
+            def encode(self, pcm):
+                return pcm
+
+            def flush(self):
+                return b""
+
+            def close(self):
+                pass
+
+        created = []
+        original_create_audio_encoder = self.web_control.create_audio_encoder
+        self.web_control.create_audio_encoder = lambda icecast: created.append(icecast) or Encoder()
+        try:
+            icecast_a = self.config.IcecastConfig(
+                host="example.com",
+                port=8000,
+                mount="/a",
+                username="source",
+                password="password",
+                format="mp3",
+                sample_rate=22050,
+                bitrate=32,
+            )
+            icecast_b = self.config.IcecastConfig(
+                host="example.net",
+                port=9000,
+                mount="/b",
+                username="source",
+                password="password",
+                format="mp3",
+                sample_rate=22050,
+                bitrate=32,
+            )
+            worker = self.web_control.IcecastStreamWorker(
+                stream={"id": "stream-1", "station": {"callsign": "WXN99", "frequency": "162.475"}, "outputs": []},
+                fanout=Fanout(),
+                fallback_settings_provider=lambda: None,
+            )
+            first = worker.encoder_group_for(icecast_a)
+            second = worker.encoder_group_for(icecast_b)
+            self.assertIs(first, second)
+            self.assertEqual(len(created), 1)
+            worker.stop()
+        finally:
+            self.web_control.create_audio_encoder = original_create_audio_encoder
+
+    def test_stream_sync_stops_only_changed_icecast_output(self) -> None:
+        web_control = self.web_control
+
+        class Fanout:
+            def subscribe(self, max_chunks=64):
+                return web_control.queue.Queue(maxsize=max_chunks)
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        class Writer:
+            instances = []
+
+            def __init__(self, runtime, output):
+                self.output = output
+                self.signature = web_control.icecast_output_signature(output)
+                self.started = False
+                self.stopped = False
+                Writer.instances.append(self)
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                self.stopped = True
+
+            def snapshot(self):
+                return {}
+
+        def output(output_id, mount, bitrate=32):
+            return {
+                "id": output_id,
+                "enabled": True,
+                "type": "icecast",
+                "icecast": {
+                    "host": "example.com",
+                    "port": 8000,
+                    "username": "source",
+                    "password": "password",
+                    "mount": mount,
+                    "format": "mp3",
+                    "sample_rate": 22050,
+                    "bitrate": bitrate,
+                },
+            }
+
+        original_writer = web_control.IcecastOutputWriter
+        web_control.IcecastOutputWriter = Writer
+        try:
+            stream = {
+                "id": "stream-1",
+                "station": {"callsign": "WXN99", "frequency": "162.475"},
+                "outputs": [output("one", "/one"), output("two", "/two")],
+            }
+            worker = web_control.IcecastStreamWorker(
+                stream=stream,
+                fanout=Fanout(),
+                fallback_settings_provider=lambda: None,
+            )
+            worker.sync_stream(stream)
+            first_writer, second_writer = Writer.instances
+
+            updated_stream = {
+                **stream,
+                "outputs": [output("one", "/one"), output("two", "/two", bitrate=40)],
+            }
+            worker.sync_stream(updated_stream)
+
+            self.assertFalse(first_writer.stopped)
+            self.assertTrue(second_writer.stopped)
+            self.assertEqual(len(Writer.instances), 3)
+        finally:
+            web_control.IcecastOutputWriter = original_writer
+
 
 if __name__ == "__main__":
     unittest.main()
