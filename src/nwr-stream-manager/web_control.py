@@ -131,6 +131,22 @@ DEFAULT_STREAM_BITRATES = {
     "mp3": 64,
     "ogg": 48,
 }
+STREAM_SERVICE_CUSTOM = "custom"
+STREAM_SERVICE_GWES = "gwes"
+STREAM_SERVICE_WEATHERUSA = "weatherusa"
+STREAM_SERVICE_NWRORG = "nwrorg"
+STREAM_SERVICE_NAMES = {
+    STREAM_SERVICE_CUSTOM: "Custom Icecast server",
+    STREAM_SERVICE_GWES: "GWES Weather Radio",
+    STREAM_SERVICE_WEATHERUSA: "WeatherUSA",
+    STREAM_SERVICE_NWRORG: "NOAA Weather Radio Org",
+}
+STREAM_SERVICE_HOSTS = {
+    "ingest.wxr.gwes-cdn.net": STREAM_SERVICE_GWES,
+    "radio-master.weatherusa.net": STREAM_SERVICE_WEATHERUSA,
+    "wxradio.org": STREAM_SERVICE_NWRORG,
+}
+STREAM_SAMPLE_RATES = {8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000}
 STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
@@ -1314,7 +1330,7 @@ class RtlControlService:
         with self.lock:
             stream = self._stream_locked(stream_id)
             self._reject_duplicate_icecast_locked(icecast)
-            stream_outputs(stream).append(
+            mutable_stream_outputs(stream).append(
                 {
                     "id": uuid.uuid4().hex,
                     "enabled": True,
@@ -2556,6 +2572,18 @@ def stream_outputs(stream: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def mutable_stream_outputs(stream: dict[str, Any]) -> list[dict[str, Any]]:
+    outputs = stream.get("outputs")
+    if isinstance(outputs, list):
+        return outputs
+    stream_outputs(stream)
+    outputs = stream.get("outputs")
+    if isinstance(outputs, list):
+        return outputs
+    stream["outputs"] = []
+    return stream["outputs"]
+
+
 def enabled_output_count(
     stream: dict[str, Any],
     *,
@@ -2666,9 +2694,18 @@ def friendly_stream_error(exc: Exception) -> str:
 def validate_icecast_payload(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("icecast settings are required")
+    service = str(raw.get("service", "")).strip().lower()
+    if not service:
+        service = STREAM_SERVICE_HOSTS.get(str(raw.get("host", "")).strip().lower(), STREAM_SERVICE_CUSTOM)
+    if service not in STREAM_SERVICE_NAMES:
+        raise ValueError("Streaming service is not supported")
     host = str(raw.get("host", "")).strip()
     if not host:
         raise ValueError("Icecast host is required")
+    normalized_host = host.lower()
+    suggested_service = STREAM_SERVICE_HOSTS.get(normalized_host)
+    if service == STREAM_SERVICE_CUSTOM and suggested_service:
+        raise ValueError(f"Please select {STREAM_SERVICE_NAMES[suggested_service]} instead of typing its Icecast URL in custom Icecast setup.")
     try:
         port = int(raw.get("port", 8000))
     except (TypeError, ValueError) as exc:
@@ -2691,13 +2728,47 @@ def validate_icecast_payload(raw: Any) -> dict[str, Any]:
     stream_format = str(raw.get("format", "ogg")).strip().lower()
     if stream_format not in {"ogg", "mp3"}:
         raise ValueError("Icecast streaming format must be OGG or MP3")
-    sample_rate = int(raw.get("sample_rate", DEFAULT_STREAM_SAMPLE_RATE))
-    if sample_rate not in {8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000}:
+    try:
+        sample_rate = int(raw.get("sample_rate", DEFAULT_STREAM_SAMPLE_RATE))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Icecast sample rate must be a number") from exc
+    if sample_rate not in STREAM_SAMPLE_RATES:
         raise ValueError("Icecast sample rate is not supported")
-    bitrate = int(raw.get("bitrate", DEFAULT_STREAM_BITRATES[stream_format]))
+    try:
+        bitrate = int(raw.get("bitrate", DEFAULT_STREAM_BITRATES[stream_format]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Icecast bitrate must be a number") from exc
     if bitrate < 8 or bitrate > 320 or bitrate % 8 != 0:
         raise ValueError("Icecast bitrate must be from 8 through 320 Kbps in 8 Kbps steps")
+    if service == STREAM_SERVICE_GWES:
+        if normalized_host != "ingest.wxr.gwes-cdn.net" or port != 10000:
+            raise ValueError("GWES Weather Radio requires its predefined Icecast server.")
+        if stream_format != "mp3":
+            raise ValueError("GWES Weather Radio requires MP3 streaming.")
+        if bitrate < 64:
+            raise ValueError("GWES Weather Radio requires a bitrate of at least 64 Kbps.")
+    elif service == STREAM_SERVICE_WEATHERUSA:
+        if normalized_host != "radio-master.weatherusa.net" or port != 80:
+            raise ValueError("WeatherUSA requires its predefined Icecast server.")
+        if username != "source":
+            raise ValueError("WeatherUSA requires the predefined Icecast username.")
+        if bitrate < 32 or bitrate > 56:
+            raise ValueError("WeatherUSA bitrate must be from 32 through 56 Kbps.")
+        if sample_rate > 22050:
+            raise ValueError("WeatherUSA sample rate cannot be above 22050 Hz.")
+    elif service == STREAM_SERVICE_NWRORG:
+        if normalized_host != "wxradio.org" or port != 8000:
+            raise ValueError("NOAA Weather Radio Org requires its predefined Icecast server.")
+        if username != "source" or password != "WxRadio2014":
+            raise ValueError("NOAA Weather Radio Org requires its predefined Icecast credentials.")
+        if stream_format != "mp3":
+            raise ValueError("NOAA Weather Radio Org requires MP3 streaming.")
+        if bitrate != 32:
+            raise ValueError("NOAA Weather Radio Org requires a bitrate of 32 Kbps.")
+        if sample_rate != 22050:
+            raise ValueError("NOAA Weather Radio Org requires a sample rate of 22050 Hz.")
     return {
+        "service": service,
         "host": host,
         "port": port,
         "username": username,
@@ -2795,6 +2866,7 @@ h1 { font-size: 22px; margin: 0; }
 h2 { font-size: 20px; margin: 0 0 16px; }
 h3 { font-size: 16px; margin: 18px 0 10px; }
 section { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+[hidden] { display: none !important; }
 label { display: grid; gap: 6px; font-weight: 600; margin-bottom: 14px; }
 select, input, button { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; }
 fieldset { border: 1px solid #d8dde6; border-radius: 6px; margin: 16px 0 0; padding: 14px; }
@@ -2974,35 +3046,54 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <div id="selected_station" class="hint">Select a station to continue.</div>
       </div>
       <div id="wizard_step_credentials" class="wizard-step" hidden>
-        <p>The next step is to enter your icecast credentials for the service you want to stream to. Enter them below, then click next.</p>
+        <p id="icecast_credentials_intro">The next step is to enter your icecast credentials for the service you want to stream to. Enter them below, then click next.</p>
+        <div id="icecast_service_help" class="hint"></div>
         <fieldset id="icecast_fields">
           <legend>Icecast Credentials</legend>
           <div class="grid">
-            <label>Host
+            <label id="icecast_host_label">Host
               <input id="icecast_host" type="text" autocomplete="off">
             </label>
-            <label>Port
+            <label id="icecast_port_label">Port
               <input id="icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000">
             </label>
-            <label>Username
+            <label id="icecast_username_label">Username
               <input id="icecast_username" type="text" autocomplete="username">
             </label>
-            <label>Password
+            <label id="icecast_password_label">Password
               <input id="icecast_password" type="password" autocomplete="current-password">
             </label>
-            <label class="checkbox-row">
+            <label id="show_icecast_password_label" class="checkbox-row">
               <input id="show_icecast_password" type="checkbox">
               Show password
             </label>
-            <label>Mountpoint
+            <label id="icecast_mount_label">Mountpoint
               <input id="icecast_mount" type="text" placeholder="/station.mp3">
+            </label>
+            <label id="icecast_alt_label" class="checkbox-row" hidden>
+              <input id="icecast_alt_enabled" type="checkbox">
+              Alternate stream
+            </label>
+            <label id="icecast_alt_number_label" hidden>Alternate stream number
+              <input id="icecast_alt_number" type="number" min="1" max="9" step="1" value="1">
             </label>
           </div>
         </fieldset>
       </div>
+      <div id="wizard_step_service" class="wizard-step" hidden>
+        <p>There are several online platforms you may stream to. You can choose to stream to one of them, or you may stream to a custom icecast server.</p>
+        <label>Streaming service
+          <select id="icecast_service">
+            <option value="custom">Custom Icecast server</option>
+            <option value="gwes">GWES Weather Radio</option>
+            <option value="weatherusa">WeatherUSA</option>
+            <option value="nwrorg">NOAA Weather Radio Org</option>
+          </select>
+        </label>
+      </div>
       <div id="wizard_step_codec" class="wizard-step" hidden>
         <p>What audio codec would you like to use for the stream format? MP3 is generally more compatible, while OGG may give better audio quality at lower internet usage.</p>
-        <fieldset>
+        <fieldset id="icecast_format_fieldset">
           <legend>Stream Format</legend>
           <label><input id="icecast_format_mp3" name="icecast_format" type="radio" value="mp3" checked> MP3</label>
           <label><input id="icecast_format_ogg" name="icecast_format" type="radio" value="ogg"> OGG</label>
@@ -3013,7 +3104,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <fieldset>
           <legend>Audio Settings</legend>
         <div class="grid">
-          <label>Sample Rate
+          <label id="icecast_sample_rate_label">Sample Rate
             <select id="icecast_sample_rate">
               <option value="8000">8000 Hz</option>
               <option value="11025">11025 Hz</option>
@@ -3025,7 +3116,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               <option value="48000">48000 Hz</option>
             </select>
           </label>
-          <label>Bitrate
+          <label id="icecast_bitrate_label">Bitrate
             <select id="icecast_bitrate"></select>
           </label>
           <label id="output_enabled_label"><input id="output_enabled" type="checkbox" checked> Output enabled</label>
@@ -3083,34 +3174,50 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </table>
         <div id="output_form_panel" hidden>
           <h3 id="output_form_title">Add output</h3>
+          <label>Streaming service
+            <select id="settings_icecast_service">
+              <option value="custom">Custom Icecast server</option>
+              <option value="gwes">GWES Weather Radio</option>
+              <option value="weatherusa">WeatherUSA</option>
+              <option value="nwrorg">NOAA Weather Radio Org</option>
+            </select>
+          </label>
+          <div id="settings_icecast_service_help" class="hint"></div>
           <fieldset>
             <legend>Icecast output</legend>
             <div class="grid">
-              <label>Host
+              <label id="settings_icecast_host_label">Host
                 <input id="settings_icecast_host" type="text" autocomplete="off">
               </label>
-              <label>Port
+              <label id="settings_icecast_port_label">Port
                 <input id="settings_icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000">
               </label>
-              <label>Username
+              <label id="settings_icecast_username_label">Username
                 <input id="settings_icecast_username" type="text" autocomplete="username">
               </label>
-              <label>Password
+              <label id="settings_icecast_password_label">Password
                 <input id="settings_icecast_password" type="password" autocomplete="current-password">
               </label>
-              <label class="checkbox-row">
+              <label id="settings_show_icecast_password_label" class="checkbox-row">
                 <input id="settings_show_icecast_password" type="checkbox">
                 Show password
               </label>
-              <label>Mountpoint
+              <label id="settings_icecast_mount_label">Mountpoint
                 <input id="settings_icecast_mount" type="text" placeholder="/station.mp3">
               </label>
-              <fieldset>
+              <label id="settings_icecast_alt_label" class="checkbox-row" hidden>
+                <input id="settings_icecast_alt_enabled" type="checkbox">
+                Alternate stream
+              </label>
+              <label id="settings_icecast_alt_number_label" hidden>Alternate stream number
+                <input id="settings_icecast_alt_number" type="number" min="1" max="9" step="1" value="1">
+              </label>
+              <fieldset id="settings_icecast_format_fieldset">
                 <legend>Format</legend>
                 <label><input id="settings_icecast_format_mp3" name="settings_icecast_format" type="radio" value="mp3" checked> MP3</label>
                 <label><input id="settings_icecast_format_ogg" name="settings_icecast_format" type="radio" value="ogg"> OGG</label>
               </fieldset>
-              <label>Sample rate
+              <label id="settings_icecast_sample_rate_label">Sample rate
                 <select id="settings_icecast_sample_rate">
                   <option value="8000">8000 Hz</option>
                   <option value="11025">11025 Hz</option>
@@ -3122,7 +3229,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                   <option value="48000">48000 Hz</option>
                 </select>
               </label>
-              <label>Bitrate
+              <label id="settings_icecast_bitrate_label">Bitrate
                 <select id="settings_icecast_bitrate"></select>
               </label>
             </div>
@@ -3349,6 +3456,26 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 const controls = ["serial", "sample_rate", "gain", "ppm_correction", "bias_tee", "gain_auto"];
 const DEFAULT_STREAM_SAMPLE_RATE = 24000;
 const DEFAULT_STREAM_BITRATES = {mp3: 64, ogg: 48};
+const STREAM_SERVICE_CUSTOM = "custom";
+const STREAM_SERVICE_GWES = "gwes";
+const STREAM_SERVICE_WEATHERUSA = "weatherusa";
+const STREAM_SERVICE_NWRORG = "nwrorg";
+const STREAM_SERVICE_HOSTS = {
+  "ingest.wxr.gwes-cdn.net": STREAM_SERVICE_GWES,
+  "radio-master.weatherusa.net": STREAM_SERVICE_WEATHERUSA,
+  "wxradio.org": STREAM_SERVICE_NWRORG
+};
+const STREAM_SERVICE_NAMES = {
+  custom: "Custom Icecast server",
+  gwes: "GWES Weather Radio",
+  weatherusa: "WeatherUSA",
+  nwrorg: "NOAA Weather Radio Org"
+};
+const STREAM_SERVICE_HELP = {
+  gwes: `If you do not yet have icecast credentials for streaming this station to this service, you'll need to <a href="https://forms.office.com/r/MLx6hKmnCe" target="_blank" rel="noopener noreferrer">submit your stream</a> to GWES Weather Radio and receive icecast credentials.`,
+  weatherusa: `If you do not yet have icecast credentials for streaming this station to this service, you must <a href="https://www.weatherusa.net/members/new" target="_blank" rel="noopener noreferrer">create an account on WeatherUSA</a> and <a href="https://www.weatherusa.net/members/services/radio" target="_blank" rel="noopener noreferrer">create a stream</a>. Once your stream is created, you must enter the icecast credentials into this page.`,
+  nwrorg: `Use the <a href="https://noaaweatherradio.org/N2radio-finder.php" target="_blank" rel="noopener noreferrer">Weather Radio Station Lookup Utility</a> from NOAA Weather Radio Org to determine what the mountpoint should be.`
+};
 let applying = false;
 let timer = null;
 let gainValues = [];
@@ -3494,19 +3621,22 @@ function chooseStation() {
 }
 
 function streamPayload() {
-  const selectedFormat = document.querySelector("input[name='icecast_format']:checked");
+  const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+  const station = selectedStation();
+  const selectedFormat = selectedWizardFormat();
+  const icecast = applyServicePresetToIcecast({
+    host: document.getElementById("icecast_host").value,
+    port: Number(document.getElementById("icecast_port").value),
+    username: document.getElementById("icecast_username").value,
+    password: document.getElementById("icecast_password").value,
+    mount: document.getElementById("icecast_mount").value,
+    format: selectedFormat,
+    sample_rate: Number(document.getElementById("icecast_sample_rate").value),
+    bitrate: Number(document.getElementById("icecast_bitrate").value)
+  }, service, station, "icecast");
   return {
     station_key: selectedStationKey,
-    icecast: {
-      host: document.getElementById("icecast_host").value,
-      port: Number(document.getElementById("icecast_port").value),
-      username: document.getElementById("icecast_username").value,
-      password: document.getElementById("icecast_password").value,
-      mount: document.getElementById("icecast_mount").value,
-      format: selectedFormat ? selectedFormat.value : "mp3",
-      sample_rate: Number(document.getElementById("icecast_sample_rate").value),
-      bitrate: Number(document.getElementById("icecast_bitrate").value)
-    }
+    icecast
   };
 }
 
@@ -3603,6 +3733,182 @@ function streamOutputs(stream) {
   return [];
 }
 
+function normalizedServiceHost(host) {
+  return String(host || "").trim().toLowerCase();
+}
+
+function serviceForHost(host) {
+  return STREAM_SERVICE_HOSTS[normalizedServiceHost(host)] || STREAM_SERVICE_CUSTOM;
+}
+
+function stationSiteToken(station) {
+  return String((station && station.site_name) || "")
+    .replace(/[^A-Za-z0-9 ]+/g, " ")
+    .split(/\\s+/)
+    .filter(Boolean)
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join("");
+}
+
+function stationCallsign(station) {
+  return String((station && station.callsign) || "").trim().toUpperCase();
+}
+
+function stationState(station) {
+  return String((station && station.state) || "").trim().toUpperCase();
+}
+
+function selectedWizardFormat() {
+  const selectedFormat = document.querySelector("input[name='icecast_format']:checked");
+  return selectedFormat ? selectedFormat.value : "mp3";
+}
+
+function selectedSettingsFormat() {
+  const selectedFormat = document.querySelector("input[name='settings_icecast_format']:checked");
+  return selectedFormat ? selectedFormat.value : "mp3";
+}
+
+function weatherUsaMount(station, format) {
+  const callsign = stationCallsign(station) || "CALLSIGN";
+  return `/NWR/${callsign}.${format || "mp3"}`;
+}
+
+function isWeatherUsaGeneratedMount(value, station) {
+  const mount = String(value || "").trim();
+  return mount === weatherUsaMount(station, "mp3") || mount === weatherUsaMount(station, "ogg");
+}
+
+function nwrOrgBaseMount(station) {
+  const state = stationState(station) || "XX";
+  const site = stationSiteToken(station) || "Site";
+  const callsign = stationCallsign(station) || "CALLSIGN";
+  return `/${state}-${site}-${callsign}`;
+}
+
+function nwrOrgMount(station, alternate, alternateNumber) {
+  const suffix = alternate ? `-alt${Math.max(1, Math.min(9, Number(alternateNumber || 1)))}` : "";
+  return `${nwrOrgBaseMount(station)}${suffix}`;
+}
+
+function serviceFromIcecast(icecast) {
+  const explicit = String((icecast && icecast.service) || "").trim();
+  if (explicit && STREAM_SERVICE_NAMES[explicit]) return explicit;
+  return serviceForHost(icecast && icecast.host);
+}
+
+function applyServicePresetToIcecast(icecast, service, station, prefix = "icecast") {
+  const payload = Object.assign({}, icecast, {service});
+  const format = payload.format || "mp3";
+  if (service === STREAM_SERVICE_GWES) {
+    payload.host = "ingest.wxr.gwes-cdn.net";
+    payload.port = 10000;
+    payload.format = "mp3";
+    payload.bitrate = Math.max(64, Number(payload.bitrate || 64));
+    payload.sample_rate = Number(payload.sample_rate || 22050);
+  } else if (service === STREAM_SERVICE_WEATHERUSA) {
+    payload.host = "radio-master.weatherusa.net";
+    payload.port = 80;
+    payload.username = "source";
+    payload.format = format;
+    payload.bitrate = Math.max(32, Math.min(56, Number(payload.bitrate || (format === "mp3" ? 56 : 48))));
+    payload.sample_rate = Math.min(22050, Number(payload.sample_rate || 22050));
+    if (!String(payload.mount || "").trim()) payload.mount = weatherUsaMount(station, payload.format);
+  } else if (service === STREAM_SERVICE_NWRORG) {
+    const altEnabled = document.getElementById(`${prefix}_alt_enabled`);
+    const altNumber = document.getElementById(`${prefix}_alt_number`);
+    payload.host = "wxradio.org";
+    payload.port = 8000;
+    payload.username = "source";
+    payload.password = "WxRadio2014";
+    payload.format = "mp3";
+    payload.bitrate = 32;
+    payload.sample_rate = 22050;
+    payload.mount = nwrOrgMount(station, altEnabled && altEnabled.checked, altNumber ? altNumber.value : 1);
+  }
+  return payload;
+}
+
+function setServiceHelp(elementId, service) {
+  const element = document.getElementById(elementId);
+  if (!element) return;
+  element.innerHTML = STREAM_SERVICE_HELP[service] || "";
+}
+
+function setHidden(id, hidden) {
+  const element = document.getElementById(id);
+  if (element) element.hidden = hidden;
+}
+
+function setReadOnly(id, readOnly) {
+  const element = document.getElementById(id);
+  if (element) element.readOnly = readOnly;
+}
+
+function setSelectDisabled(id, disabled) {
+  const element = document.getElementById(id);
+  if (element) element.disabled = disabled;
+}
+
+function setOptionAvailability(selectId, predicate) {
+  const select = document.getElementById(selectId);
+  if (!select) return;
+  let selectedStillAvailable = false;
+  for (const option of select.options) {
+    const allowed = predicate(Number(option.value));
+    option.disabled = !allowed;
+    if (option.selected && allowed) selectedStillAvailable = true;
+  }
+  if (!selectedStillAvailable) {
+    for (const option of select.options) {
+      if (!option.disabled) {
+        select.value = option.value;
+        break;
+      }
+    }
+  }
+}
+
+function clampServiceFields(prefix, service) {
+  if (service === STREAM_SERVICE_GWES) {
+    setOptionAvailability(`${prefix}_bitrate`, value => value >= 64);
+    setOptionAvailability(`${prefix}_sample_rate`, () => true);
+  } else if (service === STREAM_SERVICE_WEATHERUSA) {
+    setOptionAvailability(`${prefix}_bitrate`, value => value >= 32 && value <= 56);
+    setOptionAvailability(`${prefix}_sample_rate`, value => value <= 22050);
+  } else if (service === STREAM_SERVICE_NWRORG) {
+    setOptionAvailability(`${prefix}_bitrate`, value => value === 32);
+    setOptionAvailability(`${prefix}_sample_rate`, value => value === 22050);
+    setValue(`${prefix}_bitrate`, 32);
+    setValue(`${prefix}_sample_rate`, 22050);
+  } else {
+    setOptionAvailability(`${prefix}_bitrate`, () => true);
+    setOptionAvailability(`${prefix}_sample_rate`, () => true);
+  }
+}
+
+function applyServiceControls(prefix, service) {
+  setHidden(`${prefix}_host_label`, service !== STREAM_SERVICE_CUSTOM);
+  setHidden(`${prefix}_port_label`, service !== STREAM_SERVICE_CUSTOM);
+  setHidden(`${prefix}_username_label`, service === STREAM_SERVICE_WEATHERUSA || service === STREAM_SERVICE_NWRORG);
+  setHidden(`${prefix}_password_label`, service === STREAM_SERVICE_NWRORG);
+  setHidden(prefix === "icecast" ? "show_icecast_password_label" : "settings_show_icecast_password_label", service === STREAM_SERVICE_NWRORG);
+  setHidden(`${prefix}_mount_label`, service === STREAM_SERVICE_NWRORG);
+  setHidden(`${prefix}_alt_label`, service !== STREAM_SERVICE_NWRORG);
+  const alternateEnabled = document.getElementById(`${prefix}_alt_enabled`);
+  setHidden(`${prefix}_alt_number_label`, service !== STREAM_SERVICE_NWRORG || !alternateEnabled || !alternateEnabled.checked);
+  setHidden(`${prefix}_format_fieldset`, service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_NWRORG);
+  setHidden(`${prefix}_sample_rate_label`, service === STREAM_SERVICE_NWRORG);
+  setHidden(`${prefix}_bitrate_label`, service === STREAM_SERVICE_NWRORG);
+  setReadOnly(`${prefix}_username`, service === STREAM_SERVICE_WEATHERUSA);
+  setSelectDisabled(`${prefix}_sample_rate`, service === STREAM_SERVICE_NWRORG);
+  setSelectDisabled(`${prefix}_bitrate`, service === STREAM_SERVICE_NWRORG);
+  const mp3 = document.getElementById(`${prefix}_format_mp3`);
+  const ogg = document.getElementById(`${prefix}_format_ogg`);
+  if (mp3) mp3.disabled = service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_NWRORG;
+  if (ogg) ogg.disabled = service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_NWRORG;
+  clampServiceFields(prefix, service);
+}
+
 function findConfiguredOutput(streamId, outputId) {
   const stream = configuredStreams.find(item => item.id === streamId);
   if (!stream) return null;
@@ -3613,31 +3919,39 @@ function findConfiguredOutput(streamId, outputId) {
 }
 
 function setIcecastForm(icecast, enabled = true) {
-  setValue("icecast_host", icecast.host || "");
-  setValue("icecast_port", icecast.port || "");
-  setValue("icecast_username", icecast.username || "");
-  setValue("icecast_password", icecast.password || "");
-  setValue("icecast_mount", icecast.mount || "");
-  const format = icecast.format || "mp3";
-  setChecked("icecast_format_mp3", format === "mp3");
-  setChecked("icecast_format_ogg", format === "ogg");
-  setValue("icecast_sample_rate", icecast.sample_rate || 24000);
-  setValue("icecast_bitrate", icecast.bitrate || (format === "mp3" ? 64 : 48));
+  const service = serviceFromIcecast(icecast);
+  const station = selectedStation();
+  const preset = applyServicePresetToIcecast(icecast || {}, service, station, "icecast");
+  setValue("icecast_service", service);
+  setValue("icecast_host", preset.host || "");
+  setValue("icecast_port", preset.port || "");
+  setValue("icecast_username", preset.username || "");
+  setValue("icecast_password", preset.password || "");
+  setValue("icecast_mount", preset.mount || "");
+  const format = (icecast && icecast.format) || "mp3";
+  setChecked("icecast_format_mp3", preset.format === "mp3");
+  setChecked("icecast_format_ogg", preset.format === "ogg");
+  setValue("icecast_sample_rate", preset.sample_rate || 24000);
+  setValue("icecast_bitrate", preset.bitrate || (format === "mp3" ? 64 : 48));
   setChecked("output_enabled", enabled);
+  setServiceHelp("icecast_service_help", service);
+  applyServiceControls("icecast", service);
 }
 
 function settingsIcecastPayload() {
-  const selectedFormat = document.querySelector("input[name='settings_icecast_format']:checked");
-  return {
+  const service = document.getElementById("settings_icecast_service").value || STREAM_SERVICE_CUSTOM;
+  const selected = findConfiguredOutput(settingsStreamId, editingOutputId);
+  const station = selected ? selected.stream.station : currentSettingsStream() ? currentSettingsStream().station : null;
+  return applyServicePresetToIcecast({
     host: document.getElementById("settings_icecast_host").value,
     port: Number(document.getElementById("settings_icecast_port").value),
     username: document.getElementById("settings_icecast_username").value,
     password: document.getElementById("settings_icecast_password").value,
     mount: document.getElementById("settings_icecast_mount").value,
-    format: selectedFormat ? selectedFormat.value : "mp3",
+    format: selectedSettingsFormat(),
     sample_rate: Number(document.getElementById("settings_icecast_sample_rate").value),
     bitrate: Number(document.getElementById("settings_icecast_bitrate").value)
-  };
+  }, service, station, "settings_icecast");
 }
 
 function outputFormSignature() {
@@ -3665,8 +3979,16 @@ function duplicateOutputExists(icecast, ignoreOutputId = "") {
   return false;
 }
 
+function customServiceHostWarning(host) {
+  const service = serviceForHost(host);
+  if (service === STREAM_SERVICE_CUSTOM) return "";
+  return `Please select ${STREAM_SERVICE_NAMES[service]} instead of typing its Icecast URL in custom Icecast setup.`;
+}
+
 function settingsCredentialsComplete() {
   const payload = settingsIcecastPayload();
+  const service = document.getElementById("settings_icecast_service").value || STREAM_SERVICE_CUSTOM;
+  if (service === STREAM_SERVICE_CUSTOM && customServiceHostWarning(payload.host)) return false;
   return Boolean(
     payload.host.trim() &&
     payload.port >= 1 &&
@@ -3678,20 +4000,27 @@ function settingsCredentialsComplete() {
 }
 
 function setSettingsIcecastForm(icecast) {
-  setValue("settings_icecast_host", icecast.host || "");
-  setValue("settings_icecast_port", icecast.port || "");
-  setValue("settings_icecast_username", icecast.username || "");
-  setValue("settings_icecast_password", icecast.password || "");
-  setValue("settings_icecast_mount", icecast.mount || "");
-  const format = icecast.format || "mp3";
+  const service = serviceFromIcecast(icecast);
+  const selected = findConfiguredOutput(settingsStreamId, editingOutputId);
+  const station = selected ? selected.stream.station : currentSettingsStream() ? currentSettingsStream().station : null;
+  const preset = applyServicePresetToIcecast(icecast || {}, service, station, "settings_icecast");
+  setValue("settings_icecast_service", service);
+  setValue("settings_icecast_host", preset.host || "");
+  setValue("settings_icecast_port", preset.port || "");
+  setValue("settings_icecast_username", preset.username || "");
+  setValue("settings_icecast_password", preset.password || "");
+  setValue("settings_icecast_mount", preset.mount || "");
+  const format = preset.format || "mp3";
   setChecked("settings_icecast_format_mp3", format === "mp3");
   setChecked("settings_icecast_format_ogg", format === "ogg");
-  setValue("settings_icecast_sample_rate", icecast.sample_rate || 24000);
-  setValue("settings_icecast_bitrate", icecast.bitrate || (format === "mp3" ? 64 : 48));
+  setValue("settings_icecast_sample_rate", preset.sample_rate || 24000);
+  setValue("settings_icecast_bitrate", preset.bitrate || (format === "mp3" ? 64 : 48));
+  setServiceHelp("settings_icecast_service_help", service);
+  applyServiceControls("settings_icecast", service);
 }
 
 function clearSettingsIcecastForm() {
-  setSettingsIcecastForm({format: "mp3", sample_rate: 24000, bitrate: 64});
+  setSettingsIcecastForm({service: STREAM_SERVICE_CUSTOM, format: "mp3", sample_rate: 24000, bitrate: 64});
   setChecked("settings_show_icecast_password", false);
   document.getElementById("settings_icecast_password").type = "password";
   outputFormOriginalSignature = outputFormSignature();
@@ -3704,6 +4033,63 @@ function setOutputResult(message, kind = "") {
   if (element.className !== className) element.className = className;
   const text = String(message || "");
   if (element.textContent !== text) element.textContent = text;
+}
+
+function maybeShowNwrOrgSubmissionDialog(icecast) {
+  if (!icecast || icecast.service !== STREAM_SERVICE_NWRORG) return;
+  const message = "If you have not already done so, you must fill out the submission form for NOAA Weather Radio ORG before your stream will appear on the website.\\n\\nOpen the submission form in a new tab?";
+  if (window.confirm(message)) {
+    window.open("http://noaaweatherradio.org/addstream/addstream.html", "_blank", "noopener,noreferrer");
+  }
+}
+
+function resetWizardForService(service) {
+  const station = selectedStation();
+  const current = streamPayload().icecast;
+  const next = applyServicePresetToIcecast({
+    service,
+    format: selectedWizardFormat(),
+    sample_rate: DEFAULT_STREAM_SAMPLE_RATE,
+    bitrate: service === STREAM_SERVICE_WEATHERUSA ? 48 : DEFAULT_STREAM_BITRATES.mp3,
+    mount: service === STREAM_SERVICE_WEATHERUSA ? weatherUsaMount(station, selectedWizardFormat()) : ""
+  }, service, station, "icecast");
+  if (service === STREAM_SERVICE_CUSTOM) {
+    next.host = "";
+    next.port = "";
+    next.username = "";
+    next.password = "";
+    next.mount = "";
+  } else if (service === STREAM_SERVICE_WEATHERUSA) {
+    next.password = current.password || "";
+  }
+  setIcecastForm(next, true);
+  icecastAuthPassed = false;
+  icecastAuthSignature = "";
+  renderWizard();
+}
+
+function resetSettingsForService(service) {
+  const stream = currentSettingsStream();
+  const station = stream ? stream.station : null;
+  const current = settingsIcecastPayload();
+  const next = applyServicePresetToIcecast({
+    service,
+    format: selectedSettingsFormat(),
+    sample_rate: DEFAULT_STREAM_SAMPLE_RATE,
+    bitrate: service === STREAM_SERVICE_WEATHERUSA ? 48 : DEFAULT_STREAM_BITRATES.mp3,
+    mount: service === STREAM_SERVICE_WEATHERUSA ? weatherUsaMount(station, selectedSettingsFormat()) : ""
+  }, service, station, "settings_icecast");
+  if (service === STREAM_SERVICE_CUSTOM) {
+    next.host = "";
+    next.port = "";
+    next.username = "";
+    next.password = "";
+    next.mount = "";
+  } else if (service === STREAM_SERVICE_WEATHERUSA) {
+    next.password = current.password || "";
+  }
+  setSettingsIcecastForm(next);
+  updateOutputFormButtons();
 }
 
 function setFallbackResult(message, kind = "") {
@@ -4035,7 +4421,7 @@ function cancelOutputForm() {
 }
 
 function clearIcecastForm() {
-  setIcecastForm({format: "mp3", sample_rate: 24000, bitrate: 64}, true);
+  setIcecastForm({service: STREAM_SERVICE_CUSTOM, format: "mp3", sample_rate: 24000, bitrate: 64}, true);
   setChecked("show_icecast_password", false);
   document.getElementById("icecast_password").type = "password";
 }
@@ -4053,6 +4439,8 @@ function icecastCredentialSignature() {
 
 function credentialsComplete() {
   const payload = streamPayload().icecast;
+  const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+  if (service === STREAM_SERVICE_CUSTOM && customServiceHostWarning(payload.host)) return false;
   return Boolean(
     payload.host.trim() &&
     payload.port >= 1 &&
@@ -4064,7 +4452,7 @@ function credentialsComplete() {
 }
 
 function setWizardStep(step) {
-  wizardStep = Math.max(0, Math.min(3, step));
+  wizardStep = Math.max(0, Math.min(4, step));
   renderWizard();
 }
 
@@ -4074,24 +4462,41 @@ function setWizardPanel(id, visible) {
 
 function renderWizard() {
   const editMode = wizardMode === "edit";
+  const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+  const needsCodecStep = service === STREAM_SERVICE_CUSTOM || service === STREAM_SERVICE_WEATHERUSA;
+  const needsQualityStep = service === STREAM_SERVICE_CUSTOM || service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_WEATHERUSA;
+  if (service === STREAM_SERVICE_GWES) {
+    setChecked("icecast_format_mp3", true);
+    setChecked("icecast_format_ogg", false);
+  }
+  const hostWarning = service === STREAM_SERVICE_CUSTOM ? customServiceHostWarning(document.getElementById("icecast_host").value) : "";
+  if (hostWarning) setStreamResult(hostWarning, "error");
+  else if (document.getElementById("stream-result").textContent.startsWith("Please select ")) setStreamResult("");
+  setServiceHelp("icecast_service_help", service);
+  applyServiceControls("icecast", service);
   setText("stream_wizard_title", editMode ? "Edit Stream Output" : "Add Stream");
   setWizardPanel("wizard_step_station", !editMode && wizardStep === 0);
-  setWizardPanel("wizard_step_credentials", editMode || wizardStep === 1);
-  setWizardPanel("wizard_step_codec", editMode || wizardStep === 2);
-  setWizardPanel("wizard_step_quality", editMode || wizardStep === 3);
+  setWizardPanel("wizard_step_service", !editMode && wizardStep === 1);
+  setWizardPanel("wizard_step_codec", !editMode && wizardStep === 2 && needsCodecStep);
+  setWizardPanel("wizard_step_credentials", editMode || wizardStep === 3 || (!needsCodecStep && wizardStep === 2));
+  setWizardPanel("wizard_step_quality", !editMode && wizardStep === 4 && needsQualityStep);
   document.getElementById("cancel_wizard").hidden = editMode;
   document.getElementById("wizard_back").hidden = editMode || wizardStep === 0;
-  document.getElementById("wizard_next").hidden = editMode || wizardStep === 3;
-  document.getElementById("wizard_finish").hidden = editMode || wizardStep !== 3;
+  document.getElementById("wizard_next").hidden = editMode || (wizardStep === 4) || (!needsQualityStep && wizardStep >= 3);
+  document.getElementById("wizard_finish").hidden = editMode || !(wizardStep === 4 || (!needsQualityStep && wizardStep >= 3));
   document.getElementById("save_output").hidden = !editMode;
   document.getElementById("cancel_output_edit").hidden = !editMode;
   const next = document.getElementById("wizard_next");
+  const finish = document.getElementById("wizard_finish");
   if (wizardStep === 0) {
     setDisabled(next, !selectedStation());
-  } else if (wizardStep === 1) {
+  } else if (wizardStep === 3 || (!needsCodecStep && wizardStep === 2)) {
     setDisabled(next, !credentialsComplete());
   } else {
     setDisabled(next, false);
+  }
+  if (!finish.hidden) {
+    setDisabled(finish, wizardStep === 3 && !credentialsComplete());
   }
 }
 
@@ -5652,11 +6057,23 @@ document.getElementById("station_results").addEventListener("change", chooseStat
 
 for (const formatControl of document.querySelectorAll("input[name='icecast_format']")) {
   formatControl.addEventListener("change", () => {
+    const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+    const station = selectedStation();
+    const mount = document.getElementById("icecast_mount").value;
+    if (service === STREAM_SERVICE_WEATHERUSA && (!mount.trim() || isWeatherUsaGeneratedMount(mount, station))) {
+      setValue("icecast_mount", weatherUsaMount(station, selectedWizardFormat()));
+    }
     wizardDirty = true;
     icecastAuthPassed = false;
+    icecastAuthSignature = "";
     renderWizard();
   });
 }
+
+document.getElementById("icecast_service").addEventListener("change", event => {
+  wizardDirty = true;
+  resetWizardForService(event.target.value || STREAM_SERVICE_CUSTOM);
+});
 
 for (const id of ["icecast_host", "icecast_port", "icecast_username", "icecast_password", "icecast_mount"]) {
   document.getElementById(id).addEventListener("input", () => {
@@ -5667,9 +6084,12 @@ for (const id of ["icecast_host", "icecast_port", "icecast_username", "icecast_p
   });
 }
 
-for (const id of ["icecast_sample_rate", "icecast_bitrate", "output_enabled"]) {
+for (const id of ["icecast_sample_rate", "icecast_bitrate", "output_enabled", "icecast_alt_enabled", "icecast_alt_number"]) {
   document.getElementById(id).addEventListener("change", () => {
     wizardDirty = true;
+    icecastAuthPassed = false;
+    icecastAuthSignature = "";
+    applyServiceControls("icecast", document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM);
     renderWizard();
   });
 }
@@ -5683,20 +6103,41 @@ document.getElementById("settings_show_icecast_password").addEventListener("chan
 });
 
 for (const id of [
+  "settings_icecast_service",
   "settings_icecast_host",
   "settings_icecast_port",
   "settings_icecast_username",
   "settings_icecast_password",
   "settings_icecast_mount",
   "settings_icecast_sample_rate",
-  "settings_icecast_bitrate"
+  "settings_icecast_bitrate",
+  "settings_icecast_alt_enabled",
+  "settings_icecast_alt_number"
 ]) {
   document.getElementById(id).addEventListener("input", updateOutputFormButtons);
-  document.getElementById(id).addEventListener("change", updateOutputFormButtons);
+  document.getElementById(id).addEventListener("change", event => {
+    if (id === "settings_icecast_service") {
+      resetSettingsForService(event.target.value || STREAM_SERVICE_CUSTOM);
+      return;
+    }
+    if (id === "settings_icecast_alt_enabled" || id === "settings_icecast_alt_number") {
+      applyServiceControls("settings_icecast", document.getElementById("settings_icecast_service").value || STREAM_SERVICE_CUSTOM);
+    }
+    updateOutputFormButtons();
+  });
 }
 
 for (const formatControl of document.querySelectorAll("input[name='settings_icecast_format']")) {
-  formatControl.addEventListener("change", updateOutputFormButtons);
+  formatControl.addEventListener("change", () => {
+    const service = document.getElementById("settings_icecast_service").value || STREAM_SERVICE_CUSTOM;
+    const stream = currentSettingsStream();
+    const station = stream ? stream.station : null;
+    const mount = document.getElementById("settings_icecast_mount").value;
+    if (service === STREAM_SERVICE_WEATHERUSA && (!mount.trim() || isWeatherUsaGeneratedMount(mount, station))) {
+      setValue("settings_icecast_mount", weatherUsaMount(station, selectedSettingsFormat()));
+    }
+    updateOutputFormButtons();
+  });
 }
 
 document.getElementById("open_add_output").addEventListener("click", beginAddOutput);
@@ -5733,9 +6174,13 @@ document.getElementById("add_output").addEventListener("click", async () => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({stream_id: settingsStreamId, icecast})
     });
+    outputTableSignature = "";
     renderStreams(data.streams || []);
     setOutputResult(data.message, data.success ? "success" : "error");
-    if (data.success) cancelOutputForm();
+    if (data.success) {
+      cancelOutputForm();
+      maybeShowNwrOrgSubmissionDialog(icecast);
+    }
   } catch (error) {
     setOutputResult(error.message, "error");
   } finally {
@@ -5752,6 +6197,7 @@ document.getElementById("save_output_settings").addEventListener("click", async 
     return;
   }
   const icecast = settingsIcecastPayload();
+  const oldService = serviceFromIcecast(selected.output.icecast || {});
   if (duplicateOutputExists(icecast, editingOutputId)) {
     setOutputResult("An output with these credentials already exists.", "error");
     return;
@@ -5771,7 +6217,10 @@ document.getElementById("save_output_settings").addEventListener("click", async 
     });
     renderStreams(data.streams || []);
     setOutputResult(data.message, data.success ? "success" : "error");
-    if (data.success) cancelOutputForm();
+    if (data.success) {
+      cancelOutputForm();
+      if (oldService !== STREAM_SERVICE_NWRORG) maybeShowNwrOrgSubmissionDialog(icecast);
+    }
   } catch (error) {
     setOutputResult(error.message, "error");
   } finally {
@@ -5905,7 +6354,12 @@ document.getElementById("cancel_wizard").addEventListener("click", () => {
 });
 
 document.getElementById("wizard_back").addEventListener("click", () => {
-  setWizardStep(wizardStep - 1);
+  const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+  if (wizardStep === 3 && (service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_NWRORG)) {
+    setWizardStep(1);
+  } else {
+    setWizardStep(wizardStep - 1);
+  }
 });
 
 document.getElementById("wizard_next").addEventListener("click", async () => {
@@ -5914,6 +6368,23 @@ document.getElementById("wizard_next").addEventListener("click", async () => {
     return;
   }
   if (wizardStep === 1) {
+    const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+    if (service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_NWRORG) {
+      setWizardStep(3);
+    } else {
+      setWizardStep(2);
+    }
+    return;
+  }
+  if (wizardStep === 2) {
+    const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+    if (service === STREAM_SERVICE_WEATHERUSA && !document.getElementById("icecast_mount").value.trim()) {
+      setValue("icecast_mount", weatherUsaMount(selectedStation(), selectedWizardFormat()));
+    }
+    setWizardStep(3);
+    return;
+  }
+  if (wizardStep === 3) {
     const button = document.getElementById("wizard_next");
     setDisabled(button, true);
     setStreamResult("Testing Icecast authentication...");
@@ -5928,7 +6399,12 @@ document.getElementById("wizard_next").addEventListener("click", async () => {
       if (data.success) {
         icecastAuthPassed = true;
         icecastAuthSignature = signature;
-        setWizardStep(2);
+        const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+        if (service === STREAM_SERVICE_NWRORG) {
+          setWizardStep(3);
+        } else {
+          setWizardStep(4);
+        }
       }
     } catch (error) {
       setStreamResult(error.message, "error");
@@ -5937,28 +6413,41 @@ document.getElementById("wizard_next").addEventListener("click", async () => {
     }
     return;
   }
-  if (wizardStep === 2) {
-    setWizardStep(3);
-  }
 });
 
 document.getElementById("wizard_finish").addEventListener("click", async () => {
   const button = document.getElementById("wizard_finish");
   setDisabled(button, true);
-  setStreamResult("Creating stream...");
+  const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+  setStreamResult(service === STREAM_SERVICE_NWRORG && !icecastAuthPassed ? "Testing Icecast authentication..." : "Creating stream...");
   try {
     if (!icecastAuthPassed || icecastAuthSignature !== icecastCredentialSignature()) {
-      throw new Error("Icecast credentials must be tested before creating the stream.");
+      const signature = icecastCredentialSignature();
+      const auth = await request("/api/icecast-auth", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({icecast: streamPayload().icecast})
+      });
+      if (!auth.success) {
+        setStreamResult(auth.message, "error");
+        return;
+      }
+      icecastAuthPassed = true;
+      icecastAuthSignature = signature;
     }
+    setStreamResult("Creating stream...");
+    const payload = streamPayload();
+    const createdIcecast = payload.icecast;
     const data = await request("/api/streams", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(streamPayload())
+      body: JSON.stringify(payload)
     });
     renderStreams(data.streams || []);
     setStreamResult(data.message, data.success ? "success" : "error");
     if (data.success) {
       finishWizard();
+      maybeShowNwrOrgSubmissionDialog(createdIcecast);
     }
   } catch (error) {
     setStreamResult(error.message, "error");

@@ -49,6 +49,133 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(summary["event_name"], "Severe Thunderstorm Warning")
         self.assertIn("Severe thunderstorm warning issued August 9, 2026 at", summary["summary"])
 
+    def test_custom_icecast_rejects_known_service_host(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Please select GWES Weather Radio"):
+            self.web_control.validate_icecast_payload(
+                {
+                    "service": "custom",
+                    "host": "ingest.wxr.gwes-cdn.net",
+                    "port": 10000,
+                    "username": "user",
+                    "password": "secret",
+                    "mount": "/WXN99.mp3",
+                    "format": "mp3",
+                    "sample_rate": 22050,
+                    "bitrate": 64,
+                }
+            )
+
+    def test_gwes_requires_mp3_and_minimum_bitrate(self) -> None:
+        valid = {
+            "service": "gwes",
+            "host": "ingest.wxr.gwes-cdn.net",
+            "port": 10000,
+            "username": "user",
+            "password": "secret",
+            "mount": "/WXN99.mp3",
+            "format": "mp3",
+            "sample_rate": 24000,
+            "bitrate": 64,
+        }
+        self.assertEqual(self.web_control.validate_icecast_payload(valid)["service"], "gwes")
+        invalid = dict(valid, bitrate=56)
+        with self.assertRaisesRegex(ValueError, "at least 64 Kbps"):
+            self.web_control.validate_icecast_payload(invalid)
+        invalid = dict(valid, format="ogg")
+        with self.assertRaisesRegex(ValueError, "requires MP3"):
+            self.web_control.validate_icecast_payload(invalid)
+
+    def test_weatherusa_restricts_audio_settings(self) -> None:
+        valid = {
+            "service": "weatherusa",
+            "host": "radio-master.weatherusa.net",
+            "port": 80,
+            "username": "source",
+            "password": "secret",
+            "mount": "/NWR/WXN99.ogg",
+            "format": "ogg",
+            "sample_rate": 22050,
+            "bitrate": 48,
+        }
+        self.assertEqual(self.web_control.validate_icecast_payload(valid)["service"], "weatherusa")
+        with self.assertRaisesRegex(ValueError, "cannot be above 22050"):
+            self.web_control.validate_icecast_payload(dict(valid, sample_rate=24000))
+        with self.assertRaisesRegex(ValueError, "32 through 56"):
+            self.web_control.validate_icecast_payload(dict(valid, bitrate=64))
+
+    def test_noaa_weather_radio_org_requires_fixed_settings(self) -> None:
+        valid = {
+            "service": "nwrorg",
+            "host": "wxradio.org",
+            "port": 8000,
+            "username": "source",
+            "password": "WxRadio2014",
+            "mount": "/MI-WestOlive-WXN99-alt1",
+            "format": "mp3",
+            "sample_rate": 22050,
+            "bitrate": 32,
+        }
+        self.assertEqual(self.web_control.validate_icecast_payload(valid)["service"], "nwrorg")
+        with self.assertRaisesRegex(ValueError, "requires a bitrate of 32"):
+            self.web_control.validate_icecast_payload(dict(valid, bitrate=40))
+        with self.assertRaisesRegex(ValueError, "predefined Icecast credentials"):
+            self.web_control.validate_icecast_payload(dict(valid, password="other"))
+
+    def test_add_stream_output_appends_to_persisted_output_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            existing_output = {
+                "id": "output-1",
+                "enabled": True,
+                "type": "icecast",
+                "icecast": {
+                    "service": "custom",
+                    "host": "example.com",
+                    "port": 8000,
+                    "username": "source",
+                    "password": "secret",
+                    "mount": "/one",
+                    "format": "mp3",
+                    "sample_rate": 22050,
+                    "bitrate": 32,
+                },
+            }
+            stream = {
+                "id": "stream-1",
+                "enabled": True,
+                "station": {"callsign": "WXN99", "frequency": "162.475"},
+                "outputs": [existing_output],
+            }
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+            service.test_icecast_auth = lambda icecast: {"success": True, "message": "Authentication successful."}
+            service._sync_stream_workers_locked = lambda: None
+
+            response = service.add_stream_output(
+                {
+                    "stream_id": "stream-1",
+                    "icecast": {
+                        "service": "custom",
+                        "host": "example.net",
+                        "port": 8000,
+                        "username": "source",
+                        "password": "secret",
+                        "mount": "/two",
+                        "format": "mp3",
+                        "sample_rate": 22050,
+                        "bitrate": 32,
+                    },
+                }
+            )
+
+            self.assertTrue(response["success"])
+            self.assertEqual(len(stream["outputs"]), 2)
+            self.assertEqual(stream["outputs"][1]["icecast"]["mount"], "/two")
+            saved = json.loads((streams_dir / "WXN99" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual([output["icecast"]["mount"] for output in saved["outputs"]], ["/one", "/two"])
+
     def test_alert_detail_uses_same_location_lookup(self) -> None:
         alert = {
             "event_type": "TOR",
