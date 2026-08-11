@@ -56,6 +56,7 @@ if __package__:
         validate_rtl_sample_rate,
     )
     from .same_data import lookup_event, lookup_location
+    from .webrtc import server_webrtc_capabilities
 else:
     import importlib
     import types
@@ -75,6 +76,7 @@ else:
     nfm = importlib.import_module(f"{package_name}.nfm")
     rtl = importlib.import_module(f"{package_name}.rtl")
     same_data = importlib.import_module(f"{package_name}.same_data")
+    webrtc = importlib.import_module(f"{package_name}.webrtc")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
     deemphasis_makeup_gain = audio_effects.deemphasis_makeup_gain
     AUDIO_NYQUIST_HZ = config_module.AUDIO_NYQUIST_HZ
@@ -105,6 +107,7 @@ else:
     validate_rtl_sample_rate = rtl.validate_rtl_sample_rate
     lookup_event = same_data.lookup_event
     lookup_location = same_data.lookup_location
+    server_webrtc_capabilities = webrtc.server_webrtc_capabilities
 
 repo_root = Path(__file__).resolve().parents[2]
 if str(repo_root) not in sys.path:
@@ -1688,6 +1691,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_json(self.service.stream_status())
         elif path == "/api/eas-alert-streams":
             self._send_json(self.service.eas_alert_streams())
+        elif path == "/api/webrtc-capabilities":
+            self._send_json(server_webrtc_capabilities().to_dict())
         elif path == "/api/eas-alerts":
             query = parse_qs(parsed.query)
             try:
@@ -3464,6 +3469,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 
   <section>
     <h2>Logs</h2>
+    <div id="webrtc_support_status" class="hint" hidden></div>
     <pre id="logs" aria-live="off" aria-label="RTL-SDR log output"></pre>
   </section>
 </main>
@@ -3530,6 +3536,10 @@ let easAlertReturnPage = 1;
 let lastEasAlertRefreshAt = 0;
 let easBulkOptionsSignature = "";
 let easBulkServerNow = null;
+let webRtcSupport = {
+  browser: {webrtc: false, opus: false},
+  server: {available: false}
+};
 const EAS_ALERTS_PER_PAGE = 25;
 const PROTECTED_AUDIO_BANDS = [
   {min: 900, max: 1100},
@@ -3542,6 +3552,44 @@ async function request(path, options = {}) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || response.statusText);
   return data;
+}
+
+function detectBrowserWebRtcSupport() {
+  const peerConnectionClass = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+  const receiverClass = window.RTCRtpReceiver;
+  let opus = false;
+  if (receiverClass && typeof receiverClass.getCapabilities === "function") {
+    const capabilities = receiverClass.getCapabilities("audio");
+    opus = Boolean(
+      capabilities &&
+      Array.isArray(capabilities.codecs) &&
+      capabilities.codecs.some(codec => String(codec.mimeType || "").toLowerCase() === "audio/opus")
+    );
+  }
+  return {
+    webrtc: Boolean(peerConnectionClass),
+    opus
+  };
+}
+
+async function loadWebRtcSupport() {
+  const browser = detectBrowserWebRtcSupport();
+  let server = {available: false, transport_available: false, opus_available: false};
+  try {
+    server = await request("/api/webrtc-capabilities");
+  } catch (error) {
+    server = {available: false, error: error.message};
+  }
+  webRtcSupport = {browser, server};
+  window.nwrWebRtcSupport = webRtcSupport;
+  const element = document.getElementById("webrtc_support_status");
+  if (element) {
+    element.dataset.browserWebrtc = browser.webrtc ? "true" : "false";
+    element.dataset.browserOpus = browser.opus ? "true" : "false";
+    element.dataset.serverWebrtc = server.available ? "true" : "false";
+    element.textContent = `WebRTC browser=${browser.webrtc && browser.opus ? "available" : "unavailable"}, server=${server.available ? "available" : "unavailable"}`;
+  }
+  return webRtcSupport;
 }
 
 function deviceLabel(device) {
@@ -6618,6 +6666,7 @@ async function refresh() {
 (async function init() {
   populateBitrates();
   selectAudioEffect("volume", false);
+  loadWebRtcSupport();
   const data = await request("/api/status");
   await loadDevices(data.settings.serial);
   await searchStations();

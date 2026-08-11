@@ -33,6 +33,7 @@ dependencies = [
   "soxr",
   "lameenc",
   "PyOgg",
+  "aiortc",
   "easrecorder @ git+https://github.com/maxbaykowski/easrecorder.git@main",
 ]
 
