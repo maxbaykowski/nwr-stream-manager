@@ -304,9 +304,13 @@ class CompatBaseRtlSdr:
     def _set_optional_int(self, name: str, value: int) -> None:
         function = getattr(rtlsdr_lib, name, None)
         if function is None:
+            LOG.debug("librtlsdr does not expose optional %s; skipping", name)
             return
         result = function(self.dev_p, value)
         if result < 0:
+            if name == "rtlsdr_set_dithering" and value == 0:
+                LOG.debug("librtlsdr rejected disabling dithering with %s; continuing", result)
+                return
             raise CompatLibUSBError(result, f"Could not set {name}")
 
     def _reset_buffer(self) -> None:
@@ -422,6 +426,34 @@ except Exception as exc:
         BaseRtlSdr = None  # type: ignore[assignment]
         LibUSBError = IOError  # type: ignore[assignment]
         RTLSDR_IMPORT_ERROR = fallback_exc
+
+
+def _librtlsdr_supports_dithering() -> bool:
+    return rtlsdr_lib is not None and getattr(rtlsdr_lib, "rtlsdr_set_dithering", None) is not None
+
+
+def _open_rtlsdr_device(device_index: int, *, quiet: bool) -> BaseRtlSdr:
+    if BaseRtlSdr is None:
+        raise RtlDependencyError(str(RTLSDR_IMPORT_ERROR))
+    if BaseRtlSdr is not CompatBaseRtlSdr and not _librtlsdr_supports_dithering():
+        LOG.info(
+            "librtlsdr does not support dithering control; using direct compatibility wrapper "
+            "to keep dithering disabled-compatible"
+        )
+        with _suppress_native_stderr(quiet):
+            return CompatBaseRtlSdr(device_index=device_index, dithering_enabled=False)
+    try:
+        with _suppress_native_stderr(quiet):
+            return BaseRtlSdr(device_index=device_index, dithering_enabled=False)
+    except AttributeError as exc:
+        if BaseRtlSdr is CompatBaseRtlSdr or "rtlsdr_set_dithering" not in str(exc):
+            raise
+        LOG.info(
+            "PyRTLSDR tried to use unsupported dithering control; retrying with direct "
+            "librtlsdr compatibility wrapper"
+        )
+        with _suppress_native_stderr(quiet):
+            return CompatBaseRtlSdr(device_index=device_index, dithering_enabled=False)
 
 
 class RtlCaptureSource:
@@ -582,8 +614,7 @@ class RtlCaptureSource:
         validate_ppm_correction(self.config.ppm_correction)
         device_index = self._resolve_serial_to_device_index(self.config.serial)
         try:
-            with _suppress_native_stderr(quiet):
-                sdr = BaseRtlSdr(device_index=device_index, dithering_enabled=False)
+            sdr = _open_rtlsdr_device(device_index, quiet=quiet)
         except LibUSBError as exc:
             if getattr(exc, "errno", None) == -3:
                 raise RtlDeviceAccessFatalError(

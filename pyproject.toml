@@ -30,6 +30,7 @@ dependencies = [
   "numpy",
   "sounddevice",
   "pyrtlsdr",
+  "pyrtlsdrlib; platform_machine == 'x86_64' or platform_machine == 'AMD64'",
   "soxr",
   "lameenc",
   "PyOgg",
