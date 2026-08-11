@@ -24,7 +24,7 @@ DEFAULT_RTL_SAMPLE_RATE = 1_024_000
 DEFAULT_READ_CHUNK_BYTES = 131_072
 DEFAULT_READ_TIMEOUT_SECONDS = 5.0
 RTL_ASYNC_BUFFER_COUNT = 15
-MAX_RTL_ASYNC_BUFFER_SECONDS = 0.05
+MAX_RTL_ASYNC_BUFFER_SECONDS = 0.02
 RTL_SAMPLE_RATE_RANGES = (
     (225_001, 300_000),
     (900_001, 3_200_000),
@@ -432,13 +432,19 @@ class RtlCaptureSource:
         self.sdr: BaseRtlSdr | None = None
         self.sdr_lock = threading.Lock()
         self.output_queue: queue.Queue[RtlSampleBatch | Exception | None] = queue.Queue(
-            maxsize=8
+            maxsize=32
         )
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.device_wait_logged = False
         self.device_busy_logged = False
         self.gain_values_db: list[float] = []
+        self.stats_lock = threading.Lock()
+        self.offered_batches = 0
+        self.offered_bytes = 0
+        self.dropped_batches = 0
+        self.dropped_bytes = 0
+        self.last_offer_at = 0.0
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -469,6 +475,24 @@ class RtlCaptureSource:
         if isinstance(item, Exception):
             raise item
         return item
+
+    def stats(self) -> dict[str, int | float | None]:
+        with self.stats_lock:
+            return {
+                "offered_batches": self.offered_batches,
+                "offered_bytes": self.offered_bytes,
+                "offered_samples": self.offered_bytes // 2,
+                "dropped_batches": self.dropped_batches,
+                "dropped_bytes": self.dropped_bytes,
+                "dropped_samples": self.dropped_bytes // 2,
+                "queue_depth": self.output_queue.qsize(),
+                "queue_capacity": self.output_queue.maxsize,
+                "last_offer_age_seconds": (
+                    round(time.monotonic() - self.last_offer_at, 3)
+                    if self.last_offer_at
+                    else None
+                ),
+            }
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -606,9 +630,7 @@ class RtlCaptureSource:
 
     def _reader_loop(self, sdr: BaseRtlSdr) -> None:
         assert rtlsdr_lib is not None
-        chunk_size = int(self.config.read_chunk_bytes)
         async_buffer_size = self._rtl_async_buffer_size(self.config)
-        reservoir = bytearray()
         async_done = threading.Event()
         callback_errors: list[Exception] = []
         last_data_at = time.monotonic()
@@ -637,19 +659,18 @@ class RtlCaptureSource:
             if should_stop():
                 return
             try:
-                reservoir.extend(ctypes.string_at(buffer, int(length)))
-                while len(reservoir) >= chunk_size:
-                    chunk = bytes(reservoir[:chunk_size])
-                    del reservoir[:chunk_size]
-                    last_data_at = time.monotonic()
-                    batch = RtlSampleBatch(
-                        data=chunk,
-                        sample_rate=self.config.sample_rate,
-                        center_frequency_hz=self.config.center_frequency_hz,
-                    )
-                    if not self._offer(batch):
-                        cancel_async_read()
-                        return
+                chunk = ctypes.string_at(buffer, int(length))
+                if not chunk:
+                    return
+                last_data_at = time.monotonic()
+                batch = RtlSampleBatch(
+                    data=chunk,
+                    sample_rate=self.config.sample_rate,
+                    center_frequency_hz=self.config.center_frequency_hz,
+                )
+                if not self._offer(batch):
+                    cancel_async_read()
+                    return
             except Exception as exc:
                 callback_errors.append(exc)
                 cancel_async_read()
@@ -678,13 +699,35 @@ class RtlCaptureSource:
             watchdog.join(timeout=1.0)
 
     def _offer(self, item: RtlSampleBatch | Exception | None) -> bool:
+        if self.stop_event.is_set():
+            return False
         while not self.stop_event.is_set():
             try:
-                self.output_queue.put(item, timeout=0.25)
+                self.output_queue.put_nowait(item)
+                self._record_offered_item(item)
                 return True
             except queue.Full:
-                continue
+                try:
+                    dropped = self.output_queue.get_nowait()
+                except queue.Empty:
+                    continue
+                self._record_dropped_item(dropped)
         return False
+
+    def _record_offered_item(self, item: RtlSampleBatch | Exception | None) -> None:
+        if not isinstance(item, RtlSampleBatch):
+            return
+        with self.stats_lock:
+            self.offered_batches += 1
+            self.offered_bytes += len(item.data)
+            self.last_offer_at = time.monotonic()
+
+    def _record_dropped_item(self, item: RtlSampleBatch | Exception | None) -> None:
+        if not isinstance(item, RtlSampleBatch):
+            return
+        with self.stats_lock:
+            self.dropped_batches += 1
+            self.dropped_bytes += len(item.data)
 
     def _close_sdr(self) -> None:
         with self.sdr_lock:
@@ -747,7 +790,9 @@ class RtlCaptureSource:
     @staticmethod
     def _rtl_async_buffer_size(config: RtlConfig) -> int:
         target_size = int(2.0 * float(config.sample_rate) * MAX_RTL_ASYNC_BUFFER_SECONDS)
-        target_size = max(512, min(int(config.read_chunk_bytes), target_size))
+        if config.read_chunk_bytes:
+            target_size = min(int(config.read_chunk_bytes), target_size)
+        target_size = max(512, target_size)
         target_size -= target_size % 512
         return max(512, target_size)
 

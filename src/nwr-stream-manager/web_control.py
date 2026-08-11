@@ -56,7 +56,14 @@ if __package__:
         validate_rtl_sample_rate,
     )
     from .same_data import lookup_event, lookup_location
-    from .webrtc import server_webrtc_capabilities
+    from .webrtc import (
+        AiortcSessionManager,
+        WebRtcAsyncRunner,
+        WebRtcAudioSource,
+        WebRtcError,
+        create_webrtc_pcm_audio_track,
+        server_webrtc_capabilities,
+    )
 else:
     import importlib
     import types
@@ -107,6 +114,11 @@ else:
     validate_rtl_sample_rate = rtl.validate_rtl_sample_rate
     lookup_event = same_data.lookup_event
     lookup_location = same_data.lookup_location
+    AiortcSessionManager = webrtc.AiortcSessionManager
+    WebRtcAsyncRunner = webrtc.WebRtcAsyncRunner
+    WebRtcAudioSource = webrtc.WebRtcAudioSource
+    WebRtcError = webrtc.WebRtcError
+    create_webrtc_pcm_audio_track = webrtc.create_webrtc_pcm_audio_track
     server_webrtc_capabilities = webrtc.server_webrtc_capabilities
 
 repo_root = Path(__file__).resolve().parents[2]
@@ -154,6 +166,7 @@ STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
 STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
+STREAM_WORKER_RAW_QUEUE_CHUNKS = 4
 STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
@@ -347,15 +360,22 @@ class IcecastStreamWorker:
         stream: dict[str, Any],
         fanout: RawRtlFanout,
         fallback_settings_provider,
+        state_directory: Path,
     ) -> None:
         self.stream = stream
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
-        self.queue = fanout.subscribe(max_chunks=64)
+        self.state_directory = state_directory
+        self.queue = fanout.subscribe(max_chunks=STREAM_WORKER_RAW_QUEUE_CHUNKS)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run_pcm_producer, name=f"icecast-stream-{stream['id']}", daemon=True)
         self.outputs: dict[str, IcecastOutputWriter] = {}
         self.encoder_groups: dict[tuple[str, int, int], IcecastEncoderGroup] = {}
+        self.monitor_sources: dict[str, WebRtcAudioSource] = {}
+        self.eas_config: EasRecordingConfig | None = None
+        self.eas_recorder: EasRecorderOutput | None = None
+        self.eas_status = "disabled"
+        self.eas_error: str | None = None
         self.last_audio_at: float | None = None
         self.lock = threading.Lock()
 
@@ -376,11 +396,16 @@ class IcecastStreamWorker:
         for encoder_group in list(self.encoder_groups.values()):
             encoder_group.stop()
         self.encoder_groups = {}
+        for source in list(self.monitor_sources.values()):
+            source.close()
+        self.monitor_sources = {}
+        self._stop_eas_recorder()
         if self.thread.ident is not None:
             self.thread.join(timeout=2.0)
 
     def sync_stream(self, stream: dict[str, Any]) -> None:
-        self.stream = stream
+        with self.lock:
+            self.stream = stream
         desired = {
             str(output.get("id", "")): output
             for output in stream_outputs(stream)
@@ -397,9 +422,53 @@ class IcecastStreamWorker:
             writer = IcecastOutputWriter(self, output)
             self.outputs[output_id] = writer
             writer.start()
+        self._sync_eas_recorder(stream)
+
+    def audio_config(self) -> AudioConfig:
+        with self.lock:
+            stream = self.stream
+        return audio_config_from_stream(stream)
 
     def snapshots(self) -> list[dict[str, Any]]:
         return [output.snapshot() for output in list(self.outputs.values())]
+
+    def eas_snapshot(self) -> dict[str, Any] | None:
+        with self.lock:
+            config = self.eas_config
+            status = self.eas_status
+            error = self.eas_error
+        if config is None:
+            return None
+        return {
+            "id": self.id,
+            "status": status,
+            "error": error,
+            "directory": config.directory,
+        }
+
+    def add_monitor_source(self, client_id: str) -> WebRtcAudioSource:
+        source = WebRtcAudioSource()
+        with self.lock:
+            old_source = self.monitor_sources.pop(client_id, None)
+            self.monitor_sources[client_id] = source
+        if old_source is not None:
+            old_source.close()
+        return source
+
+    def remove_monitor_source(self, client_id: str) -> None:
+        with self.lock:
+            source = self.monitor_sources.pop(client_id, None)
+        if source is not None:
+            source.close()
+
+    def monitor_source_stats(self, client_id: str) -> dict[str, Any]:
+        with self.lock:
+            source = self.monitor_sources.get(client_id)
+        return source.stats() if source is not None else {}
+
+    def has_monitor_sources(self) -> bool:
+        with self.lock:
+            return bool(self.monitor_sources)
 
     def _run_pcm_producer(self) -> None:
         station = self.stream["station"]
@@ -408,7 +477,7 @@ class IcecastStreamWorker:
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int, int] | None = None
         demodulator = ComplexNfmDemodulator()
-        audio_config = audio_config_from_stream(self.stream)
+        audio_config = self.audio_config()
         effects = AudioEffectsProcessor(audio_config)
         pending = np.array([], dtype=np.float32)
         fallback = load_web_fallback_audio()
@@ -473,7 +542,7 @@ class IcecastStreamWorker:
             while len(pending) >= STREAM_FRAME_SAMPLES:
                 frame = pending[:STREAM_FRAME_SAMPLES]
                 pending = pending[STREAM_FRAME_SAMPLES:]
-                next_audio_config = audio_config_from_stream(self.stream)
+                next_audio_config = self.audio_config()
                 if next_audio_config != audio_config:
                     audio_config = next_audio_config
                     changed_effects = effects.update_config(audio_config)
@@ -505,9 +574,29 @@ class IcecastStreamWorker:
         for encoder_group in list(self.encoder_groups.values()):
             if encoder_group.has_outputs():
                 queue_latest(encoder_group.pcm_queue, pcm)
+        with self.lock:
+            monitor_sources = list(self.monitor_sources.values())
+            eas_recorder = self.eas_recorder
+        for source in monitor_sources:
+            source.push_pcm(pcm)
+        if eas_recorder is not None:
+            try:
+                eas_recorder.write(pcm)
+            except Exception as exc:
+                self._set_eas_status("needs-attention", str(exc))
+                LOG.warning(
+                    "EAS recorder failed for %s: %s",
+                    self.stream.get("station", {}).get("callsign"),
+                    exc,
+                )
+                self._stop_eas_recorder()
 
     def _has_connected_outputs(self) -> bool:
-        return any(encoder_group.has_outputs() for encoder_group in list(self.encoder_groups.values()))
+        return (
+            any(encoder_group.has_outputs() for encoder_group in list(self.encoder_groups.values()))
+            or self.has_monitor_sources()
+            or self.has_eas_recorder()
+        )
 
     def _stop_unused_encoder_groups(self) -> None:
         for key, encoder_group in list(self.encoder_groups.items()):
@@ -515,6 +604,70 @@ class IcecastStreamWorker:
                 continue
             self.encoder_groups.pop(key, None)
             encoder_group.stop()
+
+    def has_eas_recorder(self) -> bool:
+        with self.lock:
+            return self.eas_recorder is not None
+
+    def _sync_eas_recorder(self, stream: dict[str, Any]) -> None:
+        settings = eas_recording_settings_from_stream(stream)
+        next_config = (
+            eas_config_from_stream(stream, self.state_directory, settings)
+            if settings.enabled
+            else None
+        )
+        with self.lock:
+            current_config = self.eas_config
+        if next_config == current_config:
+            return
+        self._stop_eas_recorder()
+        if next_config is None:
+            with self.lock:
+                self.eas_config = None
+                self.eas_status = "disabled"
+                self.eas_error = None
+            return
+        try:
+            recorder = EasRecorderOutput(next_config)
+        except Exception as exc:
+            LOG.warning(
+                "EAS recorder failed for %s: %s",
+                stream.get("station", {}).get("callsign"),
+                exc,
+            )
+            with self.lock:
+                self.eas_config = next_config
+                self.eas_recorder = None
+                self.eas_status = "needs-attention"
+                self.eas_error = str(exc)
+            return
+        with self.lock:
+            self.eas_config = next_config
+            self.eas_recorder = recorder
+            self.eas_status = "enabled"
+            self.eas_error = None
+        LOG.info(
+            "started EAS recorder for %s in %s",
+            stream.get("station", {}).get("callsign", "unknown"),
+            next_config.directory,
+        )
+
+    def _stop_eas_recorder(self) -> None:
+        with self.lock:
+            recorder = self.eas_recorder
+            self.eas_recorder = None
+            if self.eas_config is not None:
+                self.eas_status = "disabled"
+        if recorder is not None:
+            try:
+                recorder.close()
+            except Exception as exc:
+                LOG.debug("EAS recorder close failed: %s", exc)
+
+    def _set_eas_status(self, status: str, error: str | None = None) -> None:
+        with self.lock:
+            self.eas_status = status
+            self.eas_error = error
 
 
 class IcecastEncoderGroup:
@@ -709,6 +862,10 @@ class EasStreamWorker:
         with self.lock:
             self.status = "disabled"
 
+    def sync_stream(self, stream: dict[str, Any]) -> None:
+        with self.lock:
+            self.stream = stream
+
     def _set_status(self, status: str, error: str | None = None) -> None:
         with self.lock:
             self.status = status
@@ -724,6 +881,11 @@ class EasStreamWorker:
             "error": error,
             "directory": self.config.directory,
         }
+
+    def audio_config(self) -> AudioConfig:
+        with self.lock:
+            stream = self.stream
+        return audio_config_from_stream(stream)
 
     def _run(self) -> None:
         recorder = None
@@ -750,7 +912,7 @@ class EasStreamWorker:
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int, int] | None = None
         demodulator = ComplexNfmDemodulator()
-        audio_config = audio_config_from_stream(self.stream)
+        audio_config = self.audio_config()
         effects = AudioEffectsProcessor(audio_config)
         pending = np.array([], dtype=np.float32)
         fallback = load_web_fallback_audio()
@@ -805,7 +967,7 @@ class EasStreamWorker:
             while len(pending) >= STREAM_FRAME_SAMPLES:
                 frame = pending[:STREAM_FRAME_SAMPLES]
                 pending = pending[STREAM_FRAME_SAMPLES:]
-                next_audio_config = audio_config_from_stream(self.stream)
+                next_audio_config = self.audio_config()
                 if next_audio_config != audio_config:
                     audio_config = next_audio_config
                     changed_effects = effects.update_config(audio_config)
@@ -835,7 +997,9 @@ class RtlControlService:
         self.drain_thread: threading.Thread | None = None
         self.drain_stop = threading.Event()
         self.stream_workers: dict[str, IcecastStreamWorker] = {}
-        self.eas_workers: dict[str, EasStreamWorker] = {}
+        self.monitor_streams_by_client: dict[str, str] = {}
+        self.webrtc_runner = WebRtcAsyncRunner()
+        self.webrtc_sessions = AiortcSessionManager()
         self.icecast_auth_cache: dict[str, float] = {}
         self.capture_error: str | None = None
         self.last_batch_at: float | None = None
@@ -848,6 +1012,11 @@ class RtlControlService:
             self._select_only_connected_device()
 
     def close(self) -> None:
+        try:
+            self.webrtc_runner.run(self.webrtc_sessions.close_all(), timeout=3.0)
+        except Exception as exc:
+            LOG.debug("WebRTC monitor cleanup failed: %s", exc)
+        self.webrtc_runner.stop()
         self.stop_capture()
 
     def status(self) -> dict[str, Any]:
@@ -856,11 +1025,13 @@ class RtlControlService:
             settings = self._effective_settings_locked()
             active = capture is not None
             gain_values = capture.get_gain_values() if capture is not None else []
+            capture_stats = capture.stats() if capture is not None else {}
             return {
                 "settings": asdict(settings),
                 "gain_values": gain_values,
                 "active": active,
                 "capture_error": self.capture_error,
+                "capture_stats": capture_stats,
                 "last_batch_at": self.last_batch_at,
                 "received_chunks": self.received_chunks,
                 "received_bytes": self.received_bytes,
@@ -941,7 +1112,10 @@ class RtlControlService:
 
     def stream_status(self) -> dict[str, Any]:
         with self.lock:
-            return {"streams": list(self.streams)}
+            return {
+                "streams": list(self.streams),
+                "monitoring": dict(getattr(self, "monitor_streams_by_client", {})),
+            }
 
     def eas_alert_streams(self) -> dict[str, Any]:
         with self.lock:
@@ -1218,6 +1392,91 @@ class RtlControlService:
         with self.lock:
             return self.fallback_settings
 
+    def start_monitor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id", "")).strip()
+        stream_id = str(payload.get("stream_id", "")).strip()
+        sdp = str(payload.get("sdp", "")).strip()
+        offer_type = str(payload.get("type", "offer")).strip() or "offer"
+        if not client_id:
+            raise ValueError("monitor client id is required")
+        if not stream_id:
+            raise ValueError("stream id is required")
+        if not sdp:
+            raise ValueError("WebRTC offer SDP is required")
+        capabilities = server_webrtc_capabilities()
+        if not capabilities.available:
+            raise ValueError(
+                "WebRTC monitoring is unavailable: "
+                + (capabilities.transport_error or capabilities.opus_error or "server WebRTC support is incomplete")
+            )
+
+        self.stop_monitor({"client_id": client_id})
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            if stream.get("enabled", True) is False:
+                raise ValueError("start the stream before monitoring it")
+            self.monitor_streams_by_client[client_id] = stream_id
+            self._sync_stream_workers_locked()
+            worker = self.stream_workers.get(stream_worker_key(stream))
+            if worker is None:
+                self.monitor_streams_by_client.pop(client_id, None)
+                raise ValueError("stream worker could not be started for monitoring")
+            source = worker.add_monitor_source(client_id)
+            station = stream.get("station", {})
+
+        try:
+            track = create_webrtc_pcm_audio_track(source)
+            answer = self.webrtc_runner.run(
+                self.webrtc_sessions.accept_offer(
+                    session_id=client_id,
+                    sdp=sdp,
+                    type=offer_type,
+                    tracks=(track,),
+                )
+            )
+        except Exception:
+            with self.lock:
+                self._remove_monitor_source_locked(client_id)
+            raise
+        LOG.info(
+            "started WebRTC monitor for %s on client %s",
+            station.get("callsign", stream_id),
+            client_id,
+        )
+        return {
+            "success": True,
+            "stream_id": stream_id,
+            "answer": answer,
+            "monitoring": self.monitor_status(client_id),
+        }
+
+    def stop_monitor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id", "")).strip()
+        if not client_id:
+            raise ValueError("monitor client id is required")
+        with self.lock:
+            stopped_stream_id = self.monitor_streams_by_client.get(client_id, "")
+            self._remove_monitor_source_locked(client_id)
+        try:
+            self.webrtc_runner.run(self.webrtc_sessions.close(client_id), timeout=3.0)
+        except Exception as exc:
+            LOG.debug("WebRTC monitor close failed for client %s: %s", client_id, exc)
+        if stopped_stream_id:
+            LOG.info("stopped WebRTC monitor for stream %s on client %s", stopped_stream_id, client_id)
+        return {"success": True, "monitoring": self.monitor_status(client_id)}
+
+    def monitor_status(self, client_id: str) -> dict[str, Any]:
+        with self.lock:
+            stream_id = self.monitor_streams_by_client.get(client_id, "")
+            worker = None
+            if stream_id:
+                for candidate in self.stream_workers.values():
+                    if candidate.id == stream_id:
+                        worker = candidate
+                        break
+            stats = worker.monitor_source_stats(client_id) if worker is not None else {}
+        return {"client_id": client_id, "stream_id": stream_id, "stats": stats}
+
     def _icecast_auth_cached_locked(self, cache_key: str) -> bool:
         now = time.time()
         for key, timestamp in list(self.icecast_auth_cache.items()):
@@ -1233,6 +1492,9 @@ class RtlControlService:
             self.streams = [stream for stream in self.streams if stream.get("id") != stream_id]
             if not removed:
                 raise ValueError("stream was not found")
+            for client_id, monitored_stream_id in list(self.monitor_streams_by_client.items()):
+                if monitored_stream_id == stream_id:
+                    self._remove_monitor_source_locked(client_id)
             remove_stream_configs(self.streams_directory, removed)
             self._sync_stream_workers_locked()
         LOG.info("removed stream %s", stream_id)
@@ -1247,6 +1509,10 @@ class RtlControlService:
             stream = self._stream_locked(stream_id)
             stream["enabled"] = enabled
             stream["updated_at"] = time.time()
+            if not enabled:
+                for client_id, monitored_stream_id in list(self.monitor_streams_by_client.items()):
+                    if monitored_stream_id == stream_id:
+                        self._remove_monitor_source_locked(client_id)
             save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         LOG.info("%s stream %s", "started" if enabled else "stopped", stream_id)
@@ -1275,6 +1541,9 @@ class RtlControlService:
             stream["audio"] = audio
             stream["updated_at"] = time.time()
             save_streams(self.streams_directory, self.streams)
+            worker = self.stream_workers.get(stream_worker_key(stream))
+            if worker is not None:
+                worker.sync_stream(stream)
         LOG.info("updated audio effects for stream %s", stream_id)
         return self.stream_status()
 
@@ -1582,29 +1851,22 @@ class RtlControlService:
     def _sync_stream_workers_locked(self) -> None:
         fanout = self.raw_fanout
         desired: dict[str, dict[str, Any]] = {}
-        desired_eas: dict[str, tuple[dict[str, Any], EasRecordingConfig]] = {}
+        monitored_stream_ids = set(self.monitor_streams_by_client.values())
         if fanout is not None:
             for stream in self.streams:
                 if not stream.get("enabled", True):
                     continue
-                if any(output.get("enabled", True) for output in stream_outputs(stream)):
+                stream_id = str(stream.get("id", ""))
+                if (
+                    any(output.get("enabled", True) for output in stream_outputs(stream))
+                    or stream_id in monitored_stream_ids
+                    or eas_recording_settings_from_stream(stream).enabled
+                ):
                     desired[stream_worker_key(stream)] = stream
-                eas_settings = eas_recording_settings_from_stream(stream)
-                if eas_settings.enabled:
-                    desired_eas[str(stream.get("id", ""))] = (
-                        stream,
-                        eas_config_from_stream(stream, self.state_path.parent, eas_settings),
-                    )
 
         for key in list(self.stream_workers):
             if key not in desired:
                 worker = self.stream_workers.pop(key)
-                worker.stop()
-        for key in list(self.eas_workers):
-            current = self.eas_workers[key]
-            desired_item = desired_eas.get(key)
-            if desired_item is None or current.config != desired_item[1]:
-                worker = self.eas_workers.pop(key)
                 worker.stop()
 
         if fanout is None:
@@ -1619,6 +1881,7 @@ class RtlControlService:
                 stream=stream,
                 fanout=fanout,
                 fallback_settings_provider=self.fallback_settings_snapshot,
+                state_directory=self.state_path.parent,
             )
             self.stream_workers[key] = worker
             worker.start()
@@ -1626,30 +1889,21 @@ class RtlControlService:
                 "started stream worker for %s",
                 stream.get("station", {}).get("callsign", "unknown"),
             )
-        for key, (stream, config) in desired_eas.items():
-            if key in self.eas_workers:
-                continue
-            worker = EasStreamWorker(
-                stream=stream,
-                config=config,
-                fanout=fanout,
-                fallback_settings_provider=self.fallback_settings_snapshot,
-            )
-            self.eas_workers[key] = worker
-            worker.start()
-            LOG.info(
-                "started EAS recorder for %s in %s",
-                stream.get("station", {}).get("callsign", "unknown"),
-                config.directory,
-            )
+
+    def _remove_monitor_source_locked(self, client_id: str) -> None:
+        stream_id = self.monitor_streams_by_client.pop(client_id, "")
+        if not stream_id:
+            return
+        for worker in self.stream_workers.values():
+            if worker.id == stream_id:
+                worker.remove_monitor_source(client_id)
+                break
+        self._sync_stream_workers_locked()
 
     def _stop_stream_workers_locked(self) -> None:
         for worker in list(self.stream_workers.values()):
             worker.stop()
         self.stream_workers = {}
-        for worker in list(self.eas_workers.values()):
-            worker.stop()
-        self.eas_workers = {}
 
     def _active_streams_locked(self) -> list[dict[str, Any]]:
         snapshots: list[dict[str, Any]] = []
@@ -1661,7 +1915,12 @@ class RtlControlService:
         return snapshots
 
     def _active_eas_recorders_locked(self) -> list[dict[str, Any]]:
-        return [worker.snapshot() for worker in self.eas_workers.values()]
+        snapshots = []
+        for worker in self.stream_workers.values():
+            snapshot = worker.eas_snapshot()
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return snapshots
 
 
 class RtlControlHandler(BaseHTTPRequestHandler):
@@ -1761,6 +2020,14 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
+        elif path == "/api/monitor/status":
+            query = parse_qs(parsed.query)
+            try:
+                response = self.service.monitor_status(query.get("client_id", [""])[0])
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -1775,6 +2042,24 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                     str(payload.get("start", "")),
                     str(payload.get("end", "")),
                 )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/monitor/start":
+            try:
+                payload = self._read_json()
+                response = self.service.start_monitor(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/monitor/stop":
+            try:
+                payload = self._read_json()
+                response = self.service.stop_monitor(payload)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -2971,6 +3256,13 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <button id="dismiss_nwrorg_submission" type="button">Dismiss</button>
   </div>
 </div>
+<div id="monitor_unstable_dialog" class="notice-dialog" role="dialog" aria-labelledby="monitor_unstable_title" aria-live="assertive" hidden>
+  <h2 id="monitor_unstable_title">Stream monitoring stopped</h2>
+  <p>Your internet connection is too unstable for stream monitoring.</p>
+  <div class="actions">
+    <button id="dismiss_monitor_unstable" type="button">Dismiss</button>
+  </div>
+</div>
 <main>
   <div id="view_dashboard" class="view">
     <section>
@@ -3046,6 +3338,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </tr>
         </tbody>
       </table>
+      <div id="streams-result" class="message"></div>
     </section>
   </div>
 
@@ -3164,6 +3457,11 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <input id="stream_enabled" type="checkbox">
         Stream enabled
       </label>
+      <label class="checkbox-row">
+        <input id="stream_monitor_enabled" type="checkbox">
+        Monitor
+      </label>
+      <div id="stream-settings-result" class="message"></div>
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
         <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
         <button id="tab_audio" type="button" role="tab" aria-selected="false" aria-controls="panel_audio" tabindex="-1">Audio Effects</button>
@@ -3470,6 +3768,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <section>
     <h2>Logs</h2>
     <div id="webrtc_support_status" class="hint" hidden></div>
+    <audio id="stream_monitor_audio" autoplay playsinline hidden></audio>
     <pre id="logs" aria-live="off" aria-label="RTL-SDR log output"></pre>
   </section>
 </main>
@@ -3540,6 +3839,15 @@ let webRtcSupport = {
   browser: {webrtc: false, opus: false},
   server: {available: false}
 };
+let monitorClientId = "";
+let monitorStreamId = "";
+let monitorPeerConnection = null;
+let monitorUnstableTimer = null;
+let monitorStatsTimer = null;
+let monitorLastPacketCount = 0;
+let monitorLastPacketAt = 0;
+const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
+const MONITOR_STATS_INTERVAL_MS = 5000;
 const EAS_ALERTS_PER_PAGE = 25;
 const PROTECTED_AUDIO_BANDS = [
   {min: 900, max: 1100},
@@ -3590,6 +3898,215 @@ async function loadWebRtcSupport() {
     element.textContent = `WebRTC browser=${browser.webrtc && browser.opus ? "available" : "unavailable"}, server=${server.available ? "available" : "unavailable"}`;
   }
   return webRtcSupport;
+}
+
+function pageMonitorClientId() {
+  if (!monitorClientId) {
+    monitorClientId = window.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  }
+  return monitorClientId;
+}
+
+function showMonitorUnstableDialog() {
+  const dialog = document.getElementById("monitor_unstable_dialog");
+  if (!dialog) return;
+  dialog.hidden = false;
+  const button = document.getElementById("dismiss_monitor_unstable");
+  if (button) button.focus();
+}
+
+function dismissMonitorUnstableDialog() {
+  const dialog = document.getElementById("monitor_unstable_dialog");
+  if (dialog) dialog.hidden = true;
+}
+
+function clearMonitorUnstableTimer() {
+  if (monitorUnstableTimer) {
+    clearTimeout(monitorUnstableTimer);
+    monitorUnstableTimer = null;
+  }
+}
+
+function clearMonitorStatsTimer() {
+  if (monitorStatsTimer) {
+    clearInterval(monitorStatsTimer);
+    monitorStatsTimer = null;
+  }
+}
+
+function clearMonitorWatchdogs() {
+  clearMonitorUnstableTimer();
+  clearMonitorStatsTimer();
+}
+
+function markMonitorPacketProgress(packetCount) {
+  monitorLastPacketCount = packetCount;
+  monitorLastPacketAt = Date.now();
+  clearMonitorUnstableTimer();
+}
+
+async function stopMonitorForUnstableConnection(reason = "") {
+  if (!monitorStreamId) return;
+  clearMonitorUnstableTimer();
+  console.warn("monitor connection unstable", reason);
+  await stopStreamMonitor({notifyServer: true, unstable: true});
+}
+
+function scheduleMonitorUnstableStop(reason = "") {
+  if (!monitorStreamId || monitorUnstableTimer) return;
+  monitorUnstableTimer = setTimeout(async () => {
+    monitorUnstableTimer = null;
+    await stopMonitorForUnstableConnection(reason);
+  }, MONITOR_UNSTABLE_TIMEOUT_MS);
+}
+
+async function pollMonitorPacketStats() {
+  const peer = monitorPeerConnection;
+  if (!peer || !monitorStreamId) return;
+  try {
+    const stats = await peer.getStats();
+    let packetCount = 0;
+    stats.forEach(report => {
+      if (report.type === "inbound-rtp" && (report.kind === "audio" || report.mediaType === "audio")) {
+        packetCount += Number(report.packetsReceived || 0);
+      }
+    });
+    if (packetCount > monitorLastPacketCount) {
+      markMonitorPacketProgress(packetCount);
+      return;
+    }
+    if (monitorLastPacketAt && Date.now() - monitorLastPacketAt >= MONITOR_UNSTABLE_TIMEOUT_MS) {
+      await stopMonitorForUnstableConnection("no incoming audio packets");
+    }
+  } catch (error) {
+    console.debug("monitor packet stats failed", error);
+  }
+}
+
+function startMonitorPacketStats() {
+  clearMonitorStatsTimer();
+  monitorLastPacketCount = 0;
+  monitorLastPacketAt = Date.now();
+  monitorStatsTimer = setInterval(pollMonitorPacketStats, MONITOR_STATS_INTERVAL_MS);
+}
+
+async function startStreamMonitor(streamId) {
+  if (monitorStreamId === streamId && monitorPeerConnection) return;
+  await stopStreamMonitor({notifyServer: true});
+  if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
+    throw new Error("This browser does not support WebRTC Opus audio monitoring.");
+  }
+  if (!webRtcSupport.server.available) {
+    const error = webRtcSupport.server.transport_error || webRtcSupport.server.opus_error || "Server WebRTC support is unavailable.";
+    throw new Error(error);
+  }
+  const peer = new RTCPeerConnection({iceServers: []});
+  monitorPeerConnection = peer;
+  monitorStreamId = streamId;
+  const audio = document.getElementById("stream_monitor_audio");
+  const transceiver = peer.addTransceiver("audio", {direction: "recvonly"});
+  if (transceiver.receiver && "jitterBufferTarget" in transceiver.receiver) {
+    try {
+      transceiver.receiver.jitterBufferTarget = 0.05;
+    } catch (error) {
+      console.debug("WebRTC receiver jitterBufferTarget is not writable", error);
+    }
+  }
+  peer.addEventListener("track", event => {
+    if (event.receiver && "jitterBufferTarget" in event.receiver) {
+      try {
+        event.receiver.jitterBufferTarget = 0.05;
+      } catch (error) {
+        console.debug("WebRTC track jitterBufferTarget is not writable", error);
+      }
+    }
+    audio.srcObject = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+    audio.hidden = true;
+    audio.play().catch(error => setStreamResult(`Monitoring audio could not start: ${error.message}`, "error"));
+    event.track.addEventListener("mute", () => {
+      if (monitorPeerConnection === peer) scheduleMonitorUnstableStop("audio track muted");
+    });
+    event.track.addEventListener("unmute", () => {
+      if (monitorPeerConnection === peer) clearMonitorUnstableTimer();
+    });
+  });
+  peer.addEventListener("connectionstatechange", () => {
+    if (monitorPeerConnection !== peer) return;
+    if (["connected"].includes(peer.connectionState)) {
+      clearMonitorUnstableTimer();
+      return;
+    }
+    if (["failed", "closed", "disconnected"].includes(peer.connectionState)) {
+      scheduleMonitorUnstableStop(`connectionState=${peer.connectionState}`);
+    }
+  });
+  peer.addEventListener("iceconnectionstatechange", () => {
+    if (monitorPeerConnection !== peer) return;
+    if (["connected", "completed"].includes(peer.iceConnectionState)) {
+      clearMonitorUnstableTimer();
+      return;
+    }
+    if (["failed", "closed", "disconnected"].includes(peer.iceConnectionState)) {
+      scheduleMonitorUnstableStop(`iceConnectionState=${peer.iceConnectionState}`);
+    }
+  });
+  const offer = await peer.createOffer();
+  await peer.setLocalDescription(offer);
+  const data = await request("/api/monitor/start", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      client_id: pageMonitorClientId(),
+      stream_id: streamId,
+      sdp: peer.localDescription.sdp,
+      type: peer.localDescription.type
+    })
+  });
+  await peer.setRemoteDescription(data.answer);
+  startMonitorPacketStats();
+  renderStreams(configuredStreams);
+  if (settingsStreamId) renderStreamSettings();
+}
+
+async function stopStreamMonitor(options = {}) {
+  const notifyServer = options.notifyServer !== false;
+  const unstable = options.unstable === true;
+  const clientId = pageMonitorClientId();
+  const peer = monitorPeerConnection;
+  monitorPeerConnection = null;
+  monitorStreamId = "";
+  clearMonitorWatchdogs();
+  const audio = document.getElementById("stream_monitor_audio");
+  if (audio) {
+    audio.pause();
+    audio.srcObject = null;
+  }
+  if (peer) peer.close();
+  if (notifyServer) {
+    try {
+      await request("/api/monitor/stop", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({client_id: clientId})
+      });
+    } catch (error) {
+      console.warn("monitor stop failed", error);
+    }
+  }
+  renderStreams(configuredStreams);
+  if (settingsStreamId) renderStreamSettings();
+  if (unstable) showMonitorUnstableDialog();
+}
+
+async function toggleStreamMonitor(streamId, resultHandler = setStreamResult) {
+  if (monitorStreamId === streamId) {
+    await stopStreamMonitor();
+    resultHandler("Monitoring stopped.", "success");
+    return;
+  }
+  resultHandler("Starting monitor...");
+  await startStreamMonitor(streamId);
+  resultHandler("Monitoring started.", "success");
 }
 
 function deviceLabel(device) {
@@ -4650,7 +5167,9 @@ function renderStreamSettings() {
   const addButton = document.getElementById("open_add_output");
   setDisabled(addButton, !stream);
   setDisabled(document.getElementById("stream_enabled"), !stream);
+  setDisabled(document.getElementById("stream_monitor_enabled"), !stream || stream.enabled === false);
   if (stream) setChecked("stream_enabled", stream.enabled !== false);
+  setChecked("stream_monitor_enabled", Boolean(stream && monitorStreamId === stream.id));
   setAudioEffectsControls(stream);
   setEasControls(stream);
   renderIcecastOutputsTable(stream);
@@ -4833,6 +5352,7 @@ function activeStreamSignature(rows) {
         enabled: output.enabled !== false,
         type: output.type || "icecast"
       })),
+      monitoring: monitorStreamId === stream.id,
       status: normalizeStreamStatus(stream.status)
     };
   }));
@@ -4908,6 +5428,12 @@ function streamActionsCell(stream) {
   toggle.setAttribute("role", "menuitem");
   toggle.dataset.action = "toggle-active-stream";
   toggle.dataset.streamId = stream.id || "";
+  const monitor = document.createElement("button");
+  monitor.type = "button";
+  monitor.textContent = monitorStreamId === stream.id ? "Stop monitoring" : "Monitor";
+  monitor.setAttribute("role", "menuitem");
+  monitor.dataset.action = "toggle-monitor";
+  monitor.dataset.streamId = stream.id || "";
   const edit = document.createElement("button");
   edit.type = "button";
   edit.textContent = "Edit stream settings";
@@ -4923,6 +5449,7 @@ function streamActionsCell(stream) {
   remove.dataset.streamId = stream.id || "";
   remove.dataset.outputId = output.id || "";
   menu.appendChild(toggle);
+  menu.appendChild(monitor);
   menu.appendChild(edit);
   menu.appendChild(remove);
   cell.appendChild(button);
@@ -5073,6 +5600,22 @@ function setText(id, value) {
 
 function setStreamResult(message, kind = "") {
   const element = document.getElementById("stream-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setStreamsResult(message, kind = "") {
+  const element = document.getElementById("streams-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setStreamSettingsResult(message, kind = "") {
+  const element = document.getElementById("stream-settings-result");
   const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
   if (element.className !== className) element.className = className;
   const text = String(message || "");
@@ -5923,6 +6466,7 @@ for (const link of document.querySelectorAll("nav a[data-view]")) {
 
 document.getElementById("dismiss_nwrorg_submission").addEventListener("click", dismissNwrOrgSubmissionDialog);
 document.getElementById("nwrorg_submission_link").addEventListener("click", dismissNwrOrgSubmissionDialog);
+document.getElementById("dismiss_monitor_unstable").addEventListener("click", dismissMonitorUnstableDialog);
 
 document.getElementById("tab_outputs").addEventListener("click", () => showSettingsTab("outputs"));
 document.getElementById("tab_audio").addEventListener("click", () => showSettingsTab("audio"));
@@ -6010,9 +6554,20 @@ document.getElementById("active-streams-body").addEventListener("click", async e
       return;
     }
     try {
-      await setStreamEnabled(target.dataset.streamId, stream.enabled === false, setStreamResult);
+      await setStreamEnabled(target.dataset.streamId, stream.enabled === false, setStreamsResult);
     } catch (error) {
-      setStreamResult(error.message, "error");
+      setStreamsResult(error.message, "error");
+    }
+    return;
+  }
+  if (target.dataset.action === "toggle-monitor") {
+    closeStreamActionMenus();
+    try {
+      await toggleStreamMonitor(target.dataset.streamId, setStreamsResult);
+    } catch (error) {
+      setStreamsResult(error.message, "error");
+      renderStreams(configuredStreams);
+      if (settingsStreamId) renderStreamSettings();
     }
     return;
   }
@@ -6023,9 +6578,9 @@ document.getElementById("active-streams-body").addEventListener("click", async e
         method: "DELETE"
       });
       renderStreams(data.streams || []);
-      setStreamResult("");
+      setStreamsResult("");
     } catch (error) {
-      setStreamResult(error.message, "error");
+      setStreamsResult(error.message, "error");
     }
   }
 });
@@ -6228,6 +6783,24 @@ document.getElementById("stream_enabled").addEventListener("change", async event
     if (stream) setChecked("stream_enabled", stream.enabled !== false);
   } finally {
     setDisabled(event.target, false);
+  }
+});
+
+document.getElementById("stream_monitor_enabled").addEventListener("change", async event => {
+  if (!settingsStreamId || applying) return;
+  setDisabled(event.target, true);
+  try {
+    if (event.target.checked) {
+      await toggleStreamMonitor(settingsStreamId, setStreamSettingsResult);
+    } else if (monitorStreamId === settingsStreamId) {
+      await stopStreamMonitor();
+      setStreamSettingsResult("Monitoring stopped.", "success");
+    }
+  } catch (error) {
+    setStreamSettingsResult(error.message, "error");
+  } finally {
+    setDisabled(event.target, false);
+    renderStreamSettings();
   }
 });
 
@@ -6530,6 +7103,10 @@ document.getElementById("wizard_finish").addEventListener("click", async () => {
 });
 
 window.addEventListener("beforeunload", event => {
+  if (monitorStreamId && navigator.sendBeacon) {
+    const payload = JSON.stringify({client_id: pageMonitorClientId()});
+    navigator.sendBeacon("/api/monitor/stop", new Blob([payload], {type: "application/json"}));
+  }
   if (!wizardDirty && !outputFormIsOpen()) return;
   event.preventDefault();
   event.returnValue = "";

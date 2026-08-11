@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import asyncio
 import sys
 import types
 import unittest
@@ -51,11 +52,95 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(controller.current_kbps, 128)
 
     def test_audio_source_keeps_latest_frames_when_slow_consumer_falls_behind(self) -> None:
-        source = self.webrtc.WebRtcAudioSource(max_frames=1)
+        source = self.webrtc.WebRtcAudioSource(max_frames=1, prebuffer_frames=0)
         source.push_pcm(b"old")
         source.push_pcm(b"new")
         self.assertEqual(source.dropped_frames, 1)
-        self.assertEqual(source.get_latest_pcm(), b"new")
+        self.assertEqual(source.get_latest_pcm(), b"new" + b"\x00" * (source.frame_bytes - 3))
+
+    def test_audio_source_async_callback_buffer_preserves_frame_order(self) -> None:
+        async def run_test():
+            source = self.webrtc.WebRtcAudioSource(max_frames=4, prebuffer_frames=2, low_water_frames=0)
+            frame_a = b"a" * source.frame_bytes
+            frame_b = b"b" * source.frame_bytes
+            source.push_pcm(frame_a)
+            source.push_pcm(frame_b)
+            first = await source.read_pcm()
+            second = await source.read_pcm()
+            return first, second, source.underrun_frames
+
+        first, second, underruns = asyncio.run(run_test())
+        self.assertEqual(first, b"a" * len(first))
+        self.assertEqual(second, b"b" * len(second))
+        self.assertEqual(underruns, 0)
+
+    def test_audio_source_reports_buffer_stats_and_underruns(self) -> None:
+        async def run_test():
+            source = self.webrtc.WebRtcAudioSource(max_frames=2, prebuffer_frames=0, low_water_frames=0)
+            source.push_pcm(b"a")
+            await source.read_pcm()
+            await source.read_pcm(timeout=0)
+            return source.stats()
+
+        stats = asyncio.run(run_test())
+        self.assertEqual(stats["pushed_frames"], 1)
+        self.assertEqual(stats["read_frames"], 1)
+        self.assertEqual(stats["underrun_frames"], 1)
+        self.assertEqual(stats["dropped_frames"], 0)
+        self.assertEqual(stats["buffered_frames"], 0)
+
+    def test_audio_source_discards_stale_frames_to_hold_low_latency(self) -> None:
+        async def run_test():
+            source = self.webrtc.WebRtcAudioSource(
+                max_frames=8,
+                prebuffer_frames=0,
+                target_latency_frames=2,
+                low_water_frames=0,
+            )
+            for value in (b"a", b"b", b"c", b"d", b"e"):
+                source.push_pcm(value)
+            first = await source.read_pcm()
+            stats = source.stats()
+            return first, stats, source.frame_bytes
+
+        first, stats, frame_bytes = asyncio.run(run_test())
+        self.assertEqual(first, b"d" + b"\x00" * (frame_bytes - 1))
+        self.assertEqual(stats["stale_frames"], 3)
+        self.assertEqual(stats["buffered_frames"], 1)
+
+    def test_webrtc_track_waits_for_complete_resampled_frame_before_padding(self) -> None:
+        class Source:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            async def read_pcm(self):
+                self.reads += 1
+                return b"x"
+
+        class ShortFirstResampler:
+            def __init__(self, _input_rate, _output_rate) -> None:
+                self.calls = 0
+
+            def process(self, _pcm: bytes) -> bytes:
+                self.calls += 1
+                if self.calls == 1:
+                    return b"\x01\x00" * 480
+                return b"\x02\x00" * 480
+
+        original_resampler = self.webrtc.PcmResampler
+        self.webrtc.PcmResampler = ShortFirstResampler
+        try:
+            try:
+                source = Source()
+                track = self.webrtc.create_webrtc_pcm_audio_track(source)
+            except self.webrtc.WebRtcError as exc:
+                self.skipTest(str(exc))
+            frame = asyncio.run(track.recv())
+        finally:
+            self.webrtc.PcmResampler = original_resampler
+
+        self.assertEqual(source.reads, 2)
+        self.assertEqual(frame.samples, self.webrtc.WEBRTC_OPUS_FRAME_SAMPLES)
 
     def test_server_capability_report_has_expected_shape(self) -> None:
         report = self.webrtc.server_webrtc_capabilities().to_dict()

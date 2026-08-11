@@ -176,6 +176,48 @@ class EasAlertTests(unittest.TestCase):
             saved = json.loads((streams_dir / "WXN99" / "config.json").read_text(encoding="utf-8"))
             self.assertEqual([output["icecast"]["mount"] for output in saved["outputs"]], ["/one", "/two"])
 
+    def test_stream_status_reports_runtime_monitoring_without_persisting_it(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.lock = self.web_control.threading.RLock()
+        service.streams = [{"id": "stream-1", "station": {"callsign": "WXN99"}}]
+        service.monitor_streams_by_client = {"client-1": "stream-1"}
+
+        status = service.stream_status()
+
+        self.assertEqual(status["monitoring"], {"client-1": "stream-1"})
+        self.assertNotIn("monitoring", service.streams[0])
+
+    def test_stream_worker_monitor_source_receives_processed_pcm_frame(self) -> None:
+        worker = object.__new__(self.web_control.IcecastStreamWorker)
+        worker.encoder_groups = {}
+        worker.monitor_sources = {}
+        worker.eas_recorder = None
+        worker.lock = self.web_control.threading.Lock()
+        source = worker.add_monitor_source("client-1")
+
+        worker._write_pcm(b"frame")
+
+        self.assertTrue(source.get_latest_pcm(timeout=0.01).startswith(b"frame"))
+
+    def test_stream_worker_eas_recorder_taps_processed_pcm_frame(self) -> None:
+        class Recorder:
+            def __init__(self) -> None:
+                self.frames = []
+
+            def write(self, pcm) -> None:
+                self.frames.append(pcm)
+
+        recorder = Recorder()
+        worker = object.__new__(self.web_control.IcecastStreamWorker)
+        worker.encoder_groups = {}
+        worker.monitor_sources = {}
+        worker.eas_recorder = recorder
+        worker.lock = self.web_control.threading.Lock()
+
+        worker._write_pcm(b"processed")
+
+        self.assertEqual(recorder.frames, [b"processed"])
+
     def test_alert_detail_uses_same_location_lookup(self) -> None:
         alert = {
             "event_type": "TOR",
@@ -525,9 +567,13 @@ class EasAlertTests(unittest.TestCase):
     def test_audio_effects_update_does_not_stop_active_workers(self) -> None:
         class Worker:
             stopped = False
+            synced = False
 
             def stop(self) -> None:
                 self.stopped = True
+
+            def sync_stream(self, stream) -> None:
+                self.synced = True
 
         with tempfile.TemporaryDirectory() as temp_dir:
             streams_dir = Path(temp_dir) / "streams"
@@ -558,8 +604,7 @@ class EasAlertTests(unittest.TestCase):
             service.lock = self.web_control.threading.RLock()
             service.streams_directory = streams_dir
             service.streams = [stream]
-            service.stream_workers = {"stream-1:output-1": icecast_worker}
-            service.eas_workers = {"stream-1": eas_worker}
+            service.stream_workers = {"stream-1": icecast_worker}
 
             response = service.update_audio_effects({
                 "stream_id": "stream-1",
@@ -574,7 +619,7 @@ class EasAlertTests(unittest.TestCase):
             })
 
             self.assertFalse(icecast_worker.stopped)
-            self.assertFalse(eas_worker.stopped)
+            self.assertTrue(icecast_worker.synced)
             self.assertEqual(response["streams"][0]["audio"]["volume"]["multiplier"], 1.2)
 
     def test_audio_effects_processor_volume_update_reuses_effect_objects(self) -> None:
@@ -700,6 +745,7 @@ class EasAlertTests(unittest.TestCase):
                 stream={"id": "stream-1", "station": {"callsign": "WXN99", "frequency": "162.475"}, "outputs": []},
                 fanout=Fanout(),
                 fallback_settings_provider=lambda: None,
+                state_directory=Path(tempfile.gettempdir()),
             )
             first = worker.encoder_group_for(icecast_a)
             second = worker.encoder_group_for(icecast_b)
@@ -767,6 +813,7 @@ class EasAlertTests(unittest.TestCase):
                 stream=stream,
                 fanout=Fanout(),
                 fallback_settings_provider=lambda: None,
+                state_directory=Path(tempfile.gettempdir()),
             )
             worker.sync_stream(stream)
             first_writer, second_writer = Writer.instances
