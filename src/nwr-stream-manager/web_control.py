@@ -2918,6 +2918,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 .success { color: #0f7a34; }
 .status-connected { color: #0f7a34; }
 .hint { color: #526070; font-size: 13px; margin-top: -8px; }
+.notice-dialog { position: fixed; right: 24px; bottom: 24px; z-index: 20; max-width: min(420px, calc(100vw - 48px)); padding: 16px; border: 1px solid #b9c0cc; border-radius: 8px; background: #fff; box-shadow: 0 12px 30px rgb(20 24 31 / 22%); }
+.notice-dialog h2 { font-size: 18px; margin-bottom: 8px; }
+.notice-dialog p { margin: 0 0 14px; }
 @media (prefers-color-scheme: dark) {
   body { background: #101318; color: #eef2f7; }
   header, section, select, input, button { background: #181d24; color: #eef2f7; border-color: #333b48; }
@@ -2930,6 +2933,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
   .tabs { border-color: #333b48; }
   .tabs button[aria-selected="true"] { border-bottom-color: #181d24; }
+  .notice-dialog { background: #181d24; border-color: #333b48; }
 }
 @media (max-width: 680px) {
   .effects-layout { display: block; }
@@ -2951,6 +2955,17 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </nav>
   </div>
 </header>
+<div id="nwrorg_submission_dialog" class="notice-dialog" role="dialog" aria-labelledby="nwrorg_submission_title" aria-live="polite" hidden>
+  <h2 id="nwrorg_submission_title">NOAA Weather Radio Org</h2>
+  <p>
+    If you have not already done so, you must fill out the
+    <a id="nwrorg_submission_link" href="http://noaaweatherradio.org/addstream/addstream.html" target="_blank" rel="noopener noreferrer">submission form</a>
+    for NOAA Weather Radio Org before your stream will appear on the website.
+  </p>
+  <div class="actions">
+    <button id="dismiss_nwrorg_submission" type="button">Dismiss</button>
+  </div>
+</div>
 <main>
   <div id="view_dashboard" class="view">
     <section>
@@ -4035,12 +4050,18 @@ function setOutputResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
-function maybeShowNwrOrgSubmissionDialog(icecast) {
+function dismissNwrOrgSubmissionDialog() {
+  const dialog = document.getElementById("nwrorg_submission_dialog");
+  if (dialog) dialog.hidden = true;
+}
+
+function maybeShowNwrOrgSubmissionNotice(icecast) {
   if (!icecast || icecast.service !== STREAM_SERVICE_NWRORG) return;
-  const message = "If you have not already done so, you must fill out the submission form for NOAA Weather Radio ORG before your stream will appear on the website.\\n\\nOpen the submission form in a new tab?";
-  if (window.confirm(message)) {
-    window.open("http://noaaweatherradio.org/addstream/addstream.html", "_blank", "noopener,noreferrer");
-  }
+  const dialog = document.getElementById("nwrorg_submission_dialog");
+  if (!dialog) return;
+  dialog.hidden = false;
+  const link = document.getElementById("nwrorg_submission_link");
+  if (link) link.focus();
 }
 
 function resetWizardForService(service) {
@@ -5852,6 +5873,9 @@ for (const link of document.querySelectorAll("nav a[data-view]")) {
   });
 }
 
+document.getElementById("dismiss_nwrorg_submission").addEventListener("click", dismissNwrOrgSubmissionDialog);
+document.getElementById("nwrorg_submission_link").addEventListener("click", dismissNwrOrgSubmissionDialog);
+
 document.getElementById("tab_outputs").addEventListener("click", () => showSettingsTab("outputs"));
 document.getElementById("tab_audio").addEventListener("click", () => showSettingsTab("audio"));
 document.getElementById("tab_eas").addEventListener("click", () => showSettingsTab("eas"));
@@ -6179,7 +6203,7 @@ document.getElementById("add_output").addEventListener("click", async () => {
     setOutputResult(data.message, data.success ? "success" : "error");
     if (data.success) {
       cancelOutputForm();
-      maybeShowNwrOrgSubmissionDialog(icecast);
+      maybeShowNwrOrgSubmissionNotice(icecast);
     }
   } catch (error) {
     setOutputResult(error.message, "error");
@@ -6219,7 +6243,7 @@ document.getElementById("save_output_settings").addEventListener("click", async 
     setOutputResult(data.message, data.success ? "success" : "error");
     if (data.success) {
       cancelOutputForm();
-      if (oldService !== STREAM_SERVICE_NWRORG) maybeShowNwrOrgSubmissionDialog(icecast);
+      if (oldService !== STREAM_SERVICE_NWRORG) maybeShowNwrOrgSubmissionNotice(icecast);
     }
   } catch (error) {
     setOutputResult(error.message, "error");
@@ -6447,7 +6471,7 @@ document.getElementById("wizard_finish").addEventListener("click", async () => {
     setStreamResult(data.message, data.success ? "success" : "error");
     if (data.success) {
       finishWizard();
-      maybeShowNwrOrgSubmissionDialog(createdIcecast);
+      maybeShowNwrOrgSubmissionNotice(createdIcecast);
     }
   } catch (error) {
     setStreamResult(error.message, "error");
