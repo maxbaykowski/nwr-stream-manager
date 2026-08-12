@@ -24,12 +24,31 @@ class RtlCaptureTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.rtl = load_rtl_module()
 
-    def test_async_buffer_size_is_small_for_low_latency_callbacks(self) -> None:
+    def test_async_buffer_size_stays_low_latency_at_low_sample_rates(self) -> None:
         config = self.rtl.RtlConfig(serial="dummy", sample_rate=240_040)
         buffer_size = self.rtl.RtlCaptureSource._rtl_async_buffer_size(config)
         self.assertEqual(buffer_size % 512, 0)
         self.assertLess(buffer_size, config.read_chunk_bytes)
-        self.assertLessEqual(buffer_size, 10_240)
+        self.assertLessEqual(buffer_size, 25_600)
+
+    def test_async_buffer_size_is_about_fifty_milliseconds_at_default_sample_rate(self) -> None:
+        config = self.rtl.RtlConfig(serial="dummy", sample_rate=1_024_000)
+        buffer_size = self.rtl.RtlCaptureSource._rtl_async_buffer_size(config)
+        self.assertEqual(buffer_size % 512, 0)
+        self.assertGreaterEqual(buffer_size, 100_000)
+        self.assertLessEqual(buffer_size, 105_000)
+
+    def test_async_buffer_size_scales_up_at_high_sample_rates(self) -> None:
+        low_config = self.rtl.RtlConfig(serial="dummy", sample_rate=240_040)
+        high_config = self.rtl.RtlConfig(serial="dummy", sample_rate=3_200_000)
+
+        low_buffer_size = self.rtl.RtlCaptureSource._rtl_async_buffer_size(low_config)
+        high_buffer_size = self.rtl.RtlCaptureSource._rtl_async_buffer_size(high_config)
+
+        self.assertEqual(high_buffer_size % 512, 0)
+        self.assertGreater(high_buffer_size, low_buffer_size)
+        self.assertGreater(high_buffer_size, high_config.read_chunk_bytes)
+        self.assertLessEqual(high_buffer_size, 320_000)
 
     def test_capture_offer_drops_oldest_batch_instead_of_blocking_callback(self) -> None:
         source = self.rtl.RtlCaptureSource(self.rtl.RtlConfig(serial="dummy"))

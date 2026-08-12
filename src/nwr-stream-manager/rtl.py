@@ -24,7 +24,7 @@ DEFAULT_RTL_SAMPLE_RATE = 1_024_000
 DEFAULT_READ_CHUNK_BYTES = 131_072
 DEFAULT_READ_TIMEOUT_SECONDS = 5.0
 RTL_ASYNC_BUFFER_COUNT = 15
-MAX_RTL_ASYNC_BUFFER_SECONDS = 0.02
+RTL_ASYNC_BUFFER_SECONDS = 0.05
 RTL_SAMPLE_RATE_RANGES = (
     (225_001, 300_000),
     (900_001, 3_200_000),
@@ -820,9 +820,8 @@ class RtlCaptureSource:
 
     @staticmethod
     def _rtl_async_buffer_size(config: RtlConfig) -> int:
-        target_size = int(2.0 * float(config.sample_rate) * MAX_RTL_ASYNC_BUFFER_SECONDS)
-        if config.read_chunk_bytes:
-            target_size = min(int(config.read_chunk_bytes), target_size)
+        sample_rate = max(1, int(config.sample_rate))
+        target_size = int(2.0 * float(sample_rate) * RTL_ASYNC_BUFFER_SECONDS)
         target_size = max(512, target_size)
         target_size -= target_size % 512
         return max(512, target_size)
@@ -894,18 +893,33 @@ class ProcessedIqSource:
         output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
     ) -> None:
         self.rtl_source = rtl_source
-        self.dc_blocker = IqDcBlocker()
-        self.channelizer = IqChannelizer(
-            input_rate=rtl_source.config.sample_rate,
-            center_frequency_hz=rtl_source.config.center_frequency_hz,
-            target_frequency_hz=target_frequency_hz,
-            output_rate=output_rate,
-        )
+        self.target_frequency_hz = target_frequency_hz
+        self.output_rate = output_rate
+        self.dc_blocker: IqDcBlocker | None = None
+        self.channelizer: IqChannelizer | None = None
+        self.channelizer_key: tuple[int, int, int] | None = None
 
     def read(self, timeout: float | None = None):
         batch = self.rtl_source.read(timeout=timeout)
+        next_key = (
+            batch.sample_rate,
+            batch.center_frequency_hz,
+            int(round(self.target_frequency_hz)),
+        )
+        if self.channelizer is None or self.channelizer_key != next_key:
+            self.dc_blocker = IqDcBlocker(batch.sample_rate)
+            self.channelizer = IqChannelizer(
+                input_rate=batch.sample_rate,
+                center_frequency_hz=batch.center_frequency_hz,
+                target_frequency_hz=int(round(self.target_frequency_hz)),
+                output_rate=self.output_rate,
+            )
+            self.channelizer_key = next_key
         centered_iq = rtl_u8_to_complex64(batch.data)
+        if self.dc_blocker is None:
+            self.dc_blocker = IqDcBlocker(batch.sample_rate)
         dc_blocked_iq = self.dc_blocker.process(centered_iq)
+        assert self.channelizer is not None
         return self.channelizer.process_complex(dc_blocked_iq)
 
 

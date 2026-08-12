@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import mimetypes
 import os
 import queue
@@ -166,7 +167,9 @@ STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
 STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
-STREAM_WORKER_RAW_QUEUE_CHUNKS = 4
+STREAM_WORKER_RAW_QUEUE_SECONDS = 0.75
+STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS = 8
+STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 64
 STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
@@ -266,7 +269,9 @@ class RawRtlFanout:
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
 
-    def subscribe(self, max_chunks: int = 32) -> queue.Queue:
+    def subscribe(self, max_chunks: int | None = None, max_seconds: float | None = None) -> queue.Queue:
+        if max_chunks is None:
+            max_chunks = self._chunks_for_seconds(max_seconds or STREAM_WORKER_RAW_QUEUE_SECONDS)
         subscriber: queue.Queue = queue.Queue(maxsize=max_chunks)
         with self.subscribers_lock:
             self.subscribers.add(subscriber)
@@ -287,6 +292,18 @@ class RawRtlFanout:
         self.stop_event.set()
         if self.thread is not None:
             self.thread.join(timeout=2.0)
+
+    def _chunks_for_seconds(self, seconds: float) -> int:
+        sample_rate = max(1, int(self.source.config.sample_rate))
+        chunk_bytes = max(512, self.source._rtl_async_buffer_size(self.source.config))
+        chunk_seconds = max(0.001, chunk_bytes / (2.0 * float(sample_rate)))
+        return max(
+            STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS,
+            min(
+                STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS,
+                int(math.ceil(max(0.0, seconds) / chunk_seconds)),
+            ),
+        )
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -320,19 +337,44 @@ class ComplexNfmDemodulator:
         self.previous_sample: np.complex64 | None = None
 
     def process(self, iq: np.ndarray) -> np.ndarray:
+        if len(iq) == 0:
+            return np.array([], dtype=np.float32)
         if len(iq) < 2 and self.previous_sample is None:
-            if len(iq) == 1:
-                self.previous_sample = iq[-1]
+            self.previous_sample = iq[-1]
             return np.array([], dtype=np.float32)
         if self.previous_sample is None:
-            previous = iq[:-1]
-            current = iq[1:]
+            output = np.angle(iq[1:] * np.conj(iq[:-1])).astype(np.float32)
         else:
-            previous = np.concatenate((np.array([self.previous_sample], dtype=np.complex64), iq[:-1]))
-            current = iq
+            output = np.empty(len(iq), dtype=np.float32)
+            output[0] = np.angle(iq[0] * np.conj(self.previous_sample))
+            if len(iq) > 1:
+                output[1:] = np.angle(iq[1:] * np.conj(iq[:-1])).astype(np.float32)
         self.previous_sample = iq[-1]
-        demodulated = np.angle(current * np.conj(previous)).astype(np.float32)
-        return (demodulated / np.pi * 1.5).astype(np.float32, copy=False)
+        return (output / np.pi * 1.5).astype(np.float32, copy=False)
+
+
+class FloatFrameBuffer:
+    def __init__(self, frame_samples: int) -> None:
+        self.frame_samples = frame_samples
+        self.pending = np.empty(0, dtype=np.float32)
+        self.offset = 0
+
+    def clear(self) -> None:
+        self.pending = np.empty(0, dtype=np.float32)
+        self.offset = 0
+
+    def push(self, samples: np.ndarray):
+        samples = samples.astype(np.float32, copy=False)
+        if self.offset:
+            self.pending = self.pending[self.offset :]
+            self.offset = 0
+        self.pending = samples if len(self.pending) == 0 else np.concatenate((self.pending, samples))
+        while len(self.pending) - self.offset >= self.frame_samples:
+            frame = self.pending[self.offset : self.offset + self.frame_samples]
+            self.offset += self.frame_samples
+            yield frame
+        if self.offset and self.offset >= len(self.pending):
+            self.clear()
 
 
 def load_web_fallback_audio():
@@ -385,7 +427,7 @@ class IcecastStreamWorker:
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
         self.state_directory = state_directory
-        self.queue = fanout.subscribe(max_chunks=STREAM_WORKER_RAW_QUEUE_CHUNKS)
+        self.queue = fanout.subscribe(max_seconds=STREAM_WORKER_RAW_QUEUE_SECONDS)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run_pcm_producer, name=f"icecast-stream-{stream['id']}", daemon=True)
         self.outputs: dict[str, IcecastOutputWriter] = {}
@@ -492,13 +534,13 @@ class IcecastStreamWorker:
     def _run_pcm_producer(self) -> None:
         station = self.stream["station"]
         target_frequency_hz = float(station["frequency"]) * 1_000_000
-        dc_blocker = IqDcBlocker()
+        dc_blocker: IqDcBlocker | None = None
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int, int] | None = None
         demodulator = ComplexNfmDemodulator()
         audio_config = self.audio_config()
         effects = AudioEffectsProcessor(audio_config)
-        pending = np.array([], dtype=np.float32)
+        frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
         fallback = load_web_fallback_audio()
         fallback_state = WebFallbackPlaybackState()
         last_real_audio = time.monotonic()
@@ -510,7 +552,7 @@ class IcecastStreamWorker:
                 except queue.Empty:
                     pass
                 fallback_state.reset()
-                pending = np.array([], dtype=np.float32)
+                frame_buffer.clear()
                 continue
             try:
                 batch: RtlSampleBatch = self.queue.get(
@@ -539,6 +581,7 @@ class IcecastStreamWorker:
                 int(round(target_frequency_hz)),
             )
             if channelizer is None or channelizer_key != next_channelizer_key:
+                dc_blocker = IqDcBlocker(batch.sample_rate)
                 channelizer = IqChannelizer(
                     input_rate=batch.sample_rate,
                     center_frequency_hz=batch.center_frequency_hz,
@@ -548,6 +591,8 @@ class IcecastStreamWorker:
                 channelizer_key = next_channelizer_key
                 demodulator = ComplexNfmDemodulator()
             iq = rtl_u8_to_complex64(batch.data)
+            if dc_blocker is None:
+                dc_blocker = IqDcBlocker(batch.sample_rate)
             audio = demodulator.process(channelizer.process_complex(dc_blocker.process(iq)))
             if len(audio) == 0:
                 continue
@@ -557,10 +602,7 @@ class IcecastStreamWorker:
             fallback_state.reset()
             with self.lock:
                 self.last_audio_at = time.time()
-            pending = np.concatenate((pending, audio.astype(np.float32, copy=False)))
-            while len(pending) >= STREAM_FRAME_SAMPLES:
-                frame = pending[:STREAM_FRAME_SAMPLES]
-                pending = pending[STREAM_FRAME_SAMPLES:]
+            for frame in frame_buffer.push(audio):
                 next_audio_config = self.audio_config()
                 if next_audio_config != audio_config:
                     audio_config = next_audio_config
@@ -856,7 +898,7 @@ class WeatherReceiverWorker:
     ) -> None:
         self.client_id = client_id
         self.fanout = fanout
-        self.queue = fanout.subscribe(max_chunks=STREAM_WORKER_RAW_QUEUE_CHUNKS)
+        self.queue = fanout.subscribe(max_seconds=STREAM_WORKER_RAW_QUEUE_SECONDS)
         self.source = WebRtcAudioSource()
         self.frequency_hz = validate_receiver_frequency(frequency_hz)
         self.stop_event = threading.Event()
@@ -901,12 +943,12 @@ class WeatherReceiverWorker:
             return self.frequency_hz
 
     def _run(self) -> None:
-        dc_blocker = IqDcBlocker()
+        dc_blocker: IqDcBlocker | None = None
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int] | None = None
         demodulator = ComplexNfmDemodulator()
         effects = AudioEffectsProcessor(RECEIVER_AUDIO_CONFIG)
-        pending = np.array([], dtype=np.float32)
+        frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
         while not self.stop_event.is_set():
             try:
                 batch: RtlSampleBatch = self.queue.get(timeout=0.5)
@@ -918,6 +960,7 @@ class WeatherReceiverWorker:
             target_frequency_hz = self._frequency_hz()
             next_channelizer_key = (batch.sample_rate, batch.center_frequency_hz)
             if channelizer is None or channelizer_key != next_channelizer_key:
+                dc_blocker = IqDcBlocker(batch.sample_rate)
                 channelizer = IqChannelizer(
                     input_rate=batch.sample_rate,
                     center_frequency_hz=batch.center_frequency_hz,
@@ -930,168 +973,15 @@ class WeatherReceiverWorker:
                 channelizer.target_frequency_hz = target_frequency_hz
                 channelizer.shifter.offset_hz = float(batch.center_frequency_hz - target_frequency_hz)
             iq = rtl_u8_to_complex64(batch.data)
+            if dc_blocker is None:
+                dc_blocker = IqDcBlocker(batch.sample_rate)
             audio = demodulator.process(channelizer.process_complex(dc_blocker.process(iq)))
             if len(audio) == 0:
                 continue
-            pending = np.concatenate((pending, audio.astype(np.float32, copy=False)))
-            while len(pending) >= STREAM_FRAME_SAMPLES:
-                frame = pending[:STREAM_FRAME_SAMPLES]
-                pending = pending[STREAM_FRAME_SAMPLES:]
+            for frame in frame_buffer.push(audio):
                 self.source.push_pcm(float_to_s16(effects.process(frame)))
                 with self.lock:
                     self.last_audio_at = time.time()
-
-
-class EasStreamWorker:
-    def __init__(
-        self,
-        *,
-        stream: dict[str, Any],
-        config: EasRecordingConfig,
-        fanout: RawRtlFanout,
-        fallback_settings_provider,
-    ) -> None:
-        self.stream = stream
-        self.config = config
-        self.fanout = fanout
-        self.fallback_settings_provider = fallback_settings_provider
-        self.queue = fanout.subscribe(max_chunks=64)
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run, name=f"eas-recorder-{stream['id']}", daemon=True)
-        self.status = "disabled"
-        self.error: str | None = None
-        self.lock = threading.Lock()
-
-    @property
-    def id(self) -> str:
-        return str(self.stream["id"])
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        self.fanout.unsubscribe(self.queue)
-        if self.thread.ident is not None:
-            self.thread.join(timeout=2.0)
-        with self.lock:
-            self.status = "disabled"
-
-    def sync_stream(self, stream: dict[str, Any]) -> None:
-        with self.lock:
-            self.stream = stream
-
-    def _set_status(self, status: str, error: str | None = None) -> None:
-        with self.lock:
-            self.status = status
-            self.error = error
-
-    def snapshot(self) -> dict[str, Any]:
-        with self.lock:
-            status = self.status
-            error = self.error
-        return {
-            "id": self.id,
-            "status": status,
-            "error": error,
-            "directory": self.config.directory,
-        }
-
-    def audio_config(self) -> AudioConfig:
-        with self.lock:
-            stream = self.stream
-        return audio_config_from_stream(stream)
-
-    def _run(self) -> None:
-        recorder = None
-        try:
-            recorder = EasRecorderOutput(self.config)
-            self._set_status("enabled")
-            self._produce_pcm(recorder)
-        except Exception as exc:
-            if not self.stop_event.is_set():
-                self._set_status("needs-attention", str(exc))
-                LOG.warning("EAS recorder failed for %s: %s", self.stream.get("station", {}).get("callsign"), exc)
-        finally:
-            if recorder is not None:
-                try:
-                    recorder.close()
-                except Exception as exc:
-                    LOG.debug("EAS recorder close failed: %s", exc)
-            self._set_status("disabled")
-
-    def _produce_pcm(self, recorder: EasRecorderOutput) -> None:
-        station = self.stream["station"]
-        target_frequency_hz = float(station["frequency"]) * 1_000_000
-        dc_blocker = IqDcBlocker()
-        channelizer: IqChannelizer | None = None
-        channelizer_key: tuple[int, int, int] | None = None
-        demodulator = ComplexNfmDemodulator()
-        audio_config = self.audio_config()
-        effects = AudioEffectsProcessor(audio_config)
-        pending = np.array([], dtype=np.float32)
-        fallback = load_web_fallback_audio()
-        fallback_state = WebFallbackPlaybackState()
-        last_real_audio = time.monotonic()
-        idle_output_active = False
-        while not self.stop_event.is_set():
-            try:
-                batch: RtlSampleBatch = self.queue.get(
-                    timeout=STREAM_FRAME_SECONDS if idle_output_active else STREAM_IDLE_DETECTION_SECONDS
-                )
-            except queue.Empty:
-                idle_output_active = True
-                fallback_settings = self.fallback_settings_provider()
-                idle_seconds = time.monotonic() - last_real_audio
-                if not fallback_settings.enabled:
-                    fallback_state.reset()
-                    continue
-                if not fallback_state.active and idle_seconds < fallback_settings.silence_timeout_seconds:
-                    fallback_state.reset()
-                    recorder.write(STREAM_SILENCE_FRAME)
-                    continue
-                if not fallback_state.active:
-                    fallback_state.active = True
-                    LOG.info("starting EAS fallback audio for %s after %.1f seconds without IQ", station.get("callsign"), idle_seconds)
-                recorder.write(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds))
-                continue
-            idle_output_active = False
-            next_channelizer_key = (
-                batch.sample_rate,
-                batch.center_frequency_hz,
-                int(round(target_frequency_hz)),
-            )
-            if channelizer is None or channelizer_key != next_channelizer_key:
-                channelizer = IqChannelizer(
-                    input_rate=batch.sample_rate,
-                    center_frequency_hz=batch.center_frequency_hz,
-                    target_frequency_hz=int(round(target_frequency_hz)),
-                    output_rate=IQ_SAMPLE_RATE,
-                )
-                channelizer_key = next_channelizer_key
-                demodulator = ComplexNfmDemodulator()
-            iq = rtl_u8_to_complex64(batch.data)
-            audio = demodulator.process(channelizer.process_complex(dc_blocker.process(iq)))
-            if len(audio) == 0:
-                continue
-            last_real_audio = time.monotonic()
-            if fallback_state.active:
-                LOG.info("stopping EAS fallback audio for %s", station.get("callsign"))
-            fallback_state.reset()
-            pending = np.concatenate((pending, audio.astype(np.float32, copy=False)))
-            while len(pending) >= STREAM_FRAME_SAMPLES:
-                frame = pending[:STREAM_FRAME_SAMPLES]
-                pending = pending[STREAM_FRAME_SAMPLES:]
-                next_audio_config = self.audio_config()
-                if next_audio_config != audio_config:
-                    audio_config = next_audio_config
-                    changed_effects = effects.update_config(audio_config)
-                    LOG.info(
-                        "applied EAS recorder audio effects update for %s: %s",
-                        station.get("callsign"),
-                        ", ".join(changed_effects) or "none",
-                    )
-                recorder.write(float_to_s16(effects.process(frame)))
 
 
 class RtlControlService:

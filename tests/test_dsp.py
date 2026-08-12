@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import importlib
+import sys
+import types
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_PATH = REPO_ROOT / "src" / "nwr-stream-manager"
+
+
+def load_dsp_module():
+    package = types.ModuleType("nwr_stream_manager")
+    package.__path__ = [str(PACKAGE_PATH)]  # type: ignore[attr-defined]
+    package.__version__ = "0.0.0"  # type: ignore[attr-defined]
+    sys.modules.setdefault("nwr_stream_manager", package)
+    return importlib.import_module("nwr_stream_manager.dsp")
+
+
+class DspTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.dsp = load_dsp_module()
+
+    def test_iq_dc_blocker_slowly_tracks_dc_over_about_one_second(self) -> None:
+        sample_rate = 1000
+        blocker = self.dsp.IqDcBlocker(sample_rate=sample_rate, time_constant_seconds=1.0)
+        chunks = [np.ones(50, dtype=np.complex64) for _index in range(20)]
+
+        outputs = [blocker.process(chunk) for chunk in chunks]
+        output = np.concatenate(outputs)
+
+        self.assertGreater(abs(output[0]), 0.99)
+        self.assertGreater(abs(output[-1]), 0.36)
+        self.assertLess(abs(output[-1]), 0.40)
+
+    def test_iq_dc_blocker_is_sample_rate_aware(self) -> None:
+        slow = self.dsp.IqDcBlocker(sample_rate=1000, time_constant_seconds=1.0)
+        fast = self.dsp.IqDcBlocker(sample_rate=2000, time_constant_seconds=1.0)
+
+        slow_output = np.concatenate(
+            [slow.process(np.ones(50, dtype=np.complex64)) for _index in range(20)]
+        )
+        fast_output = np.concatenate(
+            [fast.process(np.ones(50, dtype=np.complex64)) for _index in range(20)]
+        )
+
+        self.assertLess(abs(slow_output[-1]), abs(fast_output[-1]))
+
+    def test_iq_dc_blocker_preserves_audio_rate_offset_energy(self) -> None:
+        sample_rate = 240_000
+        seconds = 0.1
+        count = round(sample_rate * seconds)
+        time_axis = np.arange(count, dtype=np.float32) / sample_rate
+        tone = np.exp(1j * 2.0 * np.pi * 1000.0 * time_axis).astype(np.complex64)
+        blocker = self.dsp.IqDcBlocker(sample_rate=sample_rate, time_constant_seconds=1.0)
+
+        output = blocker.process(tone)
+
+        self.assertGreater(float(np.mean(np.abs(output[-1000:]))), 0.99)
+
+    def test_integer_decimator_matches_filter_then_downsample_reference(self) -> None:
+        rng = np.random.default_rng(123)
+        decimator = self.dsp.IntegerDecimator.create(
+            96_000,
+            24_000,
+            transition_hz=4_000,
+            attenuation_db=60,
+        )
+        reference_filter = self.dsp.FirFilter(decimator.fir.taps.copy())
+        reference_seen = 0
+        actual_parts = []
+        expected_parts = []
+
+        for size in (17, 301, 409):
+            samples = (
+                rng.normal(size=size) + 1j * rng.normal(size=size)
+            ).astype(np.complex64)
+            actual_parts.append(decimator.process(samples))
+            filtered = reference_filter.process(samples)
+            offset = (-reference_seen) % decimator.factor
+            expected_parts.append(filtered[offset :: decimator.factor])
+            reference_seen += int(filtered.size)
+
+        actual = np.concatenate(actual_parts)
+        expected = np.concatenate(expected_parts)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+    def test_rational_resampler_matches_filter_then_interpolate_reference(self) -> None:
+        rng = np.random.default_rng(456)
+        resampler = self.dsp.RationalResampler(
+            100_000,
+            24_000,
+            transition_hz=4_000,
+            attenuation_db=60,
+        )
+        reference_filter = self.dsp.FirFilter(resampler.fir.taps.copy())
+        reference_seen = 0
+        next_position = 0.0
+        tail = np.array([], dtype=np.complex64)
+        actual_parts = []
+        expected_parts = []
+
+        for size in (101, 503, 257):
+            samples = (
+                rng.normal(size=size) + 1j * rng.normal(size=size)
+            ).astype(np.complex64)
+            actual_parts.append(resampler.process(samples))
+            filtered = reference_filter.process(samples)
+            work = np.concatenate((tail, filtered)) if tail.size else filtered
+            work_start = reference_seen - int(tail.size)
+            work_end = reference_seen + int(filtered.size)
+            max_position = work_end - 1
+            step = 100_000 / 24_000
+            position = next_position
+            if position < work_start:
+                position += np.ceil((work_start - position) / step) * step
+            positions = []
+            while position < max_position:
+                positions.append(position)
+                position += step
+            next_position = position
+            reference_seen += int(filtered.size)
+            tail = work[-1:].copy()
+            if not positions:
+                continue
+            local_positions = np.asarray(positions, dtype=np.float64) - float(work_start)
+            indices = np.floor(local_positions).astype(np.int64)
+            fractions = (local_positions - indices).astype(np.float32)
+            left = work[indices]
+            right = work[indices + 1]
+            expected_parts.append((left + (right - left) * fractions).astype(np.complex64))
+
+        actual = np.concatenate(actual_parts)
+        expected = np.concatenate(expected_parts)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+    def test_create_decimator_uses_staged_numpy_decimator_for_high_rates(self) -> None:
+        decimator = self.dsp.create_decimator(1_024_000, 24_000)
+
+        self.assertIsInstance(decimator, self.dsp.StagedDecimator)
+        self.assertIsInstance(decimator.first_stage, self.dsp.IntegerDecimator)
+        self.assertIsInstance(decimator.final_stage, self.dsp.RationalResampler)
+        self.assertGreaterEqual(decimator.intermediate_rate, self.dsp.STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE)
+        self.assertLessEqual(decimator.intermediate_rate, self.dsp.STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE)
+
+    def test_staged_decimator_preserves_baseband_and_rejects_out_of_band_aliases(self) -> None:
+        sample_rate = 1_024_000
+        count = round(sample_rate * 0.25)
+        time_axis = np.arange(count, dtype=np.float32) / sample_rate
+
+        desired = np.exp(1j * 2.0 * np.pi * 1_000.0 * time_axis).astype(np.complex64)
+        adjacent = np.exp(1j * 2.0 * np.pi * 100_000.0 * time_axis).astype(np.complex64)
+
+        desired_output = self.dsp.create_decimator(sample_rate, 24_000).process(desired)
+        adjacent_output = self.dsp.create_decimator(sample_rate, 24_000).process(adjacent)
+
+        self.assertGreater(float(np.mean(np.abs(desired_output[-1000:]))), 0.5)
+        self.assertLess(float(np.mean(np.abs(adjacent_output[-1000:]))), 0.05)
+
+
+if __name__ == "__main__":
+    unittest.main()

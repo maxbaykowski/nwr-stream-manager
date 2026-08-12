@@ -218,6 +218,16 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertEqual(recorder.frames, [b"processed"])
 
+    def test_stream_worker_treats_eas_as_shared_processed_output(self) -> None:
+        worker = object.__new__(self.web_control.IcecastStreamWorker)
+        worker.encoder_groups = {}
+        worker.monitor_sources = {}
+        worker.eas_recorder = object()
+        worker.lock = self.web_control.threading.Lock()
+
+        self.assertTrue(worker._has_connected_outputs())
+        self.assertFalse(hasattr(self.web_control, "EasStreamWorker"))
+
     def test_receiver_frequency_validation_accepts_only_nwr_channels(self) -> None:
         self.assertEqual(self.web_control.validate_receiver_frequency(162475000), 162475000)
         with self.assertRaisesRegex(ValueError, "valid NWR receiver frequency"):
@@ -716,11 +726,22 @@ class EasAlertTests(unittest.TestCase):
         self.assertGreater(float(np.max(np.abs(output))), 0.07)
         self.assertLess(float(np.max(np.abs(output))), 0.13)
 
+    def test_complex_nfm_demodulator_accepts_empty_streaming_blocks(self) -> None:
+        demodulator = self.web_control.ComplexNfmDemodulator()
+
+        first = demodulator.process(np.array([1 + 0j], dtype=np.complex64))
+        empty = demodulator.process(np.array([], dtype=np.complex64))
+        resumed = demodulator.process(np.array([0 + 1j], dtype=np.complex64))
+
+        self.assertEqual(len(first), 0)
+        self.assertEqual(len(empty), 0)
+        self.assertEqual(len(resumed), 1)
+
     def test_icecast_outputs_with_same_encoding_share_encoder_group(self) -> None:
         web_control = self.web_control
 
         class Fanout:
-            def subscribe(self, max_chunks=64):
+            def subscribe(self, max_chunks=64, max_seconds=None):
                 return web_control.queue.Queue(maxsize=max_chunks)
 
             def unsubscribe(self, subscriber):
@@ -780,7 +801,7 @@ class EasAlertTests(unittest.TestCase):
         web_control = self.web_control
 
         class Fanout:
-            def subscribe(self, max_chunks=64):
+            def subscribe(self, max_chunks=64, max_seconds=None):
                 return web_control.queue.Queue(maxsize=max_chunks)
 
             def unsubscribe(self, subscriber):
