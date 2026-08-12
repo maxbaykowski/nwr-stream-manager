@@ -4028,6 +4028,7 @@ let monitorLastPacketAt = 0;
 let receiverClientId = "";
 let receiverPeerConnection = null;
 let receiverPlaying = false;
+let receiverPaused = false;
 let receiverChannelIndex = 3;
 let receiverUnstableTimer = null;
 let receiverStatsTimer = null;
@@ -4400,14 +4401,14 @@ function markReceiverPacketProgress(packetCount) {
 }
 
 async function stopReceiverForUnstableConnection(reason = "") {
-  if (!receiverPlaying) return;
+  if (!receiverPeerConnection) return;
   clearReceiverUnstableTimer();
   console.warn("weather receiver connection unstable", reason);
   await stopWeatherReceiver({notifyServer: true, unstable: true});
 }
 
 function scheduleReceiverUnstableStop(reason = "") {
-  if (!receiverPlaying || receiverUnstableTimer) return;
+  if (!receiverPlaying || receiverPaused || receiverUnstableTimer) return;
   receiverUnstableTimer = setTimeout(async () => {
     receiverUnstableTimer = null;
     await stopReceiverForUnstableConnection(reason);
@@ -4416,7 +4417,7 @@ function scheduleReceiverUnstableStop(reason = "") {
 
 async function pollReceiverPacketStats() {
   const peer = receiverPeerConnection;
-  if (!peer || !receiverPlaying) return;
+  if (!peer || !receiverPlaying || receiverPaused) return;
   try {
     const stats = await peer.getStats();
     let packetCount = 0;
@@ -4445,13 +4446,13 @@ function startReceiverPacketStats() {
 }
 
 function updateReceiverMediaSession() {
-  if (!("mediaSession" in navigator) || !("MediaMetadata" in window) || !receiverPlaying) return;
+  if (!("mediaSession" in navigator) || !("MediaMetadata" in window) || !receiverPeerConnection) return;
   const channel = currentReceiverChannel();
   navigator.mediaSession.metadata = new MediaMetadata({
     title: channel.label,
     artist: "NOAA Weather Radio"
   });
-  navigator.mediaSession.playbackState = "playing";
+  navigator.mediaSession.playbackState = receiverPlaying ? "playing" : "paused";
   try {
     navigator.mediaSession.setActionHandler("previoustrack", () => receiverPreviousChannel());
     navigator.mediaSession.setActionHandler("nexttrack", () => receiverNextChannel());
@@ -4476,7 +4477,20 @@ function clearReceiverMediaSession() {
 }
 
 async function startWeatherReceiver() {
-  if (receiverPlaying && receiverPeerConnection) return;
+  if (receiverPeerConnection) {
+    receiverPlaying = true;
+    receiverPaused = false;
+    clearReceiverUnstableTimer();
+    const audio = document.getElementById("stream_monitor_audio");
+    if (audio && audio.srcObject) {
+      await audio.play();
+    }
+    startReceiverPacketStats();
+    updateReceiverMediaSession();
+    renderReceiverControls();
+    setReceiverResult(`Listening to ${currentReceiverChannel().label}.`, "success");
+    return;
+  }
   await stopStreamMonitor({notifyServer: true});
   if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
     throw new Error("This browser does not support WebRTC Opus audio.");
@@ -4488,6 +4502,7 @@ async function startWeatherReceiver() {
   const peer = new RTCPeerConnection({iceServers: []});
   receiverPeerConnection = peer;
   receiverPlaying = true;
+  receiverPaused = false;
   renderReceiverControls();
   const audio = document.getElementById("stream_monitor_audio");
   const transceiver = peer.addTransceiver("audio", {direction: "recvonly"});
@@ -4577,15 +4592,19 @@ async function stopWeatherReceiver(options = {}) {
   const preserveMediaSession = options.preserveMediaSession === true;
   const clientId = pageReceiverClientId();
   const peer = receiverPeerConnection;
-  receiverPeerConnection = null;
   receiverPlaying = false;
+  receiverPaused = preserveMediaSession && !!peer;
   clearReceiverWatchdogs();
-  if (preserveMediaSession && "mediaSession" in navigator) {
-    navigator.mediaSession.playbackState = "paused";
-  } else {
-    clearReceiverMediaSession();
-  }
   const audio = document.getElementById("stream_monitor_audio");
+  if (preserveMediaSession && peer) {
+    if (audio) audio.pause();
+    updateReceiverMediaSession();
+    renderReceiverControls();
+    return;
+  }
+  receiverPeerConnection = null;
+  receiverPaused = false;
+  clearReceiverMediaSession();
   if (audio) {
     audio.pause();
     audio.srcObject = null;
@@ -4611,7 +4630,7 @@ async function setReceiverChannel(index) {
   receiverChannelIndex = ((index % count) + count) % count;
   renderReceiverControls();
   updateReceiverMediaSession();
-  if (!receiverPlaying) return;
+  if (!receiverPeerConnection) return;
   const channel = currentReceiverChannel();
   await request("/api/receiver/tune", {
     method: "POST",
@@ -7008,7 +7027,7 @@ document.getElementById("receiver_play_pause").addEventListener("click", async (
   try {
     if (receiverPlaying) {
       await stopWeatherReceiver({preserveMediaSession: true});
-      setReceiverResult("Receiver stopped.", "success");
+      setReceiverResult("Receiver paused.", "success");
     } else {
       setReceiverResult("Starting receiver...");
       await startWeatherReceiver();
@@ -7658,7 +7677,7 @@ window.addEventListener("beforeunload", event => {
     const payload = JSON.stringify({client_id: pageMonitorClientId()});
     navigator.sendBeacon("/api/monitor/stop", new Blob([payload], {type: "application/json"}));
   }
-  if (receiverPlaying && navigator.sendBeacon) {
+  if (receiverPeerConnection && navigator.sendBeacon) {
     const payload = JSON.stringify({client_id: pageReceiverClientId()});
     navigator.sendBeacon("/api/receiver/stop", new Blob([payload], {type: "application/json"}));
   }
