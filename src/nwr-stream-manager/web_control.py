@@ -6719,8 +6719,16 @@ function applyRoute(route) {
   showView(route.view);
 }
 
+function outputFormHasUnsavedChanges() {
+  return currentViewName() === "stream_settings" && outputFormDirty;
+}
+
+function wizardHasUnsavedChanges() {
+  return currentViewName() === "add_stream" && wizardDirty;
+}
+
 function hasUnsavedNavigationState() {
-  return Boolean(wizardDirty || outputFormIsOpen());
+  return Boolean(wizardHasUnsavedChanges() || outputFormHasUnsavedChanges());
 }
 
 function confirmDiscardNavigation() {
@@ -7681,7 +7689,7 @@ window.addEventListener("beforeunload", event => {
     const payload = JSON.stringify({client_id: pageReceiverClientId()});
     navigator.sendBeacon("/api/receiver/stop", new Blob([payload], {type: "application/json"}));
   }
-  if (!wizardDirty && !outputFormIsOpen()) return;
+  if (!hasUnsavedNavigationState()) return;
   event.preventDefault();
   event.returnValue = "";
 });
