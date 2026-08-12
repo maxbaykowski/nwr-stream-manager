@@ -1011,7 +1011,6 @@ class RtlControlService:
         self.last_batch_at: float | None = None
         self.received_chunks = 0
         self.received_bytes = 0
-        self._last_rate_log_at = 0.0
         if self.settings.serial:
             self._start_or_update_capture_locked()
         else:
@@ -1925,22 +1924,11 @@ class RtlControlService:
                     self.capture_error = str(exc)
                 LOG.warning("RTL-SDR control capture reported: %s", exc)
                 continue
-            now = time.monotonic()
             with self.lock:
                 self.capture_error = None
                 self.last_batch_at = batch.captured_at
                 self.received_chunks += 1
                 self.received_bytes += len(batch.data)
-                chunks = self.received_chunks
-                total_bytes = self.received_bytes
-            if now - self._last_rate_log_at >= 2.0:
-                self._last_rate_log_at = now
-                LOG.info(
-                    "RTL-SDR capture receiving IQ: chunks=%s bytes=%s sample_rate=%s",
-                    chunks,
-                    total_bytes,
-                    batch.sample_rate,
-                )
 
     def _sync_stream_workers_locked(self) -> None:
         fanout = self.raw_fanout
@@ -3265,11 +3253,17 @@ def access_urls(host: str, port: int) -> list[str]:
     return [f"http://{address}:{port}" for address in ordered_hosts]
 
 
+def configure_dependency_logging() -> None:
+    for name in ("aioice", "aiortc"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def run_server(host: str, port: int, state_path: Path, verbose: bool = False) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    configure_dependency_logging()
     ring_handler = RingLogHandler()
     logging.getLogger().addHandler(ring_handler)
     service = RtlControlService(state_path, ring_handler)
