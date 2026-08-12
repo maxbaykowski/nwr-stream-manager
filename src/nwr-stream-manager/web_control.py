@@ -3395,9 +3395,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <nav aria-label="Main">
       <a id="nav_dashboard" href="/" data-view="dashboard" aria-current="page">Dashboard</a>
       <a id="nav_rtl" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
-      <a id="nav_receiver" href="/?view=receiver" data-view="receiver">Weather Radio Receiver</a>
       <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
       <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" hidden>EAS alerts</a>
+      <a id="nav_receiver" href="/?view=receiver" data-view="receiver">Weather Radio Receiver</a>
     </nav>
   </div>
 </header>
@@ -3487,7 +3487,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <div class="metric"><b>Frequency</b><span id="receiver_frequency">162.475 MHz</span></div>
       </div>
       <div class="actions" aria-label="Weather radio receiver controls">
-        <button id="receiver_previous" type="button">Previous</button>
+        <button id="receiver_previous" type="button">Previous channel</button>
         <button id="receiver_play_pause" type="button">Play</button>
         <button id="receiver_next" type="button">Next channel</button>
       </div>
@@ -3643,9 +3643,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div id="stream-settings-result" class="message"></div>
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
         <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
-        <button id="tab_audio" type="button" role="tab" aria-selected="false" aria-controls="panel_audio" tabindex="-1">Audio Effects</button>
         <button id="tab_eas" type="button" role="tab" aria-selected="false" aria-controls="panel_eas" tabindex="-1">EAS Recording</button>
         <button id="tab_fallback" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback" tabindex="-1">Fallback Audio</button>
+        <button id="tab_audio" type="button" role="tab" aria-selected="false" aria-controls="panel_audio" tabindex="-1">Audio Effects</button>
       </div>
       <div id="panel_outputs" class="tabpanel" role="tabpanel" aria-labelledby="tab_outputs">
         <div class="actions">
@@ -5493,9 +5493,9 @@ function activeSettingsTab() {
 function showSettingsTab(name) {
   for (const tab of [
     {name: "outputs", button: "tab_outputs", panel: "panel_outputs"},
-    {name: "audio", button: "tab_audio", panel: "panel_audio"},
     {name: "eas", button: "tab_eas", panel: "panel_eas"},
-    {name: "fallback", button: "tab_fallback", panel: "panel_fallback"}
+    {name: "fallback", button: "tab_fallback", panel: "panel_fallback"},
+    {name: "audio", button: "tab_audio", panel: "panel_audio"}
   ]) {
     const selected = tab.name === name;
     document.getElementById(tab.button).setAttribute("aria-selected", selected ? "true" : "false");
@@ -7051,7 +7051,7 @@ document.getElementById("tab_audio").addEventListener("click", () => showSetting
 document.getElementById("tab_eas").addEventListener("click", () => showSettingsTab("eas"));
 document.getElementById("tab_fallback").addEventListener("click", () => showSettingsTab("fallback"));
 document.querySelector(".tabs").addEventListener("keydown", event => {
-  const tabs = [document.getElementById("tab_outputs"), document.getElementById("tab_audio"), document.getElementById("tab_eas"), document.getElementById("tab_fallback")];
+  const tabs = [document.getElementById("tab_outputs"), document.getElementById("tab_eas"), document.getElementById("tab_fallback"), document.getElementById("tab_audio")];
   const index = tabs.indexOf(event.target);
   if (index < 0) return;
   let nextIndex = index;
