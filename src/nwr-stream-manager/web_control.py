@@ -170,6 +170,25 @@ STREAM_WORKER_RAW_QUEUE_CHUNKS = 4
 STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
+NWR_RECEIVER_CHANNELS_HZ = (
+    162_400_000,
+    162_425_000,
+    162_450_000,
+    162_475_000,
+    162_500_000,
+    162_525_000,
+    162_550_000,
+)
+RECEIVER_AUDIO_CONFIG = parse_audio_config(
+    {
+        "deemphasis": {"enabled": True, "tau": 300},
+        "comfort_noise": {"enabled": False, "level_db": -40},
+        "volume": {"enabled": False, "multiplier": 1.0},
+        "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
+        "lowpass": {"enabled": True, "frequency": 3400, "sharpness": 2},
+        "notch": {"enabled": False, "frequency": 3000, "sharpness": 0},
+    }
+)
 FALLBACK_STATE_FILE_NAME = "fallback.json"
 
 
@@ -827,6 +846,102 @@ class IcecastOutputWriter:
         self._set_status("disabled")
 
 
+class WeatherReceiverWorker:
+    def __init__(
+        self,
+        *,
+        client_id: str,
+        fanout: RawRtlFanout,
+        frequency_hz: int,
+    ) -> None:
+        self.client_id = client_id
+        self.fanout = fanout
+        self.queue = fanout.subscribe(max_chunks=STREAM_WORKER_RAW_QUEUE_CHUNKS)
+        self.source = WebRtcAudioSource()
+        self.frequency_hz = validate_receiver_frequency(frequency_hz)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"weather-receiver-{client_id}",
+            daemon=True,
+        )
+        self.lock = threading.Lock()
+        self.last_audio_at: float | None = None
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.fanout.unsubscribe(self.queue)
+        self.source.close()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=2.0)
+
+    def set_frequency(self, frequency_hz: int) -> int:
+        frequency_hz = validate_receiver_frequency(frequency_hz)
+        with self.lock:
+            self.frequency_hz = frequency_hz
+        return frequency_hz
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            frequency_hz = self.frequency_hz
+            last_audio_at = self.last_audio_at
+        return {
+            "client_id": self.client_id,
+            "frequency_hz": frequency_hz,
+            "frequency_mhz": receiver_frequency_mhz(frequency_hz),
+            "last_audio_at": last_audio_at,
+            "stats": self.source.stats(),
+        }
+
+    def _frequency_hz(self) -> int:
+        with self.lock:
+            return self.frequency_hz
+
+    def _run(self) -> None:
+        dc_blocker = IqDcBlocker()
+        channelizer: IqChannelizer | None = None
+        channelizer_key: tuple[int, int] | None = None
+        demodulator = ComplexNfmDemodulator()
+        effects = AudioEffectsProcessor(RECEIVER_AUDIO_CONFIG)
+        pending = np.array([], dtype=np.float32)
+        while not self.stop_event.is_set():
+            try:
+                batch: RtlSampleBatch = self.queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                LOG.warning("weather receiver RTL-SDR source failed for client %s: %s", self.client_id, exc)
+                continue
+            target_frequency_hz = self._frequency_hz()
+            next_channelizer_key = (batch.sample_rate, batch.center_frequency_hz)
+            if channelizer is None or channelizer_key != next_channelizer_key:
+                channelizer = IqChannelizer(
+                    input_rate=batch.sample_rate,
+                    center_frequency_hz=batch.center_frequency_hz,
+                    target_frequency_hz=target_frequency_hz,
+                    output_rate=IQ_SAMPLE_RATE,
+                )
+                channelizer_key = next_channelizer_key
+                demodulator = ComplexNfmDemodulator()
+            else:
+                channelizer.target_frequency_hz = target_frequency_hz
+                channelizer.shifter.offset_hz = float(batch.center_frequency_hz - target_frequency_hz)
+            iq = rtl_u8_to_complex64(batch.data)
+            audio = demodulator.process(channelizer.process_complex(dc_blocker.process(iq)))
+            if len(audio) == 0:
+                continue
+            pending = np.concatenate((pending, audio.astype(np.float32, copy=False)))
+            while len(pending) >= STREAM_FRAME_SAMPLES:
+                frame = pending[:STREAM_FRAME_SAMPLES]
+                pending = pending[STREAM_FRAME_SAMPLES:]
+                self.source.push_pcm(float_to_s16(effects.process(frame)))
+                with self.lock:
+                    self.last_audio_at = time.time()
+
+
 class EasStreamWorker:
     def __init__(
         self,
@@ -998,6 +1113,7 @@ class RtlControlService:
         self.drain_stop = threading.Event()
         self.stream_workers: dict[str, IcecastStreamWorker] = {}
         self.monitor_streams_by_client: dict[str, str] = {}
+        self.receiver_workers: dict[str, WeatherReceiverWorker] = {}
         self.webrtc_runner = WebRtcAsyncRunner()
         self.webrtc_sessions = AiortcSessionManager()
         self.icecast_auth_cache: dict[str, float] = {}
@@ -1410,6 +1526,7 @@ class RtlControlService:
                 + (capabilities.transport_error or capabilities.opus_error or "server WebRTC support is incomplete")
             )
 
+        self.stop_receiver({"client_id": client_id})
         self.stop_monitor({"client_id": client_id})
         with self.lock:
             stream = self._stream_locked(stream_id)
@@ -1499,6 +1616,91 @@ class RtlControlService:
             self._sync_stream_workers_locked()
         LOG.info("removed stream %s", stream_id)
         return self.stream_status()
+
+    def start_receiver(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id", "")).strip()
+        sdp = str(payload.get("sdp", "")).strip()
+        offer_type = str(payload.get("type", "offer")).strip() or "offer"
+        frequency_hz = validate_receiver_frequency(payload.get("frequency_hz", NWR_CENTER_FREQUENCY_HZ))
+        if not client_id:
+            raise ValueError("receiver client id is required")
+        if not sdp:
+            raise ValueError("WebRTC offer SDP is required")
+        capabilities = server_webrtc_capabilities()
+        if not capabilities.available:
+            raise ValueError(
+                "WebRTC receiver is unavailable: "
+                + (capabilities.transport_error or capabilities.opus_error or "server WebRTC support is incomplete")
+            )
+        self.stop_monitor({"client_id": client_id})
+        self.stop_receiver({"client_id": client_id})
+        with self.lock:
+            fanout = self.raw_fanout
+            if fanout is None:
+                raise ValueError("RTL-SDR capture is not active")
+            worker = WeatherReceiverWorker(
+                client_id=client_id,
+                fanout=fanout,
+                frequency_hz=frequency_hz,
+            )
+            self.receiver_workers[client_id] = worker
+            worker.start()
+        try:
+            track = create_webrtc_pcm_audio_track(worker.source)
+            answer = self.webrtc_runner.run(
+                self.webrtc_sessions.accept_offer(
+                    session_id=client_id,
+                    sdp=sdp,
+                    type=offer_type,
+                    tracks=(track,),
+                )
+            )
+        except Exception:
+            with self.lock:
+                self._remove_receiver_locked(client_id)
+            raise
+        LOG.info("started weather receiver for %s MHz on client %s", receiver_frequency_mhz(frequency_hz), client_id)
+        return {
+            "success": True,
+            "answer": answer,
+            "receiver": self.receiver_status(client_id),
+        }
+
+    def tune_receiver(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id", "")).strip()
+        frequency_hz = validate_receiver_frequency(payload.get("frequency_hz", NWR_CENTER_FREQUENCY_HZ))
+        if not client_id:
+            raise ValueError("receiver client id is required")
+        with self.lock:
+            worker = self.receiver_workers.get(client_id)
+            if worker is None:
+                raise ValueError("weather radio receiver is not playing")
+            worker.set_frequency(frequency_hz)
+        LOG.info("tuned weather receiver client %s to %s MHz", client_id, receiver_frequency_mhz(frequency_hz))
+        return {"success": True, "receiver": self.receiver_status(client_id)}
+
+    def stop_receiver(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id", "")).strip()
+        if not client_id:
+            raise ValueError("receiver client id is required")
+        with self.lock:
+            stopped = self._remove_receiver_locked(client_id)
+        try:
+            self.webrtc_runner.run(self.webrtc_sessions.close(client_id), timeout=3.0)
+        except Exception as exc:
+            LOG.debug("WebRTC receiver close failed for client %s: %s", client_id, exc)
+        if stopped:
+            LOG.info("stopped weather receiver for client %s", client_id)
+        return {"success": True, "receiver": self.receiver_status(client_id)}
+
+    def receiver_status(self, client_id: str) -> dict[str, Any]:
+        with self.lock:
+            worker = self.receiver_workers.get(client_id)
+        if worker is None:
+            return {"client_id": client_id, "playing": False}
+        snapshot = worker.snapshot()
+        snapshot["playing"] = True
+        return snapshot
 
     def update_stream(self, payload: dict[str, Any]) -> dict[str, Any]:
         stream_id = str(payload.get("stream_id", "")).strip()
@@ -1769,6 +1971,7 @@ class RtlControlService:
 
     def _detach_capture_locked(self) -> None:
         self.drain_stop.set()
+        self._stop_receiver_workers_locked()
         self._stop_stream_workers_locked()
         fanout = self.raw_fanout
         self.raw_fanout = None
@@ -1791,6 +1994,7 @@ class RtlControlService:
     def stop_capture(self) -> None:
         with self.lock:
             self.drain_stop.set()
+            self._stop_receiver_workers_locked()
             self._stop_stream_workers_locked()
             fanout = self.raw_fanout
             self.raw_fanout = None
@@ -1900,10 +2104,22 @@ class RtlControlService:
                 break
         self._sync_stream_workers_locked()
 
+    def _remove_receiver_locked(self, client_id: str) -> bool:
+        worker = self.receiver_workers.pop(client_id, None)
+        if worker is None:
+            return False
+        worker.stop()
+        return True
+
     def _stop_stream_workers_locked(self) -> None:
         for worker in list(self.stream_workers.values()):
             worker.stop()
         self.stream_workers = {}
+
+    def _stop_receiver_workers_locked(self) -> None:
+        for worker in list(self.receiver_workers.values()):
+            worker.stop()
+        self.receiver_workers = {}
 
     def _active_streams_locked(self) -> list[dict[str, Any]]:
         snapshots: list[dict[str, Any]] = []
@@ -2028,6 +2244,14 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
+        elif path == "/api/receiver/status":
+            query = parse_qs(parsed.query)
+            try:
+                response = self.service.receiver_status(query.get("client_id", [""])[0])
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -2060,6 +2284,33 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json()
                 response = self.service.stop_monitor(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/receiver/start":
+            try:
+                payload = self._read_json()
+                response = self.service.start_receiver(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/receiver/tune":
+            try:
+                payload = self._read_json()
+                response = self.service.tune_receiver(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/receiver/stop":
+            try:
+                payload = self._read_json()
+                response = self.service.stop_receiver(payload)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -2897,6 +3148,20 @@ def stream_worker_key(stream: dict[str, Any]) -> str:
     return str(stream.get("id", ""))
 
 
+def validate_receiver_frequency(raw: Any) -> int:
+    try:
+        frequency_hz = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("select a valid NWR receiver frequency") from exc
+    if frequency_hz not in NWR_RECEIVER_CHANNELS_HZ:
+        raise ValueError("select a valid NWR receiver frequency")
+    return frequency_hz
+
+
+def receiver_frequency_mhz(frequency_hz: int) -> str:
+    return f"{frequency_hz / 1_000_000:.3f}"
+
+
 def icecast_encoder_key(config: IcecastConfig) -> tuple[str, int, int]:
     return config.format, config.sample_rate, config.bitrate
 
@@ -3240,6 +3505,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <nav aria-label="Main">
       <a id="nav_dashboard" href="/" data-view="dashboard" aria-current="page">Dashboard</a>
       <a id="nav_rtl" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
+      <a id="nav_receiver" href="/?view=receiver" data-view="receiver">Weather Radio Receiver</a>
       <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
       <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" hidden>EAS alerts</a>
     </nav>
@@ -3261,6 +3527,13 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <p>Your internet connection is too unstable for stream monitoring.</p>
   <div class="actions">
     <button id="dismiss_monitor_unstable" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="receiver_unstable_dialog" class="notice-dialog" role="dialog" aria-labelledby="receiver_unstable_title" aria-live="assertive" hidden>
+  <h2 id="receiver_unstable_title">Weather radio receiver stopped</h2>
+  <p>Your internet connection is too unstable for realtime listening of weather radio.</p>
+  <div class="actions">
+    <button id="dismiss_receiver_unstable" type="button">Dismiss</button>
   </div>
 </div>
 <main>
@@ -3313,6 +3586,22 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </div>
       </div>
       <div class="hint">Valid RTL-SDR sample-rate ranges: 225001-300000 S/s and 900001-3200000 S/s.</div>
+    </section>
+  </div>
+
+  <div id="view_receiver" class="view" hidden>
+    <section>
+      <h2>Weather Radio Receiver</h2>
+      <p>Freely tune around the NWR band and listen right in your browser.</p>
+      <div class="status" aria-live="off">
+        <div class="metric"><b>Frequency</b><span id="receiver_frequency">162.475 MHz</span></div>
+      </div>
+      <div class="actions" aria-label="Weather radio receiver controls">
+        <button id="receiver_previous" type="button">Previous</button>
+        <button id="receiver_play_pause" type="button">Play</button>
+        <button id="receiver_next" type="button">Next channel</button>
+      </div>
+      <div id="receiver-result" class="message"></div>
     </section>
   </div>
 
@@ -3846,8 +4135,25 @@ let monitorUnstableTimer = null;
 let monitorStatsTimer = null;
 let monitorLastPacketCount = 0;
 let monitorLastPacketAt = 0;
+let receiverClientId = "";
+let receiverPeerConnection = null;
+let receiverPlaying = false;
+let receiverChannelIndex = 3;
+let receiverUnstableTimer = null;
+let receiverStatsTimer = null;
+let receiverLastPacketCount = 0;
+let receiverLastPacketAt = 0;
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
+const NWR_RECEIVER_CHANNELS = [
+  {frequency_hz: 162400000, label: "162.400 MHz"},
+  {frequency_hz: 162425000, label: "162.425 MHz"},
+  {frequency_hz: 162450000, label: "162.450 MHz"},
+  {frequency_hz: 162475000, label: "162.475 MHz"},
+  {frequency_hz: 162500000, label: "162.500 MHz"},
+  {frequency_hz: 162525000, label: "162.525 MHz"},
+  {frequency_hz: 162550000, label: "162.550 MHz"}
+];
 const EAS_ALERTS_PER_PAGE = 25;
 const PROTECTED_AUDIO_BANDS = [
   {min: 900, max: 1100},
@@ -3939,10 +4245,19 @@ function clearMonitorWatchdogs() {
   clearMonitorStatsTimer();
 }
 
+function resumeMonitorPlayback() {
+  const audio = document.getElementById("stream_monitor_audio");
+  if (!audio || !audio.srcObject || !monitorStreamId) return;
+  if (audio.paused || audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    audio.play().catch(error => console.debug("monitor playback resume failed", error));
+  }
+}
+
 function markMonitorPacketProgress(packetCount) {
   monitorLastPacketCount = packetCount;
   monitorLastPacketAt = Date.now();
   clearMonitorUnstableTimer();
+  resumeMonitorPlayback();
 }
 
 async function stopMonitorForUnstableConnection(reason = "") {
@@ -3992,6 +4307,7 @@ function startMonitorPacketStats() {
 
 async function startStreamMonitor(streamId) {
   if (monitorStreamId === streamId && monitorPeerConnection) return;
+  await stopWeatherReceiver({notifyServer: true});
   await stopStreamMonitor({notifyServer: true});
   if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
     throw new Error("This browser does not support WebRTC Opus audio monitoring.");
@@ -4023,11 +4339,22 @@ async function startStreamMonitor(streamId) {
     audio.srcObject = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
     audio.hidden = true;
     audio.play().catch(error => setStreamResult(`Monitoring audio could not start: ${error.message}`, "error"));
+    for (const eventName of ["waiting", "stalled", "suspend"]) {
+      audio.addEventListener(eventName, () => {
+        if (monitorPeerConnection === peer) scheduleMonitorUnstableStop(`audio ${eventName}`);
+      });
+    }
+    audio.addEventListener("playing", () => {
+      if (monitorPeerConnection === peer) clearMonitorUnstableTimer();
+    });
     event.track.addEventListener("mute", () => {
       if (monitorPeerConnection === peer) scheduleMonitorUnstableStop("audio track muted");
     });
     event.track.addEventListener("unmute", () => {
-      if (monitorPeerConnection === peer) clearMonitorUnstableTimer();
+      if (monitorPeerConnection === peer) {
+        clearMonitorUnstableTimer();
+        resumeMonitorPlayback();
+      }
     });
   });
   peer.addEventListener("connectionstatechange", () => {
@@ -4107,6 +4434,320 @@ async function toggleStreamMonitor(streamId, resultHandler = setStreamResult) {
   resultHandler("Starting monitor...");
   await startStreamMonitor(streamId);
   resultHandler("Monitoring started.", "success");
+}
+
+function pageReceiverClientId() {
+  if (!receiverClientId) {
+    receiverClientId = window.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  }
+  return receiverClientId;
+}
+
+function currentReceiverChannel() {
+  return NWR_RECEIVER_CHANNELS[receiverChannelIndex] || NWR_RECEIVER_CHANNELS[3];
+}
+
+function renderReceiverControls() {
+  const channel = currentReceiverChannel();
+  setText("receiver_frequency", channel.label);
+  const playPause = document.getElementById("receiver_play_pause");
+  if (playPause) playPause.textContent = receiverPlaying ? "Pause" : "Play";
+}
+
+function setReceiverResult(message, kind = "") {
+  const element = document.getElementById("receiver-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function showReceiverUnstableDialog() {
+  const dialog = document.getElementById("receiver_unstable_dialog");
+  if (!dialog) return;
+  dialog.hidden = false;
+  const button = document.getElementById("dismiss_receiver_unstable");
+  if (button) button.focus();
+}
+
+function dismissReceiverUnstableDialog() {
+  const dialog = document.getElementById("receiver_unstable_dialog");
+  if (dialog) dialog.hidden = true;
+}
+
+function clearReceiverUnstableTimer() {
+  if (receiverUnstableTimer) {
+    clearTimeout(receiverUnstableTimer);
+    receiverUnstableTimer = null;
+  }
+}
+
+function clearReceiverStatsTimer() {
+  if (receiverStatsTimer) {
+    clearInterval(receiverStatsTimer);
+    receiverStatsTimer = null;
+  }
+}
+
+function clearReceiverWatchdogs() {
+  clearReceiverUnstableTimer();
+  clearReceiverStatsTimer();
+}
+
+function resumeReceiverPlayback() {
+  const audio = document.getElementById("stream_monitor_audio");
+  if (!audio || !audio.srcObject || !receiverPlaying) return;
+  if (audio.paused || audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    audio.play().catch(error => console.debug("receiver playback resume failed", error));
+  }
+}
+
+function markReceiverPacketProgress(packetCount) {
+  receiverLastPacketCount = packetCount;
+  receiverLastPacketAt = Date.now();
+  clearReceiverUnstableTimer();
+  resumeReceiverPlayback();
+}
+
+async function stopReceiverForUnstableConnection(reason = "") {
+  if (!receiverPlaying) return;
+  clearReceiverUnstableTimer();
+  console.warn("weather receiver connection unstable", reason);
+  await stopWeatherReceiver({notifyServer: true, unstable: true});
+}
+
+function scheduleReceiverUnstableStop(reason = "") {
+  if (!receiverPlaying || receiverUnstableTimer) return;
+  receiverUnstableTimer = setTimeout(async () => {
+    receiverUnstableTimer = null;
+    await stopReceiverForUnstableConnection(reason);
+  }, MONITOR_UNSTABLE_TIMEOUT_MS);
+}
+
+async function pollReceiverPacketStats() {
+  const peer = receiverPeerConnection;
+  if (!peer || !receiverPlaying) return;
+  try {
+    const stats = await peer.getStats();
+    let packetCount = 0;
+    stats.forEach(report => {
+      if (report.type === "inbound-rtp" && (report.kind === "audio" || report.mediaType === "audio")) {
+        packetCount += Number(report.packetsReceived || 0);
+      }
+    });
+    if (packetCount > receiverLastPacketCount) {
+      markReceiverPacketProgress(packetCount);
+      return;
+    }
+    if (receiverLastPacketAt && Date.now() - receiverLastPacketAt >= MONITOR_UNSTABLE_TIMEOUT_MS) {
+      await stopReceiverForUnstableConnection("no incoming audio packets");
+    }
+  } catch (error) {
+    console.debug("receiver packet stats failed", error);
+  }
+}
+
+function startReceiverPacketStats() {
+  clearReceiverStatsTimer();
+  receiverLastPacketCount = 0;
+  receiverLastPacketAt = Date.now();
+  receiverStatsTimer = setInterval(pollReceiverPacketStats, MONITOR_STATS_INTERVAL_MS);
+}
+
+function updateReceiverMediaSession() {
+  if (!("mediaSession" in navigator) || !("MediaMetadata" in window) || !receiverPlaying) return;
+  const channel = currentReceiverChannel();
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: channel.label,
+    artist: "NOAA Weather Radio"
+  });
+  navigator.mediaSession.playbackState = "playing";
+  try {
+    navigator.mediaSession.setActionHandler("previoustrack", () => receiverPreviousChannel());
+    navigator.mediaSession.setActionHandler("nexttrack", () => receiverNextChannel());
+    navigator.mediaSession.setActionHandler("play", () => startWeatherReceiver());
+    navigator.mediaSession.setActionHandler("pause", () => stopWeatherReceiver({preserveMediaSession: true}));
+  } catch (error) {
+    console.debug("media session action setup failed", error);
+  }
+}
+
+function clearReceiverMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  try {
+    for (const action of ["previoustrack", "nexttrack", "play", "pause"]) {
+      navigator.mediaSession.setActionHandler(action, null);
+    }
+    navigator.mediaSession.metadata = null;
+    navigator.mediaSession.playbackState = "none";
+  } catch (error) {
+    console.debug("media session cleanup failed", error);
+  }
+}
+
+async function startWeatherReceiver() {
+  if (receiverPlaying && receiverPeerConnection) return;
+  await stopStreamMonitor({notifyServer: true});
+  if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
+    throw new Error("This browser does not support WebRTC Opus audio.");
+  }
+  if (!webRtcSupport.server.available) {
+    const error = webRtcSupport.server.transport_error || webRtcSupport.server.opus_error || "Server WebRTC support is unavailable.";
+    throw new Error(error);
+  }
+  const peer = new RTCPeerConnection({iceServers: []});
+  receiverPeerConnection = peer;
+  receiverPlaying = true;
+  renderReceiverControls();
+  const audio = document.getElementById("stream_monitor_audio");
+  const transceiver = peer.addTransceiver("audio", {direction: "recvonly"});
+  if (transceiver.receiver && "jitterBufferTarget" in transceiver.receiver) {
+    try {
+      transceiver.receiver.jitterBufferTarget = 0.05;
+    } catch (error) {
+      console.debug("WebRTC receiver jitterBufferTarget is not writable", error);
+    }
+  }
+  peer.addEventListener("track", event => {
+    if (event.receiver && "jitterBufferTarget" in event.receiver) {
+      try {
+        event.receiver.jitterBufferTarget = 0.05;
+      } catch (error) {
+        console.debug("WebRTC track jitterBufferTarget is not writable", error);
+      }
+    }
+    audio.srcObject = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+    audio.hidden = true;
+    audio.play().catch(error => setReceiverResult(`Receiver audio could not start: ${error.message}`, "error"));
+    for (const eventName of ["waiting", "stalled", "suspend"]) {
+      audio.addEventListener(eventName, () => {
+        if (receiverPeerConnection === peer) scheduleReceiverUnstableStop(`audio ${eventName}`);
+      });
+    }
+    audio.addEventListener("playing", () => {
+      if (receiverPeerConnection === peer) clearReceiverUnstableTimer();
+    });
+    event.track.addEventListener("mute", () => {
+      if (receiverPeerConnection === peer) scheduleReceiverUnstableStop("audio track muted");
+    });
+    event.track.addEventListener("unmute", () => {
+      if (receiverPeerConnection === peer) {
+        clearReceiverUnstableTimer();
+        resumeReceiverPlayback();
+      }
+    });
+  });
+  peer.addEventListener("connectionstatechange", () => {
+    if (receiverPeerConnection !== peer) return;
+    if (peer.connectionState === "connected") {
+      clearReceiverUnstableTimer();
+      return;
+    }
+    if (["failed", "closed", "disconnected"].includes(peer.connectionState)) {
+      scheduleReceiverUnstableStop(`connectionState=${peer.connectionState}`);
+    }
+  });
+  peer.addEventListener("iceconnectionstatechange", () => {
+    if (receiverPeerConnection !== peer) return;
+    if (["connected", "completed"].includes(peer.iceConnectionState)) {
+      clearReceiverUnstableTimer();
+      return;
+    }
+    if (["failed", "closed", "disconnected"].includes(peer.iceConnectionState)) {
+      scheduleReceiverUnstableStop(`iceConnectionState=${peer.iceConnectionState}`);
+    }
+  });
+  try {
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    const channel = currentReceiverChannel();
+    const data = await request("/api/receiver/start", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        client_id: pageReceiverClientId(),
+        frequency_hz: channel.frequency_hz,
+        sdp: peer.localDescription.sdp,
+        type: peer.localDescription.type
+      })
+    });
+    await peer.setRemoteDescription(data.answer);
+    startReceiverPacketStats();
+    updateReceiverMediaSession();
+    setReceiverResult(`Listening to ${channel.label}.`, "success");
+  } catch (error) {
+    await stopWeatherReceiver({notifyServer: true});
+    throw error;
+  }
+}
+
+async function stopWeatherReceiver(options = {}) {
+  const notifyServer = options.notifyServer !== false;
+  const unstable = options.unstable === true;
+  const preserveMediaSession = options.preserveMediaSession === true;
+  const clientId = pageReceiverClientId();
+  const peer = receiverPeerConnection;
+  receiverPeerConnection = null;
+  receiverPlaying = false;
+  clearReceiverWatchdogs();
+  if (preserveMediaSession && "mediaSession" in navigator) {
+    navigator.mediaSession.playbackState = "paused";
+  } else {
+    clearReceiverMediaSession();
+  }
+  const audio = document.getElementById("stream_monitor_audio");
+  if (audio) {
+    audio.pause();
+    audio.srcObject = null;
+  }
+  if (peer) peer.close();
+  if (notifyServer) {
+    try {
+      await request("/api/receiver/stop", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({client_id: clientId})
+      });
+    } catch (error) {
+      console.warn("receiver stop failed", error);
+    }
+  }
+  renderReceiverControls();
+  if (unstable) showReceiverUnstableDialog();
+}
+
+async function setReceiverChannel(index) {
+  const count = NWR_RECEIVER_CHANNELS.length;
+  receiverChannelIndex = ((index % count) + count) % count;
+  renderReceiverControls();
+  updateReceiverMediaSession();
+  if (!receiverPlaying) return;
+  const channel = currentReceiverChannel();
+  await request("/api/receiver/tune", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      client_id: pageReceiverClientId(),
+      frequency_hz: channel.frequency_hz
+    })
+  });
+  setReceiverResult(`Listening to ${channel.label}.`, "success");
+}
+
+async function receiverPreviousChannel() {
+  try {
+    await setReceiverChannel(receiverChannelIndex - 1);
+  } catch (error) {
+    setReceiverResult(error.message, "error");
+  }
+}
+
+async function receiverNextChannel() {
+  try {
+    await setReceiverChannel(receiverChannelIndex + 1);
+  } catch (error) {
+    setReceiverResult(error.message, "error");
+  }
 }
 
 function deviceLabel(device) {
@@ -6067,6 +6708,7 @@ function routeForView(name, params = {}) {
   const query = new URLSearchParams();
   if (name === "dashboard") return "/";
   if (name === "rtl") query.set("view", "rtl");
+  if (name === "receiver") query.set("view", "receiver");
   if (name === "streams") query.set("view", "streams");
   if (name === "add_stream") query.set("view", "add_stream");
   if (name === "stream_settings") {
@@ -6101,7 +6743,7 @@ function routeForView(name, params = {}) {
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
-  if (["dashboard", "rtl", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
+  if (["dashboard", "rtl", "receiver", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
     return {
       view,
       streamId: query.get("stream") || "",
@@ -6164,6 +6806,7 @@ function applyRoute(route) {
     return;
   }
   if (route.view !== "stream_settings") settingsStreamId = "";
+  if (route.view === "receiver") renderReceiverControls();
   showView(route.view);
 }
 
@@ -6467,6 +7110,24 @@ for (const link of document.querySelectorAll("nav a[data-view]")) {
 document.getElementById("dismiss_nwrorg_submission").addEventListener("click", dismissNwrOrgSubmissionDialog);
 document.getElementById("nwrorg_submission_link").addEventListener("click", dismissNwrOrgSubmissionDialog);
 document.getElementById("dismiss_monitor_unstable").addEventListener("click", dismissMonitorUnstableDialog);
+document.getElementById("dismiss_receiver_unstable").addEventListener("click", dismissReceiverUnstableDialog);
+
+document.getElementById("receiver_previous").addEventListener("click", receiverPreviousChannel);
+document.getElementById("receiver_next").addEventListener("click", receiverNextChannel);
+document.getElementById("receiver_play_pause").addEventListener("click", async () => {
+  try {
+    if (receiverPlaying) {
+      await stopWeatherReceiver({preserveMediaSession: true});
+      setReceiverResult("Receiver stopped.", "success");
+    } else {
+      setReceiverResult("Starting receiver...");
+      await startWeatherReceiver();
+    }
+  } catch (error) {
+    setReceiverResult(error.message, "error");
+    renderReceiverControls();
+  }
+});
 
 document.getElementById("tab_outputs").addEventListener("click", () => showSettingsTab("outputs"));
 document.getElementById("tab_audio").addEventListener("click", () => showSettingsTab("audio"));
@@ -7107,6 +7768,10 @@ window.addEventListener("beforeunload", event => {
     const payload = JSON.stringify({client_id: pageMonitorClientId()});
     navigator.sendBeacon("/api/monitor/stop", new Blob([payload], {type: "application/json"}));
   }
+  if (receiverPlaying && navigator.sendBeacon) {
+    const payload = JSON.stringify({client_id: pageReceiverClientId()});
+    navigator.sendBeacon("/api/receiver/stop", new Blob([payload], {type: "application/json"}));
+  }
   if (!wizardDirty && !outputFormIsOpen()) return;
   event.preventDefault();
   event.returnValue = "";
@@ -7243,6 +7908,7 @@ async function refresh() {
 (async function init() {
   populateBitrates();
   selectAudioEffect("volume", false);
+  renderReceiverControls();
   loadWebRtcSupport();
   const data = await request("/api/status");
   await loadDevices(data.settings.serial);

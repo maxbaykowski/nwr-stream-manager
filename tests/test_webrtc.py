@@ -142,6 +142,39 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(source.reads, 2)
         self.assertEqual(frame.samples, self.webrtc.WEBRTC_OPUS_FRAME_SAMPLES)
 
+    def test_webrtc_track_uses_short_pcm_read_timeout_to_keep_sender_alive(self) -> None:
+        class Source:
+            def __init__(self) -> None:
+                self.timeouts = []
+
+            async def read_pcm(self, timeout=0.25):
+                self.timeouts.append(timeout)
+                return b"\x00" * 960
+
+        class FullFrameResampler:
+            def __init__(self, _input_rate, _output_rate) -> None:
+                pass
+
+            def process(self, _pcm: bytes) -> bytes:
+                return b"\x00" * (self_webrtc.WEBRTC_OPUS_FRAME_SAMPLES * 2)
+
+        self_webrtc = self.webrtc
+        original_resampler = self.webrtc.PcmResampler
+        self.webrtc.PcmResampler = FullFrameResampler
+        try:
+            try:
+                source = Source()
+                track = self.webrtc.create_webrtc_pcm_audio_track(source)
+            except self.webrtc.WebRtcError as exc:
+                self.skipTest(str(exc))
+            asyncio.run(track.recv())
+        finally:
+            self.webrtc.PcmResampler = original_resampler
+
+        self.assertEqual(len(source.timeouts), 1)
+        self.assertGreaterEqual(source.timeouts[0], 0)
+        self.assertLessEqual(source.timeouts[0], self.webrtc.WEBRTC_FRAME_SECONDS)
+
     def test_server_capability_report_has_expected_shape(self) -> None:
         report = self.webrtc.server_webrtc_capabilities().to_dict()
         self.assertIn("available", report)

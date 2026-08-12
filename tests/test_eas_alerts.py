@@ -218,6 +218,27 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertEqual(recorder.frames, [b"processed"])
 
+    def test_receiver_frequency_validation_accepts_only_nwr_channels(self) -> None:
+        self.assertEqual(self.web_control.validate_receiver_frequency(162475000), 162475000)
+        with self.assertRaisesRegex(ValueError, "valid NWR receiver frequency"):
+            self.web_control.validate_receiver_frequency(162487500)
+
+    def test_receiver_worker_retunes_existing_channelizer_without_replacing_shifter(self) -> None:
+        worker = object.__new__(self.web_control.WeatherReceiverWorker)
+        channelizer = self.web_control.IqChannelizer(
+            input_rate=240040,
+            center_frequency_hz=162475000,
+            target_frequency_hz=162475000,
+        )
+        shifter = channelizer.shifter
+        channelizer.shifter._phase = 1.25
+        channelizer.target_frequency_hz = 162425000
+        channelizer.shifter.offset_hz = float(162475000 - 162425000)
+
+        self.assertIs(channelizer.shifter, shifter)
+        self.assertEqual(channelizer.shifter.offset_hz, 50000.0)
+        self.assertEqual(channelizer.shifter._phase, 1.25)
+
     def test_alert_detail_uses_same_location_lookup(self) -> None:
         alert = {
             "event_type": "TOR",

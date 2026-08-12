@@ -450,9 +450,13 @@ def create_webrtc_pcm_audio_track(source: WebRtcAudioSource):
             if self._started_at is None:
                 self._started_at = time.monotonic()
             attempts = 0
+            deadline = time.monotonic() + WEBRTC_FRAME_SECONDS
             while len(self._pending) < needed_bytes and attempts < 4:
-                self._pending.extend(self._resampler.process(await self._source.read_pcm()))
+                timeout = max(0.0, deadline - time.monotonic())
+                self._pending.extend(self._resampler.process(await _read_source_pcm(self._source, timeout)))
                 attempts += 1
+                if time.monotonic() >= deadline:
+                    break
             if len(self._pending) < needed_bytes:
                 pcm = bytes(self._pending) + b"\x00" * (needed_bytes - len(self._pending))
                 self._pending.clear()
@@ -476,6 +480,13 @@ def create_webrtc_pcm_audio_track(source: WebRtcAudioSource):
             return frame
 
     return WebRtcPcmAudioTrack(source)
+
+
+async def _read_source_pcm(source: WebRtcAudioSource, timeout: float) -> bytes:
+    try:
+        return await source.read_pcm(timeout=timeout)
+    except TypeError:
+        return await source.read_pcm()
 
 
 class AiortcSessionManager:
