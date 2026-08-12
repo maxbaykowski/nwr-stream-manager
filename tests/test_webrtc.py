@@ -184,6 +184,19 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(report["minimum_bitrate_kbps"], 32)
         self.assertEqual(report["bitrate_step_kbps"], 8)
 
+    def test_opus_loader_uses_system_libopus(self) -> None:
+        original_module = self.webrtc._OPUS_MODULE
+        self.webrtc._OPUS_MODULE = None
+        try:
+            try:
+                opus = self.webrtc._load_system_opus_module()
+            except self.webrtc.OpusSupportError as exc:
+                self.skipTest(str(exc))
+            self.assertTrue(hasattr(opus, "opus_encoder_create"))
+            self.assertEqual(opus.OPUS_APPLICATION_AUDIO, 2049)
+        finally:
+            self.webrtc._OPUS_MODULE = original_module
+
     def test_bitrate_feedback_from_transport_stats(self) -> None:
         class Stats:
             availableOutgoingBitrate = 96_000
@@ -196,9 +209,9 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(feedback["packet_loss_fraction"], 0.02)
         self.assertEqual(feedback["rtt_ms"], 250.0)
 
-    def test_pyogg_opus_encoder_encodes_20_ms_packet_when_available(self) -> None:
+    def test_opus_encoder_encodes_20_ms_packet_when_available(self) -> None:
         try:
-            encoder = self.webrtc.PyOggOpusEncoder(input_sample_rate=24_000)
+            encoder = self.webrtc.OpusEncoder(input_sample_rate=24_000)
         except self.webrtc.OpusSupportError as exc:
             self.skipTest(str(exc))
         try:

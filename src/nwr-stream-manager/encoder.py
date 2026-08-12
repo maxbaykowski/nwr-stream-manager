@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import random
 from dataclasses import dataclass
 from typing import Protocol
@@ -24,6 +25,151 @@ class AudioEncoder(Protocol):
 
     def close(self) -> None:
         ...
+
+
+ogg_int64_t = ctypes.c_int64
+
+
+class OggPackBuffer(ctypes.Structure):
+    _fields_ = [
+        ("endbyte", ctypes.c_long),
+        ("endbit", ctypes.c_int),
+        ("buffer", ctypes.POINTER(ctypes.c_ubyte)),
+        ("ptr", ctypes.POINTER(ctypes.c_ubyte)),
+        ("storage", ctypes.c_long),
+    ]
+
+
+class OggPage(ctypes.Structure):
+    _fields_ = [
+        ("header", ctypes.POINTER(ctypes.c_ubyte)),
+        ("header_len", ctypes.c_long),
+        ("body", ctypes.POINTER(ctypes.c_ubyte)),
+        ("body_len", ctypes.c_long),
+    ]
+
+
+class OggStreamState(ctypes.Structure):
+    _fields_ = [
+        ("body_data", ctypes.POINTER(ctypes.c_ubyte)),
+        ("body_storage", ctypes.c_long),
+        ("body_fill", ctypes.c_long),
+        ("body_returned", ctypes.c_long),
+        ("lacing_vals", ctypes.POINTER(ctypes.c_int)),
+        ("granule_vals", ctypes.POINTER(ogg_int64_t)),
+        ("lacing_storage", ctypes.c_long),
+        ("lacing_fill", ctypes.c_long),
+        ("lacing_packet", ctypes.c_long),
+        ("lacing_returned", ctypes.c_long),
+        ("header", ctypes.c_ubyte * 282),
+        ("header_fill", ctypes.c_int),
+        ("e_o_s", ctypes.c_int),
+        ("b_o_s", ctypes.c_int),
+        ("serialno", ctypes.c_long),
+        ("pageno", ctypes.c_long),
+        ("packetno", ogg_int64_t),
+        ("granulepos", ogg_int64_t),
+    ]
+
+
+class OggPacket(ctypes.Structure):
+    _fields_ = [
+        ("packet", ctypes.POINTER(ctypes.c_ubyte)),
+        ("bytes", ctypes.c_long),
+        ("b_o_s", ctypes.c_long),
+        ("e_o_s", ctypes.c_long),
+        ("granulepos", ogg_int64_t),
+        ("packetno", ogg_int64_t),
+    ]
+
+
+class VorbisInfo(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_int),
+        ("channels", ctypes.c_int),
+        ("rate", ctypes.c_long),
+        ("bitrate_upper", ctypes.c_long),
+        ("bitrate_nominal", ctypes.c_long),
+        ("bitrate_lower", ctypes.c_long),
+        ("bitrate_window", ctypes.c_long),
+        ("codec_setup", ctypes.c_void_p),
+    ]
+
+
+class VorbisDspState(ctypes.Structure):
+    pass
+
+
+class VorbisBlock(ctypes.Structure):
+    pass
+
+
+class AllocChain(ctypes.Structure):
+    pass
+
+
+VorbisDspState._fields_ = [
+    ("analysisp", ctypes.c_int),
+    ("vi", ctypes.POINTER(VorbisInfo)),
+    ("pcm", ctypes.POINTER(ctypes.POINTER(ctypes.c_float))),
+    ("pcmret", ctypes.POINTER(ctypes.POINTER(ctypes.c_float))),
+    ("pcm_storage", ctypes.c_int),
+    ("pcm_current", ctypes.c_int),
+    ("pcm_returned", ctypes.c_int),
+    ("preextrapolate", ctypes.c_int),
+    ("eofflag", ctypes.c_int),
+    ("lW", ctypes.c_long),
+    ("W", ctypes.c_long),
+    ("nW", ctypes.c_long),
+    ("centerW", ctypes.c_long),
+    ("granulepos", ogg_int64_t),
+    ("sequence", ogg_int64_t),
+    ("glue_bits", ogg_int64_t),
+    ("time_bits", ogg_int64_t),
+    ("floor_bits", ogg_int64_t),
+    ("res_bits", ogg_int64_t),
+    ("backend_state", ctypes.c_void_p),
+]
+
+
+AllocChain._fields_ = [
+    ("ptr", ctypes.c_void_p),
+    ("next", ctypes.POINTER(AllocChain)),
+]
+
+
+VorbisBlock._fields_ = [
+    ("pcm", ctypes.POINTER(ctypes.POINTER(ctypes.c_float))),
+    ("opb", OggPackBuffer),
+    ("lW", ctypes.c_long),
+    ("W", ctypes.c_long),
+    ("nW", ctypes.c_long),
+    ("pcmend", ctypes.c_int),
+    ("mode", ctypes.c_int),
+    ("eofflag", ctypes.c_int),
+    ("granulepos", ogg_int64_t),
+    ("sequence", ogg_int64_t),
+    ("vd", ctypes.POINTER(VorbisDspState)),
+    ("localstore", ctypes.c_void_p),
+    ("localtop", ctypes.c_long),
+    ("localalloc", ctypes.c_long),
+    ("totaluse", ctypes.c_long),
+    ("reap", ctypes.POINTER(AllocChain)),
+    ("glue_bits", ctypes.c_long),
+    ("time_bits", ctypes.c_long),
+    ("floor_bits", ctypes.c_long),
+    ("res_bits", ctypes.c_long),
+    ("internal", ctypes.c_void_p),
+]
+
+
+class VorbisComment(ctypes.Structure):
+    _fields_ = [
+        ("user_comments", ctypes.POINTER(ctypes.c_char_p)),
+        ("comment_lengths", ctypes.POINTER(ctypes.c_int)),
+        ("comments", ctypes.c_int),
+        ("vendor", ctypes.c_char_p),
+    ]
 
 
 def create_audio_encoder(config: IcecastConfig) -> AudioEncoder:
@@ -110,49 +256,54 @@ class Mp3Encoder:
         pass
 
 
+def _load_shared_library(name: str, sonames: tuple[str, ...]) -> ctypes.CDLL:
+    candidates = [ctypes.util.find_library(name), *sonames]
+    errors = []
+    for candidate in dict.fromkeys(filter(None, candidates)):
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+    detail = "; ".join(errors) if errors else f"ctypes could not locate {name}"
+    raise EncoderError(f"required shared library '{name}' could not be loaded: {detail}")
+
+
 class OggVorbisEncoder:
     def __init__(self, config: IcecastConfig) -> None:
-        try:
-            from pyogg import vorbis
-        except ImportError as exc:
-            raise EncoderError(
-                "Ogg/Vorbis output requires the 'PyOgg' Python package"
-            ) from exc
-
         self.config = config
-        self.vorbis = vorbis
-        self.libogg = vorbis.libogg
-        self.libvorbis = vorbis.libvorbis
-        self.libvorbisenc = vorbis.libvorbisenc
+        self.libogg = _load_shared_library("ogg", ("libogg.so.0", "libogg.so"))
+        self.libvorbis = _load_shared_library("vorbis", ("libvorbis.so.0", "libvorbis.so"))
+        self.libvorbisenc = _load_shared_library(
+            "vorbisenc", ("libvorbisenc.so.2", "libvorbisenc.so")
+        )
         self.resampler = PcmResampler(IQ_SAMPLE_RATE, config.sample_rate)
         self.closed = False
         self._configure_ctypes()
-        self.vi = vorbis.vorbis_info()
-        self.vc = vorbis.vorbis_comment()
-        self.vd = vorbis.vorbis_dsp_state()
-        self.vb = vorbis.vorbis_block()
-        self.os = vorbis.ogg_stream_state()
+        self.vi = VorbisInfo()
+        self.vc = VorbisComment()
+        self.vd = VorbisDspState()
+        self.vb = VorbisBlock()
+        self.os = OggStreamState()
         self._init_encoder()
 
     def _configure_ctypes(self) -> None:
-        v = self.vorbis
-        self.libvorbis.vorbis_info_init.argtypes = [ctypes.POINTER(v.vorbis_info)]
+        self.libvorbis.vorbis_info_init.argtypes = [ctypes.POINTER(VorbisInfo)]
         self.libvorbis.vorbis_info_init.restype = None
-        self.libvorbis.vorbis_info_clear.argtypes = [ctypes.POINTER(v.vorbis_info)]
+        self.libvorbis.vorbis_info_clear.argtypes = [ctypes.POINTER(VorbisInfo)]
         self.libvorbis.vorbis_info_clear.restype = None
-        self.libvorbis.vorbis_comment_init.argtypes = [ctypes.POINTER(v.vorbis_comment)]
+        self.libvorbis.vorbis_comment_init.argtypes = [ctypes.POINTER(VorbisComment)]
         self.libvorbis.vorbis_comment_init.restype = None
         self.libvorbis.vorbis_comment_add.argtypes = [
-            ctypes.POINTER(v.vorbis_comment),
+            ctypes.POINTER(VorbisComment),
             ctypes.c_char_p,
         ]
         self.libvorbis.vorbis_comment_add.restype = None
         self.libvorbis.vorbis_comment_clear.argtypes = [
-            ctypes.POINTER(v.vorbis_comment)
+            ctypes.POINTER(VorbisComment)
         ]
         self.libvorbis.vorbis_comment_clear.restype = None
         self.libvorbisenc.vorbis_encode_init.argtypes = [
-            ctypes.POINTER(v.vorbis_info),
+            ctypes.POINTER(VorbisInfo),
             ctypes.c_long,
             ctypes.c_long,
             ctypes.c_long,
@@ -161,81 +312,80 @@ class OggVorbisEncoder:
         ]
         self.libvorbisenc.vorbis_encode_init.restype = ctypes.c_int
         self.libvorbis.vorbis_analysis_init.argtypes = [
-            ctypes.POINTER(v.vorbis_dsp_state),
-            ctypes.POINTER(v.vorbis_info),
+            ctypes.POINTER(VorbisDspState),
+            ctypes.POINTER(VorbisInfo),
         ]
         self.libvorbis.vorbis_analysis_init.restype = ctypes.c_int
         self.libvorbis.vorbis_analysis_buffer.restype = ctypes.POINTER(
             ctypes.POINTER(ctypes.c_float)
         )
         self.libvorbis.vorbis_analysis_wrote.argtypes = [
-            ctypes.POINTER(v.vorbis_dsp_state),
+            ctypes.POINTER(VorbisDspState),
             ctypes.c_int,
         ]
         self.libvorbis.vorbis_analysis_wrote.restype = ctypes.c_int
         self.libvorbis.vorbis_block_init.argtypes = [
-            ctypes.POINTER(v.vorbis_dsp_state),
-            ctypes.POINTER(v.vorbis_block),
+            ctypes.POINTER(VorbisDspState),
+            ctypes.POINTER(VorbisBlock),
         ]
         self.libvorbis.vorbis_block_init.restype = ctypes.c_int
-        self.libvorbis.vorbis_block_clear.argtypes = [ctypes.POINTER(v.vorbis_block)]
+        self.libvorbis.vorbis_block_clear.argtypes = [ctypes.POINTER(VorbisBlock)]
         self.libvorbis.vorbis_block_clear.restype = ctypes.c_int
         self.libvorbis.vorbis_dsp_clear.argtypes = [
-            ctypes.POINTER(v.vorbis_dsp_state)
+            ctypes.POINTER(VorbisDspState)
         ]
         self.libvorbis.vorbis_dsp_clear.restype = None
         self.libvorbis.vorbis_analysis_headerout.argtypes = [
-            ctypes.POINTER(v.vorbis_dsp_state),
-            ctypes.POINTER(v.vorbis_comment),
-            ctypes.POINTER(v.ogg_packet),
-            ctypes.POINTER(v.ogg_packet),
-            ctypes.POINTER(v.ogg_packet),
+            ctypes.POINTER(VorbisDspState),
+            ctypes.POINTER(VorbisComment),
+            ctypes.POINTER(OggPacket),
+            ctypes.POINTER(OggPacket),
+            ctypes.POINTER(OggPacket),
         ]
         self.libvorbis.vorbis_analysis_headerout.restype = ctypes.c_int
         self.libvorbis.vorbis_analysis_blockout.argtypes = [
-            ctypes.POINTER(v.vorbis_dsp_state),
-            ctypes.POINTER(v.vorbis_block),
+            ctypes.POINTER(VorbisDspState),
+            ctypes.POINTER(VorbisBlock),
         ]
         self.libvorbis.vorbis_analysis_blockout.restype = ctypes.c_int
         self.libvorbis.vorbis_analysis.argtypes = [
-            ctypes.POINTER(v.vorbis_block),
-            ctypes.POINTER(v.ogg_packet),
+            ctypes.POINTER(VorbisBlock),
+            ctypes.POINTER(OggPacket),
         ]
         self.libvorbis.vorbis_analysis.restype = ctypes.c_int
         self.libvorbis.vorbis_bitrate_addblock.argtypes = [
-            ctypes.POINTER(v.vorbis_block)
+            ctypes.POINTER(VorbisBlock)
         ]
         self.libvorbis.vorbis_bitrate_addblock.restype = ctypes.c_int
         self.libvorbis.vorbis_bitrate_flushpacket.argtypes = [
-            ctypes.POINTER(v.vorbis_dsp_state),
-            ctypes.POINTER(v.ogg_packet),
+            ctypes.POINTER(VorbisDspState),
+            ctypes.POINTER(OggPacket),
         ]
         self.libvorbis.vorbis_bitrate_flushpacket.restype = ctypes.c_int
         self.libogg.ogg_stream_init.argtypes = [
-            ctypes.POINTER(v.ogg_stream_state),
+            ctypes.POINTER(OggStreamState),
             ctypes.c_int,
         ]
         self.libogg.ogg_stream_init.restype = ctypes.c_int
         self.libogg.ogg_stream_packetin.argtypes = [
-            ctypes.POINTER(v.ogg_stream_state),
-            ctypes.POINTER(v.ogg_packet),
+            ctypes.POINTER(OggStreamState),
+            ctypes.POINTER(OggPacket),
         ]
         self.libogg.ogg_stream_packetin.restype = ctypes.c_int
         self.libogg.ogg_stream_pageout.argtypes = [
-            ctypes.POINTER(v.ogg_stream_state),
-            ctypes.POINTER(v.ogg_page),
+            ctypes.POINTER(OggStreamState),
+            ctypes.POINTER(OggPage),
         ]
         self.libogg.ogg_stream_pageout.restype = ctypes.c_int
         self.libogg.ogg_stream_flush.argtypes = [
-            ctypes.POINTER(v.ogg_stream_state),
-            ctypes.POINTER(v.ogg_page),
+            ctypes.POINTER(OggStreamState),
+            ctypes.POINTER(OggPage),
         ]
         self.libogg.ogg_stream_flush.restype = ctypes.c_int
-        self.libogg.ogg_stream_clear.argtypes = [ctypes.POINTER(v.ogg_stream_state)]
+        self.libogg.ogg_stream_clear.argtypes = [ctypes.POINTER(OggStreamState)]
         self.libogg.ogg_stream_clear.restype = ctypes.c_int
 
     def _init_encoder(self) -> None:
-        v = self.vorbis
         self.libvorbis.vorbis_info_init(ctypes.byref(self.vi))
         result = self.libvorbisenc.vorbis_encode_init(
             ctypes.byref(self.vi),
@@ -260,9 +410,9 @@ class OggVorbisEncoder:
         self.libvorbis.vorbis_block_init(ctypes.byref(self.vd), ctypes.byref(self.vb))
         self.libogg.ogg_stream_init(ctypes.byref(self.os), random.randint(1, 2**31 - 1))
 
-        header = v.ogg_packet()
-        header_comment = v.ogg_packet()
-        header_code = v.ogg_packet()
+        header = OggPacket()
+        header_comment = OggPacket()
+        header_code = OggPacket()
         result = self.libvorbis.vorbis_analysis_headerout(
             ctypes.byref(self.vd),
             ctypes.byref(self.vc),
@@ -320,8 +470,7 @@ class OggVorbisEncoder:
 
     def _drain_packets(self) -> bytes:
         output = bytearray()
-        v = self.vorbis
-        packet = v.ogg_packet()
+        packet = OggPacket()
         while self.libvorbis.vorbis_analysis_blockout(
             ctypes.byref(self.vd), ctypes.byref(self.vb)
         ):
@@ -338,7 +487,7 @@ class OggVorbisEncoder:
 
     def _pageout_pages(self) -> bytes:
         output = bytearray()
-        page = self.vorbis.ogg_page()
+        page = OggPage()
         while self.libogg.ogg_stream_pageout(
             ctypes.byref(self.os), ctypes.byref(page)
         ):
@@ -347,7 +496,7 @@ class OggVorbisEncoder:
 
     def _flush_pages(self) -> bytes:
         output = bytearray()
-        page = self.vorbis.ogg_page()
+        page = OggPage()
         while self.libogg.ogg_stream_flush(ctypes.byref(self.os), ctypes.byref(page)):
             output.extend(_page_bytes(page))
         return bytes(output)

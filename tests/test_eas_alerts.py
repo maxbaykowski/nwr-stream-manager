@@ -792,6 +792,8 @@ class EasAlertTests(unittest.TestCase):
             first = worker.encoder_group_for(icecast_a)
             second = worker.encoder_group_for(icecast_b)
             self.assertIs(first, second)
+            self.assertEqual(first.header(), b"header")
+            self.assertEqual(second.header(), b"header")
             self.assertEqual(len(created), 1)
             worker.stop()
         finally:

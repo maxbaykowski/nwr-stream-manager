@@ -33,7 +33,6 @@ dependencies = [
   "pyrtlsdrlib; platform_machine == 'x86_64' or platform_machine == 'AMD64'",
   "soxr",
   "lameenc",
-  "PyOgg",
   "aiortc",
   "easrecorder @ git+https://github.com/maxbaykowski/easrecorder.git@main",
 ]

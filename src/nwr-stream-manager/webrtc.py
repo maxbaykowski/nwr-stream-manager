@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import asyncio
 import importlib.util
 import logging
@@ -39,7 +40,35 @@ class WebRtcError(RuntimeError):
 
 
 class OpusSupportError(WebRtcError, EncoderError):
-    """Raised when PyOgg/libopus cannot provide the raw Opus encoder API."""
+    """Raised when libopus cannot provide the raw Opus encoder API."""
+
+
+class _OpusEncoderStruct(ctypes.Structure):
+    pass
+
+
+class _CtypesOpusModule:
+    OPUS_OK = 0
+    OPUS_APPLICATION_AUDIO = 2049
+    OPUS_SET_BITRATE_REQUEST = 4002
+    OPUS_SET_VBR_REQUEST = 4006
+    OPUS_SET_COMPLEXITY_REQUEST = 4010
+    OPUS_SET_SIGNAL_REQUEST = 4024
+    OPUS_SIGNAL_VOICE = 3001
+
+    OpusEncoder = _OpusEncoderStruct
+    opus_int16 = ctypes.c_int16
+
+    def __init__(self, library: ctypes.CDLL) -> None:
+        self.library = library
+        self.opus_encoder_create = library.opus_encoder_create
+        self.opus_encoder_ctl = library.opus_encoder_ctl
+        self.opus_encode = library.opus_encode
+        self.opus_encoder_destroy = library.opus_encoder_destroy
+        self.opus_strerror = library.opus_strerror
+
+
+_OPUS_MODULE: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -146,7 +175,7 @@ class OpusBitrateController:
         return self.current_kbps
 
 
-class PyOggOpusEncoder:
+class OpusEncoder:
     def __init__(
         self,
         *,
@@ -583,10 +612,14 @@ def bitrate_feedback_from_stats(stats: Any) -> dict[str, float | int | None]:
 
 
 def _load_opus_module():
-    try:
-        from pyogg import opus
-    except ImportError as exc:
-        raise OpusSupportError("PyOgg with Opus support is required") from exc
+    global _OPUS_MODULE
+    if _OPUS_MODULE is not None:
+        return _OPUS_MODULE
+    _OPUS_MODULE = _load_system_opus_module()
+    return _OPUS_MODULE
+
+
+def _load_system_opus_module():
     required = (
         "opus_encoder_create",
         "opus_encoder_ctl",
@@ -594,12 +627,27 @@ def _load_opus_module():
         "opus_encoder_destroy",
         "opus_strerror",
     )
-    missing = [name for name in required if not hasattr(opus, name)]
-    if missing:
-        raise OpusSupportError(
-            "PyOgg Opus bindings are missing required symbols: " + ", ".join(missing)
-        )
-    return opus
+    candidates = [
+        ctypes.util.find_library("opus"),
+        "libopus.so.0",
+        "libopus.so",
+        "opus.dll",
+        "libopus.dylib",
+    ]
+    errors = []
+    for candidate in dict.fromkeys(filter(None, candidates)):
+        try:
+            library = ctypes.CDLL(candidate)
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+            continue
+        missing = [name for name in required if not hasattr(library, name)]
+        if missing:
+            errors.append(f"{candidate}: missing symbols {', '.join(missing)}")
+            continue
+        return _CtypesOpusModule(library)
+    detail = "; ".join(errors) if errors else "ctypes could not locate libopus"
+    raise OpusSupportError(f"system libopus could not be loaded: {detail}")
 
 
 def _load_aiortc():
