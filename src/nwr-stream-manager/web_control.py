@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -134,6 +135,7 @@ import numpy as np
 LOG = logging.getLogger(__name__)
 STATE_DIRECTORY_NAME = "nwr-stream-manager"
 STATE_FILE_NAME = "rtl-control.json"
+LOG_FILE_NAME = "nwr-stream-manager.log"
 STREAMS_STATE_FILE_NAME = "streams.json"
 STREAMS_DIRECTORY_NAME = "streams"
 STREAM_CONFIG_FILE_NAME = "config.json"
@@ -1402,6 +1404,7 @@ class RtlControlService:
         stream_id = str(payload.get("stream_id", "")).strip()
         sdp = str(payload.get("sdp", "")).strip()
         offer_type = str(payload.get("type", "offer")).strip() or "offer"
+        LOG.info("WebRTC monitor start requested: client=%s stream=%s", client_id or "<missing>", stream_id or "<missing>")
         if not client_id:
             raise ValueError("monitor client id is required")
         if not stream_id:
@@ -1410,6 +1413,12 @@ class RtlControlService:
             raise ValueError("WebRTC offer SDP is required")
         capabilities = server_webrtc_capabilities()
         if not capabilities.available:
+            LOG.warning(
+                "WebRTC monitor unavailable for client %s: transport=%s opus=%s",
+                client_id,
+                capabilities.transport_error or "ok",
+                capabilities.opus_error or "ok",
+            )
             raise ValueError(
                 "WebRTC monitoring is unavailable: "
                 + (capabilities.transport_error or capabilities.opus_error or "server WebRTC support is incomplete")
@@ -1420,12 +1429,14 @@ class RtlControlService:
         with self.lock:
             stream = self._stream_locked(stream_id)
             if stream.get("enabled", True) is False:
+                LOG.warning("WebRTC monitor rejected for client %s: stream %s is disabled", client_id, stream_id)
                 raise ValueError("start the stream before monitoring it")
             self.monitor_streams_by_client[client_id] = stream_id
             self._sync_stream_workers_locked()
             worker = self.stream_workers.get(stream_worker_key(stream))
             if worker is None:
                 self.monitor_streams_by_client.pop(client_id, None)
+                LOG.warning("WebRTC monitor rejected for client %s: worker unavailable for stream %s", client_id, stream_id)
                 raise ValueError("stream worker could not be started for monitoring")
             source = worker.add_monitor_source(client_id)
             station = stream.get("station", {})
@@ -1440,9 +1451,10 @@ class RtlControlService:
                     tracks=(track,),
                 )
             )
-        except Exception:
+        except Exception as exc:
             with self.lock:
                 self._remove_monitor_source_locked(client_id)
+            LOG.exception("WebRTC monitor negotiation failed for client %s stream %s: %s", client_id, stream_id, exc)
             raise
         LOG.info(
             "started WebRTC monitor for %s on client %s",
@@ -1511,12 +1523,23 @@ class RtlControlService:
         sdp = str(payload.get("sdp", "")).strip()
         offer_type = str(payload.get("type", "offer")).strip() or "offer"
         frequency_hz = validate_receiver_frequency(payload.get("frequency_hz", NWR_CENTER_FREQUENCY_HZ))
+        LOG.info(
+            "weather receiver start requested: client=%s frequency=%s MHz",
+            client_id or "<missing>",
+            receiver_frequency_mhz(frequency_hz),
+        )
         if not client_id:
             raise ValueError("receiver client id is required")
         if not sdp:
             raise ValueError("WebRTC offer SDP is required")
         capabilities = server_webrtc_capabilities()
         if not capabilities.available:
+            LOG.warning(
+                "WebRTC receiver unavailable for client %s: transport=%s opus=%s",
+                client_id,
+                capabilities.transport_error or "ok",
+                capabilities.opus_error or "ok",
+            )
             raise ValueError(
                 "WebRTC receiver is unavailable: "
                 + (capabilities.transport_error or capabilities.opus_error or "server WebRTC support is incomplete")
@@ -1526,6 +1549,7 @@ class RtlControlService:
         with self.lock:
             fanout = self.raw_fanout
             if fanout is None:
+                LOG.warning("weather receiver rejected for client %s: RTL-SDR capture is not active", client_id)
                 raise ValueError("RTL-SDR capture is not active")
             worker = WeatherReceiverWorker(
                 client_id=client_id,
@@ -1544,9 +1568,10 @@ class RtlControlService:
                     tracks=(track,),
                 )
             )
-        except Exception:
+        except Exception as exc:
             with self.lock:
                 self._remove_receiver_locked(client_id)
+            LOG.exception("weather receiver negotiation failed for client %s: %s", client_id, exc)
             raise
         LOG.info("started weather receiver for %s MHz on client %s", receiver_frequency_mhz(frequency_hz), client_id)
         return {
@@ -2023,6 +2048,11 @@ class RtlControlHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:
         LOG.debug("HTTP %s - %s", self.address_string(), format % args)
 
+    def _client_address(self) -> str:
+        host = self.client_address[0] if self.client_address else self.address_string()
+        port = self.client_address[1] if self.client_address and len(self.client_address) > 1 else ""
+        return f"{host}:{port}" if port else host
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -2149,11 +2179,31 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(response)
             return
+        if path == "/api/client-log":
+            try:
+                payload = self._read_json()
+                level = str(payload.get("level", "info")).lower()
+                area = str(payload.get("area", "client"))[:40]
+                message = str(payload.get("message", ""))[:240]
+                details = payload.get("details", {})
+                detail_text = json.dumps(details, sort_keys=True)[:1000] if isinstance(details, dict) else str(details)[:1000]
+                log_message = "client %s from %s: %s %s" % (area, self._client_address(), message, detail_text)
+                if level in {"warning", "warn", "error"}:
+                    LOG.warning("%s", log_message)
+                else:
+                    LOG.info("%s", log_message)
+            except Exception as exc:
+                LOG.warning("client log failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json({"success": True})
+            return
         if path == "/api/monitor/start":
             try:
                 payload = self._read_json()
                 response = self.service.start_monitor(payload)
             except Exception as exc:
+                LOG.warning("API monitor start failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -2163,6 +2213,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 payload = self._read_json()
                 response = self.service.stop_monitor(payload)
             except Exception as exc:
+                LOG.warning("API monitor stop failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -2172,6 +2223,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 payload = self._read_json()
                 response = self.service.start_receiver(payload)
             except Exception as exc:
+                LOG.warning("API receiver start failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -2181,6 +2233,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 payload = self._read_json()
                 response = self.service.tune_receiver(payload)
             except Exception as exc:
+                LOG.warning("API receiver tune failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -2190,6 +2243,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 payload = self._read_json()
                 response = self.service.stop_receiver(payload)
             except Exception as exc:
+                LOG.warning("API receiver stop failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -3225,6 +3279,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--state", type=Path, default=default_state_path())
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="path for the rotating server log file; defaults to the state directory",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -3258,12 +3318,26 @@ def configure_dependency_logging() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-def run_server(host: str, port: int, state_path: Path, verbose: bool = False) -> None:
+def default_log_path(state_path: Path) -> Path:
+    return state_path.with_name(LOG_FILE_NAME)
+
+
+def configure_file_logging(path: Path) -> None:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=3)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(handler)
+
+
+def run_server(host: str, port: int, state_path: Path, verbose: bool = False, log_file: Path | None = None) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     configure_dependency_logging()
+    log_path = log_file or default_log_path(state_path)
+    configure_file_logging(log_path)
     ring_handler = RingLogHandler()
     logging.getLogger().addHandler(ring_handler)
     service = RtlControlService(state_path, ring_handler)
@@ -3273,6 +3347,7 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False) ->
     for url in access_urls(host, port):
         LOG.info("RTL-SDR control web interface available at %s", url)
     LOG.info("RTL-SDR settings will be remembered in %s", state_path)
+    LOG.info("server log file is %s", log_path)
     try:
         server.serve_forever()
     finally:
@@ -3283,7 +3358,7 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False) ->
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        run_server(args.host, args.port, args.state, args.verbose)
+        run_server(args.host, args.port, args.state, args.verbose, args.log_file)
     except KeyboardInterrupt:
         return 130
     return 0
@@ -4053,6 +4128,14 @@ async function request(path, options = {}) {
   return data;
 }
 
+function logClientEvent(level, area, message, details = {}) {
+  fetch("/api/client-log", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({level, area, message, details})
+  }).catch(() => {});
+}
+
 function detectBrowserWebRtcSupport() {
   const peerConnectionClass = window.RTCPeerConnection || window.webkitRTCPeerConnection;
   const receiverClass = window.RTCRtpReceiver;
@@ -4192,13 +4275,16 @@ function startMonitorPacketStats() {
 
 async function startStreamMonitor(streamId) {
   if (monitorStreamId === streamId && monitorPeerConnection) return;
+  logClientEvent("info", "monitor", "monitor start requested", {stream_id: streamId});
   await stopWeatherReceiver({notifyServer: true});
   await stopStreamMonitor({notifyServer: true});
   if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
+    logClientEvent("warning", "monitor", "browser does not support WebRTC Opus monitoring", webRtcSupport.browser);
     throw new Error("This browser does not support WebRTC Opus audio monitoring.");
   }
   if (!webRtcSupport.server.available) {
     const error = webRtcSupport.server.transport_error || webRtcSupport.server.opus_error || "Server WebRTC support is unavailable.";
+    logClientEvent("warning", "monitor", "server WebRTC support unavailable", webRtcSupport.server);
     throw new Error(error);
   }
   const peer = new RTCPeerConnection({iceServers: []});
@@ -4275,6 +4361,7 @@ async function startStreamMonitor(streamId) {
     })
   });
   await peer.setRemoteDescription(data.answer);
+  logClientEvent("info", "monitor", "monitor WebRTC answer accepted", {stream_id: streamId});
   startMonitorPacketStats();
   renderStreams(configuredStreams);
   if (settingsStreamId) renderStreamSettings();
@@ -4312,13 +4399,19 @@ async function stopStreamMonitor(options = {}) {
 
 async function toggleStreamMonitor(streamId, resultHandler = setStreamResult) {
   if (monitorStreamId === streamId) {
+    logClientEvent("info", "monitor", "monitor stop requested", {stream_id: streamId});
     await stopStreamMonitor();
     resultHandler("Monitoring stopped.", "success");
     return;
   }
   resultHandler("Starting monitor...");
-  await startStreamMonitor(streamId);
-  resultHandler("Monitoring started.", "success");
+  try {
+    await startStreamMonitor(streamId);
+    resultHandler("Monitoring started.", "success");
+  } catch (error) {
+    logClientEvent("warning", "monitor", "monitor start failed in browser", {stream_id: streamId, error: error.message});
+    throw error;
+  }
 }
 
 function pageReceiverClientId() {
@@ -4472,6 +4565,7 @@ function clearReceiverMediaSession() {
 
 async function startWeatherReceiver() {
   if (receiverPeerConnection) {
+    logClientEvent("info", "receiver", "receiver resume requested", {frequency: currentReceiverChannel().label});
     receiverPlaying = true;
     receiverPaused = false;
     clearReceiverUnstableTimer();
@@ -4485,12 +4579,15 @@ async function startWeatherReceiver() {
     setReceiverResult(`Listening to ${currentReceiverChannel().label}.`, "success");
     return;
   }
+  logClientEvent("info", "receiver", "receiver start requested", {frequency: currentReceiverChannel().label});
   await stopStreamMonitor({notifyServer: true});
   if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
+    logClientEvent("warning", "receiver", "browser does not support WebRTC Opus receiver", webRtcSupport.browser);
     throw new Error("This browser does not support WebRTC Opus audio.");
   }
   if (!webRtcSupport.server.available) {
     const error = webRtcSupport.server.transport_error || webRtcSupport.server.opus_error || "Server WebRTC support is unavailable.";
+    logClientEvent("warning", "receiver", "server WebRTC support unavailable", webRtcSupport.server);
     throw new Error(error);
   }
   const peer = new RTCPeerConnection({iceServers: []});
@@ -4571,10 +4668,12 @@ async function startWeatherReceiver() {
       })
     });
     await peer.setRemoteDescription(data.answer);
+    logClientEvent("info", "receiver", "receiver WebRTC answer accepted", {frequency: channel.label});
     startReceiverPacketStats();
     updateReceiverMediaSession();
     setReceiverResult(`Listening to ${channel.label}.`, "success");
   } catch (error) {
+    logClientEvent("warning", "receiver", "receiver start failed in browser", {frequency: currentReceiverChannel().label, error: error.message});
     await stopWeatherReceiver({notifyServer: true});
     throw error;
   }
