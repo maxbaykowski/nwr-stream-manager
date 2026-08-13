@@ -1261,6 +1261,22 @@ class EasAlertTests(unittest.TestCase):
         self.assertIsNotNone(remaining)
         self.assertGreater(float(remaining), 0.0)
 
+    def test_iq_storage_remaining_smoothing_ignores_small_fluctuations(self) -> None:
+        smoothed = self.web_control.smooth_iq_storage_remaining_seconds(
+            previous=180_000.0,
+            elapsed_since_update=1.0,
+            raw=179_800.0,
+        )
+        self.assertEqual(smoothed, 179_999.0)
+
+    def test_iq_storage_remaining_smoothing_reacts_to_large_storage_drop(self) -> None:
+        smoothed = self.web_control.smooth_iq_storage_remaining_seconds(
+            previous=180_000.0,
+            elapsed_since_update=1.0,
+            raw=170_000.0,
+        )
+        self.assertEqual(smoothed, 170_000.0)
+
     @staticmethod
     def _complex_to_rtl_u8(iq: np.ndarray) -> bytes:
         interleaved = np.empty(iq.size * 2, dtype=np.float32)

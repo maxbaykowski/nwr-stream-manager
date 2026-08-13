@@ -189,6 +189,9 @@ IQ_RECORDER_SAMPLE_RATES = (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_0
 IQ_RECORDER_DEFAULT_DURATION_SECONDS = 300
 IQ_RECORDER_MIN_DURATION_SECONDS = 0
 IQ_RECORDER_MAX_DURATION_SECONDS = 24 * 60 * 60
+IQ_STORAGE_ESTIMATE_MIN_CORRECTION_SECONDS = 30.0
+IQ_STORAGE_ESTIMATE_MAX_CORRECTION_SECONDS = 300.0
+IQ_STORAGE_ESTIMATE_CORRECTION_FRACTION = 0.002
 STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
@@ -1299,6 +1302,8 @@ class IqRecorderWorker:
         self.bytes_written = 0
         self.samples_written = 0
         self.batch_count = 0
+        self.storage_remaining_seconds: float | None = None
+        self.storage_remaining_updated_at: float | None = None
 
     def start(self) -> None:
         self.config.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1336,6 +1341,24 @@ class IqRecorderWorker:
                 "batch_count": self.batch_count,
                 "error": self.error,
             }
+
+    def storage_time_remaining(self, storage: dict[str, Any], recordings_directory: Path) -> float | None:
+        snapshot = self.snapshot()
+        raw_remaining = estimate_iq_storage_remaining_seconds(snapshot, storage, recordings_directory)
+        now = time.monotonic()
+        with self.lock:
+            if self.status_name != "recording":
+                self.storage_remaining_seconds = None
+                self.storage_remaining_updated_at = None
+                return None
+            next_remaining = smooth_iq_storage_remaining_seconds(
+                previous=self.storage_remaining_seconds,
+                elapsed_since_update=0.0 if self.storage_remaining_updated_at is None else now - self.storage_remaining_updated_at,
+                raw=raw_remaining,
+            )
+            self.storage_remaining_seconds = next_remaining
+            self.storage_remaining_updated_at = now
+            return next_remaining
 
     def _set_finished(self, status: str, error: str | None = None) -> None:
         with self.lock:
@@ -1943,8 +1966,7 @@ class RtlControlService:
         snapshot = worker.snapshot()
         snapshot["sample_rates"] = list(IQ_RECORDER_SAMPLE_RATES)
         snapshot["default_duration_seconds"] = IQ_RECORDER_DEFAULT_DURATION_SECONDS
-        snapshot["storage_remaining_seconds"] = estimate_iq_storage_remaining_seconds(
-            snapshot,
+        snapshot["storage_remaining_seconds"] = worker.storage_time_remaining(
             self.storage_monitor.snapshot(),
             self.iq_recordings_directory,
         )
@@ -4163,6 +4185,35 @@ def estimate_iq_storage_remaining_seconds(
     reserve_bytes = max(STORAGE_CRITICAL_FREE_BYTES, critical_by_percent)
     usable_bytes = max(0, available_bytes - reserve_bytes)
     return usable_bytes / write_rate
+
+
+def iq_storage_estimate_correction_threshold(seconds: float) -> float:
+    return max(
+        IQ_STORAGE_ESTIMATE_MIN_CORRECTION_SECONDS,
+        min(
+            IQ_STORAGE_ESTIMATE_MAX_CORRECTION_SECONDS,
+            max(0.0, seconds) * IQ_STORAGE_ESTIMATE_CORRECTION_FRACTION,
+        ),
+    )
+
+
+def smooth_iq_storage_remaining_seconds(
+    *,
+    previous: float | None,
+    elapsed_since_update: float,
+    raw: float | None,
+) -> float | None:
+    if raw is None:
+        return previous
+    if previous is None:
+        return max(0.0, raw)
+    expected = max(0.0, previous - max(0.0, elapsed_since_update))
+    threshold = iq_storage_estimate_correction_threshold(expected)
+    if raw < expected - threshold:
+        return max(0.0, raw)
+    if raw > expected + threshold:
+        return expected + threshold
+    return expected
 
 
 def convert_iq_recording_chunks(source, fmt: str):
