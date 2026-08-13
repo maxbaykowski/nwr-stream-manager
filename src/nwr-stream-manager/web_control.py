@@ -9,6 +9,7 @@ import mimetypes
 import os
 import queue
 import re
+import signal
 import socket
 import sys
 import tempfile
@@ -2844,14 +2845,21 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
 
 def default_state_path() -> Path:
-    state_directory = os.environ.get("STATE_DIRECTORY")
-    if state_directory:
-        base = Path(state_directory.split(":", 1)[0]).expanduser()
+    systemd_state_directory = systemd_directory_path("STATE_DIRECTORY")
+    if systemd_state_directory is not None:
+        base = systemd_state_directory
     elif os.environ.get("XDG_STATE_HOME"):
         base = Path(os.environ["XDG_STATE_HOME"]).expanduser() / STATE_DIRECTORY_NAME
     else:
         base = Path.home() / ".local" / "state" / STATE_DIRECTORY_NAME
     return base / STATE_FILE_NAME
+
+
+def systemd_directory_path(variable: str) -> Path | None:
+    value = os.environ.get(variable, "").strip()
+    if not value:
+        return None
+    return Path(value.split(":", 1)[0]).expanduser()
 
 
 def load_settings(path: Path) -> RtlControlSettings:
@@ -3744,6 +3752,9 @@ def configure_dependency_logging() -> None:
 
 
 def default_log_path(state_path: Path) -> Path:
+    logs_directory = systemd_directory_path("LOGS_DIRECTORY")
+    if logs_directory is not None:
+        return logs_directory / LOG_FILE_NAME
     return state_path.with_name(LOG_FILE_NAME)
 
 
@@ -3753,6 +3764,36 @@ def configure_file_logging(path: Path) -> None:
     handler = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=3)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.getLogger().addHandler(handler)
+
+
+def install_shutdown_signal_handlers(server: ThreadingHTTPServer) -> dict[int, Any]:
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    previous_handlers: dict[int, Any] = {}
+
+    def handle_shutdown(signum, _frame) -> None:
+        signal_name = signal.Signals(signum).name
+        LOG.info("received %s; shutting down NWR Stream Manager", signal_name)
+        threading.Thread(
+            target=server.shutdown,
+            name="http-shutdown",
+            daemon=True,
+        ).start()
+
+    for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if signum is None:
+            continue
+        previous_handlers[int(signum)] = signal.getsignal(signum)
+        signal.signal(signum, handle_shutdown)
+    return previous_handlers
+
+
+def restore_signal_handlers(previous_handlers: dict[int, Any]) -> None:
+    for signum, handler in previous_handlers.items():
+        try:
+            signal.signal(signum, handler)
+        except (OSError, ValueError):
+            pass
 
 
 def run_server(host: str, port: int, state_path: Path, verbose: bool = False, log_file: Path | None = None) -> None:
@@ -3768,6 +3809,7 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
     service = RtlControlService(state_path, ring_handler)
     RtlControlHandler.service = service
     server = ThreadingHTTPServer((host, port), RtlControlHandler)
+    previous_signal_handlers = install_shutdown_signal_handlers(server)
     LOG.info("RTL-SDR control web interface bound to %s:%s", host, port)
     for url in access_urls(host, port):
         LOG.info("RTL-SDR control web interface available at %s", url)
@@ -3776,6 +3818,7 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
     try:
         server.serve_forever()
     finally:
+        restore_signal_handlers(previous_signal_handlers)
         server.server_close()
         service.close()
 

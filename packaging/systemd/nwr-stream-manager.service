@@ -1,0 +1,24 @@
+[Unit]
+Description=NWR Stream Manager
+Documentation=https://github.com/maxbaykowski/nwr-stream-manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nwr-stream-manager
+Group=nwr-stream-manager
+SupplementaryGroups=plugdev
+StateDirectory=nwr-stream-manager
+LogsDirectory=nwr-stream-manager
+ExecStart=/usr/local/bin/nwr-stream-manager --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/nwr-stream-manager /var/log/nwr-stream-manager
+
+[Install]
+WantedBy=multi-user.target
