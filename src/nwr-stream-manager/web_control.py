@@ -176,6 +176,8 @@ STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
 MAX_JSON_REQUEST_BYTES = 1_048_576
+RECENT_EAS_ALERT_SECONDS = 24 * 60 * 60
+RECENT_EAS_ALERT_LIMIT = 10
 NWR_RECEIVER_CHANNELS_HZ = (
     162_400_000,
     162_425_000,
@@ -1184,6 +1186,7 @@ class RtlControlService:
                 "fallback": asdict(self.fallback_settings),
                 "active_streams": self._active_streams_locked(),
                 "active_eas_recorders": self._active_eas_recorders_locked(),
+                "recent_eas_alerts": self._recent_eas_alerts_locked(),
                 "logs": self.log_handler.snapshot()[-80:],
             }
 
@@ -2211,6 +2214,37 @@ class RtlControlService:
                 snapshots.append(snapshot)
         return snapshots
 
+    def _recent_eas_alerts_locked(self) -> list[dict[str, Any]]:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=RECENT_EAS_ALERT_SECONDS)
+        alerts: list[dict[str, Any]] = []
+        for stream in self.streams:
+            station = stream.get("station", {})
+            callsign = str(station.get("callsign", "Unknown"))
+            index_path = eas_alert_index_path(self.streams_directory, stream)
+            try:
+                indexed_alerts = indexed_eas_alert_entries(index_path)
+            except Exception as exc:
+                LOG.warning("could not read EAS alert index for %s: %s", callsign, exc)
+                continue
+            for index, alert in indexed_alerts:
+                issued_at = parse_utc_datetime(str(alert.get("start_time_utc", "")))
+                if issued_at < cutoff:
+                    continue
+                event = lookup_event(str(alert.get("event_type", "")))
+                alerts.append(
+                    {
+                        "id": eas_alert_id(alert, index),
+                        "stream_id": stream.get("id", ""),
+                        "callsign": callsign,
+                        "frequency": station.get("frequency", ""),
+                        "event_name": event.display_name,
+                        "issued_at_utc": issued_at.isoformat().replace("+00:00", "Z"),
+                        "issued_at_epoch": issued_at.timestamp(),
+                    }
+                )
+        alerts.sort(key=lambda item: (-float(item["issued_at_epoch"]), str(item["callsign"])))
+        return alerts[:RECENT_EAS_ALERT_LIMIT]
+
 
 class RtlControlHandler(BaseHTTPRequestHandler):
     service: RtlControlService
@@ -2561,7 +2595,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            LOG.debug("client disconnected before JSON response could be written")
 
     def _send_html(self, content: str) -> None:
         data = content.encode("utf-8")
@@ -2569,7 +2606,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            LOG.debug("client disconnected before HTML response could be written")
 
     def _send_file(self, path: Path, download_name: str, download: bool, *, delete_after: bool = False) -> None:
         content_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
@@ -2587,7 +2627,11 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                     chunk = source.read(1024 * 1024)
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        LOG.debug("client disconnected before file response could be written")
+                        break
         finally:
             if delete_after:
                 path.unlink(missing_ok=True)
@@ -3650,6 +3694,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
         <span id="nav_more_menu" class="nav-more-menu" role="menu" hidden>
           <a id="nav_receiver" href="/?view=receiver" data-view="receiver" role="menuitem">Weather Radio Receiver</a>
+          <a id="nav_logs" href="/?view=logs" data-view="logs" role="menuitem">Logs</a>
         </span>
       </span>
     </nav>
@@ -3688,18 +3733,17 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <div class="metric"><b>Configured SDR</b><span id="summary_sdr">none</span></div>
         <div class="metric"><b>Sample Rate</b><span id="summary_sample_rate">0</span></div>
         <div class="metric"><b>Gain</b><span id="summary_gain">automatic</span></div>
-        <div class="metric"><b>Active Streams</b><span id="summary_stream_count">0</span></div>
+        <div class="metric"><b>Capture</b><span id="summary_capture">inactive</span></div>
+        <div class="metric"><b>Configured Streams</b><span id="summary_stream_count">0</span></div>
       </div>
     </section>
     <section>
-      <h2>RTL-SDR Status</h2>
-      <div class="status" aria-live="off">
-        <div class="metric"><b>Capture</b><span id="active">inactive</span></div>
-        <div class="metric"><b>Chunks</b><span id="chunks">0</span></div>
-        <div class="metric"><b>Bytes</b><span id="bytes">0</span></div>
-        <div class="metric"><b>Last IQ</b><span id="last">never</span></div>
-      </div>
-      <p id="capture-error" class="error"></p>
+      <h2>Streams needing attention</h2>
+      <div id="dashboard-stream-attention" class="stream-list"></div>
+    </section>
+    <section>
+      <h2>Recently issued EAS alerts</h2>
+      <div id="dashboard-recent-alerts" class="stream-list"></div>
     </section>
   </div>
 
@@ -3746,6 +3790,21 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <button id="receiver_next" type="button">Next channel</button>
       </div>
       <div id="receiver-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_logs" class="view" hidden>
+    <section>
+      <h2>Logs</h2>
+      <div id="webrtc_support_status" class="hint" hidden></div>
+      <div class="status" aria-live="off">
+        <div class="metric"><b>Capture</b><span id="active">inactive</span></div>
+        <div class="metric"><b>Chunks</b><span id="chunks">0</span></div>
+        <div class="metric"><b>Bytes</b><span id="bytes">0</span></div>
+        <div class="metric"><b>Last IQ</b><span id="last">never</span></div>
+      </div>
+      <p id="capture-error" class="error"></p>
+      <pre id="logs" aria-live="off" aria-label="Server log output"></pre>
     </section>
   </div>
 
@@ -4198,12 +4257,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <section>
-    <h2>Logs</h2>
-    <div id="webrtc_support_status" class="hint" hidden></div>
-    <audio id="stream_monitor_audio" autoplay playsinline hidden></audio>
-    <pre id="logs" aria-live="off" aria-label="RTL-SDR log output"></pre>
-  </section>
+  <audio id="stream_monitor_audio" autoplay playsinline hidden></audio>
 </main>
 <script>
 const controls = ["serial", "sample_rate", "gain", "ppm_correction", "bias_tee", "gain_auto"];
@@ -4257,6 +4311,8 @@ let wizardDirty = false;
 let icecastAuthPassed = false;
 let icecastAuthSignature = "";
 let activeStreamsSignature = "";
+let dashboardAttentionSignature = "";
+let dashboardRecentAlertsSignature = "";
 let easAlertStreams = [];
 let easAlertStreamsSignature = "";
 let easAlertListSignature = "";
@@ -6205,8 +6261,6 @@ function renderActiveStreams(activeStreams, configured = configuredStreams) {
   const tbody = document.getElementById("active-streams-body");
   const rows = activeStreamRows(activeStreams, configured);
   const nextSignature = activeStreamSignature(rows);
-  const enabledCount = rows.filter(stream => normalizeStreamStatus(stream.status) === "enabled").length;
-  setText("summary_stream_count", enabledCount);
   if (nextSignature === activeStreamsSignature) {
     return;
   }
@@ -6226,6 +6280,135 @@ function renderActiveStreams(activeStreams, configured = configuredStreams) {
   }
   for (const stream of rows) {
     tbody.appendChild(activeStreamRow(stream));
+  }
+}
+
+function dashboardAttentionSignatureFor(items) {
+  return JSON.stringify(items.map(item => ({
+    id: item.id || "",
+    callsign: item.callsign || "",
+    status: item.status || "",
+    error: item.error || ""
+  })));
+}
+
+function streamAttentionItems(activeStreams, configured = configuredStreams) {
+  const configuredById = new Map((configured || []).map(stream => [stream.id, stream]));
+  const items = [];
+  for (const active of activeStreams || []) {
+    if (normalizeStreamStatus(active.status) !== "needs-attention") continue;
+    const configuredStream = configuredById.get(active.id) || {};
+    const station = active.station || configuredStream.station || {};
+    const outputs = active.outputs || [];
+    const output = outputs.length ? outputs[0] : {};
+    const icecast = output.icecast || {};
+    const destination = icecast.host ? outputDestination(icecast) : "";
+    items.push({
+      id: active.id || configuredStream.id || "",
+      callsign: station.callsign || "Unknown",
+      frequency: station.frequency || "",
+      status: active.status || "",
+      destination,
+      error: active.error || ""
+    });
+  }
+  items.sort((a, b) => String(a.callsign).localeCompare(String(b.callsign)) || String(a.destination).localeCompare(String(b.destination)));
+  return items;
+}
+
+function renderDashboardStreamAttention(activeStreams, configured = configuredStreams) {
+  const container = document.getElementById("dashboard-stream-attention");
+  const items = streamAttentionItems(activeStreams, configured);
+  const nextSignature = dashboardAttentionSignatureFor(items);
+  if (nextSignature === dashboardAttentionSignature) return;
+  dashboardAttentionSignature = nextSignature;
+  container.innerHTML = "";
+  if (!items.length) {
+    const healthy = document.createElement("div");
+    healthy.className = "stream-item success";
+    healthy.textContent = "All streams are healthy!";
+    container.appendChild(healthy);
+    return;
+  }
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "stream-item";
+    const link = document.createElement("a");
+    link.href = routeForView("stream_settings", {streamId: item.id});
+    link.dataset.view = "stream_settings";
+    link.dataset.streamId = item.id;
+    link.textContent = item.callsign;
+    const detail = item.error || (item.destination ? `${item.destination} needs attention.` : "This stream needs attention.");
+    row.appendChild(link);
+    row.append(`: ${detail}`);
+    container.appendChild(row);
+  }
+}
+
+function sentenceCaseAlertName(name) {
+  const text = String(name || "Unknown alert").toLowerCase();
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function relativeTimeAgo(epochSeconds) {
+  const ageSeconds = Math.max(0, Math.floor((Date.now() / 1000) - Number(epochSeconds || 0)));
+  const minutes = Math.max(0, Math.floor(ageSeconds / 60));
+  if (minutes < 1) return "less than a minute ago";
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+}
+
+function recentAlertsSignature(alerts) {
+  return JSON.stringify({
+    now_minute: Math.floor(Date.now() / 60000),
+    alerts: (alerts || []).map(alert => [
+      alert.id || "",
+      alert.stream_id || "",
+      alert.callsign || "",
+      alert.event_name || "",
+      Math.floor(Number(alert.issued_at_epoch || 0) / 60)
+    ])
+  });
+}
+
+function renderDashboardRecentAlerts(alerts) {
+  const container = document.getElementById("dashboard-recent-alerts");
+  const nextSignature = recentAlertsSignature(alerts);
+  if (nextSignature === dashboardRecentAlertsSignature) return;
+  dashboardRecentAlertsSignature = nextSignature;
+  container.innerHTML = "";
+  if (!alerts || alerts.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "stream-item hint";
+    empty.textContent = "No EAS alerts issued in the last 24 hours.";
+    container.appendChild(empty);
+    return;
+  }
+  for (const alert of alerts) {
+    const item = document.createElement("div");
+    item.className = "stream-item";
+    const alertLink = document.createElement("a");
+    alertLink.href = routeForView("eas_alert_detail", {
+      streamId: alert.stream_id || "",
+      alertId: alert.id || "",
+      page: 1
+    });
+    alertLink.dataset.view = "eas_alert_detail";
+    alertLink.dataset.streamId = alert.stream_id || "";
+    alertLink.dataset.alertId = alert.id || "";
+    alertLink.dataset.page = "1";
+    alertLink.textContent = sentenceCaseAlertName(alert.event_name);
+    const allLink = document.createElement("a");
+    allLink.href = routeForView("eas_alerts", {streamId: alert.stream_id || "", page: 1});
+    allLink.dataset.view = "eas_alerts";
+    allLink.dataset.streamId = alert.stream_id || "";
+    allLink.dataset.page = "1";
+    allLink.textContent = `View all EAS alerts for ${alert.callsign || "this stream"}`;
+    item.appendChild(alertLink);
+    item.append(` issued ${relativeTimeAgo(alert.issued_at_epoch)} on ${alert.callsign || "Unknown"}. `);
+    item.appendChild(allLink);
+    container.appendChild(item);
   }
 }
 
@@ -6901,7 +7084,7 @@ function showView(name) {
     }
   }
   if (moreButton) {
-    if (name === "receiver") {
+    if (["receiver", "logs"].includes(name)) {
       moreButton.setAttribute("aria-current", "page");
     } else {
       moreButton.removeAttribute("aria-current");
@@ -6919,6 +7102,7 @@ function routeForView(name, params = {}) {
   if (name === "dashboard") return "/";
   if (name === "rtl") query.set("view", "rtl");
   if (name === "receiver") query.set("view", "receiver");
+  if (name === "logs") query.set("view", "logs");
   if (name === "streams") query.set("view", "streams");
   if (name === "add_stream") query.set("view", "add_stream");
   if (name === "stream_settings") {
@@ -6953,7 +7137,7 @@ function routeForView(name, params = {}) {
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
-  if (["dashboard", "rtl", "receiver", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
+  if (["dashboard", "rtl", "receiver", "logs", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
     return {
       view,
       streamId: query.get("stream") || "",
@@ -7102,8 +7286,12 @@ function updateDashboard(data) {
   setText("summary_sdr", activeSdrLabel(settings));
   setText("summary_sample_rate", `${settings.sample_rate} S/s`);
   setText("summary_gain", settings.gain === null ? "automatic" : `${settings.gain} dB`);
+  setText("summary_capture", data.active ? "active" : "inactive");
+  setText("summary_stream_count", configuredStreams.length);
   activeStreamSnapshots = data.active_streams || [];
   renderActiveStreams(data.active_streams || [], configuredStreams);
+  renderDashboardStreamAttention(data.active_streams || [], configuredStreams);
+  renderDashboardRecentAlerts(data.recent_eas_alerts || []);
   if (settingsStreamId) renderStreamSettings();
 }
 
@@ -7340,22 +7528,26 @@ document.addEventListener("blur", event => {
   commitAudioFrequencyElement(event.target, true);
 }, true);
 
-for (const link of document.querySelectorAll("nav a[data-view]")) {
-  link.addEventListener("click", event => {
-    if (
-      event.defaultPrevented ||
-      event.button !== 0 ||
-      event.metaKey ||
-      event.ctrlKey ||
-      event.shiftKey ||
-      event.altKey
-    ) {
-      return;
-    }
-    event.preventDefault();
-    navigateTo(link.dataset.view);
+document.addEventListener("click", event => {
+  const link = event.target && event.target.closest("a[data-view]");
+  if (!link) return;
+  if (
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.shiftKey ||
+    event.altKey
+  ) {
+    return;
+  }
+  event.preventDefault();
+  navigateTo(link.dataset.view, {
+    streamId: link.dataset.streamId || "",
+    alertId: link.dataset.alertId || "",
+    page: Number(link.dataset.page || 1)
   });
-}
+});
 
 document.getElementById("nav_more_button").addEventListener("click", () => {
   toggleNavMoreMenu();

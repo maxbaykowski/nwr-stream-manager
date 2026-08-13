@@ -9,6 +9,7 @@ import types
 import unittest
 import zipfile
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
@@ -134,6 +135,45 @@ class EasAlertTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "too large"):
             handler._read_json()
+
+    def test_recent_eas_alerts_filters_last_24_hours_and_sorts_by_callsign_tie(self) -> None:
+        web_control = self.web_control
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            streams = [
+                {"id": "wz", "station": {"callsign": "WZ2560", "frequency": "162.500"}},
+                {"id": "wxn", "station": {"callsign": "WXN99", "frequency": "162.475"}},
+                {"id": "old", "station": {"callsign": "KZZ99", "frequency": "162.450"}},
+            ]
+            for stream in streams:
+                index_path = web_control.eas_alert_index_path(streams_dir, stream)
+                index_path.parent.mkdir(parents=True, exist_ok=True)
+                issued = now - timedelta(hours=25) if stream["id"] == "old" else now
+                index_path.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "alerts": [
+                                {
+                                    "event_type": "SVR",
+                                    "start_time_utc": issued.isoformat().replace("+00:00", "Z"),
+                                    "file_path": str(index_path.parent / "alert.wav"),
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            service = object.__new__(web_control.RtlControlService)
+            service.streams = streams
+            service.streams_directory = streams_dir
+
+            alerts = service._recent_eas_alerts_locked()
+
+        self.assertEqual([alert["callsign"] for alert in alerts], ["WXN99", "WZ2560"])
+        self.assertEqual(alerts[0]["event_name"], "Severe Thunderstorm Warning")
 
     def test_gwes_requires_mp3_and_minimum_bitrate(self) -> None:
         valid = {
