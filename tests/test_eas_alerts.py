@@ -5,6 +5,7 @@ import importlib
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 import zipfile
@@ -1096,6 +1097,158 @@ class EasAlertTests(unittest.TestCase):
             self.assertEqual(len(Writer.instances), 3)
         finally:
             web_control.IcecastOutputWriter = original_writer
+
+    def test_iq_recorder_writes_spectrum_cf32_from_synthetic_rtl_iq(self) -> None:
+        web_control = self.web_control
+
+        class Fanout:
+            def __init__(self):
+                self.queue = web_control.queue.Queue(maxsize=8)
+
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return self.queue
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        class Storage:
+            def add_path(self, path):
+                pass
+
+            def recording_started(self):
+                pass
+
+            def recording_stopped(self):
+                pass
+
+            def is_critical(self, path):
+                return False
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            output_path = Path(tempdir) / "spectrum.cf32"
+            fanout = Fanout()
+            sample_rate = 192_000
+            iq = np.exp(1j * 2 * np.pi * 1000 * np.arange(2048, dtype=np.float32) / sample_rate).astype(np.complex64)
+            raw = self._complex_to_rtl_u8(iq)
+            worker = web_control.IqRecorderWorker(
+                fanout=fanout,
+                config=web_control.IqRecorderConfig(
+                    recording_id="recording-1",
+                    mode=web_control.IQ_RECORDER_MODE_SPECTRUM,
+                    sample_rate=sample_rate,
+                    duration_seconds=1.0,
+                    output_path=output_path,
+                    index_path=Path(tempdir) / "index.json",
+                    frequency_hz=162_475_000,
+                ),
+                storage_monitor=Storage(),
+            )
+            worker.start()
+            fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=sample_rate, center_frequency_hz=162_475_000))
+            self._wait_for(lambda: output_path.exists() and output_path.stat().st_size >= iq.size * 8)
+            worker.stop()
+
+            self.assertEqual(output_path.stat().st_size, iq.size * 8)
+            self.assertEqual(worker.snapshot()["sample_rate"], sample_rate)
+            entries = web_control.load_iq_recording_entries(Path(tempdir) / "index.json")
+            self.assertEqual(entries[0]["id"], "recording-1")
+            self.assertEqual(entries[0]["sample_rate"], sample_rate)
+
+    def test_iq_recorder_writes_stream_channel_cf32_from_synthetic_rtl_iq(self) -> None:
+        web_control = self.web_control
+
+        class Fanout:
+            def __init__(self):
+                self.queue = web_control.queue.Queue(maxsize=8)
+
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return self.queue
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        class Storage:
+            def add_path(self, path):
+                pass
+
+            def recording_started(self):
+                pass
+
+            def recording_stopped(self):
+                pass
+
+            def is_critical(self, path):
+                return False
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            output_path = Path(tempdir) / "stream.cf32"
+            fanout = Fanout()
+            sample_rate = 240_000
+            iq = np.exp(1j * 2 * np.pi * 1000 * np.arange(48_000, dtype=np.float32) / sample_rate).astype(np.complex64)
+            raw = self._complex_to_rtl_u8(iq)
+            worker = web_control.IqRecorderWorker(
+                fanout=fanout,
+                config=web_control.IqRecorderConfig(
+                    recording_id="recording-2",
+                    mode=web_control.IQ_RECORDER_MODE_STREAM,
+                    sample_rate=web_control.IQ_SAMPLE_RATE,
+                    duration_seconds=1.0,
+                    output_path=output_path,
+                    index_path=Path(tempdir) / "index.json",
+                    frequency_hz=162_475_000,
+                    stream_id="stream-1",
+                    stream_label="WXN99",
+                    target_frequency_hz=162_475_000,
+                ),
+                storage_monitor=Storage(),
+            )
+            worker.start()
+            fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=sample_rate, center_frequency_hz=162_475_000))
+            self._wait_for(lambda: output_path.exists() and output_path.stat().st_size > 0)
+            worker.stop()
+
+            self.assertEqual(output_path.stat().st_size % 8, 0)
+            self.assertEqual(worker.snapshot()["sample_rate"], web_control.IQ_SAMPLE_RATE)
+
+    def test_iq_recording_download_conversion_and_name(self) -> None:
+        web_control = self.web_control
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "recording.cf32"
+            floats = np.array([-1.0, 0.0, 1.0, 0.5], dtype="<f4")
+            path.write_bytes(floats.tobytes())
+            self.assertEqual(web_control.iq_recording_download_size(path, "cf"), 16)
+            self.assertEqual(web_control.iq_recording_download_size(path, "s16"), 8)
+            self.assertEqual(web_control.iq_recording_download_size(path, "u8"), 4)
+            with path.open("rb") as source:
+                signed = b"".join(web_control.convert_iq_recording_chunks(source, "s16"))
+            self.assertEqual(np.frombuffer(signed, dtype="<i2").tolist(), [-32767, 0, 32767, 16384])
+            with path.open("rb") as source:
+                unsigned = b"".join(web_control.convert_iq_recording_chunks(source, "u8"))
+            self.assertEqual(np.frombuffer(unsigned, dtype=np.uint8).tolist(), [0, 128, 255, 191])
+            recording = {
+                "sample_rate": 240000,
+                "frequency_hz": 162475000,
+                "started_at": datetime(2026, 8, 13, 17, 17, tzinfo=timezone.utc).timestamp(),
+            }
+            name = web_control.iq_recording_download_name(recording, "cf")
+            self.assertTrue(name.startswith("nwrstmgr-s240000-f162475000-"))
+            self.assertTrue(name.endswith("-cf.raw"))
+
+    @staticmethod
+    def _complex_to_rtl_u8(iq: np.ndarray) -> bytes:
+        interleaved = np.empty(iq.size * 2, dtype=np.float32)
+        interleaved[0::2] = np.clip(iq.real, -1.0, 1.0)
+        interleaved[1::2] = np.clip(iq.imag, -1.0, 1.0)
+        return np.clip(np.round(interleaved * 127.5 + 127.5), 0, 255).astype(np.uint8).tobytes()
+
+    @staticmethod
+    def _wait_for(predicate, timeout: float = 2.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        raise AssertionError("condition was not met before timeout")
 
 
 if __name__ == "__main__":

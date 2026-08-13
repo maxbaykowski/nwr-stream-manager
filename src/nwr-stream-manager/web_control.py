@@ -37,7 +37,7 @@ if __package__:
         IQ_SAMPLE_RATE,
         parse_audio_config,
     )
-    from .dsp import ComplexArray, IqChannelizer
+    from .dsp import ComplexArray, IqChannelizer, complex64_to_interleaved_f32, create_decimator
     from .eas_recording import EasRecorderOutput
     from .encoder import PcmResampler, create_audio_encoder
     from .fallback_audio import load_fallback_audio
@@ -95,6 +95,8 @@ else:
     parse_audio_config = config_module.parse_audio_config
     ComplexArray = dsp.ComplexArray
     IqChannelizer = dsp.IqChannelizer
+    complex64_to_interleaved_f32 = dsp.complex64_to_interleaved_f32
+    create_decimator = dsp.create_decimator
     EasRecorderOutput = eas_recording.EasRecorderOutput
     PcmResampler = encoder.PcmResampler
     create_audio_encoder = encoder.create_audio_encoder
@@ -138,6 +140,8 @@ STREAMS_STATE_FILE_NAME = "streams.json"
 STREAMS_DIRECTORY_NAME = "streams"
 STREAM_CONFIG_FILE_NAME = "config.json"
 STREAMS_DIRECTORY_MARKER_FILE_NAME = ".per-stream-configs"
+IQ_RECORDINGS_DIRECTORY_NAME = "iq-recordings"
+IQ_RECORDINGS_INDEX_FILE_NAME = "index.json"
 STORAGE_IDLE_POLL_SECONDS = 30.0
 STORAGE_RECORDING_POLL_SECONDS = 2.0
 STORAGE_LOW_FREE_BYTES = 1_000_000_000
@@ -178,6 +182,13 @@ STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
 STREAM_WORKER_RAW_QUEUE_SECONDS = 0.75
 STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS = 8
 STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 64
+IQ_RECORDER_RAW_QUEUE_SECONDS = 1.0
+IQ_RECORDER_MODE_STREAM = "stream"
+IQ_RECORDER_MODE_SPECTRUM = "spectrum"
+IQ_RECORDER_SAMPLE_RATES = (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_000, DEFAULT_RTL_SAMPLE_RATE)
+IQ_RECORDER_DEFAULT_DURATION_SECONDS = 300
+IQ_RECORDER_MIN_DURATION_SECONDS = 1
+IQ_RECORDER_MAX_DURATION_SECONDS = 24 * 60 * 60
 STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
@@ -1248,6 +1259,187 @@ class IcecastStreamWorker:
             self.eas_error = error
 
 
+@dataclass(frozen=True)
+class IqRecorderConfig:
+    recording_id: str
+    mode: str
+    sample_rate: int
+    duration_seconds: float
+    output_path: Path
+    index_path: Path
+    frequency_hz: int
+    stream_id: str = ""
+    stream_label: str = ""
+    target_frequency_hz: int | None = None
+
+
+class IqRecorderWorker:
+    def __init__(
+        self,
+        *,
+        fanout: RawRtlFanout,
+        config: IqRecorderConfig,
+        storage_monitor: StorageMonitor,
+    ) -> None:
+        self.fanout = fanout
+        self.config = config
+        self.storage_monitor = storage_monitor
+        self.queue = subscribe_raw_fanout(
+            fanout,
+            max_seconds=IQ_RECORDER_RAW_QUEUE_SECONDS,
+            name=f"iq-recorder:{config.mode}",
+        )
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="iq-recorder", daemon=True)
+        self.lock = threading.Lock()
+        self.status_name = "recording"
+        self.error: str | None = None
+        self.started_at = time.time()
+        self.stopped_at: float | None = None
+        self.bytes_written = 0
+        self.samples_written = 0
+        self.batch_count = 0
+
+    def start(self) -> None:
+        self.config.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.storage_monitor.add_path(self.config.output_path.parent)
+        self.storage_monitor.recording_started()
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.fanout.unsubscribe(self.queue)
+        if self.thread.ident is not None:
+            self.thread.join(timeout=3.0)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            now = time.time()
+            stopped_at = self.stopped_at
+            elapsed = max(0.0, (stopped_at or now) - self.started_at)
+            remaining = max(0.0, self.config.duration_seconds - elapsed) if self.status_name == "recording" else 0.0
+            return {
+                "active": self.status_name == "recording",
+                "id": self.config.recording_id,
+                "status": self.status_name,
+                "mode": self.config.mode,
+                "stream_id": self.config.stream_id,
+                "stream_label": self.config.stream_label,
+                "sample_rate": self.config.sample_rate,
+                "frequency_hz": self.config.frequency_hz,
+                "duration_seconds": self.config.duration_seconds,
+                "elapsed_seconds": elapsed,
+                "remaining_seconds": remaining,
+                "bytes_written": self.bytes_written,
+                "samples_written": self.samples_written,
+                "file_name": self.config.output_path.name,
+                "started_at": self.started_at,
+                "stopped_at": stopped_at,
+                "batch_count": self.batch_count,
+                "error": self.error,
+            }
+
+    def _set_finished(self, status: str, error: str | None = None) -> None:
+        with self.lock:
+            if self.status_name != "recording":
+                return
+            self.status_name = status
+            self.error = error
+            self.stopped_at = time.time()
+
+    def _add_written(self, sample_count: int, byte_count: int) -> None:
+        with self.lock:
+            self.samples_written += sample_count
+            self.bytes_written += byte_count
+            self.batch_count += 1
+
+    def _run(self) -> None:
+        channelizer: IqChannelizer | None = None
+        channelizer_key: tuple[int, int, int] | None = None
+        dc_blocker: IqDcBlocker | None = None
+        decimator = None
+        decimator_key: tuple[int, int] | None = None
+        try:
+            with self.config.output_path.open("wb") as output:
+                while not self.stop_event.is_set():
+                    elapsed = time.time() - self.started_at
+                    if elapsed >= self.config.duration_seconds:
+                        self._set_finished("completed")
+                        break
+                    if self.storage_monitor.is_critical(self.config.output_path.parent):
+                        self._set_finished("needs-attention", storage_status_message("critical"))
+                        break
+                    try:
+                        batch: RtlSampleBatch = self.queue.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    iq = rtl_u8_to_complex64(batch.data)
+                    if iq.size == 0:
+                        continue
+                    if self.config.mode == IQ_RECORDER_MODE_STREAM:
+                        if self.config.target_frequency_hz is None:
+                            raise ValueError("stream recording target frequency is missing")
+                        next_key = (batch.sample_rate, batch.center_frequency_hz, int(self.config.target_frequency_hz))
+                        if channelizer is None or channelizer_key != next_key:
+                            dc_blocker = IqDcBlocker(batch.sample_rate)
+                            channelizer = IqChannelizer(
+                                input_rate=batch.sample_rate,
+                                center_frequency_hz=batch.center_frequency_hz,
+                                target_frequency_hz=int(self.config.target_frequency_hz),
+                                output_rate=IQ_SAMPLE_RATE,
+                            )
+                            channelizer_key = next_key
+                        if dc_blocker is None:
+                            dc_blocker = IqDcBlocker(batch.sample_rate)
+                        recorded_iq = channelizer.process_complex(dc_blocker.process(iq))
+                    else:
+                        if self.config.sample_rate > batch.sample_rate:
+                            raise ValueError("recording sample rate is higher than the RTL-SDR sample rate")
+                        if self.config.sample_rate == batch.sample_rate:
+                            recorded_iq = iq
+                        else:
+                            next_key = (batch.sample_rate, self.config.sample_rate)
+                            if decimator is None or decimator_key != next_key:
+                                decimator = create_decimator(batch.sample_rate, self.config.sample_rate)
+                                decimator_key = next_key
+                            recorded_iq = decimator.process(iq)
+                    if recorded_iq.size == 0:
+                        continue
+                    data = complex64_to_interleaved_f32(recorded_iq)
+                    output.write(data)
+                    self._add_written(int(recorded_iq.size), len(data))
+                else:
+                    self._set_finished("stopped")
+        except Exception as exc:
+            LOG.exception("I/Q recorder failed: %s", exc)
+            self._set_finished("needs-attention", str(exc))
+        finally:
+            self.fanout.unsubscribe(self.queue)
+            self.storage_monitor.recording_stopped()
+            self._write_metadata()
+
+    def _write_metadata(self) -> None:
+        snapshot = self.snapshot()
+        if snapshot["bytes_written"] <= 0:
+            return
+        metadata = {
+            "id": self.config.recording_id,
+            "mode": self.config.mode,
+            "stream_id": self.config.stream_id,
+            "stream_label": self.config.stream_label,
+            "sample_rate": self.config.sample_rate,
+            "frequency_hz": self.config.frequency_hz,
+            "duration_seconds": snapshot["elapsed_seconds"],
+            "bytes": snapshot["bytes_written"],
+            "samples": snapshot["samples_written"],
+            "file_path": str(self.config.output_path),
+            "started_at": snapshot["started_at"],
+            "stopped_at": snapshot["stopped_at"] or time.time(),
+            "status": snapshot["status"],
+        }
+        upsert_iq_recording_metadata(self.config.index_path, metadata)
+
+
 class IcecastEncoderGroup:
     def __init__(self, key: tuple[str, int, int], config: IcecastConfig) -> None:
         self.key = key
@@ -1518,6 +1710,8 @@ class RtlControlService:
         self.state_path = state_path
         self.streams_state_path = state_path.with_name(STREAMS_STATE_FILE_NAME)
         self.streams_directory = state_path.parent / STREAMS_DIRECTORY_NAME
+        self.iq_recordings_directory = state_path.parent / IQ_RECORDINGS_DIRECTORY_NAME
+        self.iq_recordings_index_path = self.iq_recordings_directory / IQ_RECORDINGS_INDEX_FILE_NAME
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.log_handler = log_handler
         self.storage_monitor = StorageMonitor(
@@ -1537,6 +1731,8 @@ class RtlControlService:
         self.stream_workers: dict[str, IcecastStreamWorker] = {}
         self.monitor_streams_by_client: dict[str, str] = {}
         self.receiver_workers: dict[str, WeatherReceiverWorker] = {}
+        self.iq_recorder: IqRecorderWorker | None = None
+        self.iq_recording_downloads: set[str] = set()
         self.webrtc_runner = WebRtcAsyncRunner()
         self.webrtc_sessions = AiortcSessionManager()
         self.icecast_auth_cache: dict[str, float] = {}
@@ -1544,6 +1740,7 @@ class RtlControlService:
         self.last_batch_at: float | None = None
         self.received_chunks = 0
         self.received_bytes = 0
+        self.storage_monitor.add_path(self.iq_recordings_directory)
         self.storage_monitor.start()
         if self.settings.serial:
             self._start_or_update_capture_locked()
@@ -1556,6 +1753,11 @@ class RtlControlService:
         except Exception as exc:
             LOG.debug("WebRTC monitor cleanup failed: %s", exc)
         self.webrtc_runner.stop()
+        with self.lock:
+            recorder = self.iq_recorder
+            self.iq_recorder = None
+        if recorder is not None:
+            recorder.stop()
         self.stop_capture()
         self.storage_monitor.stop()
 
@@ -1563,8 +1765,12 @@ class RtlControlService:
         message = str(snapshot.get("message") or storage_status_message("critical"))
         with self.lock:
             workers = list(self.stream_workers.values())
+            recorder = self.iq_recorder
         for worker in workers:
             worker.stop_eas_recording_due_to_storage(message)
+        if recorder is not None:
+            LOG.warning("stopping I/Q recorder because storage is critically low")
+            recorder.stop()
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -1590,6 +1796,7 @@ class RtlControlService:
                 "active_eas_recorders": self._active_eas_recorders_locked(),
                 "recent_eas_alerts": self._recent_eas_alerts_locked(),
                 "storage": self.storage_monitor.snapshot(),
+                "iq_recorder": self._iq_recorder_status_locked(),
                 "logs": self.log_handler.snapshot()[-80:],
             }
 
@@ -1666,6 +1873,158 @@ class RtlControlService:
                 "streams": list(self.streams),
                 "monitoring": dict(getattr(self, "monitor_streams_by_client", {})),
             }
+
+    def iq_recorder_status(self) -> dict[str, Any]:
+        with self.lock:
+            return self._iq_recorder_status_locked()
+
+    def iq_recordings(self) -> dict[str, Any]:
+        with self.lock:
+            downloading = set(self.iq_recording_downloads)
+        recordings = []
+        for recording in load_iq_recording_entries(self.iq_recordings_index_path):
+            item = iq_recording_summary(recording)
+            item["downloading"] = item["id"] in downloading
+            recordings.append(item)
+        recordings.sort(key=lambda item: float(item.get("started_at", 0.0)), reverse=True)
+        return {"recordings": recordings}
+
+    def remove_iq_recording(self, recording_id: str) -> dict[str, Any]:
+        recording_id = str(recording_id).strip()
+        if not recording_id:
+            raise ValueError("I/Q recording id is required")
+        with self.lock:
+            if recording_id in self.iq_recording_downloads:
+                raise ValueError("This I/Q recording is currently being downloaded.")
+        data = load_iq_recording_index(self.iq_recordings_index_path)
+        recording = None
+        remaining = []
+        for entry in data["recordings"]:
+            if str(entry.get("id", "")) == recording_id:
+                recording = entry
+            else:
+                remaining.append(entry)
+        if recording is None:
+            raise ValueError("I/Q recording was not found")
+        path = safe_iq_recording_file_path(self.iq_recordings_directory, recording, require_exists=False)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        data["recordings"] = remaining
+        atomic_write_json(self.iq_recordings_index_path, data)
+        LOG.info("removed I/Q recording %s", recording_id)
+        return self.iq_recordings()
+
+    def iq_recording_download_info(self, recording_id: str, fmt: str) -> tuple[dict[str, Any], Path, str, int]:
+        recording_id = str(recording_id).strip()
+        fmt = validate_iq_download_format(fmt)
+        if not recording_id:
+            raise ValueError("I/Q recording id is required")
+        recording = find_iq_recording(self.iq_recordings_index_path, recording_id)
+        path = safe_iq_recording_file_path(self.iq_recordings_directory, recording)
+        return recording, path, iq_recording_download_name(recording, fmt), iq_recording_download_size(path, fmt)
+
+    def begin_iq_recording_download(self, recording_id: str) -> None:
+        with self.lock:
+            self.iq_recording_downloads.add(recording_id)
+
+    def finish_iq_recording_download(self, recording_id: str) -> None:
+        with self.lock:
+            self.iq_recording_downloads.discard(recording_id)
+
+    def _iq_recorder_status_locked(self) -> dict[str, Any]:
+        worker = self.iq_recorder
+        if worker is None:
+            return {
+                "active": False,
+                "status": "idle",
+                "sample_rates": list(IQ_RECORDER_SAMPLE_RATES),
+                "default_duration_seconds": IQ_RECORDER_DEFAULT_DURATION_SECONDS,
+            }
+        snapshot = worker.snapshot()
+        snapshot["sample_rates"] = list(IQ_RECORDER_SAMPLE_RATES)
+        snapshot["default_duration_seconds"] = IQ_RECORDER_DEFAULT_DURATION_SECONDS
+        return snapshot
+
+    def start_iq_recording(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            existing = self.iq_recorder
+            if existing is not None and existing.snapshot().get("active"):
+                raise ValueError("I/Q recording is already in progress")
+            fanout = self.raw_fanout
+            if fanout is None:
+                raise ValueError("RTL-SDR capture is not active")
+            config = self._iq_recorder_config_from_payload_locked(payload)
+            if self.storage_monitor.is_critical(config.output_path.parent):
+                raise ValueError(storage_status_message("critical"))
+            worker = IqRecorderWorker(
+                fanout=fanout,
+                config=config,
+                storage_monitor=self.storage_monitor,
+            )
+            self.iq_recorder = worker
+            worker.start()
+        LOG.info(
+            "started I/Q recording: mode=%s sample_rate=%s duration=%.1fs file=%s",
+            config.mode,
+            config.sample_rate,
+            config.duration_seconds,
+            config.output_path.name,
+        )
+        return {"success": True, "iq_recorder": self.iq_recorder_status()}
+
+    def stop_iq_recording(self) -> dict[str, Any]:
+        with self.lock:
+            worker = self.iq_recorder
+        if worker is not None:
+            worker.stop()
+            LOG.info("stopped I/Q recording")
+        return {"success": True, "iq_recorder": self.iq_recorder_status()}
+
+    def _iq_recorder_config_from_payload_locked(self, payload: dict[str, Any]) -> IqRecorderConfig:
+        mode = str(payload.get("mode", IQ_RECORDER_MODE_STREAM)).strip().lower()
+        if mode not in {IQ_RECORDER_MODE_STREAM, IQ_RECORDER_MODE_SPECTRUM}:
+            raise ValueError("select a valid I/Q recording mode")
+        duration_seconds = validate_iq_recording_duration(payload.get("duration_seconds", IQ_RECORDER_DEFAULT_DURATION_SECONDS))
+        stream_id = ""
+        stream_label = ""
+        target_frequency_hz = None
+        sample_rate = DEFAULT_RTL_SAMPLE_RATE
+        file_label = mode
+        if mode == IQ_RECORDER_MODE_STREAM:
+            stream_id = str(payload.get("stream_id", "")).strip()
+            stream = self._stream_locked(stream_id)
+            if not stream.get("enabled", True):
+                raise ValueError("select an active stream")
+            station = stream.get("station", {})
+            callsign = sanitize_path_component(str(station.get("callsign", "stream")))
+            try:
+                target_frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("stream station frequency is invalid") from exc
+            stream_label = str(station.get("callsign", callsign))
+            sample_rate = IQ_SAMPLE_RATE
+            file_label = callsign
+        else:
+            sample_rate = validate_iq_recording_sample_rate(payload.get("sample_rate", DEFAULT_RTL_SAMPLE_RATE))
+            file_label = f"spectrum-{sample_rate}"
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        recording_id = uuid.uuid4().hex
+        frequency_hz = int(target_frequency_hz or NWR_CENTER_FREQUENCY_HZ)
+        output_path = unique_iq_recording_path(self.iq_recordings_directory, f"{timestamp}-{file_label}.cf32")
+        return IqRecorderConfig(
+            recording_id=recording_id,
+            mode=mode,
+            sample_rate=sample_rate,
+            duration_seconds=duration_seconds,
+            output_path=output_path,
+            index_path=self.iq_recordings_index_path,
+            frequency_hz=frequency_hz,
+            stream_id=stream_id,
+            stream_label=stream_label,
+            target_frequency_hz=target_frequency_hz,
+        )
 
     def rtl_diagnostics(self) -> dict[str, Any]:
         with self.lock:
@@ -2512,6 +2871,9 @@ class RtlControlService:
 
     def _detach_capture_locked(self) -> None:
         self.drain_stop.set()
+        if self.iq_recorder is not None:
+            self.iq_recorder.stop()
+            self.iq_recorder = None
         self._stop_receiver_workers_locked()
         self._stop_stream_workers_locked()
         fanout = self.raw_fanout
@@ -2535,6 +2897,8 @@ class RtlControlService:
     def stop_capture(self) -> None:
         with self.lock:
             self.drain_stop.set()
+            recorder = self.iq_recorder
+            self.iq_recorder = None
             self._stop_receiver_workers_locked()
             self._stop_stream_workers_locked()
             fanout = self.raw_fanout
@@ -2544,6 +2908,8 @@ class RtlControlService:
             self.capture = None
             drain_thread = self.drain_thread
             self.drain_thread = None
+        if recorder is not None:
+            recorder.stop()
         if fanout is not None:
             fanout.stop()
         if capture is not None:
@@ -2854,6 +3220,20 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
+        elif path == "/api/iq-recorder/status":
+            self._send_json(self.service.iq_recorder_status())
+        elif path == "/api/iq-recordings":
+            self._send_json(self.service.iq_recordings())
+        elif path == "/api/iq-recording-download":
+            query = parse_qs(parsed.query)
+            recording_id = query.get("id", [""])[0]
+            fmt = query.get("format", ["cf"])[0]
+            try:
+                recording, file_path, download_name, download_size = self.service.iq_recording_download_info(recording_id, fmt)
+                self._send_iq_recording(file_path, download_name, download_size, fmt, str(recording.get("id", "")))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -2942,6 +3322,25 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(response)
             return
+        if path == "/api/iq-recorder/start":
+            try:
+                payload = self._read_json()
+                response = self.service.start_iq_recording(payload)
+            except Exception as exc:
+                LOG.warning("API I/Q recorder start failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/iq-recorder/stop":
+            try:
+                response = self.service.stop_iq_recording()
+            except Exception as exc:
+                LOG.warning("API I/Q recorder stop failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path == "/api/icecast-auth":
             try:
                 payload = self._read_json()
@@ -2991,6 +3390,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 stream_id = query.get("stream_id", [""])[0]
                 output_id = query.get("output_id", [""])[0]
                 response = self.service.remove_stream_output(stream_id, output_id)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if parsed.path == "/api/iq-recording":
+            try:
+                query = parse_qs(parsed.query)
+                response = self.service.remove_iq_recording(query.get("id", [""])[0])
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -3125,6 +3533,25 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         finally:
             if delete_after:
                 path.unlink(missing_ok=True)
+
+    def _send_iq_recording(self, path: Path, download_name: str, data_length: int, fmt: str, recording_id: str) -> None:
+        self.service.begin_iq_recording_download(recording_id)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(data_length))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Disposition", f'attachment; filename="{http_header_filename(download_name)}"')
+            self.end_headers()
+            with path.open("rb") as source:
+                for chunk in convert_iq_recording_chunks(source, fmt):
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        LOG.info("I/Q recording download disconnected before completion: %s", recording_id)
+                        break
+        finally:
+            self.service.finish_iq_recording_download(recording_id)
 
 
 def default_state_path() -> Path:
@@ -3552,6 +3979,196 @@ def http_header_filename(value: str) -> str:
 def sanitize_path_component(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
     return sanitized or "stream"
+
+
+def unique_iq_recording_path(directory: Path, file_name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    cleaned = sanitize_archive_filename(file_name)
+    if not cleaned.lower().endswith(".cf32"):
+        cleaned = f"{Path(cleaned).stem or 'iq-recording'}.cf32"
+    candidate = directory / cleaned
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 2
+    while True:
+        candidate = directory / f"{stem}-{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def load_iq_recording_index(index_path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"version": 1, "recordings": []}
+    if not isinstance(data, dict) or not isinstance(data.get("recordings"), list):
+        raise ValueError("I/Q recording index must contain a recordings array")
+    data["recordings"] = [entry for entry in data["recordings"] if isinstance(entry, dict)]
+    data["version"] = int(data.get("version", 1))
+    return data
+
+
+def load_iq_recording_entries(index_path: Path) -> list[dict[str, Any]]:
+    return list(load_iq_recording_index(index_path)["recordings"])
+
+
+def upsert_iq_recording_metadata(index_path: Path, metadata: dict[str, Any]) -> None:
+    data = load_iq_recording_index(index_path)
+    recording_id = str(metadata.get("id", "")).strip()
+    if not recording_id:
+        raise ValueError("I/Q recording metadata id is required")
+    replaced = False
+    updated = []
+    for entry in data["recordings"]:
+        if str(entry.get("id", "")) == recording_id:
+            updated.append(metadata)
+            replaced = True
+        else:
+            updated.append(entry)
+    if not replaced:
+        updated.append(metadata)
+    data["recordings"] = updated
+    atomic_write_json(index_path, data)
+
+
+def find_iq_recording(index_path: Path, recording_id: str) -> dict[str, Any]:
+    for recording in load_iq_recording_entries(index_path):
+        if str(recording.get("id", "")) == recording_id:
+            return recording
+    raise ValueError("I/Q recording was not found")
+
+
+def safe_iq_recording_file_path(
+    recordings_directory: Path,
+    recording: dict[str, Any],
+    *,
+    require_exists: bool = True,
+) -> Path:
+    base = recordings_directory.resolve()
+    raw_path = recording.get("file_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("I/Q recording file is missing")
+    path = Path(raw_path).expanduser().resolve()
+    if require_exists and not path.is_file():
+        raise ValueError("I/Q recording file was not found")
+    if path != base and base not in path.parents:
+        raise ValueError("I/Q recording file path is outside the recording directory")
+    return path
+
+
+def iq_recording_summary(recording: dict[str, Any]) -> dict[str, Any]:
+    started_at = float(recording.get("started_at", 0.0) or 0.0)
+    return {
+        "id": str(recording.get("id", "")),
+        "recorded_at": format_local_datetime(datetime.fromtimestamp(started_at, timezone.utc)),
+        "started_at": started_at,
+        "duration_seconds": float(recording.get("duration_seconds", 0.0) or 0.0),
+        "duration": format_duration_hms(float(recording.get("duration_seconds", 0.0) or 0.0)),
+        "sample_rate": int(recording.get("sample_rate", 0) or 0),
+        "frequency_hz": int(recording.get("frequency_hz", NWR_CENTER_FREQUENCY_HZ) or NWR_CENTER_FREQUENCY_HZ),
+        "mode": str(recording.get("mode", "")),
+        "stream_label": str(recording.get("stream_label", "")),
+        "bytes": int(recording.get("bytes", 0) or 0),
+    }
+
+
+def format_duration_hms(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    remaining = total % 60
+    if hours:
+        return f"{hours}:{minutes:02d}:{remaining:02d}"
+    return f"{minutes}:{remaining:02d}"
+
+
+def validate_iq_download_format(raw: Any) -> str:
+    fmt = str(raw or "cf").strip().lower()
+    aliases = {
+        "float32": "cf",
+        "cf32": "cf",
+        "complex_float32": "cf",
+        "signed16": "s16",
+        "int16": "s16",
+        "unsigned8": "u8",
+        "uint8": "u8",
+    }
+    fmt = aliases.get(fmt, fmt)
+    if fmt not in {"cf", "s16", "u8"}:
+        raise ValueError("select a valid I/Q download format")
+    return fmt
+
+
+def iq_recording_download_size(path: Path, fmt: str) -> int:
+    cf_size = path.stat().st_size
+    if cf_size % 4:
+        raise ValueError("I/Q recording file is not a valid float32 stream")
+    if fmt == "cf":
+        return cf_size
+    if fmt == "s16":
+        return cf_size // 2
+    if fmt == "u8":
+        return cf_size // 4
+    raise ValueError("select a valid I/Q download format")
+
+
+def iq_recording_download_name(recording: dict[str, Any], fmt: str) -> str:
+    sample_rate = int(recording.get("sample_rate", 0) or 0)
+    frequency_hz = int(recording.get("frequency_hz", NWR_CENTER_FREQUENCY_HZ) or NWR_CENTER_FREQUENCY_HZ)
+    started_at = datetime.fromtimestamp(float(recording.get("started_at", time.time()) or time.time()), timezone.utc).astimezone()
+    date_text = started_at.strftime("%m%d%Y")
+    time_text = started_at.strftime("%H%M")
+    return f"nwrstmgr-s{sample_rate}-f{frequency_hz}-{date_text}-{time_text}-{fmt}.raw"
+
+
+def convert_iq_recording_chunks(source, fmt: str):
+    fmt = validate_iq_download_format(fmt)
+    chunk_size = 1024 * 1024
+    carry = b""
+    while True:
+        raw = carry + source.read(chunk_size)
+        if not raw:
+            break
+        usable = len(raw) - (len(raw) % 4)
+        carry = raw[usable:]
+        if usable <= 0:
+            continue
+        if fmt == "cf":
+            yield raw[:usable]
+            continue
+        floats = np.frombuffer(raw[:usable], dtype="<f4")
+        clipped = np.clip(floats, -1.0, 1.0)
+        if fmt == "s16":
+            yield np.round(clipped * 32767.0).astype("<i2").tobytes()
+        else:
+            yield np.round(clipped * 127.5 + 127.5).astype(np.uint8).tobytes()
+    if carry:
+        raise ValueError("I/Q recording file ended with a partial float32 sample")
+
+
+def validate_iq_recording_duration(raw: Any) -> float:
+    try:
+        duration = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("I/Q recording duration must be a number of seconds") from exc
+    if duration < IQ_RECORDER_MIN_DURATION_SECONDS or duration > IQ_RECORDER_MAX_DURATION_SECONDS:
+        raise ValueError("I/Q recording duration must be from 1 second through 24 hours")
+    return duration
+
+
+def validate_iq_recording_sample_rate(raw: Any) -> int:
+    try:
+        sample_rate = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("I/Q recording sample rate must be a number") from exc
+    if sample_rate not in IQ_RECORDER_SAMPLE_RATES:
+        raise ValueError("select a supported I/Q recording sample rate")
+    if sample_rate > DEFAULT_RTL_SAMPLE_RATE:
+        raise ValueError("I/Q recording sample rate cannot be higher than the RTL-SDR sample rate")
+    return sample_rate
 
 
 def validate_fallback_settings_payload(raw: Any) -> WebFallbackSettings:
@@ -4127,6 +4744,8 @@ body { margin: 0; background: #f6f7f9; color: #14181f; }
 header { background: #fff; border-bottom: 1px solid #d8dde6; }
 .topbar { max-width: 980px; margin: 0 auto; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 main { max-width: 980px; margin: 0 auto; padding: 24px; }
+.global-status-banner { max-width: 980px; margin: 14px auto 0; padding: 12px 24px; border: 1px solid #2557a7; border-radius: 8px; background: #eaf1ff; color: #14181f; font-weight: 700; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.global-status-banner a { color: #174a98; }
 h1 { font-size: 22px; margin: 0; }
 h2 { font-size: 20px; margin: 0 0 16px; }
 h3 { font-size: 16px; margin: 18px 0 10px; }
@@ -4194,6 +4813,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 @media (prefers-color-scheme: dark) {
   body { background: #101318; color: #eef2f7; }
   header, section, select, input, button { background: #181d24; color: #eef2f7; border-color: #333b48; }
+  .global-status-banner { background: #16233a; color: #eef2f7; border-color: #3f67a9; }
+  .global-status-banner a { color: #9dc1ff; }
   fieldset, .metric, .stream-item, th, td { border-color: #333b48; }
   .metric b, .hint, th { color: #9aa8ba; }
   .status-enabled { color: #5fd27a; }
@@ -4227,6 +4848,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
         <span id="nav_more_menu" class="nav-more-menu" role="menu" hidden>
           <a id="nav_receiver" href="/?view=receiver" data-view="receiver" role="menuitem">Weather Radio Receiver</a>
+          <a id="nav_iq_recorder" href="/?view=iq_recorder" data-view="iq_recorder" role="menuitem">I/Q Recorder</a>
           <a id="nav_logs" href="/?view=logs" data-view="logs" role="menuitem">Logs</a>
         </span>
       </span>
@@ -4257,6 +4879,11 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div class="actions">
     <button id="dismiss_receiver_unstable" type="button">Dismiss</button>
   </div>
+</div>
+<div id="iq_recording_banner" class="global-status-banner" hidden>
+  <span>I/Q recording in progress</span>
+  <a href="/?view=iq_recorder" data-view="iq_recorder">Return to I/Q recorder</a>
+  <span id="iq_recording_banner_elapsed">0:00</span>
 </div>
 <main>
   <div id="view_dashboard" class="view">
@@ -4320,6 +4947,98 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <button id="receiver_next" type="button">Next channel</button>
       </div>
       <div id="receiver-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_iq_recorder" class="view" hidden>
+    <section>
+      <h2>I/Q Recorder</h2>
+      <div id="iq-recorder-result" class="message"></div>
+      <div id="iq_recorder_active" hidden>
+        <div class="status" aria-live="off">
+          <div class="metric"><b>Status</b><span id="iq_status">Idle</span></div>
+          <div class="metric"><b>Source</b><span id="iq_source">None</span></div>
+          <div class="metric"><b>Sample rate</b><span id="iq_active_sample_rate">0 S/s</span></div>
+          <div class="metric"><b>File size</b><span id="iq_file_size">0 B</span></div>
+          <div class="metric"><b>Elapsed</b><span id="iq_elapsed">0:00</span></div>
+          <div class="metric"><b>Time remaining</b><span id="iq_remaining">0:00</span></div>
+          <div class="metric"><b>Storage</b><span id="iq_storage">unknown</span></div>
+        </div>
+        <div class="actions">
+          <button id="iq_stop_recording" type="button">Stop recording</button>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="open_iq_start" type="button">New recording</button>
+      </div>
+      <table aria-label="I/Q recordings">
+        <thead>
+          <tr>
+            <th>Time of recording</th>
+            <th>Duration</th>
+            <th>Sample rate</th>
+            <th>Frequency</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="iq-recordings-body" aria-live="off">
+          <tr>
+            <td colspan="5" class="hint">No I/Q recordings.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  <div id="view_iq_recorder_start" class="view" hidden>
+    <section>
+      <h2>New I/Q Recording</h2>
+      <div id="iq-start-result" class="message"></div>
+      <div id="iq_recorder_idle">
+        <fieldset>
+          <legend>Recording source</legend>
+          <label><input id="iq_mode_stream" name="iq_recording_mode" type="radio" value="stream" checked> Record I/Q data from an active stream</label>
+          <label><input id="iq_mode_spectrum" name="iq_recording_mode" type="radio" value="spectrum"> Record the entire spectrum</label>
+        </fieldset>
+        <div id="iq_stream_fields">
+          <label>Stream
+            <select id="iq_stream_select"></select>
+          </label>
+          <div class="hint">Records the selected stream's 24 kHz channel before FM demodulation.</div>
+        </div>
+        <div id="iq_spectrum_fields" hidden>
+          <label>Sample rate
+            <select id="iq_sample_rate"></select>
+          </label>
+          <div class="hint">Records spectrum I/Q centered at 162.475 MHz after RTL-SDR float conversion.</div>
+        </div>
+        <label>Recording length
+          <input id="iq_duration_minutes" type="number" min="1" max="1440" step="1" value="5">
+        </label>
+        <div class="actions">
+          <button id="iq_start_recording" type="button">Start recording</button>
+          <button id="cancel_iq_start" type="button">Cancel</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="view_iq_recording_download" class="view" hidden>
+    <section>
+      <h2>Download I/Q Recording</h2>
+      <p id="iq_download_recording_label" class="hint"></p>
+      <label>Download format
+        <select id="iq_download_format">
+          <option value="cf">Float 32 bit</option>
+          <option value="s16">Signed 16 bit</option>
+          <option value="u8">Unsigned 8-bit</option>
+        </select>
+      </label>
+      <div class="actions">
+        <button id="iq_download_recording" type="button">Download recording</button>
+        <button id="cancel_iq_download" type="button">Cancel</button>
+      </div>
+      <div id="iq-download-result" class="message"></div>
     </section>
   </div>
 
@@ -4854,6 +5573,12 @@ let easAlertReturnPage = 1;
 let lastEasAlertRefreshAt = 0;
 let easBulkOptionsSignature = "";
 let easBulkServerNow = null;
+let iqRecorderSignature = "";
+let iqStreamOptionsSignature = "";
+let iqRecordings = [];
+let iqRecordingsSignature = "";
+let selectedIqRecordingId = "";
+let lastIqRecordingsRefreshAt = 0;
 let webRtcSupport = {
   browser: {webrtc: false, opus: false},
   server: {available: false}
@@ -4877,6 +5602,7 @@ let receiverLastPacketAt = 0;
 let unloadLiveAudioStopSent = false;
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
+const IQ_RECORDER_SAMPLE_RATES = [192000, 256000, 384000, 512000, 768000, 1024000, 1536000];
 const NWR_RECEIVER_CHANNELS = [
   {frequency_hz: 162400000, label: "162.400 MHz"},
   {frequency_hz: 162425000, label: "162.425 MHz"},
@@ -4906,6 +5632,26 @@ function logClientEvent(level, area, message, details = {}) {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({level, area, message, details})
   }).catch(() => {});
+}
+
+function formatDecimalBytes(value) {
+  let bytes = Number(value || 0);
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let index = 0;
+  while (bytes >= 1000 && index < units.length - 1) {
+    bytes /= 1000;
+    index += 1;
+  }
+  return index === 0 ? `${Math.round(bytes)} ${units[index]}` : `${bytes.toFixed(1)} ${units[index]}`;
+}
+
+function formatDuration(seconds) {
+  seconds = Math.max(0, Math.floor(Number(seconds || 0)));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remaining = seconds % 60;
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+  return `${minutes}:${String(remaining).padStart(2, "0")}`;
 }
 
 function detectBrowserWebRtcSupport() {
@@ -7161,6 +7907,30 @@ function setStreamResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setIqRecorderResult(message, kind = "") {
+  const element = document.getElementById("iq-recorder-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setIqStartResult(message, kind = "") {
+  const element = document.getElementById("iq-start-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setIqDownloadResult(message, kind = "") {
+  const element = document.getElementById("iq-download-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
 function setStreamsResult(message, kind = "") {
   const element = document.getElementById("streams-result");
   const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
@@ -7605,6 +8375,7 @@ function showView(name) {
     if (
       item.dataset.view === name ||
       (item.dataset.view === "streams" && name === "stream_settings") ||
+      (item.dataset.view === "iq_recorder" && ["iq_recorder_start", "iq_recording_download"].includes(name)) ||
       (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name))
     ) {
       item.setAttribute("aria-current", "page");
@@ -7613,7 +8384,7 @@ function showView(name) {
     }
   }
   if (moreButton) {
-    if (["receiver", "logs"].includes(name)) {
+    if (["receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs"].includes(name)) {
       moreButton.setAttribute("aria-current", "page");
     } else {
       moreButton.removeAttribute("aria-current");
@@ -7631,6 +8402,12 @@ function routeForView(name, params = {}) {
   if (name === "dashboard") return "/";
   if (name === "rtl") query.set("view", "rtl");
   if (name === "receiver") query.set("view", "receiver");
+  if (name === "iq_recorder") query.set("view", "iq_recorder");
+  if (name === "iq_recorder_start") query.set("view", "iq_recorder_start");
+  if (name === "iq_recording_download") {
+    query.set("view", "iq_recording_download");
+    if (params.recordingId) query.set("recording", params.recordingId);
+  }
   if (name === "logs") query.set("view", "logs");
   if (name === "streams") query.set("view", "streams");
   if (name === "add_stream") query.set("view", "add_stream");
@@ -7666,11 +8443,12 @@ function routeForView(name, params = {}) {
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
-  if (["dashboard", "rtl", "receiver", "logs", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
+  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
     return {
       view,
       streamId: query.get("stream") || "",
       alertId: query.get("alert") || "",
+      recordingId: query.get("recording") || "",
       page: Math.max(1, Number(query.get("page") || 1))
     };
   }
@@ -7682,6 +8460,7 @@ function routeState(view, params = {}) {
     view,
     streamId: params.streamId || "",
     alertId: params.alertId || "",
+    recordingId: params.recordingId || "",
     page: Math.max(1, Number(params.page || 1))
   };
 }
@@ -7730,6 +8509,20 @@ function applyRoute(route) {
   }
   if (route.view !== "stream_settings") settingsStreamId = "";
   if (route.view === "receiver") renderReceiverControls();
+  if (route.view === "iq_recorder") {
+    loadIqRecordings().catch(error => setIqRecorderResult(error.message, "error"));
+  }
+  if (route.view === "iq_recorder_start") {
+    populateIqSampleRates();
+    renderIqStreamOptions(true);
+    renderIqModeFields();
+  }
+  if (route.view === "iq_recording_download") {
+    selectedIqRecordingId = route.recordingId || selectedIqRecordingId;
+    loadIqRecordings()
+      .then(() => renderIqDownloadPage())
+      .catch(error => setIqDownloadResult(error.message, "error"));
+  }
   showView(route.view);
 }
 
@@ -7800,6 +8593,7 @@ function currentRouteParams() {
   if (view === "eas_alerts") return {streamId: easAlertStreamId, page: easAlertPage};
   if (view === "eas_alert_export" || view === "eas_alert_delete") return {streamId: easAlertStreamId, page: easAlertPage};
   if (view === "eas_alert_detail") return {streamId: easAlertStreamId, alertId: easAlertDetailId, page: easAlertReturnPage};
+  if (view === "iq_recording_download") return {recordingId: selectedIqRecordingId};
   return {};
 }
 
@@ -7821,6 +8615,263 @@ function renderStorageSummary(storage) {
   if (warning.hidden !== hidden) warning.hidden = hidden;
 }
 
+function primaryStorageSummary(storage) {
+  const filesystems = storage && Array.isArray(storage.filesystems) ? storage.filesystems : [];
+  const primary = filesystems.length ? filesystems[0] : null;
+  return primary && primary.summary ? primary.summary.replace(/^Storage: /, "") : "unknown";
+}
+
+function populateIqSampleRates() {
+  const select = document.getElementById("iq_sample_rate");
+  if (!select || select.options.length) return;
+  for (const rate of IQ_RECORDER_SAMPLE_RATES) {
+    const option = document.createElement("option");
+    option.value = String(rate);
+    option.textContent = `${rate} S/s`;
+    if (rate === 192000) option.selected = true;
+    select.appendChild(option);
+  }
+}
+
+function activeIqStreamOptions() {
+  return configuredStreams
+    .filter(stream => stream.enabled !== false)
+    .map(stream => {
+      const station = stream.station || {};
+      const callsign = station.callsign || "Unknown";
+      const frequency = station.frequency ? `${station.frequency} MHz` : "";
+      return {id: stream.id, label: `${callsign}${frequency ? ` ${frequency}` : ""}`};
+    });
+}
+
+function renderIqStreamOptions(force = false) {
+  const select = document.getElementById("iq_stream_select");
+  if (!select) return;
+  const options = activeIqStreamOptions();
+  const signature = JSON.stringify(options);
+  if (!force && signature === iqStreamOptionsSignature) return;
+  const current = select.value;
+  select.replaceChildren();
+  for (const item of options) {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = item.label;
+    select.appendChild(option);
+  }
+  if (options.some(item => item.id === current)) {
+    select.value = current;
+  }
+  iqStreamOptionsSignature = signature;
+}
+
+function currentIqMode() {
+  const selected = document.querySelector("input[name='iq_recording_mode']:checked");
+  return selected ? selected.value : "stream";
+}
+
+function renderIqModeFields() {
+  const mode = currentIqMode();
+  setHidden("iq_stream_fields", mode !== "stream");
+  setHidden("iq_spectrum_fields", mode !== "spectrum");
+  const start = document.getElementById("iq_start_recording");
+  if (start) {
+    start.disabled = mode === "stream" && !document.getElementById("iq_stream_select").value;
+  }
+}
+
+function iqRecorderSourceText(recorder) {
+  if (!recorder || recorder.status === "idle") return "None";
+  if (recorder.mode === "stream") return recorder.stream_label || "Stream channel";
+  return "Entire spectrum at 162.475 MHz";
+}
+
+function renderIqRecorder(recorder, storage) {
+  recorder = recorder || {active: false, status: "idle"};
+  populateIqSampleRates();
+  renderIqStreamOptions();
+  const active = Boolean(recorder.active);
+  setHidden("iq_recording_banner", !active);
+  if (active) setText("iq_recording_banner_elapsed", formatDuration(recorder.elapsed_seconds));
+  setHidden("iq_recorder_active", !active);
+  setHidden("iq_recorder_idle", active);
+  const openStart = document.getElementById("open_iq_start");
+  if (openStart) setDisabled(openStart, active);
+  if (!active) {
+    renderIqModeFields();
+    const signature = JSON.stringify({status: recorder.status, error: recorder.error || ""});
+    if (signature !== iqRecorderSignature && recorder.status && recorder.status !== "idle") {
+      const message = recorder.error || (recorder.status === "completed" ? "I/Q recording completed." : "I/Q recording stopped.");
+      setIqRecorderResult(message, recorder.status === "needs-attention" ? "error" : "success");
+    }
+    iqRecorderSignature = signature;
+    return;
+  }
+  setText("iq_status", recorder.status === "recording" ? "Recording" : recorder.status);
+  setText("iq_source", iqRecorderSourceText(recorder));
+  setText("iq_active_sample_rate", `${recorder.sample_rate || 0} S/s`);
+  setText("iq_file_size", formatDecimalBytes(recorder.bytes_written));
+  setText("iq_elapsed", formatDuration(recorder.elapsed_seconds));
+  setText("iq_remaining", formatDuration(recorder.remaining_seconds));
+  setText("iq_storage", primaryStorageSummary(storage));
+  iqRecorderSignature = JSON.stringify({status: recorder.status, file_name: recorder.file_name});
+}
+
+function iqRecordingTableSignature(recordings) {
+  return JSON.stringify((recordings || []).map(recording => ({
+    id: recording.id || "",
+    recorded_at: recording.recorded_at || "",
+    duration: recording.duration || "",
+    sample_rate: recording.sample_rate || 0,
+    frequency_hz: recording.frequency_hz || 0,
+    downloading: Boolean(recording.downloading)
+  })));
+}
+
+function renderIqRecordings(recordings) {
+  iqRecordings = recordings || [];
+  const tbody = document.getElementById("iq-recordings-body");
+  if (!tbody) return;
+  const signature = iqRecordingTableSignature(iqRecordings);
+  if (signature === iqRecordingsSignature) return;
+  iqRecordingsSignature = signature;
+  tbody.innerHTML = "";
+  if (!iqRecordings.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 5;
+    cell.className = "hint";
+    cell.textContent = "No I/Q recordings.";
+    row.appendChild(cell);
+    tbody.appendChild(row);
+    return;
+  }
+  for (const recording of iqRecordings) {
+    tbody.appendChild(iqRecordingRow(recording));
+  }
+}
+
+function iqRecordingRow(recording) {
+  const row = document.createElement("tr");
+  row.appendChild(tableCell(recording.recorded_at || "Unknown"));
+  row.appendChild(tableCell(recording.duration || "0:00"));
+  row.appendChild(tableCell(`${recording.sample_rate || 0} S/s`));
+  row.appendChild(tableCell(`${recording.frequency_hz || 0} Hz`));
+  row.appendChild(iqRecordingActionsCell(recording));
+  return row;
+}
+
+function iqRecordingActionsCell(recording) {
+  const cell = document.createElement("td");
+  cell.className = "menu-cell";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "More actions";
+  button.setAttribute("aria-haspopup", "menu");
+  button.setAttribute("aria-expanded", "false");
+  button.setAttribute("aria-label", `More actions for I/Q recording from ${recording.recorded_at || "unknown time"}`);
+  button.dataset.iqRecordingMenu = recording.id || "";
+  const menu = document.createElement("div");
+  menu.className = "stream-actions-menu";
+  menu.hidden = true;
+  menu.setAttribute("role", "menu");
+  const download = document.createElement("button");
+  download.type = "button";
+  download.textContent = "Download recording";
+  download.setAttribute("role", "menuitem");
+  download.dataset.action = "download-iq-recording";
+  download.dataset.recordingId = recording.id || "";
+  menu.appendChild(download);
+  if (!recording.downloading) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove recording";
+    remove.setAttribute("role", "menuitem");
+    remove.dataset.action = "remove-iq-recording";
+    remove.dataset.recordingId = recording.id || "";
+    menu.appendChild(remove);
+  }
+  cell.appendChild(button);
+  cell.appendChild(menu);
+  return cell;
+}
+
+async function loadIqRecordings() {
+  const data = await request("/api/iq-recordings");
+  renderIqRecordings(data.recordings || []);
+  return data;
+}
+
+async function startIqRecording() {
+  const mode = currentIqMode();
+  const minutes = Math.max(1, Math.min(1440, Number(document.getElementById("iq_duration_minutes").value || 5)));
+  const payload = {
+    mode,
+    duration_seconds: Math.round(minutes * 60)
+  };
+  if (mode === "stream") {
+    payload.stream_id = document.getElementById("iq_stream_select").value;
+  } else {
+    payload.sample_rate = Number(document.getElementById("iq_sample_rate").value);
+  }
+  setIqStartResult("Starting I/Q recording...");
+  const data = await request("/api/iq-recorder/start", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  renderIqRecorder(data.iq_recorder || {}, {});
+  await loadIqRecordings();
+  navigateTo("iq_recorder", {}, false, true);
+  setIqRecorderResult("I/Q recording started.", "success");
+}
+
+async function stopIqRecording() {
+  setIqRecorderResult("Stopping I/Q recording...");
+  const data = await request("/api/iq-recorder/stop", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: "{}"
+  });
+  renderIqRecorder(data.iq_recorder || {}, {});
+  await loadIqRecordings();
+  setIqRecorderResult("I/Q recording stopped.", "success");
+}
+
+function selectedIqRecording() {
+  return iqRecordings.find(recording => recording.id === selectedIqRecordingId) || null;
+}
+
+function renderIqDownloadPage() {
+  const recording = selectedIqRecording();
+  if (!recording) {
+    setText("iq_download_recording_label", "I/Q recording was not found.");
+    return;
+  }
+  setText(
+    "iq_download_recording_label",
+    `${recording.recorded_at || "Unknown"}; ${recording.sample_rate || 0} S/s; ${recording.frequency_hz || 0} Hz`
+  );
+}
+
+async function removeIqRecording(recordingId) {
+  const data = await request(`/api/iq-recording?id=${encodeURIComponent(recordingId)}`, {method: "DELETE"});
+  renderIqRecordings(data.recordings || []);
+  setIqRecorderResult("I/Q recording removed.", "success");
+}
+
+async function downloadSelectedIqRecording() {
+  const recording = selectedIqRecording();
+  if (!recording) {
+    setIqDownloadResult("I/Q recording was not found.", "error");
+    return;
+  }
+  const format = document.getElementById("iq_download_format").value || "cf";
+  window.location.href = `/api/iq-recording-download?id=${encodeURIComponent(recording.id)}&format=${encodeURIComponent(format)}`;
+  navigateTo("iq_recorder", {}, false, true);
+  setIqRecorderResult("Download started.", "success");
+  setTimeout(() => loadIqRecordings().catch(() => {}), 500);
+}
+
 function updateDashboard(data) {
   const settings = data.settings;
   setText("summary_sdr", activeSdrLabel(settings));
@@ -7832,6 +8883,7 @@ function updateDashboard(data) {
   renderActiveStreams(data.active_streams || [], configuredStreams);
   renderDashboardStreamAttention(data.active_streams || [], configuredStreams);
   renderDashboardRecentAlerts(data.recent_eas_alerts || []);
+  renderIqRecorder(data.iq_recorder || {}, data.storage || {});
   if (settingsStreamId) renderStreamSettings();
 }
 
@@ -7881,6 +8933,10 @@ function applyStatus(data, options = {}) {
   if (now - lastEasAlertRefreshAt > 10000) {
     lastEasAlertRefreshAt = now;
     loadEasAlertStreams({preserve: true, quiet: true});
+  }
+  if (currentViewName().startsWith("iq_") && now - lastIqRecordingsRefreshAt > 5000) {
+    lastIqRecordingsRefreshAt = now;
+    loadIqRecordings().catch(() => {});
   }
   applying = false;
 }
@@ -8136,6 +9192,117 @@ document.getElementById("receiver_play_pause").addEventListener("click", async (
   } catch (error) {
     setReceiverResult(error.message, "error");
     renderReceiverControls();
+  }
+});
+
+for (const radio of document.querySelectorAll("input[name='iq_recording_mode']")) {
+  radio.addEventListener("change", renderIqModeFields);
+}
+document.getElementById("iq_stream_select").addEventListener("change", renderIqModeFields);
+document.getElementById("iq_start_recording").addEventListener("click", async () => {
+  try {
+    await startIqRecording();
+  } catch (error) {
+    setIqStartResult(error.message, "error");
+  }
+});
+document.getElementById("iq_stop_recording").addEventListener("click", async () => {
+  try {
+    await stopIqRecording();
+  } catch (error) {
+    setIqRecorderResult(error.message, "error");
+  }
+});
+document.getElementById("open_iq_start").addEventListener("click", () => {
+  setIqStartResult("");
+  navigateTo("iq_recorder_start");
+});
+document.getElementById("cancel_iq_start").addEventListener("click", () => {
+  navigateTo("iq_recorder");
+});
+document.getElementById("cancel_iq_download").addEventListener("click", () => {
+  navigateTo("iq_recorder");
+});
+document.getElementById("iq_download_recording").addEventListener("click", async () => {
+  try {
+    await downloadSelectedIqRecording();
+  } catch (error) {
+    setIqDownloadResult(error.message, "error");
+  }
+});
+document.getElementById("iq-recordings-body").addEventListener("click", async event => {
+  const target = event.target;
+  if (!target || !target.dataset) return;
+  if (target.dataset.iqRecordingMenu !== undefined) {
+    const menu = target.nextElementSibling;
+    const shouldOpen = menu.hidden;
+    if (shouldOpen) {
+      openStreamActionMenu(target, null);
+    } else {
+      closeStreamActionMenu(menu, false);
+    }
+    return;
+  }
+  if (target.dataset.action === "download-iq-recording") {
+    closeStreamActionMenus();
+    selectedIqRecordingId = target.dataset.recordingId;
+    navigateTo("iq_recording_download", {recordingId: selectedIqRecordingId});
+    return;
+  }
+  if (target.dataset.action === "remove-iq-recording") {
+    closeStreamActionMenus();
+    if (!window.confirm("Remove this I/Q recording?")) return;
+    try {
+      await removeIqRecording(target.dataset.recordingId);
+    } catch (error) {
+      setIqRecorderResult(error.message, "error");
+    }
+  }
+});
+document.getElementById("iq-recordings-body").addEventListener("keydown", event => {
+  const target = event.target;
+  if (!target || !target.dataset) return;
+  if (target.dataset.iqRecordingMenu !== undefined) {
+    if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
+      event.preventDefault();
+      openStreamActionMenu(target, "first");
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      openStreamActionMenu(target, "last");
+      return;
+    }
+  }
+  if (target.getAttribute("role") === "menuitem") {
+    const menu = target.closest(".stream-actions-menu");
+    if (!menu) return;
+    const items = menuItems(menu);
+    const index = items.indexOf(target);
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      items[(index + 1) % items.length].focus();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      items[(index - 1 + items.length) % items.length].focus();
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      items[0].focus();
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      items[items.length - 1].focus();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeStreamActionMenu(menu, true);
+    }
   }
 });
 
@@ -8929,6 +10096,7 @@ async function refresh() {
 
 (async function init() {
   populateBitrates();
+  populateIqSampleRates();
   selectAudioEffect("volume", false);
   renderReceiverControls();
   loadWebRtcSupport();
@@ -8937,11 +10105,13 @@ async function refresh() {
   await searchStations();
   await loadStreams();
   await loadEasAlertStreams({preserve: true, quiet: true});
+  await loadIqRecordings();
   applyStatus(data, {syncControls: true});
   const initialRoute = routeFromLocation();
   navigateTo(initialRoute.view, {
     streamId: initialRoute.streamId,
     alertId: initialRoute.alertId,
+    recordingId: initialRoute.recordingId,
     page: initialRoute.page
   }, true);
   setInterval(refresh, 1000);
