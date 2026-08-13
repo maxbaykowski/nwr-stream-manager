@@ -187,7 +187,7 @@ IQ_RECORDER_MODE_STREAM = "stream"
 IQ_RECORDER_MODE_SPECTRUM = "spectrum"
 IQ_RECORDER_SAMPLE_RATES = (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_000, DEFAULT_RTL_SAMPLE_RATE)
 IQ_RECORDER_DEFAULT_DURATION_SECONDS = 300
-IQ_RECORDER_MIN_DURATION_SECONDS = 1
+IQ_RECORDER_MIN_DURATION_SECONDS = 0
 IQ_RECORDER_MAX_DURATION_SECONDS = 24 * 60 * 60
 STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
@@ -1317,7 +1317,6 @@ class IqRecorderWorker:
             now = time.time()
             stopped_at = self.stopped_at
             elapsed = max(0.0, (stopped_at or now) - self.started_at)
-            remaining = max(0.0, self.config.duration_seconds - elapsed) if self.status_name == "recording" else 0.0
             return {
                 "active": self.status_name == "recording",
                 "id": self.config.recording_id,
@@ -1329,7 +1328,6 @@ class IqRecorderWorker:
                 "frequency_hz": self.config.frequency_hz,
                 "duration_seconds": self.config.duration_seconds,
                 "elapsed_seconds": elapsed,
-                "remaining_seconds": remaining,
                 "bytes_written": self.bytes_written,
                 "samples_written": self.samples_written,
                 "file_name": self.config.output_path.name,
@@ -1363,7 +1361,7 @@ class IqRecorderWorker:
             with self.config.output_path.open("wb") as output:
                 while not self.stop_event.is_set():
                     elapsed = time.time() - self.started_at
-                    if elapsed >= self.config.duration_seconds:
+                    if self.config.duration_seconds > 0 and elapsed >= self.config.duration_seconds:
                         self._set_finished("completed")
                         break
                     if self.storage_monitor.is_critical(self.config.output_path.parent):
@@ -1945,6 +1943,11 @@ class RtlControlService:
         snapshot = worker.snapshot()
         snapshot["sample_rates"] = list(IQ_RECORDER_SAMPLE_RATES)
         snapshot["default_duration_seconds"] = IQ_RECORDER_DEFAULT_DURATION_SECONDS
+        snapshot["storage_remaining_seconds"] = estimate_iq_storage_remaining_seconds(
+            snapshot,
+            self.storage_monitor.snapshot(),
+            self.iq_recordings_directory,
+        )
         return snapshot
 
     def start_iq_recording(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -4124,6 +4127,44 @@ def iq_recording_download_name(recording: dict[str, Any], fmt: str) -> str:
     return f"nwrstmgr-s{sample_rate}-f{frequency_hz}-{date_text}-{time_text}-{fmt}.raw"
 
 
+def estimate_iq_storage_remaining_seconds(
+    recorder: dict[str, Any],
+    storage: dict[str, Any],
+    recordings_directory: Path,
+) -> float | None:
+    if not recorder.get("active"):
+        return None
+    elapsed = float(recorder.get("elapsed_seconds", 0.0) or 0.0)
+    bytes_written = int(recorder.get("bytes_written", 0) or 0)
+    if elapsed <= 0.0 or bytes_written <= 0:
+        return None
+    write_rate = bytes_written / elapsed
+    if write_rate <= 0.0:
+        return None
+    target_device = None
+    try:
+        target_device = int(os.stat(recordings_directory if recordings_directory.exists() else recordings_directory.parent).st_dev)
+    except OSError:
+        pass
+    filesystems = storage.get("filesystems", []) if isinstance(storage, dict) else []
+    filesystem = None
+    if target_device is not None:
+        for candidate in filesystems:
+            if candidate.get("device_id") == target_device:
+                filesystem = candidate
+                break
+    if filesystem is None and filesystems:
+        filesystem = filesystems[0]
+    if not filesystem:
+        return None
+    available_bytes = int(filesystem.get("available_bytes", 0) or 0)
+    total_bytes = int(filesystem.get("total_bytes", 0) or 0)
+    critical_by_percent = int(total_bytes * (STORAGE_CRITICAL_FREE_PERCENT / 100.0)) if total_bytes > 0 else 0
+    reserve_bytes = max(STORAGE_CRITICAL_FREE_BYTES, critical_by_percent)
+    usable_bytes = max(0, available_bytes - reserve_bytes)
+    return usable_bytes / write_rate
+
+
 def convert_iq_recording_chunks(source, fmt: str):
     fmt = validate_iq_download_format(fmt)
     chunk_size = 1024 * 1024
@@ -4155,7 +4196,7 @@ def validate_iq_recording_duration(raw: Any) -> float:
     except (TypeError, ValueError) as exc:
         raise ValueError("I/Q recording duration must be a number of seconds") from exc
     if duration < IQ_RECORDER_MIN_DURATION_SECONDS or duration > IQ_RECORDER_MAX_DURATION_SECONDS:
-        raise ValueError("I/Q recording duration must be from 1 second through 24 hours")
+        raise ValueError("I/Q recording duration must be 0 for manual stop, or up to 24 hours")
     return duration
 
 
@@ -4961,7 +5002,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <div class="metric"><b>Sample rate</b><span id="iq_active_sample_rate">0 S/s</span></div>
           <div class="metric"><b>File size</b><span id="iq_file_size">0 B</span></div>
           <div class="metric"><b>Elapsed</b><span id="iq_elapsed">0:00</span></div>
-          <div class="metric"><b>Time remaining</b><span id="iq_remaining">0:00</span></div>
+          <div class="metric"><b>Storage time remaining</b><span id="iq_remaining">calculating</span></div>
+          <div class="metric" id="iq_auto_stop_metric" hidden><b>Automatic stop</b><span id="iq_auto_stop_remaining">0:00</span></div>
           <div class="metric"><b>Storage</b><span id="iq_storage">unknown</span></div>
         </div>
         <div class="actions">
@@ -5012,9 +5054,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </label>
           <div class="hint">Records spectrum I/Q centered at 162.475 MHz after RTL-SDR float conversion.</div>
         </div>
-        <label>Recording length
-          <input id="iq_duration_minutes" type="number" min="1" max="1440" step="1" value="5">
+        <label>Stop recording after
+          <input id="iq_duration_minutes" type="number" min="0" max="1440" step="1" value="5" aria-describedby="iq_duration_hint">
         </label>
+        <div id="iq_duration_hint" class="hint">Minutes. Set to 0 to record until you manually stop it.</div>
         <div class="actions">
           <button id="iq_start_recording" type="button">Start recording</button>
           <button id="cancel_iq_start" type="button">Cancel</button>
@@ -8711,7 +8754,13 @@ function renderIqRecorder(recorder, storage) {
   setText("iq_active_sample_rate", `${recorder.sample_rate || 0} S/s`);
   setText("iq_file_size", formatDecimalBytes(recorder.bytes_written));
   setText("iq_elapsed", formatDuration(recorder.elapsed_seconds));
-  setText("iq_remaining", formatDuration(recorder.remaining_seconds));
+  setText("iq_remaining", recorder.storage_remaining_seconds === null || recorder.storage_remaining_seconds === undefined ? "calculating" : formatDuration(recorder.storage_remaining_seconds));
+  const hasAutoStop = Number(recorder.duration_seconds || 0) > 0;
+  setHidden("iq_auto_stop_metric", !hasAutoStop);
+  if (hasAutoStop) {
+    const autoStopSeconds = Math.max(0, Number(recorder.duration_seconds || 0) - Number(recorder.elapsed_seconds || 0));
+    setText("iq_auto_stop_remaining", formatDuration(autoStopSeconds));
+  }
   setText("iq_storage", primaryStorageSummary(storage));
   iqRecorderSignature = JSON.stringify({status: recorder.status, file_name: recorder.file_name});
 }
@@ -8803,7 +8852,8 @@ async function loadIqRecordings() {
 
 async function startIqRecording() {
   const mode = currentIqMode();
-  const minutes = Math.max(1, Math.min(1440, Number(document.getElementById("iq_duration_minutes").value || 5)));
+  const rawMinutes = Number(document.getElementById("iq_duration_minutes").value || 0);
+  const minutes = Math.max(0, Math.min(1440, Number.isFinite(rawMinutes) ? rawMinutes : 5));
   const payload = {
     mode,
     duration_seconds: Math.round(minutes * 60)

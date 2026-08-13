@@ -1234,6 +1234,33 @@ class EasAlertTests(unittest.TestCase):
             self.assertTrue(name.startswith("nwrstmgr-s240000-f162475000-"))
             self.assertTrue(name.endswith("-cf.raw"))
 
+    def test_iq_recording_duration_allows_manual_stop_zero(self) -> None:
+        self.assertEqual(self.web_control.validate_iq_recording_duration(0), 0)
+        with self.assertRaisesRegex(ValueError, "manual stop"):
+            self.web_control.validate_iq_recording_duration(-1)
+
+    def test_iq_storage_remaining_estimate_uses_available_space_above_critical_reserve(self) -> None:
+        recorder = {
+            "active": True,
+            "elapsed_seconds": 10.0,
+            "bytes_written": 1_000_000,
+        }
+        storage = {
+            "filesystems": [
+                {
+                    "available_bytes": self.web_control.STORAGE_CRITICAL_FREE_BYTES + 5_000_000,
+                    "total_bytes": 10_000_000_000,
+                }
+            ]
+        }
+        remaining = self.web_control.estimate_iq_storage_remaining_seconds(
+            recorder,
+            storage,
+            Path(tempfile.gettempdir()),
+        )
+        self.assertIsNotNone(remaining)
+        self.assertGreater(float(remaining), 0.0)
+
     @staticmethod
     def _complex_to_rtl_u8(iq: np.ndarray) -> bytes:
         interleaved = np.empty(iq.size * 2, dtype=np.float32)
