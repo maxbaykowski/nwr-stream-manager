@@ -138,6 +138,14 @@ STREAMS_STATE_FILE_NAME = "streams.json"
 STREAMS_DIRECTORY_NAME = "streams"
 STREAM_CONFIG_FILE_NAME = "config.json"
 STREAMS_DIRECTORY_MARKER_FILE_NAME = ".per-stream-configs"
+STORAGE_IDLE_POLL_SECONDS = 30.0
+STORAGE_RECORDING_POLL_SECONDS = 2.0
+STORAGE_LOW_FREE_BYTES = 1_000_000_000
+STORAGE_CRITICAL_FREE_BYTES = 256_000_000
+STORAGE_LOW_FREE_PERCENT = 5.0
+STORAGE_CRITICAL_FREE_PERCENT = 1.0
+STORAGE_LOW_INODES = 1024
+STORAGE_CRITICAL_INODES = 128
 STATIONS_ASSET_PATH = Path(__file__).resolve().parent / "assets" / "nwr_stations.json"
 USB_VENDOR_NAMES = {
     "0bda": "Realtek",
@@ -268,6 +276,230 @@ class RingLogHandler(logging.Handler):
     def snapshot(self) -> list[str]:
         with self.records_lock:
             return list(self.records)
+
+
+class StorageMonitor:
+    def __init__(
+        self,
+        paths: list[Path] | None = None,
+        *,
+        statvfs_provider=None,
+        stat_provider=None,
+        critical_callback=None,
+        idle_poll_seconds: float = STORAGE_IDLE_POLL_SECONDS,
+        recording_poll_seconds: float = STORAGE_RECORDING_POLL_SECONDS,
+    ) -> None:
+        self.paths = {Path(path).expanduser() for path in (paths or [])}
+        self.statvfs_provider = statvfs_provider or os.statvfs
+        self.stat_provider = stat_provider or os.stat
+        self.critical_callback = critical_callback
+        self.idle_poll_seconds = float(idle_poll_seconds)
+        self.recording_poll_seconds = float(recording_poll_seconds)
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.active_recordings = 0
+        self.snapshot_data: dict[str, Any] = self._empty_snapshot()
+        self.last_callback_status = ""
+
+    def start(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.refresh()
+        self.thread = threading.Thread(target=self._run, name="storage-monitor", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+
+    def add_path(self, path: Path) -> None:
+        with self.lock:
+            self.paths.add(Path(path).expanduser())
+        self.refresh()
+
+    def recording_started(self, path: Path | None = None) -> None:
+        if path is not None:
+            with self.lock:
+                self.paths.add(Path(path).expanduser())
+        with self.lock:
+            self.active_recordings += 1
+        self.refresh()
+
+    def recording_stopped(self) -> None:
+        with self.lock:
+            self.active_recordings = max(0, self.active_recordings - 1)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return json.loads(json.dumps(self.snapshot_data))
+
+    def is_critical(self, path: Path | None = None) -> bool:
+        snapshot = self.snapshot()
+        if path is not None:
+            target_device = self._device_id_for_path(Path(path))
+            if target_device is not None:
+                for filesystem in snapshot.get("filesystems", []):
+                    if filesystem.get("device_id") == target_device:
+                        return filesystem.get("status") == "critical"
+        return snapshot.get("status") == "critical"
+
+    def refresh(self) -> dict[str, Any]:
+        with self.lock:
+            paths = sorted(self.paths, key=lambda item: str(item))
+            active_recordings = self.active_recordings
+        filesystems_by_device: dict[int | str, dict[str, Any]] = {}
+        errors: list[str] = []
+        for path in paths:
+            existing_path = self._nearest_existing_path(path)
+            try:
+                stat_result = self.stat_provider(existing_path)
+                stats = self.statvfs_provider(existing_path)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+                continue
+            filesystem = self._filesystem_snapshot(path, existing_path, stat_result, stats)
+            device_id = filesystem["device_id"]
+            current = filesystems_by_device.get(device_id)
+            if current is None or len(str(filesystem["path"])) < len(str(current["path"])):
+                filesystems_by_device[device_id] = filesystem
+        filesystems = sorted(filesystems_by_device.values(), key=lambda item: str(item["path"]))
+        status = self._aggregate_status(filesystems, errors)
+        snapshot = {
+            "status": status,
+            "message": storage_status_message(status),
+            "active_recordings": active_recordings,
+            "poll_seconds": self.recording_poll_seconds if active_recordings > 0 else self.idle_poll_seconds,
+            "filesystems": filesystems,
+            "errors": errors,
+            "updated_at": time.time(),
+        }
+        with self.lock:
+            self.snapshot_data = snapshot
+        return snapshot
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            snapshot = self.refresh()
+            if snapshot.get("status") == "critical":
+                LOG.warning("storage is critically low; recording should stop until space is freed")
+                if self.critical_callback is not None and self.last_callback_status != "critical":
+                    self.last_callback_status = "critical"
+                    try:
+                        self.critical_callback(snapshot)
+                    except Exception as exc:
+                        LOG.warning("storage critical callback failed: %s", exc)
+            else:
+                self.last_callback_status = str(snapshot.get("status", ""))
+            poll_seconds = float(snapshot.get("poll_seconds", self.idle_poll_seconds))
+            self.stop_event.wait(max(0.5, poll_seconds))
+
+    def _device_id_for_path(self, path: Path) -> int | None:
+        try:
+            return int(self.stat_provider(self._nearest_existing_path(path)).st_dev)
+        except OSError:
+            return None
+
+    def _nearest_existing_path(self, path: Path) -> Path:
+        candidate = path.expanduser()
+        while not candidate.exists() and candidate.parent != candidate:
+            candidate = candidate.parent
+        return candidate
+
+    def _filesystem_snapshot(self, path: Path, existing_path: Path, stat_result, stats) -> dict[str, Any]:
+        fragment_size = int(getattr(stats, "f_frsize", 0) or getattr(stats, "f_bsize", 0) or 1)
+        total_bytes = int(stats.f_blocks) * fragment_size
+        free_bytes = int(stats.f_bfree) * fragment_size
+        available_bytes = int(stats.f_bavail) * fragment_size
+        used_bytes = max(0, total_bytes - free_bytes)
+        used_percent = (used_bytes / total_bytes * 100.0) if total_bytes > 0 else 0.0
+        available_percent = (available_bytes / total_bytes * 100.0) if total_bytes > 0 else 0.0
+        available_inodes = int(getattr(stats, "f_favail", 0))
+        status = storage_filesystem_status(available_bytes, available_percent, available_inodes)
+        return {
+            "path": str(path),
+            "stat_path": str(existing_path),
+            "device_id": int(stat_result.st_dev),
+            "total_bytes": total_bytes,
+            "used_bytes": used_bytes,
+            "free_bytes": free_bytes,
+            "available_bytes": available_bytes,
+            "used_percent": round(used_percent, 1),
+            "available_percent": round(available_percent, 1),
+            "available_inodes": available_inodes,
+            "status": status,
+            "summary": storage_filesystem_summary(used_bytes, total_bytes, used_percent),
+        }
+
+    @staticmethod
+    def _aggregate_status(filesystems: list[dict[str, Any]], errors: list[str]) -> str:
+        if any(item.get("status") == "critical" for item in filesystems):
+            return "critical"
+        if any(item.get("status") == "low" for item in filesystems):
+            return "low"
+        if errors and not filesystems:
+            return "unknown"
+        return "ok"
+
+    @staticmethod
+    def _empty_snapshot() -> dict[str, Any]:
+        return {
+            "status": "unknown",
+            "message": "",
+            "active_recordings": 0,
+            "poll_seconds": STORAGE_IDLE_POLL_SECONDS,
+            "filesystems": [],
+            "errors": [],
+            "updated_at": 0.0,
+        }
+
+
+def storage_filesystem_status(
+    available_bytes: int,
+    available_percent: float,
+    available_inodes: int,
+) -> str:
+    if (
+        available_bytes <= STORAGE_CRITICAL_FREE_BYTES
+        or available_percent <= STORAGE_CRITICAL_FREE_PERCENT
+        or 0 < available_inodes <= STORAGE_CRITICAL_INODES
+    ):
+        return "critical"
+    if (
+        available_bytes <= STORAGE_LOW_FREE_BYTES
+        or available_percent <= STORAGE_LOW_FREE_PERCENT
+        or 0 < available_inodes <= STORAGE_LOW_INODES
+    ):
+        return "low"
+    return "ok"
+
+
+def storage_status_message(status: str) -> str:
+    if status == "critical":
+        return "Storage is critically low. Recording has been stopped. Please free up disk space."
+    if status == "low":
+        return "Storage is running low. Please free up disk space."
+    if status == "unknown":
+        return "Storage could not be checked."
+    return ""
+
+
+def storage_filesystem_summary(used_bytes: int, total_bytes: int, used_percent: float) -> str:
+    return f"Storage: {format_storage_bytes(used_bytes)} used of {format_storage_bytes(total_bytes)} ({used_percent:.0f}%)"
+
+
+def format_storage_bytes(value: int | float) -> str:
+    value = float(max(0.0, value))
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    unit_index = 0
+    while value >= 1000.0 and unit_index < len(units) - 1:
+        value /= 1000.0
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(value)} {units[unit_index]}"
+    return f"{value:.1f} {units[unit_index]}"
 
 
 class RawRtlFanout:
@@ -659,11 +891,13 @@ class IcecastStreamWorker:
         fanout: RawRtlFanout,
         fallback_settings_provider,
         state_directory: Path,
+        storage_monitor: StorageMonitor | None = None,
     ) -> None:
         self.stream = stream
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
         self.state_directory = state_directory
+        self.storage_monitor = storage_monitor or StorageMonitor([state_directory])
         station = stream.get("station", {})
         stream_label = station.get("callsign") or stream.get("id", "stream")
         self.queue = subscribe_raw_fanout(
@@ -890,6 +1124,10 @@ class IcecastStreamWorker:
         for source in monitor_sources:
             source.push_pcm(pcm)
         if eas_recorder is not None:
+            recorder_config = getattr(eas_recorder, "config", None)
+            if recorder_config is not None and self.storage_monitor.is_critical(Path(recorder_config.directory)):
+                self.stop_eas_recording_due_to_storage(storage_status_message("critical"))
+                return
             try:
                 eas_recorder.write(pcm)
             except Exception as exc:
@@ -919,6 +1157,21 @@ class IcecastStreamWorker:
         with self.lock:
             return self.eas_recorder is not None
 
+    def stop_eas_recording_due_to_storage(self, message: str) -> None:
+        with self.lock:
+            has_recorder = self.eas_recorder is not None
+        if not has_recorder:
+            return
+        LOG.warning(
+            "stopping EAS recorder for %s because storage is critically low",
+            self.stream.get("station", {}).get("callsign"),
+        )
+        self._stop_eas_recorder()
+        with self.lock:
+            if self.eas_config is not None:
+                self.eas_status = "needs-attention"
+                self.eas_error = message
+
     def _sync_eas_recorder(self, stream: dict[str, Any]) -> None:
         settings = eas_recording_settings_from_stream(stream)
         next_config = (
@@ -936,6 +1189,19 @@ class IcecastStreamWorker:
                 self.eas_config = None
                 self.eas_status = "disabled"
                 self.eas_error = None
+            return
+        self.storage_monitor.add_path(Path(next_config.directory))
+        if self.storage_monitor.is_critical(Path(next_config.directory)):
+            message = storage_status_message("critical")
+            LOG.warning(
+                "EAS recorder not started for %s because storage is critically low",
+                stream.get("station", {}).get("callsign"),
+            )
+            with self.lock:
+                self.eas_config = next_config
+                self.eas_recorder = None
+                self.eas_status = "needs-attention"
+                self.eas_error = message
             return
         try:
             recorder = EasRecorderOutput(next_config)
@@ -956,6 +1222,7 @@ class IcecastStreamWorker:
             self.eas_recorder = recorder
             self.eas_status = "enabled"
             self.eas_error = None
+        self.storage_monitor.recording_started(Path(next_config.directory))
         LOG.info(
             "started EAS recorder for %s in %s",
             stream.get("station", {}).get("callsign", "unknown"),
@@ -973,6 +1240,7 @@ class IcecastStreamWorker:
                 recorder.close()
             except Exception as exc:
                 LOG.debug("EAS recorder close failed: %s", exc)
+            self.storage_monitor.recording_stopped()
 
     def _set_eas_status(self, status: str, error: str | None = None) -> None:
         with self.lock:
@@ -1252,6 +1520,10 @@ class RtlControlService:
         self.streams_directory = state_path.parent / STREAMS_DIRECTORY_NAME
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.log_handler = log_handler
+        self.storage_monitor = StorageMonitor(
+            [state_path.parent],
+            critical_callback=self._handle_critical_storage,
+        )
         self.lock = threading.RLock()
         self.settings = load_settings(state_path)
         self.streams = load_streams(self.streams_directory, self.streams_state_path)
@@ -1272,6 +1544,7 @@ class RtlControlService:
         self.last_batch_at: float | None = None
         self.received_chunks = 0
         self.received_bytes = 0
+        self.storage_monitor.start()
         if self.settings.serial:
             self._start_or_update_capture_locked()
         else:
@@ -1284,6 +1557,14 @@ class RtlControlService:
             LOG.debug("WebRTC monitor cleanup failed: %s", exc)
         self.webrtc_runner.stop()
         self.stop_capture()
+        self.storage_monitor.stop()
+
+    def _handle_critical_storage(self, snapshot: dict[str, Any]) -> None:
+        message = str(snapshot.get("message") or storage_status_message("critical"))
+        with self.lock:
+            workers = list(self.stream_workers.values())
+        for worker in workers:
+            worker.stop_eas_recording_due_to_storage(message)
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -1308,6 +1589,7 @@ class RtlControlService:
                 "active_streams": self._active_streams_locked(),
                 "active_eas_recorders": self._active_eas_recorders_locked(),
                 "recent_eas_alerts": self._recent_eas_alerts_locked(),
+                "storage": self.storage_monitor.snapshot(),
                 "logs": self.log_handler.snapshot()[-80:],
             }
 
@@ -2334,6 +2616,7 @@ class RtlControlService:
                 fanout=fanout,
                 fallback_settings_provider=self.fallback_settings_snapshot,
                 state_directory=self.state_path.parent,
+                storage_monitor=self.storage_monitor,
             )
             self.stream_workers[key] = worker
             worker.start()
@@ -3902,6 +4185,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 .error { color: #a40000; font-weight: 600; }
 .message { font-weight: 600; }
 .success { color: #0f7a34; }
+.storage-warning { margin-top: 12px; color: #a40000; font-weight: 700; }
 .status-connected { color: #0f7a34; }
 .hint { color: #526070; font-size: 13px; margin-top: -8px; }
 .notice-dialog { position: fixed; right: 24px; bottom: 24px; z-index: 20; max-width: min(420px, calc(100vw - 48px)); padding: 16px; border: 1px solid #b9c0cc; border-radius: 8px; background: #fff; box-shadow: 0 12px 30px rgb(20 24 31 / 22%); }
@@ -3983,7 +4267,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <div class="metric"><b>Gain</b><span id="summary_gain">automatic</span></div>
         <div class="metric"><b>Capture</b><span id="summary_capture">inactive</span></div>
         <div class="metric"><b>Configured Streams</b><span id="summary_stream_count">0</span></div>
+        <div class="metric"><b>Storage</b><span id="summary_storage">unknown</span></div>
       </div>
+      <div id="storage-warning" class="storage-warning" hidden></div>
     </section>
     <section>
       <h2>Streams needing attention</h2>
@@ -7524,12 +7810,24 @@ function activeSdrLabel(settings) {
   return option ? option.textContent : `serial ${settings.serial}`;
 }
 
+function renderStorageSummary(storage) {
+  const filesystems = storage && Array.isArray(storage.filesystems) ? storage.filesystems : [];
+  const primary = filesystems.length ? filesystems[0] : null;
+  setText("summary_storage", primary && primary.summary ? primary.summary.replace(/^Storage: /, "") : "unknown");
+  const warning = document.getElementById("storage-warning");
+  const message = storage && storage.status && storage.status !== "ok" ? storage.message || "Please free up disk space." : "";
+  if (warning.textContent !== message) warning.textContent = message;
+  const hidden = !message;
+  if (warning.hidden !== hidden) warning.hidden = hidden;
+}
+
 function updateDashboard(data) {
   const settings = data.settings;
   setText("summary_sdr", activeSdrLabel(settings));
   setText("summary_gain", settings.gain === null ? "automatic" : `${settings.gain} dB`);
   setText("summary_capture", data.active ? "active" : "inactive");
   setText("summary_stream_count", configuredStreams.length);
+  renderStorageSummary(data.storage || {});
   activeStreamSnapshots = data.active_streams || [];
   renderActiveStreams(data.active_streams || [], configuredStreams);
   renderDashboardStreamAttention(data.active_streams || [], configuredStreams);

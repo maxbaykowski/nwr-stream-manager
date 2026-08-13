@@ -166,6 +166,89 @@ class EasAlertTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sample rate is fixed"):
             service._merged_settings({"sample_rate": 1_024_000})
 
+    def test_storage_monitor_reports_decimal_used_and_total_storage(self) -> None:
+        web_control = self.web_control
+
+        def fake_stat(_path):
+            return types.SimpleNamespace(st_dev=42)
+
+        def fake_statvfs(_path):
+            return types.SimpleNamespace(
+                f_frsize=1000,
+                f_bsize=1000,
+                f_blocks=1_200_000_000,
+                f_bfree=950_500_000,
+                f_bavail=950_500_000,
+                f_favail=50_000,
+            )
+
+        monitor = web_control.StorageMonitor(
+            [Path("/")],
+            stat_provider=fake_stat,
+            statvfs_provider=fake_statvfs,
+        )
+
+        snapshot = monitor.refresh()
+        filesystem = snapshot["filesystems"][0]
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(filesystem["used_bytes"], 249_500_000_000)
+        self.assertEqual(filesystem["total_bytes"], 1_200_000_000_000)
+        self.assertEqual(filesystem["summary"], "Storage: 249.5 GB used of 1.2 TB (21%)")
+
+    def test_storage_monitor_deduplicates_paths_on_same_filesystem(self) -> None:
+        web_control = self.web_control
+
+        def fake_stat(_path):
+            return types.SimpleNamespace(st_dev=7)
+
+        def fake_statvfs(_path):
+            return types.SimpleNamespace(
+                f_frsize=4096,
+                f_bsize=4096,
+                f_blocks=100_000,
+                f_bfree=50_000,
+                f_bavail=50_000,
+                f_favail=20_000,
+            )
+
+        monitor = web_control.StorageMonitor(
+            [Path("/tmp"), Path("/tmp/nwr-stream-manager")],
+            stat_provider=fake_stat,
+            statvfs_provider=fake_statvfs,
+        )
+
+        snapshot = monitor.refresh()
+
+        self.assertEqual(len(snapshot["filesystems"]), 1)
+
+    def test_storage_monitor_marks_critical_when_available_space_is_too_low(self) -> None:
+        web_control = self.web_control
+
+        def fake_stat(_path):
+            return types.SimpleNamespace(st_dev=9)
+
+        def fake_statvfs(_path):
+            return types.SimpleNamespace(
+                f_frsize=1000,
+                f_bsize=1000,
+                f_blocks=10_000_000,
+                f_bfree=100_000,
+                f_bavail=100_000,
+                f_favail=50_000,
+            )
+
+        monitor = web_control.StorageMonitor(
+            [Path("/")],
+            stat_provider=fake_stat,
+            statvfs_provider=fake_statvfs,
+        )
+
+        snapshot = monitor.refresh()
+
+        self.assertEqual(snapshot["status"], "critical")
+        self.assertIn("Please free up disk space", snapshot["message"])
+
     def test_recent_eas_alerts_filters_last_24_hours_and_sorts_by_callsign_tie(self) -> None:
         web_control = self.web_control
         with tempfile.TemporaryDirectory() as temp_dir:
