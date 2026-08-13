@@ -36,7 +36,7 @@ if __package__:
         IQ_SAMPLE_RATE,
         parse_audio_config,
     )
-    from .dsp import IqChannelizer
+    from .dsp import ComplexArray, IqChannelizer
     from .eas_recording import EasRecorderOutput
     from .encoder import PcmResampler, create_audio_encoder
     from .fallback_audio import load_fallback_audio
@@ -45,7 +45,6 @@ if __package__:
     from .rtl import (
         DEFAULT_RTL_SAMPLE_RATE,
         NWR_CENTER_FREQUENCY_HZ,
-        RTL_SAMPLE_RATE_RANGES,
         IqDcBlocker,
         RtlConfig,
         RtlConfigError,
@@ -55,7 +54,6 @@ if __package__:
         list_usb_rtl_devices,
         rtl_u8_to_complex64,
         validate_ppm_correction,
-        validate_rtl_sample_rate,
     )
     from .same_data import lookup_event, lookup_location
     from .webrtc import (
@@ -94,6 +92,7 @@ else:
     IcecastConfig = config_module.IcecastConfig
     IQ_SAMPLE_RATE = config_module.IQ_SAMPLE_RATE
     parse_audio_config = config_module.parse_audio_config
+    ComplexArray = dsp.ComplexArray
     IqChannelizer = dsp.IqChannelizer
     EasRecorderOutput = eas_recording.EasRecorderOutput
     PcmResampler = encoder.PcmResampler
@@ -103,7 +102,6 @@ else:
     float_to_s16 = nfm.float_to_s16
     DEFAULT_RTL_SAMPLE_RATE = rtl.DEFAULT_RTL_SAMPLE_RATE
     NWR_CENTER_FREQUENCY_HZ = rtl.NWR_CENTER_FREQUENCY_HZ
-    RTL_SAMPLE_RATE_RANGES = rtl.RTL_SAMPLE_RATE_RANGES
     IqDcBlocker = rtl.IqDcBlocker
     RtlConfig = rtl.RtlConfig
     RtlConfigError = rtl.RtlConfigError
@@ -113,7 +111,6 @@ else:
     list_usb_rtl_devices = rtl.list_usb_rtl_devices
     rtl_u8_to_complex64 = rtl.rtl_u8_to_complex64
     validate_ppm_correction = rtl.validate_ppm_correction
-    validate_rtl_sample_rate = rtl.validate_rtl_sample_rate
     lookup_event = same_data.lookup_event
     lookup_location = same_data.lookup_location
     AiortcSessionManager = webrtc.AiortcSessionManager
@@ -187,6 +184,12 @@ NWR_RECEIVER_CHANNELS_HZ = (
     162_525_000,
     162_550_000,
 )
+RTL_DIAGNOSTIC_SECONDS = 1.0
+RTL_DIAGNOSTIC_QUEUE_SECONDS = 1.25
+RTL_DIAGNOSTIC_MIN_BATCHES = 2
+RTL_DIAGNOSTIC_MAX_BATCHES = 64
+RTL_DIAGNOSTIC_RAW_FFT_SIZE = 65_536
+RTL_DIAGNOSTIC_CHANNEL_FFT_SIZE = 2_048
 RECEIVER_AUDIO_CONFIG = parse_audio_config(
     {
         "deemphasis": {"enabled": True, "tau": 300},
@@ -213,7 +216,7 @@ class RtlControlSettings:
             raise RtlConfigError("select an RTL-SDR before starting capture")
         return RtlConfig(
             serial=self.serial,
-            sample_rate=validate_rtl_sample_rate(self.sample_rate),
+            sample_rate=DEFAULT_RTL_SAMPLE_RATE,
             center_frequency_hz=NWR_CENTER_FREQUENCY_HZ,
             ppm_correction=validate_ppm_correction(self.ppm_correction),
             gain=self.gain,
@@ -466,6 +469,124 @@ class ComplexNfmDemodulator:
                 output[1:] = np.angle(iq[1:] * np.conj(iq[:-1])).astype(np.float32)
         self.previous_sample = iq[-1]
         return (output / np.pi * 1.5).astype(np.float32, copy=False)
+
+
+def rms_float(samples: np.ndarray) -> float:
+    if samples.size == 0:
+        return 0.0
+    values = samples.astype(np.float64, copy=False)
+    return float(np.sqrt(np.mean(values * values)))
+
+
+def rms_complex(samples: np.ndarray) -> float:
+    if samples.size == 0:
+        return 0.0
+    magnitudes = np.abs(samples.astype(np.complex64, copy=False)).astype(np.float64, copy=False)
+    return float(np.sqrt(np.mean(magnitudes * magnitudes)))
+
+
+def peak_float(samples: np.ndarray) -> float:
+    if samples.size == 0:
+        return 0.0
+    return float(np.max(np.abs(samples)))
+
+
+def raw_iq_diagnostics(iq: ComplexArray, sample_rate: int, center_frequency_hz: int, raw: bytes = b"") -> dict[str, Any]:
+    if iq.size == 0:
+        return {
+            "sample_count": 0,
+            "raw_byte_min": None,
+            "raw_byte_max": None,
+            "raw_byte_mean": None,
+            "raw_byte_stddev": None,
+            "dc_magnitude": 0.0,
+            "rms": 0.0,
+            "peak_magnitude": 0.0,
+            "real_near_full_scale_fraction": 0.0,
+            "imag_near_full_scale_fraction": 0.0,
+            "channels": [],
+        }
+    sample_count = min(int(iq.size), RTL_DIAGNOSTIC_RAW_FFT_SIZE)
+    window_iq = iq[-sample_count:].astype(np.complex64, copy=False)
+    spectrum_window = np.hanning(sample_count).astype(np.float32)
+    spectrum = np.fft.fftshift(np.fft.fft(window_iq * spectrum_window))
+    frequencies = np.fft.fftshift(np.fft.fftfreq(sample_count, d=1.0 / float(sample_rate)))
+    power = (np.abs(spectrum) ** 2).astype(np.float64, copy=False)
+    floor = float(np.median(power)) if power.size else 0.0
+    channels = []
+    for frequency_hz in NWR_RECEIVER_CHANNELS_HZ:
+        offset_hz = float(frequency_hz - center_frequency_hz)
+        nearby = np.abs(frequencies - offset_hz) <= 6_000.0
+        local_power = float(np.max(power[nearby])) if np.any(nearby) else 0.0
+        channels.append(
+            {
+                "frequency_hz": frequency_hz,
+                "frequency_mhz": receiver_frequency_mhz(frequency_hz),
+                "offset_hz": offset_hz,
+                "raw_power_db": power_db(local_power),
+                "raw_snr_db": power_db(local_power / floor) if floor > 0.0 else None,
+            }
+        )
+    raw_bytes = np.frombuffer(raw, dtype=np.uint8) if raw else np.array([], dtype=np.uint8)
+    return {
+        "sample_count": int(iq.size),
+        "analysis_sample_count": sample_count,
+        "raw_byte_min": int(raw_bytes.min()) if raw_bytes.size else None,
+        "raw_byte_max": int(raw_bytes.max()) if raw_bytes.size else None,
+        "raw_byte_mean": float(raw_bytes.mean()) if raw_bytes.size else None,
+        "raw_byte_stddev": float(raw_bytes.std()) if raw_bytes.size else None,
+        "dc_magnitude": float(abs(np.mean(iq, dtype=np.complex128))),
+        "rms": rms_complex(iq),
+        "peak_magnitude": float(np.max(np.abs(iq))),
+        "real_near_full_scale_fraction": float(np.mean(np.abs(iq.real) > 0.98)),
+        "imag_near_full_scale_fraction": float(np.mean(np.abs(iq.imag) > 0.98)),
+        "channels": channels,
+    }
+
+
+def channel_audio_diagnostics(
+    iq: ComplexArray,
+    sample_rate: int,
+    center_frequency_hz: int,
+    frequency_hz: int,
+) -> dict[str, Any]:
+    dc_blocker = IqDcBlocker(sample_rate)
+    channelizer = IqChannelizer(
+        input_rate=sample_rate,
+        center_frequency_hz=center_frequency_hz,
+        target_frequency_hz=frequency_hz,
+        output_rate=IQ_SAMPLE_RATE,
+    )
+    demodulator = ComplexNfmDemodulator()
+    channel_iq = channelizer.process_complex(dc_blocker.process(iq))
+    audio = demodulator.process(channel_iq)
+    tone_peak_hz = None
+    if audio.size >= 64:
+        count = min(int(audio.size), RTL_DIAGNOSTIC_CHANNEL_FFT_SIZE)
+        audio_window = audio[-count:] * np.hanning(count).astype(np.float32)
+        spectrum = np.fft.rfft(audio_window)
+        frequencies = np.fft.rfftfreq(count, d=1.0 / float(IQ_SAMPLE_RATE))
+        if spectrum.size > 1:
+            tone_peak_hz = float(frequencies[int(np.argmax(np.abs(spectrum[1:])) + 1)])
+    return {
+        "frequency_hz": frequency_hz,
+        "frequency_mhz": receiver_frequency_mhz(frequency_hz),
+        "offset_hz": float(frequency_hz - center_frequency_hz),
+        "channelizer_mode": channelizer.mode,
+        "channel_iq_samples": int(channel_iq.size),
+        "channel_iq_rms": rms_complex(channel_iq),
+        "channel_iq_peak": float(np.max(np.abs(channel_iq))) if channel_iq.size else 0.0,
+        "audio_samples": int(audio.size),
+        "audio_rms": rms_float(audio),
+        "audio_peak": peak_float(audio),
+        "audio_peak_hz": tone_peak_hz,
+    }
+
+
+def power_db(value: float) -> float | None:
+    if value <= 0.0 or not math.isfinite(value):
+        return None
+    return float(10.0 * math.log10(value))
 
 
 class FloatFrameBuffer:
@@ -1181,7 +1302,6 @@ class RtlControlService:
                 "last_batch_at": self.last_batch_at,
                 "received_chunks": self.received_chunks,
                 "received_bytes": self.received_bytes,
-                "sample_rate_ranges": RTL_SAMPLE_RATE_RANGES,
                 "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
                 "fallback": asdict(self.fallback_settings),
                 "active_streams": self._active_streams_locked(),
@@ -1263,6 +1383,84 @@ class RtlControlService:
                 "streams": list(self.streams),
                 "monitoring": dict(getattr(self, "monitor_streams_by_client", {})),
             }
+
+    def rtl_diagnostics(self) -> dict[str, Any]:
+        with self.lock:
+            fanout = self.raw_fanout
+        if fanout is None:
+            raise ValueError("RTL-SDR capture is not active")
+        queue_depth = max(RTL_DIAGNOSTIC_MIN_BATCHES, min(RTL_DIAGNOSTIC_MAX_BATCHES, 16))
+        subscriber = subscribe_raw_fanout(
+            fanout,
+            max_chunks=queue_depth,
+            max_seconds=RTL_DIAGNOSTIC_QUEUE_SECONDS,
+            name="rtl-diagnostics",
+        )
+        started = time.monotonic()
+        batches: list[RtlSampleBatch] = []
+        sample_rate = 0
+        center_frequency_hz = 0
+        target_samples = 0
+        try:
+            while time.monotonic() - started < RTL_DIAGNOSTIC_QUEUE_SECONDS:
+                remaining = max(0.01, RTL_DIAGNOSTIC_QUEUE_SECONDS - (time.monotonic() - started))
+                try:
+                    batch = subscriber.get(timeout=min(0.25, remaining))
+                except queue.Empty:
+                    continue
+                if not isinstance(batch, RtlSampleBatch):
+                    continue
+                if sample_rate <= 0:
+                    sample_rate = int(batch.sample_rate)
+                    center_frequency_hz = int(batch.center_frequency_hz)
+                    target_samples = max(1, int(sample_rate * RTL_DIAGNOSTIC_SECONDS))
+                if batch.sample_rate != sample_rate or batch.center_frequency_hz != center_frequency_hz:
+                    batches = []
+                    sample_rate = int(batch.sample_rate)
+                    center_frequency_hz = int(batch.center_frequency_hz)
+                    target_samples = max(1, int(sample_rate * RTL_DIAGNOSTIC_SECONDS))
+                batches.append(batch)
+                sample_count = sum(len(item.data) // 2 for item in batches)
+                if sample_count >= target_samples:
+                    break
+        finally:
+            unsubscribe = getattr(fanout, "unsubscribe", None)
+            if unsubscribe is not None:
+                unsubscribe(subscriber)
+        if not batches:
+            raise ValueError("RTL-SDR produced no samples for diagnostics")
+        raw = b"".join(batch.data for batch in batches)
+        iq = rtl_u8_to_complex64(raw)
+        if target_samples > 0 and iq.size > target_samples:
+            iq = iq[-target_samples:]
+        raw_stats = raw_iq_diagnostics(iq, sample_rate, center_frequency_hz, raw)
+        channels = [
+            channel_audio_diagnostics(iq, sample_rate, center_frequency_hz, frequency_hz)
+            for frequency_hz in NWR_RECEIVER_CHANNELS_HZ
+        ]
+        strongest = max(
+            raw_stats["channels"],
+            key=lambda item: float(item["raw_snr_db"] if item["raw_snr_db"] is not None else -999.0),
+            default=None,
+        )
+        LOG.info(
+            "RTL-SDR diagnostics: sample_rate=%s center=%s samples=%s raw_rms=%.4f dc=%.6f strongest=%s snr=%s",
+            sample_rate,
+            center_frequency_hz,
+            raw_stats["sample_count"],
+            raw_stats["rms"],
+            raw_stats["dc_magnitude"],
+            strongest.get("frequency_mhz") if strongest else "none",
+            strongest.get("raw_snr_db") if strongest else None,
+        )
+        return {
+            "sample_rate": sample_rate,
+            "center_frequency_hz": center_frequency_hz,
+            "duration_seconds": (iq.size / float(sample_rate)) if sample_rate > 0 else 0.0,
+            "batch_count": len(batches),
+            "raw": raw_stats,
+            "channels": channels,
+        }
 
     def eas_alert_streams(self) -> dict[str, Any]:
         with self.lock:
@@ -1978,7 +2176,7 @@ class RtlControlService:
         if "serial" in payload:
             changes["serial"] = str(payload["serial"]).strip()
         if "sample_rate" in payload:
-            changes["sample_rate"] = validate_rtl_sample_rate(int(payload["sample_rate"]))
+            raise ValueError("RTL-SDR sample rate is fixed for NWR Stream Manager")
         if "ppm_correction" in payload:
             changes["ppm_correction"] = validate_ppm_correction(int(payload["ppm_correction"]))
         if "bias_tee" in payload:
@@ -2264,6 +2462,14 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_html(INDEX_HTML)
         elif path == "/api/status":
             self._send_json(self.service.status())
+        elif path == "/api/rtl/diagnostics":
+            try:
+                response = self.service.rtl_diagnostics()
+            except Exception as exc:
+                LOG.warning("RTL-SDR diagnostics failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
         elif path == "/api/devices":
             self._send_json(self.service.devices())
         elif path == "/api/stations":
@@ -2661,7 +2867,7 @@ def load_settings(path: Path) -> RtlControlSettings:
     try:
         return RtlControlSettings(
             serial=str(raw.get("serial", "")).strip(),
-            sample_rate=validate_rtl_sample_rate(int(raw.get("sample_rate", DEFAULT_RTL_SAMPLE_RATE))),
+            sample_rate=DEFAULT_RTL_SAMPLE_RATE,
             gain=None if raw.get("gain") is None else float(raw["gain"]),
             ppm_correction=validate_ppm_correction(int(raw.get("ppm_correction", 0))),
             bias_tee=bool(raw.get("bias_tee", False)),
@@ -3731,7 +3937,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <h2>Dashboard</h2>
       <div class="status" aria-live="off">
         <div class="metric"><b>Configured SDR</b><span id="summary_sdr">none</span></div>
-        <div class="metric"><b>Sample Rate</b><span id="summary_sample_rate">0</span></div>
         <div class="metric"><b>Gain</b><span id="summary_gain">automatic</span></div>
         <div class="metric"><b>Capture</b><span id="summary_capture">inactive</span></div>
         <div class="metric"><b>Configured Streams</b><span id="summary_stream_count">0</span></div>
@@ -3758,9 +3963,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
     <section>
       <div class="grid">
-        <label>Sample Rate
-          <input id="sample_rate" type="number" min="225001" max="3200000" step="1">
-        </label>
         <label>Gain
           <input id="gain" type="range" min="0" max="0" step="1" value="0" disabled>
           <span id="gain_label" class="hint">Automatic</span>
@@ -3773,7 +3975,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <label><input id="bias_tee" type="checkbox"> Bias tee</label>
         </div>
       </div>
-      <div class="hint">Valid RTL-SDR sample-rate ranges: 225001-300000 S/s and 900001-3200000 S/s.</div>
     </section>
   </div>
 
@@ -4260,7 +4461,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <audio id="stream_monitor_audio" autoplay playsinline hidden></audio>
 </main>
 <script>
-const controls = ["serial", "sample_rate", "gain", "ppm_correction", "bias_tee", "gain_auto"];
+const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto"];
 const DEFAULT_STREAM_SAMPLE_RATE = 24000;
 const DEFAULT_STREAM_BITRATES = {mp3: 64, ogg: 48};
 const STREAM_SERVICE_CUSTOM = "custom";
@@ -6583,7 +6784,6 @@ function controlSignature(data) {
   const s = data.settings;
   return JSON.stringify({
     serial: s.serial || "",
-    sample_rate: s.sample_rate,
     gain: s.gain,
     ppm_correction: s.ppm_correction,
     bias_tee: s.bias_tee,
@@ -7284,7 +7484,6 @@ function activeSdrLabel(settings) {
 function updateDashboard(data) {
   const settings = data.settings;
   setText("summary_sdr", activeSdrLabel(settings));
-  setText("summary_sample_rate", `${settings.sample_rate} S/s`);
   setText("summary_gain", settings.gain === null ? "automatic" : `${settings.gain} dB`);
   setText("summary_capture", data.active ? "active" : "inactive");
   setText("summary_stream_count", configuredStreams.length);
@@ -7299,7 +7498,6 @@ function syncControls(data) {
   const s = data.settings;
   gainValues = data.gain_values || [];
   setValue("serial", s.serial || "");
-  setValue("sample_rate", s.sample_rate);
   setChecked("gain_auto", s.gain === null);
   const gain = document.getElementById("gain");
   setAttributeIfChanged(gain, "max", Math.max(0, gainValues.length - 1));
@@ -7351,7 +7549,6 @@ function currentPayload() {
   const gainIndex = Number(document.getElementById("gain").value);
   return {
     serial: document.getElementById("serial").value,
-    sample_rate: Number(document.getElementById("sample_rate").value),
     gain: auto || gainValues.length === 0 ? null : gainValues[gainIndex],
     ppm_correction: Number(document.getElementById("ppm_correction").value),
     bias_tee: document.getElementById("bias_tee").checked

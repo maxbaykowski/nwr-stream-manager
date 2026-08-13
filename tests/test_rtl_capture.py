@@ -32,11 +32,11 @@ class RtlCaptureTests(unittest.TestCase):
         self.assertLessEqual(buffer_size, 25_600)
 
     def test_async_buffer_size_is_about_fifty_milliseconds_at_default_sample_rate(self) -> None:
-        config = self.rtl.RtlConfig(serial="dummy", sample_rate=1_024_000)
+        config = self.rtl.RtlConfig(serial="dummy")
         buffer_size = self.rtl.RtlCaptureSource._rtl_async_buffer_size(config)
         self.assertEqual(buffer_size % 512, 0)
-        self.assertGreaterEqual(buffer_size, 100_000)
-        self.assertLessEqual(buffer_size, 105_000)
+        self.assertGreaterEqual(buffer_size, 150_000)
+        self.assertLessEqual(buffer_size, 155_000)
 
     def test_async_buffer_size_scales_up_at_high_sample_rates(self) -> None:
         low_config = self.rtl.RtlConfig(serial="dummy", sample_rate=240_040)

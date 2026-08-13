@@ -148,6 +148,15 @@ class DspTests(unittest.TestCase):
         self.assertGreaterEqual(decimator.intermediate_rate, self.dsp.STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE)
         self.assertLessEqual(decimator.intermediate_rate, self.dsp.STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE)
 
+    def test_fixed_rtl_rate_uses_integer_staged_decimation(self) -> None:
+        decimator = self.dsp.create_decimator(1_536_000, 24_000)
+
+        self.assertIsInstance(decimator, self.dsp.StagedDecimator)
+        self.assertIsInstance(decimator.first_stage, self.dsp.IntegerDecimator)
+        self.assertIsInstance(decimator.final_stage, self.dsp.IntegerDecimator)
+        self.assertEqual(decimator.intermediate_rate % 24_000, 0)
+        self.assertTrue(decimator.is_integer_decimation)
+
     def test_staged_decimator_preserves_baseband_and_rejects_out_of_band_aliases(self) -> None:
         sample_rate = 1_024_000
         count = round(sample_rate * 0.25)
@@ -161,6 +170,71 @@ class DspTests(unittest.TestCase):
 
         self.assertGreater(float(np.mean(np.abs(desired_output[-1000:]))), 0.5)
         self.assertLess(float(np.mean(np.abs(adjacent_output[-1000:]))), 0.05)
+
+    def test_channelizer_shift_scales_with_fixed_rtl_sample_rate(self) -> None:
+        sample_rate = 1_536_000
+        count = round(sample_rate * 0.1)
+        time_axis = np.arange(count, dtype=np.float32) / sample_rate
+        rf_offset_hz = -50_000.0
+        samples = np.exp(1j * 2.0 * np.pi * rf_offset_hz * time_axis).astype(np.complex64)
+        channelizer = self.dsp.IqChannelizer(
+            input_rate=sample_rate,
+            center_frequency_hz=162_475_000,
+            target_frequency_hz=162_425_000,
+        )
+
+        output = channelizer.process_complex(samples)
+        settled = output[-2048:]
+        spectrum = np.fft.fftshift(np.fft.fft(settled))
+        frequencies = np.fft.fftshift(np.fft.fftfreq(settled.size, d=1 / 24_000))
+        peak_frequency = float(frequencies[int(np.argmax(np.abs(spectrum)))])
+
+        self.assertLess(abs(peak_frequency), 25.0)
+        self.assertGreater(float(np.mean(np.abs(settled))), 0.5)
+
+    def test_full_nwr_channelizer_path_recovers_nfm_audio_on_all_channels(self) -> None:
+        nwr_channels = (
+            162_400_000,
+            162_425_000,
+            162_450_000,
+            162_475_000,
+            162_500_000,
+            162_525_000,
+            162_550_000,
+        )
+        sample_rate = 1_536_000
+        center_frequency_hz = 162_475_000
+        count = round(sample_rate * 0.15)
+        time_axis = np.arange(count, dtype=np.float64) / sample_rate
+        audio_frequency_hz = 1_000.0
+        deviation_hz = 3_500.0
+
+        for target_frequency_hz in nwr_channels:
+            with self.subTest(target_frequency_hz=target_frequency_hz):
+                rf_offset_hz = float(target_frequency_hz - center_frequency_hz)
+                phase = (
+                    2.0 * np.pi * rf_offset_hz * time_axis
+                    + (deviation_hz / audio_frequency_hz)
+                    * np.sin(2.0 * np.pi * audio_frequency_hz * time_axis)
+                )
+                samples = np.exp(1j * phase).astype(np.complex64)
+                dc_blocker = self.dsp.IqDcBlocker(sample_rate=sample_rate)
+                channelizer = self.dsp.IqChannelizer(
+                    input_rate=sample_rate,
+                    center_frequency_hz=center_frequency_hz,
+                    target_frequency_hz=target_frequency_hz,
+                )
+                demodulated_iq = channelizer.process_complex(dc_blocker.process(samples))
+                previous = demodulated_iq[:-1]
+                current = demodulated_iq[1:]
+                audio = (np.angle(current * np.conj(previous)) / np.pi * 1.5).astype(np.float32)
+                settled = audio[-2048:]
+                spectrum = np.fft.rfft(settled * np.hanning(settled.size))
+                frequencies = np.fft.rfftfreq(settled.size, d=1 / 24_000)
+                peak_frequency = float(frequencies[int(np.argmax(np.abs(spectrum[1:])) + 1)])
+
+                self.assertLess(abs(peak_frequency - audio_frequency_hz), 25.0)
+                self.assertGreater(float(np.sqrt(np.mean(settled * settled))), 0.05)
 
 
 if __name__ == "__main__":

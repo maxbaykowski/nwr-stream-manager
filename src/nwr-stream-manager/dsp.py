@@ -312,7 +312,7 @@ class StagedDecimator:
     def __post_init__(self) -> None:
         if self.input_rate <= 0 or self.output_rate <= 0:
             raise ValueError("input_rate and output_rate must be greater than 0")
-        factor = self._choose_first_stage_factor(self.input_rate)
+        factor = self._choose_first_stage_factor(self.input_rate, self.output_rate)
         self.intermediate_rate = float(self.input_rate) / float(factor)
         self.first_stage = IntegerDecimator(
             factor=factor,
@@ -341,7 +341,7 @@ class StagedDecimator:
 
     @property
     def is_integer_decimation(self) -> bool:
-        return _is_integer_multiple(float(self.input_rate), self.output_rate)
+        return self.first_stage.is_integer_decimation and self.final_stage.is_integer_decimation
 
     def process(self, samples: ComplexArray) -> ComplexArray:
         if samples.size == 0:
@@ -349,12 +349,14 @@ class StagedDecimator:
         return self.final_stage.process(self.first_stage.process(samples))
 
     @staticmethod
-    def _choose_first_stage_factor(input_rate: int) -> int:
+    def _choose_first_stage_factor(input_rate: int, output_rate: int) -> int:
         if input_rate <= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
             return 1
         target = max(1, int(input_rate // STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE))
         best_factor = 1
         best_score = float("inf")
+        best_integer_factor = 1
+        best_integer_score = float("inf")
         for factor in range(1, target + 1):
             intermediate = float(input_rate) / float(factor)
             if intermediate < STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE:
@@ -363,9 +365,14 @@ class StagedDecimator:
                 score = intermediate - STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE
             else:
                 score = abs(intermediate - ((STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE + STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE) / 2.0))
+                if _is_integer_multiple(intermediate, output_rate) and score < best_integer_score:
+                    best_integer_score = score
+                    best_integer_factor = factor
             if score < best_score:
                 best_score = score
                 best_factor = factor
+        if best_integer_score < float("inf"):
+            return max(1, best_integer_factor)
         return max(1, best_factor)
 
     @staticmethod

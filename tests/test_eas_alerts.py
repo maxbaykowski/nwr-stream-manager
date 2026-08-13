@@ -136,6 +136,36 @@ class EasAlertTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "too large"):
             handler._read_json()
 
+    def test_rtl_settings_force_fixed_sample_rate_from_saved_state(self) -> None:
+        web_control = self.web_control
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "rtl-control.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "serial": "12345678",
+                        "sample_rate": 1_024_000,
+                        "gain": None,
+                        "ppm_correction": 0,
+                        "bias_tee": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            settings = web_control.load_settings(settings_path)
+
+        self.assertEqual(settings.sample_rate, web_control.DEFAULT_RTL_SAMPLE_RATE)
+        self.assertEqual(settings.to_rtl_config().sample_rate, web_control.DEFAULT_RTL_SAMPLE_RATE)
+
+    def test_rtl_settings_reject_sample_rate_update_payloads(self) -> None:
+        web_control = self.web_control
+        service = object.__new__(web_control.RtlControlService)
+        service.settings = web_control.RtlControlSettings(serial="12345678")
+
+        with self.assertRaisesRegex(ValueError, "sample rate is fixed"):
+            service._merged_settings({"sample_rate": 1_024_000})
+
     def test_recent_eas_alerts_filters_last_24_hours_and_sorts_by_callsign_tie(self) -> None:
         web_control = self.web_control
         with tempfile.TemporaryDirectory() as temp_dir:
