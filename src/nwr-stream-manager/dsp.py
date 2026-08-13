@@ -235,6 +235,16 @@ class IntegerDecimator:
 
 
 @dataclass
+class IdentityDecimator:
+    @property
+    def is_integer_decimation(self) -> bool:
+        return True
+
+    def process(self, samples: ComplexArray) -> ComplexArray:
+        return samples.astype(np.complex64, copy=False)
+
+
+@dataclass
 class RationalResampler:
     input_rate: float
     output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE
@@ -404,11 +414,27 @@ def create_decimator(
     *,
     transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ,
     attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
-) -> IntegerDecimator | RationalResampler | StagedDecimator:
+) -> IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator:
     if input_rate <= 0 or output_rate <= 0:
         raise ValueError("input_rate and output_rate must be greater than 0")
     if input_rate < output_rate:
         raise ValueError("input_rate must be greater than or equal to output_rate")
+    if input_rate == output_rate:
+        return IdentityDecimator()
+    if output_rate >= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
+        if input_rate % output_rate == 0:
+            return IntegerDecimator.create(
+                input_rate,
+                output_rate,
+                transition_hz=transition_hz,
+                attenuation_db=attenuation_db,
+            )
+        return RationalResampler(
+            input_rate,
+            output_rate,
+            transition_hz=transition_hz,
+            attenuation_db=attenuation_db,
+        )
     if input_rate <= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
         if input_rate % output_rate == 0:
             return IntegerDecimator.create(

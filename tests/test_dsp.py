@@ -157,6 +157,22 @@ class DspTests(unittest.TestCase):
         self.assertEqual(decimator.intermediate_rate % 24_000, 0)
         self.assertTrue(decimator.is_integer_decimation)
 
+    def test_wide_spectrum_decimators_do_not_use_narrowband_staging(self) -> None:
+        for output_rate in (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_000):
+            with self.subTest(output_rate=output_rate):
+                decimator = self.dsp.create_decimator(1_536_000, output_rate)
+                self.assertNotIsInstance(decimator, self.dsp.StagedDecimator)
+                samples = np.ones(4096, dtype=np.complex64)
+                output = decimator.process(samples)
+                self.assertGreater(output.size, 0)
+
+    def test_identity_decimator_for_matching_spectrum_rate(self) -> None:
+        decimator = self.dsp.create_decimator(1_536_000, 1_536_000)
+
+        self.assertIsInstance(decimator, self.dsp.IdentityDecimator)
+        samples = np.array([1 + 2j, 3 + 4j], dtype=np.complex64)
+        np.testing.assert_array_equal(decimator.process(samples), samples)
+
     def test_staged_decimator_preserves_baseband_and_rejects_out_of_band_aliases(self) -> None:
         sample_rate = 1_024_000
         count = round(sample_rate * 0.25)

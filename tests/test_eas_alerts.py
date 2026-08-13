@@ -1154,6 +1154,60 @@ class EasAlertTests(unittest.TestCase):
             self.assertEqual(entries[0]["id"], "recording-1")
             self.assertEqual(entries[0]["sample_rate"], sample_rate)
 
+    def test_iq_recorder_spectrum_decimators_support_all_recording_rates(self) -> None:
+        web_control = self.web_control
+
+        class Fanout:
+            def __init__(self):
+                self.queue = web_control.queue.Queue(maxsize=8)
+
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return self.queue
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        class Storage:
+            def add_path(self, path):
+                pass
+
+            def recording_started(self):
+                pass
+
+            def recording_stopped(self):
+                pass
+
+            def is_critical(self, path):
+                return False
+
+        input_rate = web_control.DEFAULT_RTL_SAMPLE_RATE
+        input_count = 8192
+        iq = np.exp(1j * 2 * np.pi * 1000 * np.arange(input_count, dtype=np.float32) / input_rate).astype(np.complex64)
+        raw = self._complex_to_rtl_u8(iq)
+        with tempfile.TemporaryDirectory() as tempdir:
+            for sample_rate in web_control.IQ_RECORDER_SAMPLE_RATES:
+                with self.subTest(sample_rate=sample_rate):
+                    output_path = Path(tempdir) / f"spectrum-{sample_rate}.cf32"
+                    fanout = Fanout()
+                    worker = web_control.IqRecorderWorker(
+                        fanout=fanout,
+                        config=web_control.IqRecorderConfig(
+                            recording_id=f"recording-{sample_rate}",
+                            mode=web_control.IQ_RECORDER_MODE_SPECTRUM,
+                            sample_rate=sample_rate,
+                            duration_seconds=1.0,
+                            output_path=output_path,
+                            index_path=Path(tempdir) / f"index-{sample_rate}.json",
+                            frequency_hz=162_475_000,
+                        ),
+                        storage_monitor=Storage(),
+                    )
+                    worker.start()
+                    fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=input_rate, center_frequency_hz=162_475_000))
+                    self._wait_for(lambda path=output_path: path.exists() and path.stat().st_size > 0)
+                    worker.stop()
+                    self.assertEqual(output_path.stat().st_size % 8, 0)
+
     def test_iq_recorder_writes_stream_channel_cf32_from_synthetic_rtl_iq(self) -> None:
         web_control = self.web_control
 
