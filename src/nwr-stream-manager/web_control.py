@@ -3562,9 +3562,13 @@ fieldset { border: 1px solid #d8dde6; border-radius: 6px; margin: 16px 0 0; padd
 legend { font-weight: 700; padding: 0 6px; }
 button { cursor: pointer; }
 button:disabled { cursor: default; opacity: 0.65; }
-nav { display: flex; flex-wrap: wrap; gap: 8px; }
+nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 nav a { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; text-decoration: none; }
-nav a[aria-current="page"] { border-color: #2557a7; box-shadow: inset 0 -2px 0 #2557a7; }
+nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #2557a7; box-shadow: inset 0 -2px 0 #2557a7; }
+.nav-more { position: relative; }
+.nav-more-menu { position: absolute; right: 0; z-index: 15; display: grid; gap: 4px; min-width: 230px; margin-top: 6px; padding: 6px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; box-shadow: 0 8px 18px rgb(20 24 31 / 18%); }
+.nav-more-menu[hidden] { display: none; }
+.nav-more-menu a { border: 0; border-radius: 4px; }
 .view[hidden] { display: none; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
 .row { display: flex; align-items: center; gap: 10px; }
@@ -3620,6 +3624,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .status-needs-attention { color: #ff6b7a; }
   .success { color: #5fd27a; }
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
+  .nav-more-menu { background: #181d24; border-color: #333b48; }
   .tabs { border-color: #333b48; }
   .tabs button[aria-selected="true"] { border-bottom-color: #181d24; }
   .notice-dialog { background: #181d24; border-color: #333b48; }
@@ -3641,7 +3646,12 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <a id="nav_rtl" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
       <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
       <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" hidden>EAS alerts</a>
-      <a id="nav_receiver" href="/?view=receiver" data-view="receiver">Weather Radio Receiver</a>
+      <span class="nav-more">
+        <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
+        <span id="nav_more_menu" class="nav-more-menu" role="menu" hidden>
+          <a id="nav_receiver" href="/?view=receiver" data-view="receiver" role="menuitem">Weather Radio Receiver</a>
+        </span>
+      </span>
     </nav>
   </div>
 </header>
@@ -6878,6 +6888,7 @@ function showView(name) {
   for (const view of document.querySelectorAll(".view")) {
     view.hidden = view.id !== `view_${name}`;
   }
+  const moreButton = document.getElementById("nav_more_button");
   for (const item of document.querySelectorAll("nav [data-view]")) {
     if (
       item.dataset.view === name ||
@@ -6887,6 +6898,13 @@ function showView(name) {
       item.setAttribute("aria-current", "page");
     } else {
       item.removeAttribute("aria-current");
+    }
+  }
+  if (moreButton) {
+    if (name === "receiver") {
+      moreButton.setAttribute("aria-current", "page");
+    } else {
+      moreButton.removeAttribute("aria-current");
     }
   }
 }
@@ -7019,8 +7037,40 @@ function confirmDiscardNavigation() {
   return window.confirm("Discard the current setup changes?");
 }
 
+function closeNavMoreMenu(focusButton = false) {
+  const button = document.getElementById("nav_more_button");
+  const menu = document.getElementById("nav_more_menu");
+  if (!button || !menu) return;
+  menu.hidden = true;
+  button.setAttribute("aria-expanded", "false");
+  if (focusButton) button.focus();
+}
+
+function openNavMoreMenu(focusFirst = false) {
+  const button = document.getElementById("nav_more_button");
+  const menu = document.getElementById("nav_more_menu");
+  if (!button || !menu) return;
+  menu.hidden = false;
+  button.setAttribute("aria-expanded", "true");
+  if (focusFirst) {
+    const first = menu.querySelector("[role='menuitem']");
+    if (first) first.focus();
+  }
+}
+
+function toggleNavMoreMenu(focusFirst = false) {
+  const menu = document.getElementById("nav_more_menu");
+  if (!menu) return;
+  if (menu.hidden) {
+    openNavMoreMenu(focusFirst);
+  } else {
+    closeNavMoreMenu();
+  }
+}
+
 function navigateTo(view, params = {}, replace = false, force = false) {
   if (!replace && !force && !confirmDiscardNavigation()) return;
+  closeNavMoreMenu();
   const url = routeForView(view, params);
   const state = routeState(view, params);
   if (replace) {
@@ -7307,6 +7357,36 @@ for (const link of document.querySelectorAll("nav a[data-view]")) {
   });
 }
 
+document.getElementById("nav_more_button").addEventListener("click", () => {
+  toggleNavMoreMenu();
+});
+
+document.getElementById("nav_more_button").addEventListener("keydown", event => {
+  if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    openNavMoreMenu(true);
+  }
+  if (event.key === "Escape") {
+    closeNavMoreMenu(true);
+  }
+});
+
+document.getElementById("nav_more_menu").addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeNavMoreMenu(true);
+    return;
+  }
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const items = Array.from(document.querySelectorAll("#nav_more_menu [role='menuitem']"));
+    const current = items.indexOf(document.activeElement);
+    const step = event.key === "ArrowDown" ? 1 : -1;
+    const next = items[(current + step + items.length) % items.length];
+    if (next) next.focus();
+  }
+});
+
 document.getElementById("dismiss_nwrorg_submission").addEventListener("click", dismissNwrOrgSubmissionDialog);
 document.getElementById("nwrorg_submission_link").addEventListener("click", dismissNwrOrgSubmissionDialog);
 document.getElementById("dismiss_monitor_unstable").addEventListener("click", dismissMonitorUnstableDialog);
@@ -7499,11 +7579,13 @@ document.getElementById("active-streams-body").addEventListener("keydown", event
 });
 
 document.addEventListener("click", event => {
+  if (!event.target || !event.target.closest(".nav-more")) closeNavMoreMenu();
   if (!event.target || event.target.closest(".menu-cell")) return;
   closeStreamActionMenus();
 });
 
 document.addEventListener("focusin", event => {
+  if (!event.target || !event.target.closest(".nav-more")) closeNavMoreMenu();
   if (event.target && event.target.closest(".menu-cell")) return;
   closeStreamActionMenus();
 });
