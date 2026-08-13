@@ -267,21 +267,44 @@ class RawRtlFanout:
     def __init__(self, source: RtlCaptureSource) -> None:
         self.source = source
         self.subscribers: set[queue.Queue] = set()
+        self.subscriber_names: dict[queue.Queue, str] = {}
+        self.subscriber_drops: dict[queue.Queue, int] = {}
+        self.subscriber_drop_bytes: dict[queue.Queue, int] = {}
+        self.subscriber_max_depth: dict[queue.Queue, int] = {}
         self.subscribers_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.read_batches = 0
+        self.read_bytes = 0
+        self.total_dropped_batches = 0
+        self.total_dropped_bytes = 0
+        self.last_read_at = 0.0
+        self.last_drop_log_at = 0.0
 
-    def subscribe(self, max_chunks: int | None = None, max_seconds: float | None = None) -> queue.Queue:
+    def subscribe(
+        self,
+        max_chunks: int | None = None,
+        max_seconds: float | None = None,
+        name: str = "subscriber",
+    ) -> queue.Queue:
         if max_chunks is None:
             max_chunks = self._chunks_for_seconds(max_seconds or STREAM_WORKER_RAW_QUEUE_SECONDS)
         subscriber: queue.Queue = queue.Queue(maxsize=max_chunks)
         with self.subscribers_lock:
             self.subscribers.add(subscriber)
+            self.subscriber_names[subscriber] = name
+            self.subscriber_drops[subscriber] = 0
+            self.subscriber_drop_bytes[subscriber] = 0
+            self.subscriber_max_depth[subscriber] = 0
         return subscriber
 
     def unsubscribe(self, subscriber: queue.Queue) -> None:
         with self.subscribers_lock:
             self.subscribers.discard(subscriber)
+            self.subscriber_names.pop(subscriber, None)
+            self.subscriber_drops.pop(subscriber, None)
+            self.subscriber_drop_bytes.pop(subscriber, None)
+            self.subscriber_max_depth.pop(subscriber, None)
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -320,18 +343,101 @@ class RawRtlFanout:
                 continue
             with self.subscribers_lock:
                 subscribers = list(self.subscribers)
+                self.read_batches += 1
+                self.read_bytes += len(batch.data)
+                self.last_read_at = time.monotonic()
             for subscriber in subscribers:
                 try:
                     subscriber.put_nowait(batch)
+                    self._record_subscriber_depth(subscriber)
                 except queue.Full:
                     try:
                         subscriber.get_nowait()
                     except queue.Empty:
                         pass
+                    self._record_subscriber_drop(subscriber, batch)
                     try:
                         subscriber.put_nowait(batch)
+                        self._record_subscriber_depth(subscriber)
                     except queue.Full:
+                        self._record_subscriber_drop(subscriber, batch)
                         pass
+
+    def subscriber_stats(self, subscriber: queue.Queue | None) -> dict[str, Any]:
+        if subscriber is None:
+            return {}
+        with self.subscribers_lock:
+            return self._subscriber_stats_locked(subscriber)
+
+    def stats(self) -> dict[str, Any]:
+        with self.subscribers_lock:
+            subscribers = [self._subscriber_stats_locked(subscriber) for subscriber in self.subscribers]
+            return {
+                "read_batches": self.read_batches,
+                "read_bytes": self.read_bytes,
+                "read_samples": self.read_bytes // 2,
+                "subscriber_count": len(self.subscribers),
+                "total_dropped_batches": self.total_dropped_batches,
+                "total_dropped_bytes": self.total_dropped_bytes,
+                "total_dropped_samples": self.total_dropped_bytes // 2,
+                "last_read_age_seconds": (
+                    round(time.monotonic() - self.last_read_at, 3)
+                    if self.last_read_at
+                    else None
+                ),
+                "subscribers": subscribers,
+            }
+
+    def _subscriber_stats_locked(self, subscriber: queue.Queue) -> dict[str, Any]:
+        return {
+            "name": self.subscriber_names.get(subscriber, "subscriber"),
+            "queue_depth": subscriber.qsize(),
+            "queue_capacity": subscriber.maxsize,
+            "max_queue_depth": self.subscriber_max_depth.get(subscriber, 0),
+            "dropped_batches": self.subscriber_drops.get(subscriber, 0),
+            "dropped_bytes": self.subscriber_drop_bytes.get(subscriber, 0),
+            "dropped_samples": self.subscriber_drop_bytes.get(subscriber, 0) // 2,
+        }
+
+    def _record_subscriber_depth(self, subscriber: queue.Queue) -> None:
+        with self.subscribers_lock:
+            self.subscriber_max_depth[subscriber] = max(
+                self.subscriber_max_depth.get(subscriber, 0),
+                subscriber.qsize(),
+            )
+
+    def _record_subscriber_drop(self, subscriber: queue.Queue, batch: RtlSampleBatch) -> None:
+        with self.subscribers_lock:
+            self.subscriber_drops[subscriber] = self.subscriber_drops.get(subscriber, 0) + 1
+            self.subscriber_drop_bytes[subscriber] = self.subscriber_drop_bytes.get(subscriber, 0) + len(batch.data)
+            self.total_dropped_batches += 1
+            self.total_dropped_bytes += len(batch.data)
+            name = self.subscriber_names.get(subscriber, "subscriber")
+            drops = self.subscriber_drops[subscriber]
+            now = time.monotonic()
+            should_log = now - self.last_drop_log_at >= 60.0
+            if should_log:
+                self.last_drop_log_at = now
+        if should_log:
+            LOG.warning(
+                "RTL-SDR raw fanout is dropping IQ batches for %s: subscriber_drops=%s total_drops=%s",
+                name,
+                drops,
+                self.total_dropped_batches,
+            )
+
+
+def subscribe_raw_fanout(
+    fanout,
+    *,
+    max_chunks: int | None = None,
+    max_seconds: float | None = None,
+    name: str = "subscriber",
+) -> queue.Queue:
+    try:
+        return fanout.subscribe(max_chunks=max_chunks, max_seconds=max_seconds, name=name)
+    except TypeError:
+        return fanout.subscribe(max_chunks=max_chunks, max_seconds=max_seconds)
 
 
 class ComplexNfmDemodulator:
@@ -429,7 +535,13 @@ class IcecastStreamWorker:
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
         self.state_directory = state_directory
-        self.queue = fanout.subscribe(max_seconds=STREAM_WORKER_RAW_QUEUE_SECONDS)
+        station = stream.get("station", {})
+        stream_label = station.get("callsign") or stream.get("id", "stream")
+        self.queue = subscribe_raw_fanout(
+            fanout,
+            max_seconds=STREAM_WORKER_RAW_QUEUE_SECONDS,
+            name=f"stream:{stream_label}",
+        )
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run_pcm_producer, name=f"icecast-stream-{stream['id']}", daemon=True)
         self.outputs: dict[str, IcecastOutputWriter] = {}
@@ -494,6 +606,12 @@ class IcecastStreamWorker:
 
     def snapshots(self) -> list[dict[str, Any]]:
         return [output.snapshot() for output in list(self.outputs.values())]
+
+    def raw_queue_stats(self) -> dict[str, Any]:
+        subscriber_stats = getattr(self.fanout, "subscriber_stats", None)
+        if subscriber_stats is None:
+            return {}
+        return subscriber_stats(self.queue)
 
     def eas_snapshot(self) -> dict[str, Any] | None:
         with self.lock:
@@ -839,6 +957,7 @@ class IcecastOutputWriter:
             "error": error,
             "started_at": started_at,
             "last_audio_at": last_audio_at,
+            "raw_queue": self.runtime.raw_queue_stats(),
         }
 
     def _set_status(self, status: str, error: str | None = None) -> None:
@@ -900,7 +1019,11 @@ class WeatherReceiverWorker:
     ) -> None:
         self.client_id = client_id
         self.fanout = fanout
-        self.queue = fanout.subscribe(max_seconds=STREAM_WORKER_RAW_QUEUE_SECONDS)
+        self.queue = subscribe_raw_fanout(
+            fanout,
+            max_seconds=STREAM_WORKER_RAW_QUEUE_SECONDS,
+            name=f"receiver:{client_id}",
+        )
         self.source = WebRtcAudioSource()
         self.frequency_hz = validate_receiver_frequency(frequency_hz)
         self.stop_event = threading.Event()
@@ -938,7 +1061,14 @@ class WeatherReceiverWorker:
             "frequency_mhz": receiver_frequency_mhz(frequency_hz),
             "last_audio_at": last_audio_at,
             "stats": self.source.stats(),
+            "raw_queue": self.raw_queue_stats(),
         }
+
+    def raw_queue_stats(self) -> dict[str, Any]:
+        subscriber_stats = getattr(self.fanout, "subscriber_stats", None)
+        if subscriber_stats is None:
+            return {}
+        return subscriber_stats(self.queue)
 
     def _frequency_hz(self) -> int:
         with self.lock:
@@ -1033,12 +1163,14 @@ class RtlControlService:
             active = capture is not None
             gain_values = capture.get_gain_values() if capture is not None else []
             capture_stats = capture.stats() if capture is not None else {}
+            fanout_stats = self.raw_fanout.stats() if self.raw_fanout is not None else {}
             return {
                 "settings": asdict(settings),
                 "gain_values": gain_values,
                 "active": active,
                 "capture_error": self.capture_error,
                 "capture_stats": capture_stats,
+                "raw_fanout_stats": fanout_stats,
                 "last_batch_at": self.last_batch_at,
                 "received_chunks": self.received_chunks,
                 "received_bytes": self.received_bytes,
@@ -1449,6 +1581,7 @@ class RtlControlService:
                     sdp=sdp,
                     type=offer_type,
                     tracks=(track,),
+                    on_peer_closed=self._handle_webrtc_session_closed,
                 )
             )
         except Exception as exc:
@@ -1566,6 +1699,7 @@ class RtlControlService:
                     sdp=sdp,
                     type=offer_type,
                     tracks=(track,),
+                    on_peer_closed=self._handle_webrtc_session_closed,
                 )
             )
         except Exception as exc:
@@ -1853,7 +1987,11 @@ class RtlControlService:
             self.capture = RtlCaptureSource(config)
             self.capture.start()
             self.raw_fanout = RawRtlFanout(self.capture)
-            self.monitor_queue = self.raw_fanout.subscribe(max_chunks=64)
+            self.monitor_queue = subscribe_raw_fanout(
+                self.raw_fanout,
+                max_chunks=64,
+                name="web-status-drain",
+            )
             self.raw_fanout.start()
             self.drain_stop.clear()
             self.drain_thread = threading.Thread(
@@ -2013,6 +2151,33 @@ class RtlControlService:
             return False
         worker.stop()
         return True
+
+    def _handle_webrtc_session_closed(self, client_id: str, reason: str) -> None:
+        def cleanup() -> None:
+            with self.lock:
+                stopped_stream_id = self.monitor_streams_by_client.get(client_id, "")
+                if stopped_stream_id:
+                    self._remove_monitor_source_locked(client_id)
+                stopped_receiver = self._remove_receiver_locked(client_id)
+            if stopped_stream_id:
+                LOG.info(
+                    "cleaned up stale WebRTC monitor for stream %s on client %s after %s",
+                    stopped_stream_id,
+                    client_id,
+                    reason,
+                )
+            if stopped_receiver:
+                LOG.info(
+                    "cleaned up stale weather receiver for client %s after %s",
+                    client_id,
+                    reason,
+                )
+
+        threading.Thread(
+            target=cleanup,
+            name=f"webrtc-cleanup-{client_id}",
+            daemon=True,
+        ).start()
 
     def _stop_stream_workers_locked(self) -> None:
         for worker in list(self.stream_workers.values()):
@@ -4103,6 +4268,7 @@ let receiverUnstableTimer = null;
 let receiverStatsTimer = null;
 let receiverLastPacketCount = 0;
 let receiverLastPacketAt = 0;
+let unloadLiveAudioStopSent = false;
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
 const NWR_RECEIVER_CHANNELS = [
@@ -4563,12 +4729,21 @@ function clearReceiverMediaSession() {
   }
 }
 
+function setReceiverAudioTracksEnabled(enabled) {
+  const audio = document.getElementById("stream_monitor_audio");
+  if (!audio || !audio.srcObject || typeof audio.srcObject.getAudioTracks !== "function") return;
+  for (const track of audio.srcObject.getAudioTracks()) {
+    track.enabled = enabled;
+  }
+}
+
 async function startWeatherReceiver() {
   if (receiverPeerConnection) {
     logClientEvent("info", "receiver", "receiver resume requested", {frequency: currentReceiverChannel().label});
     receiverPlaying = true;
     receiverPaused = false;
     clearReceiverUnstableTimer();
+    setReceiverAudioTracksEnabled(true);
     const audio = document.getElementById("stream_monitor_audio");
     if (audio && audio.srcObject) {
       await audio.play();
@@ -4605,6 +4780,7 @@ async function startWeatherReceiver() {
     }
   }
   peer.addEventListener("track", event => {
+    event.track.enabled = !receiverPaused;
     if (event.receiver && "jitterBufferTarget" in event.receiver) {
       try {
         event.receiver.jitterBufferTarget = 0.05;
@@ -4614,7 +4790,10 @@ async function startWeatherReceiver() {
     }
     audio.srcObject = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
     audio.hidden = true;
-    audio.play().catch(error => setReceiverResult(`Receiver audio could not start: ${error.message}`, "error"));
+    setReceiverAudioTracksEnabled(!receiverPaused);
+    if (!receiverPaused) {
+      audio.play().catch(error => setReceiverResult(`Receiver audio could not start: ${error.message}`, "error"));
+    }
     for (const eventName of ["waiting", "stalled", "suspend"]) {
       audio.addEventListener(eventName, () => {
         if (receiverPeerConnection === peer) scheduleReceiverUnstableStop(`audio ${eventName}`);
@@ -4690,6 +4869,7 @@ async function stopWeatherReceiver(options = {}) {
   clearReceiverWatchdogs();
   const audio = document.getElementById("stream_monitor_audio");
   if (preserveMediaSession && peer) {
+    setReceiverAudioTracksEnabled(false);
     if (audio) audio.pause();
     updateReceiverMediaSession();
     renderReceiverControls();
@@ -7773,7 +7953,9 @@ document.getElementById("wizard_finish").addEventListener("click", async () => {
   }
 });
 
-window.addEventListener("beforeunload", event => {
+function sendLiveAudioStopBeacon() {
+  if (unloadLiveAudioStopSent || !navigator.sendBeacon) return;
+  unloadLiveAudioStopSent = true;
   if (monitorStreamId && navigator.sendBeacon) {
     const payload = JSON.stringify({client_id: pageMonitorClientId()});
     navigator.sendBeacon("/api/monitor/stop", new Blob([payload], {type: "application/json"}));
@@ -7782,6 +7964,14 @@ window.addEventListener("beforeunload", event => {
     const payload = JSON.stringify({client_id: pageReceiverClientId()});
     navigator.sendBeacon("/api/receiver/stop", new Blob([payload], {type: "application/json"}));
   }
+}
+
+window.addEventListener("pagehide", () => {
+  sendLiveAudioStopBeacon();
+});
+
+window.addEventListener("beforeunload", event => {
+  sendLiveAudioStopBeacon();
   if (!hasUnsavedNavigationState()) return;
   event.preventDefault();
   event.returnValue = "";

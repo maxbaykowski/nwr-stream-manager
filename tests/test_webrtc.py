@@ -184,6 +184,84 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(report["minimum_bitrate_kbps"], 32)
         self.assertEqual(report["bitrate_step_kbps"], 8)
 
+    def test_session_manager_cleans_up_failed_peer(self) -> None:
+        class Description:
+            def __init__(self, sdp: str, type: str) -> None:
+                self.sdp = sdp
+                self.type = type
+
+        class Peer:
+            def __init__(self, _configuration=None) -> None:
+                self.connectionState = "new"
+                self.iceConnectionState = "new"
+                self.localDescription = Description("answer", "answer")
+                self.handlers = {}
+                self.closed = False
+
+            def on(self, event_name):
+                def register(handler):
+                    self.handlers[event_name] = handler
+                    return handler
+
+                return register
+
+            def addTrack(self, track):
+                return object()
+
+            async def setRemoteDescription(self, description):
+                self.remoteDescription = description
+
+            async def createAnswer(self):
+                return self.localDescription
+
+            async def setLocalDescription(self, description):
+                self.localDescription = description
+
+            async def close(self):
+                self.closed = True
+
+        class FakeAiortc:
+            RTCConfiguration = lambda self, iceServers=None: {"iceServers": iceServers or []}
+            RTCSessionDescription = Description
+
+            def __init__(self) -> None:
+                self.peer = Peer()
+
+            def RTCPeerConnection(self, configuration=None):
+                return self.peer
+
+        fake_aiortc = FakeAiortc()
+        original_loader = self.webrtc._load_aiortc
+        original_prefer_opus = self.webrtc._prefer_opus
+        original_configure = self.webrtc._configure_sender_bitrate
+        self.webrtc._load_aiortc = lambda: fake_aiortc
+        self.webrtc._prefer_opus = lambda _peer: None
+        self.webrtc._configure_sender_bitrate = lambda _sender, _bitrate: None
+        cleanup_events = []
+        try:
+            manager = self.webrtc.AiortcSessionManager()
+
+            async def run_test():
+                await manager.accept_offer(
+                    session_id="client-1",
+                    sdp="offer",
+                    on_peer_closed=lambda session_id, reason: cleanup_events.append((session_id, reason)),
+                )
+                self.assertIn("client-1", manager.sessions)
+                fake_aiortc.peer.connectionState = "failed"
+                await fake_aiortc.peer.handlers["connectionstatechange"]()
+                await asyncio.sleep(0)
+
+            asyncio.run(run_test())
+        finally:
+            self.webrtc._load_aiortc = original_loader
+            self.webrtc._prefer_opus = original_prefer_opus
+            self.webrtc._configure_sender_bitrate = original_configure
+
+        self.assertEqual(cleanup_events, [("client-1", "connectionState=failed")])
+        self.assertNotIn("client-1", manager.sessions)
+        self.assertTrue(fake_aiortc.peer.closed)
+
     def test_opus_loader_uses_system_libopus(self) -> None:
         original_module = self.webrtc._OPUS_MODULE
         self.webrtc._OPUS_MODULE = None

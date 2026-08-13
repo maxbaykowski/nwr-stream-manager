@@ -477,6 +477,7 @@ class RtlCaptureSource:
         self.dropped_batches = 0
         self.dropped_bytes = 0
         self.last_offer_at = 0.0
+        self.last_drop_log_at = 0.0
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -756,9 +757,22 @@ class RtlCaptureSource:
     def _record_dropped_item(self, item: RtlSampleBatch | Exception | None) -> None:
         if not isinstance(item, RtlSampleBatch):
             return
+        should_log = False
         with self.stats_lock:
             self.dropped_batches += 1
             self.dropped_bytes += len(item.data)
+            now = time.monotonic()
+            if now - self.last_drop_log_at >= 60.0:
+                self.last_drop_log_at = now
+                should_log = True
+                dropped_batches = self.dropped_batches
+                dropped_bytes = self.dropped_bytes
+        if should_log:
+            LOG.warning(
+                "RTL-SDR capture queue is dropping IQ batches: dropped_batches=%s dropped_bytes=%s",
+                dropped_batches,
+                dropped_bytes,
+            )
 
     def _close_sdr(self) -> None:
         with self.sdr_lock:

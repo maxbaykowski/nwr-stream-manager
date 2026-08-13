@@ -65,6 +65,41 @@ class EasAlertTests(unittest.TestCase):
                 }
             )
 
+    def test_raw_rtl_fanout_reports_subscriber_drops(self) -> None:
+        web_control = self.web_control
+
+        class Source:
+            config = web_control.RtlConfig(serial="dummy", sample_rate=1_024_000)
+
+            def __init__(self) -> None:
+                self.items = web_control.queue.Queue()
+                self.items.put(web_control.RtlSampleBatch(data=b"aa", sample_rate=1_024_000, center_frequency_hz=162_475_000))
+                self.items.put(web_control.RtlSampleBatch(data=b"bb", sample_rate=1_024_000, center_frequency_hz=162_475_000))
+                self.items.put(None)
+
+            @staticmethod
+            def _rtl_async_buffer_size(config):
+                return web_control.RtlCaptureSource._rtl_async_buffer_size(config)
+
+            def read(self, timeout=None):
+                item = self.items.get(timeout=timeout)
+                if item is None:
+                    raise EOFError
+                return item
+
+        fanout = web_control.RawRtlFanout(Source())
+        subscriber = fanout.subscribe(max_chunks=1, name="test-subscriber")
+        fanout.start()
+        fanout.thread.join(timeout=2.0)
+
+        stats = fanout.stats()
+        subscriber_stats = fanout.subscriber_stats(subscriber)
+        self.assertEqual(stats["read_batches"], 2)
+        self.assertEqual(stats["total_dropped_batches"], 1)
+        self.assertEqual(subscriber_stats["name"], "test-subscriber")
+        self.assertEqual(subscriber_stats["dropped_batches"], 1)
+        self.assertEqual(subscriber.get_nowait().data, b"bb")
+
     def test_gwes_requires_mp3_and_minimum_bitrate(self) -> None:
         valid = {
             "service": "gwes",

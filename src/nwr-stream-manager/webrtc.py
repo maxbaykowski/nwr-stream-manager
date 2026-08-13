@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -530,10 +530,79 @@ class AiortcSessionManager:
         sdp: str,
         type: str = "offer",
         tracks: tuple[Any, ...] = (),
+        on_peer_closed: Callable[[str, str], None] | None = None,
     ) -> dict[str, str]:
         aiortc = _load_aiortc()
         configuration = aiortc.RTCConfiguration(iceServers=[])
         peer = aiortc.RTCPeerConnection(configuration=configuration)
+        stale_close_task: asyncio.Task[Any] | None = None
+        stale_close_delay: float | None = None
+
+        def peer_is_unhealthy() -> bool:
+            return getattr(peer, "connectionState", "") in {"failed", "closed", "disconnected"} or getattr(
+                peer,
+                "iceConnectionState",
+                "",
+            ) in {"failed", "closed", "disconnected"}
+
+        def cancel_stale_close() -> None:
+            nonlocal stale_close_task, stale_close_delay
+            if stale_close_task is not None and not stale_close_task.done():
+                stale_close_task.cancel()
+            stale_close_task = None
+            stale_close_delay = None
+
+        async def close_if_current(reason: str, delay: float = 0.0) -> None:
+            if delay > 0:
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    return
+                if not peer_is_unhealthy():
+                    return
+            with self.lock:
+                if self.sessions.get(session_id) is not peer:
+                    return
+                self.sessions.pop(session_id, None)
+            if on_peer_closed is not None:
+                on_peer_closed(session_id, reason)
+            await peer.close()
+
+        def schedule_stale_close(reason: str, delay: float) -> None:
+            nonlocal stale_close_task, stale_close_delay
+            if (
+                stale_close_task is not None
+                and not stale_close_task.done()
+                and stale_close_delay == 0.0
+                and delay > 0
+            ):
+                return
+            cancel_stale_close()
+            stale_close_delay = delay
+            stale_close_task = asyncio.create_task(close_if_current(reason, delay))
+
+        @peer.on("connectionstatechange")
+        async def on_connectionstatechange() -> None:
+            state = getattr(peer, "connectionState", "")
+            if state == "connected":
+                if not peer_is_unhealthy():
+                    cancel_stale_close()
+            elif state in {"failed", "closed"}:
+                schedule_stale_close(f"connectionState={state}", 0.0)
+            elif state == "disconnected":
+                schedule_stale_close(f"connectionState={state}", 30.0)
+
+        @peer.on("iceconnectionstatechange")
+        async def on_iceconnectionstatechange() -> None:
+            state = getattr(peer, "iceConnectionState", "")
+            if state in {"connected", "completed"}:
+                if not peer_is_unhealthy():
+                    cancel_stale_close()
+            elif state in {"failed", "closed"}:
+                schedule_stale_close(f"iceConnectionState={state}", 0.0)
+            elif state == "disconnected":
+                schedule_stale_close(f"iceConnectionState={state}", 30.0)
+
         senders = []
         for track in tracks:
             senders.append(peer.addTrack(track))
