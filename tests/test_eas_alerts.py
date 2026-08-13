@@ -100,6 +100,41 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(subscriber_stats["dropped_batches"], 1)
         self.assertEqual(subscriber.get_nowait().data, b"bb")
 
+    def test_raw_rtl_fanout_does_not_retain_unsubscribed_queue_stats(self) -> None:
+        web_control = self.web_control
+
+        class Source:
+            config = web_control.RtlConfig(serial="dummy", sample_rate=1_024_000)
+
+            @staticmethod
+            def _rtl_async_buffer_size(config):
+                return web_control.RtlCaptureSource._rtl_async_buffer_size(config)
+
+        fanout = web_control.RawRtlFanout(Source())
+        subscriber = fanout.subscribe(max_chunks=1, name="stale-subscriber")
+        fanout.unsubscribe(subscriber)
+        batch = web_control.RtlSampleBatch(
+            data=b"aa",
+            sample_rate=1_024_000,
+            center_frequency_hz=162_475_000,
+        )
+
+        fanout._record_subscriber_depth(subscriber)
+        fanout._record_subscriber_drop(subscriber, batch)
+
+        self.assertEqual(fanout.stats()["subscriber_count"], 0)
+        self.assertEqual(fanout.stats()["total_dropped_batches"], 0)
+        self.assertEqual(fanout.subscriber_stats(subscriber)["name"], "subscriber")
+
+    def test_json_request_body_has_size_limit(self) -> None:
+        web_control = self.web_control
+        handler = object.__new__(web_control.RtlControlHandler)
+        handler.headers = {"Content-Length": str(web_control.MAX_JSON_REQUEST_BYTES + 1)}
+        handler.rfile = None
+
+        with self.assertRaisesRegex(ValueError, "too large"):
+            handler._read_json()
+
     def test_gwes_requires_mp3_and_minimum_bitrate(self) -> None:
         valid = {
             "service": "gwes",

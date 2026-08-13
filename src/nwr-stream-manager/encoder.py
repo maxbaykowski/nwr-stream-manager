@@ -440,8 +440,8 @@ class OggVorbisEncoder:
             ctypes.byref(self.vd), len(samples)
         )
         channel = buffer[0]
-        for index, sample in enumerate(samples):
-            channel[index] = float(sample)
+        channel_view = np.ctypeslib.as_array(channel, shape=(len(samples),))
+        channel_view[:] = samples
         self.libvorbis.vorbis_analysis_wrote(ctypes.byref(self.vd), len(samples))
         return self._drain_packets()
 

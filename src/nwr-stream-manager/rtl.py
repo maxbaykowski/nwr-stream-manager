@@ -662,7 +662,8 @@ class RtlCaptureSource:
 
     def _reader_loop(self, sdr: BaseRtlSdr) -> None:
         assert rtlsdr_lib is not None
-        async_buffer_size = self._rtl_async_buffer_size(self.config)
+        loop_config = self.config
+        async_buffer_size = self._rtl_async_buffer_size(loop_config)
         async_done = threading.Event()
         callback_errors: list[Exception] = []
         last_data_at = time.monotonic()
@@ -681,7 +682,7 @@ class RtlCaptureSource:
                 if self.stop_event.wait(0.1):
                     cancel_async_read()
                     return
-                if time.monotonic() - last_data_at > self.config.read_timeout_seconds:
+                if time.monotonic() - last_data_at > loop_config.read_timeout_seconds:
                     callback_errors.append(RtlReadError("RTL-SDR produced no data before timeout"))
                     cancel_async_read()
                     return
@@ -697,8 +698,8 @@ class RtlCaptureSource:
                 last_data_at = time.monotonic()
                 batch = RtlSampleBatch(
                     data=chunk,
-                    sample_rate=self.config.sample_rate,
-                    center_frequency_hz=self.config.center_frequency_hz,
+                    sample_rate=loop_config.sample_rate,
+                    center_frequency_hz=loop_config.center_frequency_hz,
                 )
                 if not self._offer(batch):
                     cancel_async_read()

@@ -67,6 +67,36 @@ class RtlCaptureTests(unittest.TestCase):
         self.assertEqual(stats["dropped_samples"], 1)
         self.assertEqual(stats["offered_batches"], source.output_queue.maxsize + 1)
 
+    def test_async_reader_uses_stable_config_snapshot_for_batch_metadata(self) -> None:
+        initial = self.rtl.RtlConfig(serial="dummy", sample_rate=1_024_000, center_frequency_hz=162_475_000)
+        updated = self.rtl.RtlConfig(serial="dummy", sample_rate=2_048_000, center_frequency_hz=162_400_000)
+        source = self.rtl.RtlCaptureSource(initial)
+
+        class Sdr:
+            dev_p = object()
+
+        class Lib:
+            def rtlsdr_read_async(self, _dev_p, callback, _context, _buffer_count, _buffer_size):
+                source.config = updated
+                buffer = (self_rtl.ctypes.c_ubyte * 2)(1, 2)
+                callback(buffer, 2, None)
+                return 0
+
+            def rtlsdr_cancel_async(self, _dev_p):
+                pass
+
+        self_rtl = self.rtl
+        original_lib = self.rtl.rtlsdr_lib
+        try:
+            self.rtl.rtlsdr_lib = Lib()
+            source._reader_loop(Sdr())
+        finally:
+            self.rtl.rtlsdr_lib = original_lib
+
+        batch = source.read(timeout=0)
+        self.assertEqual(batch.sample_rate, initial.sample_rate)
+        self.assertEqual(batch.center_frequency_hz, initial.center_frequency_hz)
+
     def test_open_rtlsdr_device_uses_compat_wrapper_when_dithering_symbol_is_missing(self) -> None:
         class PyBase:
             called = False

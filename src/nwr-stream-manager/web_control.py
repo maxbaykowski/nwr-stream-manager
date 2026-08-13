@@ -175,6 +175,7 @@ STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 64
 STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
+MAX_JSON_REQUEST_BYTES = 1_048_576
 NWR_RECEIVER_CHANNELS_HZ = (
     162_400_000,
     162_425_000,
@@ -401,6 +402,8 @@ class RawRtlFanout:
 
     def _record_subscriber_depth(self, subscriber: queue.Queue) -> None:
         with self.subscribers_lock:
+            if subscriber not in self.subscribers:
+                return
             self.subscriber_max_depth[subscriber] = max(
                 self.subscriber_max_depth.get(subscriber, 0),
                 subscriber.qsize(),
@@ -408,6 +411,8 @@ class RawRtlFanout:
 
     def _record_subscriber_drop(self, subscriber: queue.Queue, batch: RtlSampleBatch) -> None:
         with self.subscribers_lock:
+            if subscriber not in self.subscribers:
+                return
             self.subscriber_drops[subscriber] = self.subscriber_drops.get(subscriber, 0) + 1
             self.subscriber_drop_bytes[subscriber] = self.subscriber_drop_bytes.get(subscriber, 0) + len(batch.data)
             self.total_dropped_batches += 1
@@ -2537,7 +2542,12 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         self._send_json(response)
 
     def _read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length header") from exc
+        if length > MAX_JSON_REQUEST_BYTES:
+            raise ValueError("request body is too large")
         data = self.rfile.read(length) if length else b"{}"
         payload = json.loads(data.decode("utf-8"))
         if not isinstance(payload, dict):
