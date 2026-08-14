@@ -29,6 +29,7 @@ class EasRecordingError(RuntimeError):
 @dataclass
 class EasRecorderOutput:
     config: EasRecordingConfig
+    input_sample_rate: int = IQ_SAMPLE_RATE
 
     def __post_init__(self) -> None:
         if not self.config.enabled:
@@ -40,7 +41,7 @@ class EasRecorderOutput:
                 "EAS recording requires the 'easrecorder' Python package"
             ) from exc
 
-        self.resampler = PcmResampler(IQ_SAMPLE_RATE, EAS_RECORDER_RATE)
+        self.resampler = PcmResampler(self.input_sample_rate, EAS_RECORDER_RATE)
         self.settings = RecorderSettings(
             rate=EAS_RECORDER_RATE,
             detect_rate=EAS_RECORDER_RATE,

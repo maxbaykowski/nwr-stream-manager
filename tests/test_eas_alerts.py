@@ -811,6 +811,27 @@ class EasAlertTests(unittest.TestCase):
                 "notch": {"enabled": True, "frequency": 1500, "sharpness": 5},
             })
 
+    def test_audio_effects_allow_lowpass_and_notch_up_to_24khz_nyquist(self) -> None:
+        audio = self.web_control.validate_audio_payload({
+            "deemphasis": {"enabled": True, "tau": 530},
+            "comfort_noise": {"enabled": False, "level_db": -40},
+            "volume": {"enabled": False, "multiplier": 1},
+            "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
+            "lowpass": {"enabled": True, "frequency": 12000, "sharpness": 1},
+            "notch": {"enabled": False, "frequency": 12000, "sharpness": 1},
+        })
+        notch_audio = self.web_control.validate_audio_payload({
+            "deemphasis": {"enabled": True, "tau": 530},
+            "comfort_noise": {"enabled": False, "level_db": -40},
+            "volume": {"enabled": False, "multiplier": 1},
+            "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
+            "lowpass": {"enabled": False, "frequency": 12000, "sharpness": 1},
+            "notch": {"enabled": True, "frequency": 12000, "sharpness": 1},
+        })
+
+        self.assertEqual(audio["lowpass"]["frequency"], 12000.0)
+        self.assertEqual(notch_audio["notch"]["frequency"], 12000.0)
+
     def test_audio_config_defaults_are_stream_creation_defaults(self) -> None:
         audio = self.config.AudioConfig()
 
@@ -997,6 +1018,17 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(len(empty), 0)
         self.assertEqual(len(resumed), 1)
 
+    def test_fallback_frame_uses_audio_sample_rate(self) -> None:
+        audio = types.SimpleNamespace(
+            pcm=b"\x01\x00" * self.web_control.STREAM_FRAME_SAMPLES,
+            sample_rate=self.web_control.IQ_SAMPLE_RATE,
+        )
+        state = self.web_control.WebFallbackPlaybackState()
+
+        frame = self.web_control.next_web_fallback_frame(audio, state, loop_delay_seconds=0)
+
+        self.assertEqual(len(frame), self.web_control.STREAM_FRAME_BYTES)
+
     def test_icecast_outputs_with_same_encoding_share_encoder_group(self) -> None:
         web_control = self.web_control
 
@@ -1020,8 +1052,11 @@ class EasAlertTests(unittest.TestCase):
                 pass
 
         created = []
+        input_rates = []
         original_create_audio_encoder = self.web_control.create_audio_encoder
-        self.web_control.create_audio_encoder = lambda icecast: created.append(icecast) or Encoder()
+        self.web_control.create_audio_encoder = (
+            lambda icecast, **kwargs: input_rates.append(kwargs.get("input_sample_rate")) or created.append(icecast) or Encoder()
+        )
         try:
             icecast_a = self.config.IcecastConfig(
                 host="example.com",
@@ -1055,6 +1090,7 @@ class EasAlertTests(unittest.TestCase):
             self.assertEqual(first.header(), b"header")
             self.assertEqual(second.header(), b"header")
             self.assertEqual(len(created), 1)
+            self.assertEqual(input_rates, [self.web_control.IQ_SAMPLE_RATE])
             worker.stop()
         finally:
             self.web_control.create_audio_encoder = original_create_audio_encoder
@@ -1268,7 +1304,7 @@ class EasAlertTests(unittest.TestCase):
             transition_hz=web_control.INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
             attenuation_db=web_control.INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
         )
-        self.assertLess(decimator.fir.taps.size, 1_000)
+        self.assertLess(decimator.fir.taps.size, 900)
         iq = np.exp(1j * 2 * np.pi * 1000 * np.arange(65_536, dtype=np.float32) / input_rate).astype(np.complex64)
         raw = self._complex_to_rtl_u8(iq)
         intermediate.start()

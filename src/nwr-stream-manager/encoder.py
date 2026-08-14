@@ -172,11 +172,15 @@ class VorbisComment(ctypes.Structure):
     ]
 
 
-def create_audio_encoder(config: IcecastConfig) -> AudioEncoder:
+def create_audio_encoder(
+    config: IcecastConfig,
+    *,
+    input_sample_rate: int = IQ_SAMPLE_RATE,
+) -> AudioEncoder:
     if config.format == "mp3":
-        return Mp3Encoder(config)
+        return Mp3Encoder(config, input_sample_rate=input_sample_rate)
     if config.format == "ogg":
-        return OggVorbisEncoder(config)
+        return OggVorbisEncoder(config, input_sample_rate=input_sample_rate)
     raise EncoderError(f"unsupported icecast format: {config.format}")
 
 
@@ -220,6 +224,7 @@ class PcmResampler:
 @dataclass
 class Mp3Encoder:
     config: IcecastConfig
+    input_sample_rate: int = IQ_SAMPLE_RATE
 
     def __post_init__(self) -> None:
         try:
@@ -229,7 +234,7 @@ class Mp3Encoder:
                 "MP3 output requires the 'lameenc' Python package"
             ) from exc
 
-        self.resampler = PcmResampler(IQ_SAMPLE_RATE, self.config.sample_rate)
+        self.resampler = PcmResampler(self.input_sample_rate, self.config.sample_rate)
         self.header = b""
         self.encoder = lameenc.Encoder()
         self.encoder.set_bit_rate(self.config.bitrate)
@@ -269,14 +274,20 @@ def _load_shared_library(name: str, sonames: tuple[str, ...]) -> ctypes.CDLL:
 
 
 class OggVorbisEncoder:
-    def __init__(self, config: IcecastConfig) -> None:
+    def __init__(
+        self,
+        config: IcecastConfig,
+        *,
+        input_sample_rate: int = IQ_SAMPLE_RATE,
+    ) -> None:
         self.config = config
+        self.input_sample_rate = int(input_sample_rate)
         self.libogg = _load_shared_library("ogg", ("libogg.so.0", "libogg.so"))
         self.libvorbis = _load_shared_library("vorbis", ("libvorbis.so.0", "libvorbis.so"))
         self.libvorbisenc = _load_shared_library(
             "vorbisenc", ("libvorbisenc.so.2", "libvorbisenc.so")
         )
-        self.resampler = PcmResampler(IQ_SAMPLE_RATE, config.sample_rate)
+        self.resampler = PcmResampler(self.input_sample_rate, config.sample_rate)
         self.closed = False
         self._configure_ctypes()
         self.vi = VorbisInfo()

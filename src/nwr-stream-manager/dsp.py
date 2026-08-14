@@ -13,10 +13,10 @@ FloatArray = NDArray[np.float32]
 
 
 DEFAULT_OUTPUT_SAMPLE_RATE = 24_000
-DEFAULT_ALIAS_TRANSITION_HZ = 2_000.0
+DEFAULT_ALIAS_TRANSITION_HZ = 1_000.0
 DEFAULT_ALIAS_ATTENUATION_DB = 80.0
-WIDE_DECIMATOR_MIN_TRANSITION_HZ = 18_000.0
-WIDE_DECIMATOR_TRANSITION_FRACTION = 0.09375
+WIDE_DECIMATOR_MIN_TRANSITION_HZ = 8_000.0
+WIDE_DECIMATOR_TRANSITION_FRACTION = 1.0 / 24.0
 WIDE_DECIMATOR_ALIAS_ATTENUATION_DB = 70.0
 DEFAULT_DC_BLOCK_TIME_CONSTANT_SECONDS = 1.0
 STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE = 96_000.0
@@ -114,7 +114,7 @@ def design_alias_filter_taps(
     attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
 ) -> FloatArray:
     output_nyquist = output_rate / 2.0
-    cutoff = output_nyquist - transition_hz
+    cutoff = output_nyquist - (transition_hz / 2.0)
     if cutoff <= 0.0:
         raise ValueError("transition_hz must be smaller than output Nyquist")
     return design_lowpass_taps(

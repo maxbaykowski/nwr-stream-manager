@@ -102,6 +102,12 @@ class WebRtcTests(unittest.TestCase):
             0.5,
         )
 
+    def test_audio_source_frame_size_uses_configured_sample_rate(self) -> None:
+        source = self.webrtc.WebRtcAudioSource(sample_rate=32_000)
+
+        self.assertEqual(source.frame_bytes, 1280)
+        self.assertEqual(source.stats()["sample_rate"], 32_000)
+
     def test_audio_source_startup_prebuffer_is_not_limited_by_track_frame_timeout(self) -> None:
         async def run_test():
             source = self.webrtc.WebRtcAudioSource(

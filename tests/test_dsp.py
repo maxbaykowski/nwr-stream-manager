@@ -164,10 +164,46 @@ class DspTests(unittest.TestCase):
                 self.assertNotIsInstance(decimator, self.dsp.StagedDecimator)
                 taps = getattr(getattr(decimator, "fir", None), "taps", None)
                 self.assertIsNotNone(taps)
-                self.assertLess(taps.size, 1_000)
+                self.assertLess(taps.size, 1_200)
                 samples = np.ones(4096, dtype=np.complex64)
                 output = decimator.process(samples)
                 self.assertGreater(output.size, 0)
+
+    def test_shared_intermediate_decimator_preserves_outer_nwr_sidebands(self) -> None:
+        sample_rate = 1_536_000
+        output_rate = 192_000
+        count = round(sample_rate * 0.1)
+        time_axis = np.arange(count, dtype=np.float32) / sample_rate
+        edge_sideband = np.exp(1j * 2.0 * np.pi * 87_000.0 * time_axis).astype(np.complex64)
+        out_of_band = np.exp(1j * 2.0 * np.pi * 120_000.0 * time_axis).astype(np.complex64)
+
+        edge_output = self.dsp.create_decimator(sample_rate, output_rate).process(edge_sideband)
+        rejected_output = self.dsp.create_decimator(sample_rate, output_rate).process(out_of_band)
+
+        self.assertGreater(float(np.mean(np.abs(edge_output[-4096:]))), 0.65)
+        self.assertLess(float(np.mean(np.abs(rejected_output[-4096:]))), 0.05)
+
+    def test_channel_decimator_preserves_wide_nwr_fm_sideband(self) -> None:
+        sample_rate = 192_000
+        output_rate = 24_000
+        count = round(sample_rate * 0.1)
+        time_axis = np.arange(count, dtype=np.float32) / sample_rate
+        desired_sideband = np.exp(1j * 2.0 * np.pi * 11_000.0 * time_axis).astype(np.complex64)
+        rejected = np.exp(1j * 2.0 * np.pi * 16_000.0 * time_axis).astype(np.complex64)
+
+        desired_output = self.dsp.create_decimator(
+            sample_rate,
+            output_rate,
+            transition_hz=1_000,
+        ).process(desired_sideband)
+        rejected_output = self.dsp.create_decimator(
+            sample_rate,
+            output_rate,
+            transition_hz=1_000,
+        ).process(rejected)
+
+        self.assertGreater(float(np.mean(np.abs(desired_output[-2048:]))), 0.65)
+        self.assertLess(float(np.mean(np.abs(rejected_output[-2048:]))), 0.05)
 
     def test_identity_decimator_for_matching_spectrum_rate(self) -> None:
         decimator = self.dsp.create_decimator(1_536_000, 1_536_000)

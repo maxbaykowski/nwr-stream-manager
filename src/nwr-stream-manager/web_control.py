@@ -208,8 +208,9 @@ LIVE_IQ_QUEUE_CHUNKS = 2
 INTERMEDIATE_SOURCE_QUEUE_CHUNKS = 2
 IQ_RECORDER_QUEUE_CHUNKS = 2
 INTERMEDIATE_IQ_SAMPLE_RATE = 192_000
-INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ = 18_000.0
+INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ = 8_000.0
 INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB = 70.0
+CHANNEL_IQ_ALIAS_TRANSITION_HZ = 1_000.0
 IQ_RECORDER_RAW_QUEUE_SECONDS = 2.0
 IQ_DOWNLOAD_CHUNK_BYTES = 256 * 1024
 IQ_DOWNLOAD_YIELD_SECONDS = 0.001
@@ -1046,6 +1047,7 @@ def channel_audio_diagnostics(
         center_frequency_hz=center_frequency_hz,
         target_frequency_hz=frequency_hz,
         output_rate=IQ_SAMPLE_RATE,
+        transition_hz=CHANNEL_IQ_ALIAS_TRANSITION_HZ,
     )
     demodulator = ComplexNfmDemodulator()
     channel_iq = channelizer.process_complex(dc_blocker.process(iq))
@@ -1103,28 +1105,29 @@ class FloatFrameBuffer:
             self.clear()
 
 
-def load_web_fallback_audio():
+def load_web_fallback_audio(sample_rate: int = IQ_SAMPLE_RATE):
     audio = load_fallback_audio(None)
-    if audio.sample_rate == IQ_SAMPLE_RATE:
+    if audio.sample_rate == sample_rate:
         return audio
-    resampler = PcmResampler(audio.sample_rate, IQ_SAMPLE_RATE)
+    resampler = PcmResampler(audio.sample_rate, sample_rate)
     pcm = resampler.process(audio.pcm) + resampler.flush()
     return replace(
         audio,
-        sample_rate=IQ_SAMPLE_RATE,
+        sample_rate=sample_rate,
         pcm=pcm,
-        duration_seconds=len(pcm) / 2 / IQ_SAMPLE_RATE,
+        duration_seconds=len(pcm) / 2 / sample_rate,
     )
 
 
 def next_web_fallback_frame(audio, state: WebFallbackPlaybackState, loop_delay_seconds: float) -> bytes:
+    frame_bytes = round(audio.sample_rate * STREAM_FRAME_SECONDS) * 2
     if not audio.pcm:
-        return STREAM_SILENCE_FRAME
+        return b"\x00" * frame_bytes
     output = bytearray()
-    delay_samples = round(max(0.0, loop_delay_seconds) * IQ_SAMPLE_RATE)
-    while len(output) < STREAM_FRAME_BYTES:
+    delay_samples = round(max(0.0, loop_delay_seconds) * audio.sample_rate)
+    while len(output) < frame_bytes:
         if state.delay_samples_remaining > 0:
-            remaining_samples = (STREAM_FRAME_BYTES - len(output)) // 2
+            remaining_samples = (frame_bytes - len(output)) // 2
             silence_samples = min(remaining_samples, state.delay_samples_remaining)
             output.extend(b"\x00\x00" * silence_samples)
             state.delay_samples_remaining -= silence_samples
@@ -1134,7 +1137,7 @@ def next_web_fallback_frame(audio, state: WebFallbackPlaybackState, loop_delay_s
             if delay_samples > 0:
                 state.delay_samples_remaining = delay_samples
                 continue
-        chunk_size = min(STREAM_FRAME_BYTES - len(output), len(audio.pcm) - state.position)
+        chunk_size = min(frame_bytes - len(output), len(audio.pcm) - state.position)
         output.extend(audio.pcm[state.position : state.position + chunk_size])
         state.position += chunk_size
     return bytes(output)
@@ -1707,7 +1710,7 @@ class IcecastStreamWorker:
         }
 
     def add_monitor_source(self, client_id: str) -> WebRtcAudioSource:
-        source = WebRtcAudioSource()
+        source = WebRtcAudioSource(sample_rate=IQ_SAMPLE_RATE)
         with self.lock:
             old_source = self.monitor_sources.pop(client_id, None)
             self.monitor_sources[client_id] = source
@@ -1784,9 +1787,11 @@ class IcecastStreamWorker:
                     center_frequency_hz=batch.center_frequency_hz,
                     target_frequency_hz=int(round(target_frequency_hz)),
                     output_rate=IQ_SAMPLE_RATE,
+                    transition_hz=CHANNEL_IQ_ALIAS_TRANSITION_HZ,
                 )
                 channelizer_key = next_channelizer_key
                 demodulator = ComplexNfmDemodulator()
+                frame_buffer.clear()
             iq = iq_batch_complex(batch)
             audio = demodulator.process(channelizer.process_complex(iq))
             if len(audio) == 0:
@@ -1807,8 +1812,7 @@ class IcecastStreamWorker:
                         station.get("callsign"),
                         ", ".join(changed_effects) or "none",
                     )
-                pcm = float_to_s16(effects.process(frame))
-                self._write_pcm(pcm)
+                self._write_pcm(float_to_s16(effects.process(frame)))
 
     def encoder_group_for(self, config: IcecastConfig) -> "IcecastEncoderGroup":
         key = icecast_encoder_key(config)
@@ -1816,7 +1820,11 @@ class IcecastStreamWorker:
             encoder_group = self.encoder_groups.get(key)
             if encoder_group is not None:
                 return encoder_group
-            encoder_group = IcecastEncoderGroup(key, config)
+            encoder_group = IcecastEncoderGroup(
+                key,
+                config,
+                input_sample_rate=IQ_SAMPLE_RATE,
+            )
             self.encoder_groups[key] = encoder_group
             encoder_group.start()
             LOG.info(
@@ -1916,7 +1924,7 @@ class IcecastStreamWorker:
                 self.eas_error = message
             return
         try:
-            recorder = EasRecorderOutput(next_config)
+            recorder = EasRecorderOutput(next_config, input_sample_rate=IQ_SAMPLE_RATE)
         except Exception as exc:
             LOG.warning(
                 "EAS recorder failed for %s: %s",
@@ -2156,10 +2164,17 @@ class IqRecorderWorker:
 
 
 class IcecastEncoderGroup:
-    def __init__(self, key: tuple[str, int, int], config: IcecastConfig) -> None:
+    def __init__(
+        self,
+        key: tuple[str, int, int],
+        config: IcecastConfig,
+        *,
+        input_sample_rate: int = IQ_SAMPLE_RATE,
+    ) -> None:
         self.key = key
         self.config = config
-        self.encoder = create_audio_encoder(config)
+        self.input_sample_rate = int(input_sample_rate)
+        self.encoder = create_audio_encoder(config, input_sample_rate=self.input_sample_rate)
         self.pcm_queue: queue.Queue[bytes] = queue.Queue(maxsize=64)
         self.outputs: list[IcecastOutputWriter] = []
         self.stop_event = threading.Event()
@@ -2328,7 +2343,7 @@ class WeatherReceiverWorker:
             max_chunks=LIVE_IQ_QUEUE_CHUNKS,
             name=f"receiver:{client_id}",
         )
-        self.source = WebRtcAudioSource()
+        self.source = WebRtcAudioSource(sample_rate=IQ_SAMPLE_RATE)
         self.frequency_hz = validate_receiver_frequency(frequency_hz)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(
@@ -2400,9 +2415,11 @@ class WeatherReceiverWorker:
                     center_frequency_hz=batch.center_frequency_hz,
                     target_frequency_hz=target_frequency_hz,
                     output_rate=IQ_SAMPLE_RATE,
+                    transition_hz=CHANNEL_IQ_ALIAS_TRANSITION_HZ,
                 )
                 channelizer_key = next_channelizer_key
                 demodulator = ComplexNfmDemodulator()
+                frame_buffer.clear()
             else:
                 channelizer.target_frequency_hz = target_frequency_hz
                 channelizer.shifter.offset_hz = float(batch.center_frequency_hz - target_frequency_hz)

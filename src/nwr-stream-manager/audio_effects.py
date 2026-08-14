@@ -219,6 +219,8 @@ def _build_filter(
         return FirFilter(_highpass_kernel(cutoff, sample_rate, taps))
     taps = tap_count_for_sharpness(config.sharpness)
     if kind == "lowpass":
+        if config.frequency >= sample_rate / 2:
+            return None
         return FirFilter(_lowpass_kernel(config.frequency, sample_rate, taps))
     if kind == "notch":
         width = _notch_width(config.sharpness)

@@ -302,14 +302,16 @@ class WebRtcAudioSource:
         low_water_frames: int = WEBRTC_MONITOR_LOW_WATER_FRAMES,
         prebuffer_timeout_seconds: float = WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS,
         refill_timeout_seconds: float = WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS,
+        sample_rate: int = IQ_SAMPLE_RATE,
     ) -> None:
+        self.sample_rate = max(1, int(sample_rate))
         self.max_frames = max(1, int(max_frames))
         self.prebuffer_frames = max(0, min(int(prebuffer_frames), self.max_frames))
         self.target_latency_frames = max(1, min(int(target_latency_frames), self.max_frames))
         self.low_water_frames = max(0, min(int(low_water_frames), self.max_frames))
         self.prebuffer_timeout_seconds = max(0.0, float(prebuffer_timeout_seconds))
         self.refill_timeout_seconds = max(0.0, float(refill_timeout_seconds))
-        self.frame_bytes = round(IQ_SAMPLE_RATE * WEBRTC_FRAME_SECONDS) * 2
+        self.frame_bytes = round(self.sample_rate * WEBRTC_FRAME_SECONDS) * 2
         self.buffer: deque[bytes] = deque()
         self.lock = threading.Lock()
         self.closed = threading.Event()
@@ -393,6 +395,7 @@ class WebRtcAudioSource:
                 "prebuffer_frames": self.prebuffer_frames,
                 "target_latency_frames": self.target_latency_frames,
                 "low_water_frames": self.low_water_frames,
+                "sample_rate": self.sample_rate,
                 "pushed_frames": self.pushed_frames,
                 "read_frames": self.read_frames,
                 "dropped_frames": self.dropped_frames,
@@ -482,7 +485,10 @@ def create_webrtc_pcm_audio_track(source: WebRtcAudioSource):
         def __init__(self, audio_source: WebRtcAudioSource) -> None:
             super().__init__()
             self._source = audio_source
-            self._resampler = PcmResampler(IQ_SAMPLE_RATE, WEBRTC_OPUS_SAMPLE_RATE)
+            self._resampler = PcmResampler(
+                getattr(audio_source, "sample_rate", IQ_SAMPLE_RATE),
+                WEBRTC_OPUS_SAMPLE_RATE,
+            )
             self._pending = bytearray()
             self._pts = 0
             self._started_at: float | None = None
