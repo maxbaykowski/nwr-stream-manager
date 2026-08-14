@@ -162,6 +162,9 @@ class DspTests(unittest.TestCase):
             with self.subTest(output_rate=output_rate):
                 decimator = self.dsp.create_decimator(1_536_000, output_rate)
                 self.assertNotIsInstance(decimator, self.dsp.StagedDecimator)
+                taps = getattr(getattr(decimator, "fir", None), "taps", None)
+                self.assertIsNotNone(taps)
+                self.assertLess(taps.size, 1_000)
                 samples = np.ones(4096, dtype=np.complex64)
                 output = decimator.process(samples)
                 self.assertGreater(output.size, 0)

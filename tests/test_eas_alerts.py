@@ -40,6 +40,7 @@ class EasAlertTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.web_control = load_web_control_module()
         cls.config = importlib.import_module("nwr_stream_manager.config")
+        cls.audio_effects = importlib.import_module("nwr_stream_manager.audio_effects")
 
     def test_alert_summary_uses_same_event_lookup(self) -> None:
         alert = {
@@ -927,6 +928,41 @@ class EasAlertTests(unittest.TestCase):
         self.assertIs(processor.deemphasis, deemphasis)
         self.assertIs(processor.deemphasis_makeup, deemphasis_makeup)
 
+    def test_audio_dc_blocker_tracks_dc_without_damaging_audio_tone(self) -> None:
+        sample_rate = 24_000
+        blocker = self.audio_effects.DcBlocker(sample_rate=sample_rate)
+        time_axis = np.arange(sample_rate, dtype=np.float32) / sample_rate
+        tone = (0.5 + 0.25 * np.sin(2.0 * np.pi * 1000.0 * time_axis)).astype(np.float32)
+
+        output = np.concatenate(
+            [
+                blocker.process(tone[index : index + 480])
+                for index in range(0, tone.size, 480)
+            ]
+        )
+
+        settled = output[-4800:]
+        self.assertLess(abs(float(np.mean(settled))), 0.02)
+        self.assertGreater(float(np.max(settled) - np.min(settled)), 0.45)
+
+    def test_audio_dc_blocker_does_not_step_at_frame_boundaries(self) -> None:
+        sample_rate = 24_000
+        frame_samples = 480
+        blocker = self.audio_effects.DcBlocker(sample_rate=sample_rate)
+        samples = np.full(frame_samples * 3, 0.5, dtype=np.float32)
+
+        output = np.concatenate(
+            [
+                blocker.process(samples[index : index + frame_samples])
+                for index in range(0, samples.size, frame_samples)
+            ]
+        )
+        differences = np.abs(np.diff(output))
+        boundary_difference = float(differences[frame_samples - 1])
+
+        self.assertLess(boundary_difference, 0.01)
+        self.assertLess(boundary_difference, float(np.max(differences[: frame_samples - 1])) * 2.0)
+
     def test_deemphasis_makeup_gain_increases_with_time_constant(self) -> None:
         self.assertLess(
             self.web_control.deemphasis_makeup_gain(0),
@@ -1208,6 +1244,78 @@ class EasAlertTests(unittest.TestCase):
                     worker.stop()
                     self.assertEqual(output_path.stat().st_size % 8, 0)
 
+    def test_intermediate_iq_fanout_decimates_once_for_multiple_channel_subscribers(self) -> None:
+        web_control = self.web_control
+
+        class RawFanout:
+            def __init__(self):
+                self.queue = web_control.queue.Queue(maxsize=8)
+
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return self.queue
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        raw_fanout = RawFanout()
+        intermediate = web_control.IntermediateIqFanout(raw_fanout)
+        first = intermediate.subscribe(max_chunks=4, name="first-channel")
+        second = intermediate.subscribe(max_chunks=4, name="second-channel")
+        input_rate = web_control.DEFAULT_RTL_SAMPLE_RATE
+        decimator = web_control.create_decimator(
+            input_rate,
+            web_control.INTERMEDIATE_IQ_SAMPLE_RATE,
+            transition_hz=web_control.INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
+            attenuation_db=web_control.INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+        )
+        self.assertLess(decimator.fir.taps.size, 1_000)
+        iq = np.exp(1j * 2 * np.pi * 1000 * np.arange(65_536, dtype=np.float32) / input_rate).astype(np.complex64)
+        raw = self._complex_to_rtl_u8(iq)
+        intermediate.start()
+        raw_fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=input_rate, center_frequency_hz=162_475_000))
+        try:
+            first_batch = first.get(timeout=2.0)
+            second_batch = second.get(timeout=2.0)
+        finally:
+            intermediate.stop()
+
+        self.assertEqual(first_batch.sample_rate, 192_000)
+        self.assertEqual(second_batch.sample_rate, 192_000)
+        np.testing.assert_array_equal(first_batch.data, second_batch.data)
+        self.assertEqual(intermediate.stats()["output_batches"], 1)
+
+    def test_intermediate_iq_fanout_slow_subscriber_keeps_latest_batch(self) -> None:
+        web_control = self.web_control
+
+        class RawFanout:
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return web_control.queue.Queue(maxsize=max_chunks)
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        intermediate = web_control.IntermediateIqFanout(RawFanout())
+        subscriber = intermediate.subscribe(max_chunks=1, name="slow-channel")
+        first = web_control.IqSampleBatch(
+            data=np.array([1 + 0j], dtype=np.complex64),
+            sample_rate=192_000,
+            center_frequency_hz=162_475_000,
+        )
+        second = web_control.IqSampleBatch(
+            data=np.array([2 + 0j], dtype=np.complex64),
+            sample_rate=192_000,
+            center_frequency_hz=162_475_000,
+        )
+
+        intermediate._publish(first)
+        intermediate._publish(second)
+
+        latest = subscriber.get_nowait()
+        self.assertEqual(latest.data[0], np.complex64(2 + 0j))
+        stats = intermediate.subscriber_stats(subscriber)
+        self.assertEqual(stats["queue_capacity"], 1)
+        self.assertEqual(stats["dropped_batches"], 1)
+
     def test_iq_recorder_writes_stream_channel_cf32_from_synthetic_rtl_iq(self) -> None:
         web_control = self.web_control
 
@@ -1279,6 +1387,16 @@ class EasAlertTests(unittest.TestCase):
             with path.open("rb") as source:
                 unsigned = b"".join(web_control.convert_iq_recording_chunks(source, "u8"))
             self.assertEqual(np.frombuffer(unsigned, dtype=np.uint8).tolist(), [0, 128, 255, 191])
+            sleeps = []
+            original_sleep = web_control.time.sleep
+            web_control.time.sleep = lambda seconds: sleeps.append(seconds)
+            try:
+                with path.open("rb") as source:
+                    complex_float = b"".join(web_control.convert_iq_recording_chunks(source, "cf"))
+            finally:
+                web_control.time.sleep = original_sleep
+            self.assertEqual(complex_float, floats.tobytes())
+            self.assertEqual(sleeps, [web_control.IQ_DOWNLOAD_YIELD_SECONDS])
             recording = {
                 "sample_rate": 240000,
                 "frequency_hz": 162475000,

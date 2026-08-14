@@ -13,6 +13,7 @@ MIN_FILTER_TAPS = 5
 MIN_HIGHPASS_FILTER_TAPS = 513
 MAX_FILTER_TAPS = 1025
 DC_BLOCK_CUTOFF_HZ = 20.0
+DC_BLOCK_VECTOR_CHUNK_SAMPLES = 4096
 BASE_DEEMPHASIS_MAKEUP_GAIN = 1.0
 MAX_DEEMPHASIS_MAKEUP_GAIN = 2.2
 
@@ -55,28 +56,35 @@ class FirFilter:
 class DcBlocker:
     sample_rate: int = IQ_SAMPLE_RATE
     cutoff_hz: float = DC_BLOCK_CUTOFF_HZ
-    _previous_input: float = 0.0
-    _previous_output: float = 0.0
+    _mean: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.sample_rate <= 0:
+            raise ValueError("sample_rate must be greater than 0")
+        if self.cutoff_hz <= 0:
+            raise ValueError("cutoff_hz must be greater than 0")
         self.coefficient = float(np.exp(-2.0 * np.pi * self.cutoff_hz / self.sample_rate))
 
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         if len(samples) == 0:
             return samples
+        samples = samples.astype(np.float32, copy=False)
+        if len(samples) <= DC_BLOCK_VECTOR_CHUNK_SAMPLES:
+            return self._process_vector_chunk(samples)
         output = np.empty_like(samples, dtype=np.float32)
-        previous_input = self._previous_input
-        previous_output = self._previous_output
-        coefficient = self.coefficient
-        for index, sample in enumerate(samples):
-            current = float(sample)
-            filtered = current - previous_input + coefficient * previous_output
-            output[index] = filtered
-            previous_input = current
-            previous_output = filtered
-        self._previous_input = previous_input
-        self._previous_output = previous_output
+        for start in range(0, len(samples), DC_BLOCK_VECTOR_CHUNK_SAMPLES):
+            stop = min(start + DC_BLOCK_VECTOR_CHUNK_SAMPLES, len(samples))
+            output[start:stop] = self._process_vector_chunk(samples[start:stop])
         return output
+
+    def _process_vector_chunk(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
+        indices = np.arange(len(samples), dtype=np.float64)
+        powers = self.coefficient**indices
+        weighted = np.cumsum(samples.astype(np.float64, copy=False) / powers)
+        means = (self.coefficient ** (indices + 1.0)) * self._mean
+        means += (1.0 - self.coefficient) * powers * weighted
+        self._mean = float(means[-1])
+        return (samples - means).astype(np.float32, copy=False)
 
 
 @dataclass

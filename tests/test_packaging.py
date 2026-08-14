@@ -97,6 +97,15 @@ class PackagingTests(unittest.TestCase):
 
         self.assertIn("include packaging/systemd/*.service", manifest)
 
+    def test_iq_download_does_not_navigate_management_page(self) -> None:
+        script = self.web_control.INDEX_HTML
+        start = script.index("async function downloadSelectedIqRecording()")
+        end = script.index("function updateDashboard", start)
+        download_function = script[start:end]
+
+        self.assertIn("startBackgroundDownload", download_function)
+        self.assertNotIn("window.location.href", download_function)
+
 
 if __name__ == "__main__":
     unittest.main()

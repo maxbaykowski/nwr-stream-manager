@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hmac
 import hashlib
+from http.cookies import SimpleCookie
 import json
 import logging
 import math
@@ -9,8 +13,10 @@ import mimetypes
 import os
 import queue
 import re
+import secrets
 import signal
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -18,7 +24,7 @@ import time
 import uuid
 import zipfile
 from collections import deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -136,6 +142,22 @@ LOG = logging.getLogger(__name__)
 STATE_DIRECTORY_NAME = "nwr-stream-manager"
 STATE_FILE_NAME = "rtl-control.json"
 LOG_FILE_NAME = "nwr-stream-manager.log"
+ACCOUNTS_DATABASE_FILE_NAME = "accounts.db"
+AUTH_REALM = "NWR Stream Manager"
+AUTH_SESSION_COOKIE_NAME = "nwrstmgr_session"
+AUTH_SESSION_SECONDS = 12 * 60 * 60
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+PASSWORD_RE = re.compile(r"^[!-~]{8,256}$")
+SCRYPT_N = 16_384
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_DKLEN = 32
+PASSWORD_HASH_SCHEME = "scrypt"
+PASSWORD_HASH_VERSION = 1
+ACCOUNT_ROLE_OWNER = "owner"
+ACCOUNT_ROLE_ADMIN = "administrator"
+ACCOUNT_ROLE_READ_ONLY = "read_only"
+ACCOUNT_ROLES = {ACCOUNT_ROLE_OWNER, ACCOUNT_ROLE_ADMIN, ACCOUNT_ROLE_READ_ONLY}
 STREAMS_STATE_FILE_NAME = "streams.json"
 STREAMS_DIRECTORY_NAME = "streams"
 STREAM_CONFIG_FILE_NAME = "config.json"
@@ -179,10 +201,18 @@ STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
 STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
-STREAM_WORKER_RAW_QUEUE_SECONDS = 0.75
+STREAM_WORKER_RAW_QUEUE_SECONDS = 1.50
 STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS = 8
-STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 64
-IQ_RECORDER_RAW_QUEUE_SECONDS = 1.0
+STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 96
+LIVE_IQ_QUEUE_CHUNKS = 2
+INTERMEDIATE_SOURCE_QUEUE_CHUNKS = 2
+IQ_RECORDER_QUEUE_CHUNKS = 2
+INTERMEDIATE_IQ_SAMPLE_RATE = 192_000
+INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ = 18_000.0
+INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB = 70.0
+IQ_RECORDER_RAW_QUEUE_SECONDS = 2.0
+IQ_DOWNLOAD_CHUNK_BYTES = 256 * 1024
+IQ_DOWNLOAD_YIELD_SECONDS = 0.001
 IQ_RECORDER_MODE_STREAM = "stream"
 IQ_RECORDER_MODE_SPECTRUM = "spectrum"
 IQ_RECORDER_SAMPLE_RATES = (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_000, DEFAULT_RTL_SAMPLE_RATE)
@@ -273,6 +303,14 @@ class WebEasRecordingSettings:
     post_seconds: float = 5.0
     max_seconds: int = 120
     format: str = "wav"
+
+
+@dataclass(frozen=True)
+class IqSampleBatch:
+    data: ComplexArray
+    sample_rate: int
+    center_frequency_hz: int
+    captured_at: float = field(default_factory=time.monotonic)
 
 
 class RingLogHandler(logging.Handler):
@@ -684,6 +722,204 @@ class RawRtlFanout:
             )
 
 
+class IntermediateIqFanout:
+    def __init__(self, raw_fanout: RawRtlFanout, output_rate: int = INTERMEDIATE_IQ_SAMPLE_RATE) -> None:
+        self.raw_fanout = raw_fanout
+        self.output_rate = int(output_rate)
+        self.raw_queue = subscribe_raw_fanout(
+            raw_fanout,
+            max_chunks=INTERMEDIATE_SOURCE_QUEUE_CHUNKS,
+            name="iq-intermediate-source",
+        )
+        self.subscribers: set[queue.Queue] = set()
+        self.subscriber_names: dict[queue.Queue, str] = {}
+        self.subscriber_drops: dict[queue.Queue, int] = {}
+        self.subscriber_drop_samples: dict[queue.Queue, int] = {}
+        self.subscriber_max_depth: dict[queue.Queue, int] = {}
+        self.subscribers_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.read_batches = 0
+        self.read_samples = 0
+        self.output_batches = 0
+        self.output_samples = 0
+        self.total_dropped_batches = 0
+        self.total_dropped_samples = 0
+        self.last_output_at = 0.0
+        self.last_drop_log_at = 0.0
+
+    def subscribe(
+        self,
+        max_chunks: int | None = None,
+        max_seconds: float | None = None,
+        name: str = "subscriber",
+    ) -> queue.Queue:
+        if max_chunks is None:
+            max_chunks = max(
+                STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS,
+                min(STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS, int(math.ceil((max_seconds or STREAM_WORKER_RAW_QUEUE_SECONDS) / 0.02))),
+            )
+        subscriber: queue.Queue = queue.Queue(maxsize=max_chunks)
+        with self.subscribers_lock:
+            self.subscribers.add(subscriber)
+            self.subscriber_names[subscriber] = name
+            self.subscriber_drops[subscriber] = 0
+            self.subscriber_drop_samples[subscriber] = 0
+            self.subscriber_max_depth[subscriber] = 0
+        return subscriber
+
+    def unsubscribe(self, subscriber: queue.Queue) -> None:
+        with self.subscribers_lock:
+            self.subscribers.discard(subscriber)
+            self.subscriber_names.pop(subscriber, None)
+            self.subscriber_drops.pop(subscriber, None)
+            self.subscriber_drop_samples.pop(subscriber, None)
+            self.subscriber_max_depth.pop(subscriber, None)
+
+    def start(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, name="iq-intermediate-fanout", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.raw_fanout.unsubscribe(self.raw_queue)
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+
+    def stats(self) -> dict[str, Any]:
+        with self.subscribers_lock:
+            subscribers = [self._subscriber_stats_locked(subscriber) for subscriber in self.subscribers]
+            return {
+                "sample_rate": self.output_rate,
+                "read_batches": self.read_batches,
+                "read_samples": self.read_samples,
+                "output_batches": self.output_batches,
+                "output_samples": self.output_samples,
+                "subscriber_count": len(self.subscribers),
+                "total_dropped_batches": self.total_dropped_batches,
+                "total_dropped_samples": self.total_dropped_samples,
+                "last_output_age_seconds": (
+                    round(time.monotonic() - self.last_output_at, 3)
+                    if self.last_output_at
+                    else None
+                ),
+                "subscribers": subscribers,
+            }
+
+    def subscriber_stats(self, subscriber: queue.Queue | None) -> dict[str, Any]:
+        if subscriber is None:
+            return {}
+        with self.subscribers_lock:
+            return self._subscriber_stats_locked(subscriber)
+
+    def _run(self) -> None:
+        dc_blocker: IqDcBlocker | None = None
+        decimator = None
+        decimator_key: tuple[int, int] | None = None
+        while not self.stop_event.is_set():
+            try:
+                raw_batch: RtlSampleBatch = self.raw_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                LOG.warning("intermediate IQ fanout failed to read RTL-SDR samples: %s", exc)
+                continue
+            key = (raw_batch.sample_rate, self.output_rate)
+            if decimator is None or decimator_key != key:
+                dc_blocker = IqDcBlocker(raw_batch.sample_rate)
+                decimator = create_decimator(
+                    raw_batch.sample_rate,
+                    self.output_rate,
+                    transition_hz=INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
+                    attenuation_db=INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                )
+                decimator_key = key
+            iq = rtl_u8_to_complex64(raw_batch.data)
+            if iq.size == 0:
+                continue
+            if dc_blocker is None:
+                dc_blocker = IqDcBlocker(raw_batch.sample_rate)
+            output = decimator.process(dc_blocker.process(iq))
+            with self.subscribers_lock:
+                self.read_batches += 1
+                self.read_samples += int(iq.size)
+            if output.size == 0:
+                continue
+            batch = IqSampleBatch(
+                data=output,
+                sample_rate=self.output_rate,
+                center_frequency_hz=raw_batch.center_frequency_hz,
+                captured_at=raw_batch.captured_at,
+            )
+            self._publish(batch)
+
+    def _publish(self, batch: IqSampleBatch) -> None:
+        with self.subscribers_lock:
+            subscribers = list(self.subscribers)
+            self.output_batches += 1
+            self.output_samples += int(batch.data.size)
+            self.last_output_at = time.monotonic()
+        for subscriber in subscribers:
+            try:
+                subscriber.put_nowait(batch)
+                self._record_subscriber_depth(subscriber)
+            except queue.Full:
+                try:
+                    subscriber.get_nowait()
+                except queue.Empty:
+                    pass
+                self._record_subscriber_drop(subscriber, batch)
+                try:
+                    subscriber.put_nowait(batch)
+                    self._record_subscriber_depth(subscriber)
+                except queue.Full:
+                    self._record_subscriber_drop(subscriber, batch)
+
+    def _subscriber_stats_locked(self, subscriber: queue.Queue) -> dict[str, Any]:
+        return {
+            "name": self.subscriber_names.get(subscriber, "subscriber"),
+            "queue_depth": subscriber.qsize(),
+            "queue_capacity": subscriber.maxsize,
+            "max_queue_depth": self.subscriber_max_depth.get(subscriber, 0),
+            "dropped_batches": self.subscriber_drops.get(subscriber, 0),
+            "dropped_samples": self.subscriber_drop_samples.get(subscriber, 0),
+        }
+
+    def _record_subscriber_depth(self, subscriber: queue.Queue) -> None:
+        with self.subscribers_lock:
+            if subscriber not in self.subscribers:
+                return
+            self.subscriber_max_depth[subscriber] = max(
+                self.subscriber_max_depth.get(subscriber, 0),
+                subscriber.qsize(),
+            )
+
+    def _record_subscriber_drop(self, subscriber: queue.Queue, batch: IqSampleBatch) -> None:
+        with self.subscribers_lock:
+            if subscriber not in self.subscribers:
+                return
+            self.subscriber_drops[subscriber] = self.subscriber_drops.get(subscriber, 0) + 1
+            self.subscriber_drop_samples[subscriber] = self.subscriber_drop_samples.get(subscriber, 0) + int(batch.data.size)
+            self.total_dropped_batches += 1
+            self.total_dropped_samples += int(batch.data.size)
+            name = self.subscriber_names.get(subscriber, "subscriber")
+            drops = self.subscriber_drops[subscriber]
+            now = time.monotonic()
+            should_log = now - self.last_drop_log_at >= 60.0
+            if should_log:
+                self.last_drop_log_at = now
+        if should_log:
+            LOG.warning(
+                "intermediate IQ fanout is dropping batches for %s: subscriber_drops=%s total_drops=%s",
+                name,
+                drops,
+                self.total_dropped_batches,
+            )
+
+
 def subscribe_raw_fanout(
     fanout,
     *,
@@ -695,6 +931,13 @@ def subscribe_raw_fanout(
         return fanout.subscribe(max_chunks=max_chunks, max_seconds=max_seconds, name=name)
     except TypeError:
         return fanout.subscribe(max_chunks=max_chunks, max_seconds=max_seconds)
+
+
+def iq_batch_complex(batch: RtlSampleBatch | IqSampleBatch) -> ComplexArray:
+    data = batch.data
+    if isinstance(data, np.ndarray):
+        return data.astype(np.complex64, copy=False)
+    return rtl_u8_to_complex64(data)
 
 
 class ComplexNfmDemodulator:
@@ -897,12 +1140,471 @@ def next_web_fallback_frame(audio, state: WebFallbackPlaybackState, loop_delay_s
     return bytes(output)
 
 
+def validate_account_username(username: str) -> str:
+    username = str(username).strip()
+    if not USERNAME_RE.fullmatch(username):
+        raise ValueError("username may contain only letters, numbers, hyphen, and underscore")
+    return username
+
+
+def validate_account_password(password: str) -> str:
+    password = str(password)
+    if not PASSWORD_RE.fullmatch(password):
+        raise ValueError("password must be 8-256 printable non-space ASCII characters")
+    return password
+
+
+def hash_account_password(password: str) -> str:
+    password = validate_account_password(password)
+    salt = os.urandom(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+        dklen=SCRYPT_DKLEN,
+    )
+    return "scrypt$v={}$n={}$r={}$p={}$dklen={}$salt={}$hash={}".format(
+        PASSWORD_HASH_VERSION,
+        SCRYPT_N,
+        SCRYPT_R,
+        SCRYPT_P,
+        SCRYPT_DKLEN,
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"),
+    )
+
+
+def parse_account_password_hash(encoded_hash: str) -> dict[str, Any]:
+    parts = str(encoded_hash).split("$")
+    if not parts or parts[0] != PASSWORD_HASH_SCHEME:
+        raise ValueError("unsupported password hash scheme")
+    if len(parts) == 6:
+        _scheme, n_raw, r_raw, p_raw, salt_raw, digest_raw = parts
+        return {
+            "scheme": PASSWORD_HASH_SCHEME,
+            "version": 0,
+            "n": int(n_raw),
+            "r": int(r_raw),
+            "p": int(p_raw),
+            "dklen": None,
+            "salt": base64.b64decode(salt_raw.encode("ascii"), validate=True),
+            "digest": base64.b64decode(digest_raw.encode("ascii"), validate=True),
+        }
+    values: dict[str, str] = {}
+    for part in parts[1:]:
+        key, separator, value = part.partition("=")
+        if not separator:
+            raise ValueError("invalid password hash parameter")
+        values[key] = value
+    required = {"v", "n", "r", "p", "dklen", "salt", "hash"}
+    if set(values) != required:
+        raise ValueError("invalid password hash parameters")
+    return {
+        "scheme": PASSWORD_HASH_SCHEME,
+        "version": int(values["v"]),
+        "n": int(values["n"]),
+        "r": int(values["r"]),
+        "p": int(values["p"]),
+        "dklen": int(values["dklen"]),
+        "salt": base64.b64decode(values["salt"].encode("ascii"), validate=True),
+        "digest": base64.b64decode(values["hash"].encode("ascii"), validate=True),
+    }
+
+
+def account_password_hash_needs_upgrade(encoded_hash: str) -> bool:
+    try:
+        parsed = parse_account_password_hash(encoded_hash)
+    except (TypeError, ValueError, binascii.Error):
+        return True
+    return (
+        int(parsed["version"]) < PASSWORD_HASH_VERSION
+        or int(parsed["n"]) < SCRYPT_N
+        or int(parsed["r"]) < SCRYPT_R
+        or int(parsed["p"]) < SCRYPT_P
+        or int(parsed["dklen"] or len(parsed["digest"])) < SCRYPT_DKLEN
+    )
+
+
+def verify_account_password(password: str, encoded_hash: str) -> bool:
+    try:
+        parsed = parse_account_password_hash(encoded_hash)
+        expected = parsed["digest"]
+        digest = hashlib.scrypt(
+            str(password).encode("utf-8"),
+            salt=parsed["salt"],
+            n=int(parsed["n"]),
+            r=int(parsed["r"]),
+            p=int(parsed["p"]),
+            dklen=len(expected),
+        )
+    except (TypeError, ValueError, binascii.Error):
+        return False
+    return hmac.compare_digest(digest, expected)
+
+
+@dataclass(frozen=True)
+class AccountRecord:
+    id: int
+    username: str
+    role: str
+    must_change_password: bool
+    created_at: float
+    last_accessed_at: float | None
+
+    @property
+    def is_owner(self) -> bool:
+        return self.role == ACCOUNT_ROLE_OWNER
+
+    @property
+    def is_read_only(self) -> bool:
+        return self.role == ACCOUNT_ROLE_READ_ONLY
+
+    def to_public_dict(self) -> dict[str, Any]:
+        if self.role == ACCOUNT_ROLE_OWNER:
+            account_type = "Owner"
+        elif self.role == ACCOUNT_ROLE_READ_ONLY:
+            account_type = "Read-only"
+        else:
+            account_type = "Administrator"
+        return {
+            "id": self.id,
+            "username": self.username,
+            "role": self.role,
+            "account_type": account_type,
+            "read_only": self.is_read_only,
+            "owner": self.is_owner,
+            "must_change_password": self.must_change_password,
+            "created_at": self.created_at,
+            "last_accessed_at": self.last_accessed_at,
+        }
+
+
+@dataclass
+class AuthSession:
+    account_id: int
+    expires_at: float
+
+
+class AccountStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        self._ensure_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _ensure_schema(self) -> None:
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'accounts'"
+            ).fetchone()
+            existing_sql = str(row["sql"]) if row is not None else ""
+            if row is not None and ("CHECK (id = 1)" in existing_sql or "role" not in existing_sql):
+                connection.execute("ALTER TABLE accounts RENAME TO accounts_legacy")
+                connection.execute(
+                    """
+                    CREATE TABLE accounts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL UNIQUE,
+                        password TEXT NOT NULL,
+                        role TEXT NOT NULL DEFAULT 'administrator',
+                        must_change_password INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL DEFAULT 0,
+                        last_accessed_at REAL
+                    )
+                    """
+                )
+                now = time.time()
+                connection.execute(
+                    """
+                    INSERT INTO accounts (id, username, password, role, must_change_password, created_at, last_accessed_at)
+                    SELECT id, username, password, 'owner', must_change_password, ?, NULL FROM accounts_legacy
+                    """,
+                    (now,),
+                )
+                connection.execute("DROP TABLE accounts_legacy")
+                connection.commit()
+                return
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE,
+                    password TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'administrator',
+                    must_change_password INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL DEFAULT 0,
+                    last_accessed_at REAL
+                )
+                """
+            )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(accounts)").fetchall()}
+            if "role" not in columns:
+                connection.execute("ALTER TABLE accounts ADD COLUMN role TEXT NOT NULL DEFAULT 'administrator'")
+            if "created_at" not in columns:
+                connection.execute("ALTER TABLE accounts ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
+                connection.execute("UPDATE accounts SET created_at = ? WHERE created_at = 0", (time.time(),))
+            if "last_accessed_at" not in columns:
+                connection.execute("ALTER TABLE accounts ADD COLUMN last_accessed_at REAL")
+            owner = connection.execute("SELECT id FROM accounts WHERE role = ? LIMIT 1", (ACCOUNT_ROLE_OWNER,)).fetchone()
+            first = connection.execute("SELECT id FROM accounts ORDER BY id LIMIT 1").fetchone()
+            if owner is None and first is not None:
+                connection.execute("UPDATE accounts SET role = ? WHERE id = ?", (ACCOUNT_ROLE_OWNER, int(first["id"])))
+            connection.commit()
+
+    def _row_to_record(self, row: sqlite3.Row | None) -> AccountRecord | None:
+        if row is None:
+            return None
+        role = str(row["role"] or ACCOUNT_ROLE_ADMIN)
+        if role not in ACCOUNT_ROLES:
+            role = ACCOUNT_ROLE_ADMIN
+        last_accessed_at = row["last_accessed_at"]
+        return AccountRecord(
+            id=int(row["id"]),
+            username=str(row["username"]),
+            role=role,
+            must_change_password=bool(row["must_change_password"]),
+            created_at=float(row["created_at"] or 0.0),
+            last_accessed_at=float(last_accessed_at) if last_accessed_at is not None else None,
+        )
+
+    def has_account(self) -> bool:
+        with self.lock, self._connect() as connection:
+            row = connection.execute("SELECT 1 FROM accounts LIMIT 1").fetchone()
+            return row is not None
+
+    def create_admin(self, username: str, password: str, confirm_password: str) -> None:
+        username = validate_account_username(username)
+        password = validate_account_password(password)
+        if password != str(confirm_password):
+            raise ValueError("passwords do not match")
+        password_hash = hash_account_password(password)
+        with self.lock, self._connect() as connection:
+            if connection.execute("SELECT 1 FROM accounts LIMIT 1").fetchone() is not None:
+                raise ValueError("an administrator account already exists")
+            connection.execute(
+                """
+                INSERT INTO accounts (username, password, role, must_change_password, created_at)
+                VALUES (?, ?, ?, 0, ?)
+                """,
+                (username, password_hash, ACCOUNT_ROLE_OWNER, time.time()),
+            )
+            connection.commit()
+
+    def _generate_secret(self) -> str:
+        return secrets.token_urlsafe(12)
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        with self.lock, self._connect() as connection:
+            rows = connection.execute("SELECT * FROM accounts ORDER BY id").fetchall()
+            return [record.to_public_dict() for row in rows if (record := self._row_to_record(row)) is not None]
+
+    def account_by_id(self, account_id: int) -> AccountRecord | None:
+        with self.lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(account_id),)).fetchone()
+            return self._row_to_record(row)
+
+    def create_account(self, username: str, read_only: bool) -> tuple[dict[str, Any], str]:
+        username = validate_account_username(username)
+        secret = self._generate_secret()
+        role = ACCOUNT_ROLE_READ_ONLY if read_only else ACCOUNT_ROLE_ADMIN
+        with self.lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO accounts (username, password, role, must_change_password, created_at)
+                VALUES (?, ?, ?, 1, ?)
+                """,
+                (username, hash_account_password(secret), role, time.time()),
+            )
+            row = connection.execute("SELECT * FROM accounts WHERE username = ? LIMIT 1", (username,)).fetchone()
+            connection.commit()
+            record = self._row_to_record(row)
+            if record is None:
+                raise ValueError("account could not be created")
+            return record.to_public_dict(), secret
+
+    def reset_password(self, account_id: int) -> tuple[dict[str, Any], str]:
+        secret = self._generate_secret()
+        with self.lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(account_id),)).fetchone()
+            if row is None:
+                raise ValueError("account was not found")
+            connection.execute(
+                "UPDATE accounts SET password = ?, must_change_password = 1 WHERE id = ?",
+                (hash_account_password(secret), int(account_id)),
+            )
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(account_id),)).fetchone()
+            connection.commit()
+            record = self._row_to_record(row)
+            if record is None:
+                raise ValueError("account was not found")
+            return record.to_public_dict(), secret
+
+    def set_read_only(self, account_id: int, read_only: bool) -> dict[str, Any]:
+        with self.lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(account_id),)).fetchone()
+            record = self._row_to_record(row)
+            if record is None:
+                raise ValueError("account was not found")
+            if record.is_owner:
+                raise ValueError("the owner account cannot be made read-only")
+            role = ACCOUNT_ROLE_READ_ONLY if read_only else ACCOUNT_ROLE_ADMIN
+            connection.execute("UPDATE accounts SET role = ? WHERE id = ?", (role, record.id))
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (record.id,)).fetchone()
+            connection.commit()
+            updated = self._row_to_record(row)
+            if updated is None:
+                raise ValueError("account was not found")
+            return updated.to_public_dict()
+
+    def delete_account(self, account_id: int, requester_id: int) -> dict[str, Any]:
+        with self.lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(account_id),)).fetchone()
+            record = self._row_to_record(row)
+            if record is None:
+                raise ValueError("account was not found")
+            if record.is_owner:
+                raise ValueError("the owner account cannot be deleted")
+            if record.id == int(requester_id):
+                raise ValueError("you cannot delete the account you are using")
+            connection.execute("DELETE FROM accounts WHERE id = ?", (record.id,))
+            connection.commit()
+            return record.to_public_dict()
+
+    def change_password(self, account_id: int, current_password: str, new_password: str, confirm_password: str) -> dict[str, Any]:
+        new_password = validate_account_password(new_password)
+        if new_password != str(confirm_password):
+            raise ValueError("passwords do not match")
+        with self.lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(account_id),)).fetchone()
+            record = self._row_to_record(row)
+            if record is None:
+                raise ValueError("account was not found")
+            if not verify_account_password(str(current_password), str(row["password"])):
+                raise ValueError("current password is incorrect")
+            connection.execute(
+                "UPDATE accounts SET password = ?, must_change_password = 0 WHERE id = ?",
+                (hash_account_password(new_password), record.id),
+            )
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (record.id,)).fetchone()
+            connection.commit()
+            updated = self._row_to_record(row)
+            if updated is None:
+                raise ValueError("account was not found")
+            return updated.to_public_dict()
+
+    def verify_basic_account(self, username: str, password: str) -> AccountRecord | None:
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM accounts WHERE username = ? LIMIT 1",
+                (str(username),),
+            ).fetchone()
+            if row is None:
+                return None
+            password_hash = str(row["password"])
+            if not verify_account_password(password, password_hash):
+                return None
+            if account_password_hash_needs_upgrade(password_hash):
+                connection.execute(
+                    "UPDATE accounts SET password = ? WHERE id = ?",
+                    (hash_account_password(password), int(row["id"])),
+                )
+            connection.execute("UPDATE accounts SET last_accessed_at = ? WHERE id = ?", (time.time(), int(row["id"])))
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(row["id"]),)).fetchone()
+            connection.commit()
+            return self._row_to_record(row)
+
+    def verify_basic_credentials(self, username: str, password: str) -> bool:
+        return self.verify_basic_account(username, password) is not None
+
+    def touch_account_access(self, account_id: int, *, minimum_interval_seconds: float = 300.0) -> None:
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT last_accessed_at FROM accounts WHERE id = ? LIMIT 1",
+                (int(account_id),),
+            ).fetchone()
+            if row is None:
+                return
+            last_accessed_at = row["last_accessed_at"]
+            now = time.time()
+            if last_accessed_at is None or now - float(last_accessed_at) >= minimum_interval_seconds:
+                connection.execute("UPDATE accounts SET last_accessed_at = ? WHERE id = ?", (now, int(account_id)))
+                connection.commit()
+
+
+class AuthSessionStore:
+    def __init__(self, lifetime_seconds: float = AUTH_SESSION_SECONDS) -> None:
+        self.lifetime_seconds = float(lifetime_seconds)
+        self.sessions: dict[str, AuthSession] = {}
+        self.lock = threading.Lock()
+
+    def create(self, account_id: int = 1) -> str:
+        token = secrets.token_urlsafe(32)
+        expires_at = time.time() + self.lifetime_seconds
+        with self.lock:
+            self._prune_locked(time.time())
+            self.sessions[token] = AuthSession(account_id=int(account_id), expires_at=expires_at)
+        return token
+
+    def validate(self, token: str, accounts: AccountStore | None = None) -> AccountRecord | bool | None:
+        token = str(token)
+        now = time.time()
+        with self.lock:
+            session = self.sessions.get(token)
+            if session is None:
+                return False
+            if session.expires_at <= now:
+                self.sessions.pop(token, None)
+                return False
+            session.expires_at = now + self.lifetime_seconds
+            account_id = session.account_id
+        if accounts is None:
+            return True
+        account = accounts.account_by_id(account_id)
+        if account is None:
+            self.invalidate_token(token)
+            return None
+        accounts.touch_account_access(account.id)
+        return account
+
+    def invalidate_token(self, token: str) -> None:
+        with self.lock:
+            self.sessions.pop(str(token), None)
+
+    def invalidate_account(self, account_id: int) -> None:
+        with self.lock:
+            for token, session in list(self.sessions.items()):
+                if session.account_id == int(account_id):
+                    self.sessions.pop(token, None)
+
+    def invalidate_all(self) -> None:
+        with self.lock:
+            self.sessions.clear()
+
+    def cookie_header(self, token: str) -> str:
+        return (
+            f"{AUTH_SESSION_COOKIE_NAME}={token}; "
+            f"Max-Age={int(self.lifetime_seconds)}; Path=/; HttpOnly; SameSite=Lax"
+        )
+
+    def _prune_locked(self, now: float) -> None:
+        for token, session in list(self.sessions.items()):
+            if session.expires_at <= now:
+                self.sessions.pop(token, None)
+
+
 class IcecastStreamWorker:
     def __init__(
         self,
         *,
         stream: dict[str, Any],
-        fanout: RawRtlFanout,
+        fanout: RawRtlFanout | IntermediateIqFanout,
         fallback_settings_provider,
         state_directory: Path,
         storage_monitor: StorageMonitor | None = None,
@@ -916,7 +1618,7 @@ class IcecastStreamWorker:
         stream_label = station.get("callsign") or stream.get("id", "stream")
         self.queue = subscribe_raw_fanout(
             fanout,
-            max_seconds=STREAM_WORKER_RAW_QUEUE_SECONDS,
+            max_chunks=LIVE_IQ_QUEUE_CHUNKS,
             name=f"stream:{stream_label}",
         )
         self.stop_event = threading.Event()
@@ -1031,7 +1733,6 @@ class IcecastStreamWorker:
     def _run_pcm_producer(self) -> None:
         station = self.stream["station"]
         target_frequency_hz = float(station["frequency"]) * 1_000_000
-        dc_blocker: IqDcBlocker | None = None
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int, int] | None = None
         demodulator = ComplexNfmDemodulator()
@@ -1078,7 +1779,6 @@ class IcecastStreamWorker:
                 int(round(target_frequency_hz)),
             )
             if channelizer is None or channelizer_key != next_channelizer_key:
-                dc_blocker = IqDcBlocker(batch.sample_rate)
                 channelizer = IqChannelizer(
                     input_rate=batch.sample_rate,
                     center_frequency_hz=batch.center_frequency_hz,
@@ -1087,10 +1787,8 @@ class IcecastStreamWorker:
                 )
                 channelizer_key = next_channelizer_key
                 demodulator = ComplexNfmDemodulator()
-            iq = rtl_u8_to_complex64(batch.data)
-            if dc_blocker is None:
-                dc_blocker = IqDcBlocker(batch.sample_rate)
-            audio = demodulator.process(channelizer.process_complex(dc_blocker.process(iq)))
+            iq = iq_batch_complex(batch)
+            audio = demodulator.process(channelizer.process_complex(iq))
             if len(audio) == 0:
                 continue
             last_real_audio = time.monotonic()
@@ -1280,7 +1978,7 @@ class IqRecorderWorker:
     def __init__(
         self,
         *,
-        fanout: RawRtlFanout,
+        fanout: RawRtlFanout | IntermediateIqFanout,
         config: IqRecorderConfig,
         storage_monitor: StorageMonitor,
     ) -> None:
@@ -1289,7 +1987,7 @@ class IqRecorderWorker:
         self.storage_monitor = storage_monitor
         self.queue = subscribe_raw_fanout(
             fanout,
-            max_seconds=IQ_RECORDER_RAW_QUEUE_SECONDS,
+            max_chunks=IQ_RECORDER_QUEUE_CHUNKS,
             name=f"iq-recorder:{config.mode}",
         )
         self.stop_event = threading.Event()
@@ -1377,7 +2075,6 @@ class IqRecorderWorker:
     def _run(self) -> None:
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int, int] | None = None
-        dc_blocker: IqDcBlocker | None = None
         decimator = None
         decimator_key: tuple[int, int] | None = None
         try:
@@ -1394,7 +2091,7 @@ class IqRecorderWorker:
                         batch: RtlSampleBatch = self.queue.get(timeout=0.5)
                     except queue.Empty:
                         continue
-                    iq = rtl_u8_to_complex64(batch.data)
+                    iq = iq_batch_complex(batch)
                     if iq.size == 0:
                         continue
                     if self.config.mode == IQ_RECORDER_MODE_STREAM:
@@ -1402,7 +2099,6 @@ class IqRecorderWorker:
                             raise ValueError("stream recording target frequency is missing")
                         next_key = (batch.sample_rate, batch.center_frequency_hz, int(self.config.target_frequency_hz))
                         if channelizer is None or channelizer_key != next_key:
-                            dc_blocker = IqDcBlocker(batch.sample_rate)
                             channelizer = IqChannelizer(
                                 input_rate=batch.sample_rate,
                                 center_frequency_hz=batch.center_frequency_hz,
@@ -1410,9 +2106,7 @@ class IqRecorderWorker:
                                 output_rate=IQ_SAMPLE_RATE,
                             )
                             channelizer_key = next_key
-                        if dc_blocker is None:
-                            dc_blocker = IqDcBlocker(batch.sample_rate)
-                        recorded_iq = channelizer.process_complex(dc_blocker.process(iq))
+                        recorded_iq = channelizer.process_complex(iq)
                     else:
                         if self.config.sample_rate > batch.sample_rate:
                             raise ValueError("recording sample rate is higher than the RTL-SDR sample rate")
@@ -1624,14 +2318,14 @@ class WeatherReceiverWorker:
         self,
         *,
         client_id: str,
-        fanout: RawRtlFanout,
+        fanout: RawRtlFanout | IntermediateIqFanout,
         frequency_hz: int,
     ) -> None:
         self.client_id = client_id
         self.fanout = fanout
         self.queue = subscribe_raw_fanout(
             fanout,
-            max_seconds=STREAM_WORKER_RAW_QUEUE_SECONDS,
+            max_chunks=LIVE_IQ_QUEUE_CHUNKS,
             name=f"receiver:{client_id}",
         )
         self.source = WebRtcAudioSource()
@@ -1685,7 +2379,6 @@ class WeatherReceiverWorker:
             return self.frequency_hz
 
     def _run(self) -> None:
-        dc_blocker: IqDcBlocker | None = None
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int] | None = None
         demodulator = ComplexNfmDemodulator()
@@ -1702,7 +2395,6 @@ class WeatherReceiverWorker:
             target_frequency_hz = self._frequency_hz()
             next_channelizer_key = (batch.sample_rate, batch.center_frequency_hz)
             if channelizer is None or channelizer_key != next_channelizer_key:
-                dc_blocker = IqDcBlocker(batch.sample_rate)
                 channelizer = IqChannelizer(
                     input_rate=batch.sample_rate,
                     center_frequency_hz=batch.center_frequency_hz,
@@ -1714,10 +2406,8 @@ class WeatherReceiverWorker:
             else:
                 channelizer.target_frequency_hz = target_frequency_hz
                 channelizer.shifter.offset_hz = float(batch.center_frequency_hz - target_frequency_hz)
-            iq = rtl_u8_to_complex64(batch.data)
-            if dc_blocker is None:
-                dc_blocker = IqDcBlocker(batch.sample_rate)
-            audio = demodulator.process(channelizer.process_complex(dc_blocker.process(iq)))
+            iq = iq_batch_complex(batch)
+            audio = demodulator.process(channelizer.process_complex(iq))
             if len(audio) == 0:
                 continue
             for frame in frame_buffer.push(audio):
@@ -1734,6 +2424,8 @@ class RtlControlService:
         self.iq_recordings_directory = state_path.parent / IQ_RECORDINGS_DIRECTORY_NAME
         self.iq_recordings_index_path = self.iq_recordings_directory / IQ_RECORDINGS_INDEX_FILE_NAME
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
+        self.accounts = AccountStore(state_path.parent / ACCOUNTS_DATABASE_FILE_NAME)
+        self.auth_sessions = AuthSessionStore()
         self.log_handler = log_handler
         self.storage_monitor = StorageMonitor(
             [state_path.parent],
@@ -1746,14 +2438,21 @@ class RtlControlService:
         self.stations = load_station_database()
         self.capture: RtlCaptureSource | None = None
         self.raw_fanout: RawRtlFanout | None = None
+        self.intermediate_fanout: IntermediateIqFanout | None = None
         self.monitor_queue: queue.Queue | None = None
         self.drain_thread: threading.Thread | None = None
         self.drain_stop = threading.Event()
         self.stream_workers: dict[str, IcecastStreamWorker] = {}
         self.monitor_streams_by_client: dict[str, str] = {}
+        self.monitor_accounts_by_client: dict[str, int] = {}
         self.receiver_workers: dict[str, WeatherReceiverWorker] = {}
+        self.receiver_accounts_by_client: dict[str, int] = {}
         self.iq_recorder: IqRecorderWorker | None = None
+        self.iq_recorder_account_id: int | None = None
         self.iq_recording_downloads: set[str] = set()
+        self.iq_recording_download_accounts: dict[str, int] = {}
+        self.iq_recording_download_recordings: dict[str, str] = {}
+        self.aborted_iq_recording_downloads: set[str] = set()
         self.webrtc_runner = WebRtcAsyncRunner()
         self.webrtc_sessions = AiortcSessionManager()
         self.icecast_auth_cache: dict[str, float] = {}
@@ -1782,6 +2481,57 @@ class RtlControlService:
         self.stop_capture()
         self.storage_monitor.stop()
 
+    def revoke_account_long_lived_resources(
+        self,
+        account_id: int,
+        *,
+        stop_webrtc: bool = False,
+        abort_downloads: bool = False,
+        stop_iq_recording: bool = False,
+    ) -> None:
+        account_id = int(account_id)
+        with self.lock:
+            monitor_client_ids = [
+                client_id for client_id, owner_id in self.monitor_accounts_by_client.items()
+                if owner_id == account_id
+            ] if stop_webrtc else []
+            receiver_client_ids = [
+                client_id for client_id, owner_id in self.receiver_accounts_by_client.items()
+                if owner_id == account_id
+            ] if stop_webrtc else []
+            aborted_downloads = [
+                download_id for download_id, owner_id in self.iq_recording_download_accounts.items()
+                if owner_id == account_id
+            ] if abort_downloads else []
+            if aborted_downloads:
+                self.aborted_iq_recording_downloads.update(aborted_downloads)
+            recorder = self.iq_recorder if stop_iq_recording and self.iq_recorder_account_id == account_id else None
+            if recorder is not None:
+                self.iq_recorder = None
+                self.iq_recorder_account_id = None
+        for client_id in monitor_client_ids:
+            try:
+                self.stop_monitor({"client_id": client_id})
+            except Exception as exc:
+                LOG.debug("failed to stop monitor for revoked account %s client %s: %s", account_id, client_id, exc)
+        for client_id in receiver_client_ids:
+            try:
+                self.stop_receiver({"client_id": client_id})
+            except Exception as exc:
+                LOG.debug("failed to stop receiver for revoked account %s client %s: %s", account_id, client_id, exc)
+        if recorder is not None:
+            recorder.stop()
+            LOG.info("stopped I/Q recording for revoked account %s", account_id)
+        if monitor_client_ids or receiver_client_ids or aborted_downloads or recorder is not None:
+            LOG.info(
+                "revoked long-lived resources for account %s: monitors=%s receivers=%s downloads=%s iq_recorder=%s",
+                account_id,
+                len(monitor_client_ids),
+                len(receiver_client_ids),
+                len(aborted_downloads),
+                recorder is not None,
+            )
+
     def _handle_critical_storage(self, snapshot: dict[str, Any]) -> None:
         message = str(snapshot.get("message") or storage_status_message("critical"))
         with self.lock:
@@ -1801,6 +2551,7 @@ class RtlControlService:
             gain_values = capture.get_gain_values() if capture is not None else []
             capture_stats = capture.stats() if capture is not None else {}
             fanout_stats = self.raw_fanout.stats() if self.raw_fanout is not None else {}
+            intermediate_stats = self.intermediate_fanout.stats() if self.intermediate_fanout is not None else {}
             return {
                 "settings": asdict(settings),
                 "gain_values": gain_values,
@@ -1808,6 +2559,7 @@ class RtlControlService:
                 "capture_error": self.capture_error,
                 "capture_stats": capture_stats,
                 "raw_fanout_stats": fanout_stats,
+                "intermediate_fanout_stats": intermediate_stats,
                 "last_batch_at": self.last_batch_at,
                 "received_chunks": self.received_chunks,
                 "received_bytes": self.received_bytes,
@@ -1899,6 +2651,14 @@ class RtlControlService:
         with self.lock:
             return self._iq_recorder_status_locked()
 
+    def redacted_iq_recorder_status(self) -> dict[str, Any]:
+        return {
+            "active": False,
+            "status": "idle",
+            "sample_rates": [],
+            "default_duration_seconds": IQ_RECORDER_DEFAULT_DURATION_SECONDS,
+        }
+
     def iq_recordings(self) -> dict[str, Any]:
         with self.lock:
             downloading = set(self.iq_recording_downloads)
@@ -1946,13 +2706,25 @@ class RtlControlService:
         path = safe_iq_recording_file_path(self.iq_recordings_directory, recording)
         return recording, path, iq_recording_download_name(recording, fmt), iq_recording_download_size(path, fmt)
 
-    def begin_iq_recording_download(self, recording_id: str) -> None:
+    def begin_iq_recording_download(self, recording_id: str, account_id: int | None = None) -> str:
+        download_id = uuid.uuid4().hex
         with self.lock:
             self.iq_recording_downloads.add(recording_id)
+            self.iq_recording_download_accounts[download_id] = int(account_id or 0)
+            self.iq_recording_download_recordings[download_id] = recording_id
+        return download_id
 
-    def finish_iq_recording_download(self, recording_id: str) -> None:
+    def finish_iq_recording_download(self, download_id: str) -> None:
         with self.lock:
-            self.iq_recording_downloads.discard(recording_id)
+            recording_id = self.iq_recording_download_recordings.pop(download_id, "")
+            self.iq_recording_download_accounts.pop(download_id, None)
+            self.aborted_iq_recording_downloads.discard(download_id)
+            if recording_id and recording_id not in self.iq_recording_download_recordings.values():
+                self.iq_recording_downloads.discard(recording_id)
+
+    def iq_recording_download_aborted(self, download_id: str) -> bool:
+        with self.lock:
+            return download_id in self.aborted_iq_recording_downloads
 
     def _iq_recorder_status_locked(self) -> dict[str, Any]:
         worker = self.iq_recorder
@@ -1972,15 +2744,17 @@ class RtlControlService:
         )
         return snapshot
 
-    def start_iq_recording(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def start_iq_recording(self, payload: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
         with self.lock:
             existing = self.iq_recorder
             if existing is not None and existing.snapshot().get("active"):
                 raise ValueError("I/Q recording is already in progress")
-            fanout = self.raw_fanout
+            raw_fanout = self.raw_fanout
+            intermediate_fanout = self.intermediate_fanout
+            config = self._iq_recorder_config_from_payload_locked(payload)
+            fanout = intermediate_fanout if config.mode == IQ_RECORDER_MODE_STREAM else raw_fanout
             if fanout is None:
                 raise ValueError("RTL-SDR capture is not active")
-            config = self._iq_recorder_config_from_payload_locked(payload)
             if self.storage_monitor.is_critical(config.output_path.parent):
                 raise ValueError(storage_status_message("critical"))
             worker = IqRecorderWorker(
@@ -1989,6 +2763,7 @@ class RtlControlService:
                 storage_monitor=self.storage_monitor,
             )
             self.iq_recorder = worker
+            self.iq_recorder_account_id = int(account_id or 0) if account_id is not None else None
             worker.start()
         LOG.info(
             "started I/Q recording: mode=%s sample_rate=%s duration=%.1fs file=%s",
@@ -2002,6 +2777,8 @@ class RtlControlService:
     def stop_iq_recording(self) -> dict[str, Any]:
         with self.lock:
             worker = self.iq_recorder
+            self.iq_recorder = None
+            self.iq_recorder_account_id = None
         if worker is not None:
             worker.stop()
             LOG.info("stopped I/Q recording")
@@ -2404,7 +3181,7 @@ class RtlControlService:
         with self.lock:
             return self.fallback_settings
 
-    def start_monitor(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def start_monitor(self, payload: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
         client_id = str(payload.get("client_id", "")).strip()
         stream_id = str(payload.get("stream_id", "")).strip()
         sdp = str(payload.get("sdp", "")).strip()
@@ -2437,10 +3214,12 @@ class RtlControlService:
                 LOG.warning("WebRTC monitor rejected for client %s: stream %s is disabled", client_id, stream_id)
                 raise ValueError("start the stream before monitoring it")
             self.monitor_streams_by_client[client_id] = stream_id
+            self.monitor_accounts_by_client[client_id] = int(account_id or 0) if account_id is not None else 0
             self._sync_stream_workers_locked()
             worker = self.stream_workers.get(stream_worker_key(stream))
             if worker is None:
                 self.monitor_streams_by_client.pop(client_id, None)
+                self.monitor_accounts_by_client.pop(client_id, None)
                 LOG.warning("WebRTC monitor rejected for client %s: worker unavailable for stream %s", client_id, stream_id)
                 raise ValueError("stream worker could not be started for monitoring")
             source = worker.add_monitor_source(client_id)
@@ -2524,7 +3303,7 @@ class RtlControlService:
         LOG.info("removed stream %s", stream_id)
         return self.stream_status()
 
-    def start_receiver(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def start_receiver(self, payload: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
         client_id = str(payload.get("client_id", "")).strip()
         sdp = str(payload.get("sdp", "")).strip()
         offer_type = str(payload.get("type", "offer")).strip() or "offer"
@@ -2553,7 +3332,7 @@ class RtlControlService:
         self.stop_monitor({"client_id": client_id})
         self.stop_receiver({"client_id": client_id})
         with self.lock:
-            fanout = self.raw_fanout
+            fanout = self.intermediate_fanout
             if fanout is None:
                 LOG.warning("weather receiver rejected for client %s: RTL-SDR capture is not active", client_id)
                 raise ValueError("RTL-SDR capture is not active")
@@ -2563,6 +3342,7 @@ class RtlControlService:
                 frequency_hz=frequency_hz,
             )
             self.receiver_workers[client_id] = worker
+            self.receiver_accounts_by_client[client_id] = int(account_id or 0) if account_id is not None else 0
             worker.start()
         try:
             track = create_webrtc_pcm_audio_track(worker.source)
@@ -2865,6 +3645,8 @@ class RtlControlService:
                 max_chunks=64,
                 name="web-status-drain",
             )
+            self.intermediate_fanout = IntermediateIqFanout(self.raw_fanout)
+            self.intermediate_fanout.start()
             self.raw_fanout.start()
             self.drain_stop.clear()
             self.drain_thread = threading.Thread(
@@ -2901,6 +3683,8 @@ class RtlControlService:
             self.iq_recorder = None
         self._stop_receiver_workers_locked()
         self._stop_stream_workers_locked()
+        intermediate = self.intermediate_fanout
+        self.intermediate_fanout = None
         fanout = self.raw_fanout
         self.raw_fanout = None
         self.monitor_queue = None
@@ -2909,6 +3693,8 @@ class RtlControlService:
         drain_thread = self.drain_thread
         self.drain_thread = None
         LOG.info("stopped RTL-SDR control capture")
+        if intermediate is not None:
+            intermediate.stop()
         if fanout is not None:
             fanout.stop()
         if capture is not None:
@@ -2926,6 +3712,8 @@ class RtlControlService:
             self.iq_recorder = None
             self._stop_receiver_workers_locked()
             self._stop_stream_workers_locked()
+            intermediate = self.intermediate_fanout
+            self.intermediate_fanout = None
             fanout = self.raw_fanout
             self.raw_fanout = None
             self.monitor_queue = None
@@ -2935,6 +3723,8 @@ class RtlControlService:
             self.drain_thread = None
         if recorder is not None:
             recorder.stop()
+        if intermediate is not None:
+            intermediate.stop()
         if fanout is not None:
             fanout.stop()
         if capture is not None:
@@ -2974,7 +3764,7 @@ class RtlControlService:
                 self.received_bytes += len(batch.data)
 
     def _sync_stream_workers_locked(self) -> None:
-        fanout = self.raw_fanout
+        fanout = self.intermediate_fanout
         desired: dict[str, dict[str, Any]] = {}
         monitored_stream_ids = set(self.monitor_streams_by_client.values())
         if fanout is not None:
@@ -3018,6 +3808,7 @@ class RtlControlService:
 
     def _remove_monitor_source_locked(self, client_id: str) -> None:
         stream_id = self.monitor_streams_by_client.pop(client_id, "")
+        self.monitor_accounts_by_client.pop(client_id, None)
         if not stream_id:
             return
         for worker in self.stream_workers.values():
@@ -3028,6 +3819,7 @@ class RtlControlService:
 
     def _remove_receiver_locked(self, client_id: str) -> bool:
         worker = self.receiver_workers.pop(client_id, None)
+        self.receiver_accounts_by_client.pop(client_id, None)
         if worker is None:
             return False
         worker.stop()
@@ -3064,11 +3856,14 @@ class RtlControlService:
         for worker in list(self.stream_workers.values()):
             worker.stop()
         self.stream_workers = {}
+        self.monitor_streams_by_client = {}
+        self.monitor_accounts_by_client = {}
 
     def _stop_receiver_workers_locked(self) -> None:
         for worker in list(self.receiver_workers.values()):
             worker.stop()
         self.receiver_workers = {}
+        self.receiver_accounts_by_client = {}
 
     def _active_streams_locked(self) -> list[dict[str, Any]]:
         snapshots: list[dict[str, Any]] = []
@@ -3130,13 +3925,155 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         port = self.client_address[1] if self.client_address and len(self.client_address) > 1 else ""
         return f"{host}:{port}" if port else host
 
+    def _auth_ok_or_setup_response(self, path: str, method: str) -> bool:
+        self.current_account = None
+        has_account = self.service.accounts.has_account()
+        if not has_account:
+            if method == "GET":
+                self._send_html(SETUP_HTML)
+                return False
+            if method == "POST" and path == "/api/setup-account":
+                return True
+            self._send_json({"error": "administrator account setup is required"}, status=HTTPStatus.FORBIDDEN)
+            return False
+        if path == "/api/setup-account":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return False
+        account = self._session_auth_valid()
+        if isinstance(account, AccountRecord):
+            self.current_account = account
+            if not self._account_authorized_or_response(path, method, account):
+                return False
+            return True
+        account = self._basic_auth_valid()
+        if isinstance(account, AccountRecord):
+            self.current_account = account
+            self._pending_auth_session_cookie = self.service.auth_sessions.cookie_header(
+                self.service.auth_sessions.create(account.id)
+            )
+            if not self._account_authorized_or_response(path, method, account):
+                return False
+            return True
+        self._send_auth_required()
+        return False
+
+    def _session_auth_valid(self) -> AccountRecord | None:
+        cookie_header = self.headers.get("Cookie", "")
+        if not cookie_header:
+            return None
+        try:
+            cookies = SimpleCookie(cookie_header)
+        except Exception:
+            return None
+        morsel = cookies.get(AUTH_SESSION_COOKIE_NAME)
+        if morsel is None:
+            return None
+        account = self.service.auth_sessions.validate(morsel.value, self.service.accounts)
+        return account if isinstance(account, AccountRecord) else None
+
+    def _basic_auth_valid(self) -> AccountRecord | None:
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            return None
+        try:
+            decoded = base64.b64decode(header[6:].strip().encode("ascii"), validate=True).decode("utf-8")
+        except (UnicodeDecodeError, binascii.Error):
+            return None
+        username, separator, password = decoded.partition(":")
+        if not separator:
+            return None
+        return self.service.accounts.verify_basic_account(username, password)
+
+    def _account_authorized_or_response(self, path: str, method: str, account: AccountRecord) -> bool:
+        if account.must_change_password:
+            if method == "GET" and path == "/":
+                self._send_html(MUST_CHANGE_PASSWORD_HTML)
+                return False
+            if path in {"/api/account/me", "/api/account/password", "/api/client-log"}:
+                return True
+            self._send_json({"error": "password change is required"}, status=HTTPStatus.FORBIDDEN)
+            return False
+        if path.startswith("/api/accounts") or path in {"/api/account-reset-password", "/api/account-read-only"}:
+            if not account.is_owner:
+                self._send_json({"error": "owner account is required"}, status=HTTPStatus.FORBIDDEN)
+                return False
+            return True
+        if path == "/api/account/password":
+            return True
+        if account.is_read_only and not self._read_only_request_allowed(path, method):
+            self._send_json({"error": "this account is read-only"}, status=HTTPStatus.FORBIDDEN)
+            return False
+        return True
+
+    def _read_only_request_allowed(self, path: str, method: str) -> bool:
+        if method == "GET":
+            return path in {
+                "/",
+                "/api/status",
+                "/api/stations",
+                "/api/streams",
+                "/api/eas-alert-streams",
+                "/api/eas-alerts",
+                "/api/eas-alert-bulk-options",
+                "/api/eas-alert-range-count",
+                "/api/eas-alert-export",
+                "/api/eas-alert",
+                "/api/eas-alert-audio",
+                "/api/webrtc-capabilities",
+                "/api/monitor/status",
+                "/api/receiver/status",
+                "/api/iq-recorder/status",
+                "/api/iq-recordings",
+                "/api/iq-recording-download",
+                "/api/logs",
+                "/api/account/me",
+            }
+        if method == "POST":
+            return path in {
+                "/api/client-log",
+                "/api/monitor/start",
+                "/api/monitor/stop",
+                "/api/receiver/start",
+                "/api/receiver/tune",
+                "/api/receiver/stop",
+                "/api/account/password",
+            }
+        return False
+
+    def _send_auth_required(self) -> None:
+        payload = b'{"error":"authentication required"}'
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("WWW-Authenticate", f'Basic realm="{AUTH_REALM}", charset="UTF-8"')
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Set-Cookie", f"{AUTH_SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            LOG.debug("client disconnected before auth response could be written")
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if not self._auth_ok_or_setup_response(path, "GET"):
+            return
         if path == "/":
             self._send_html(INDEX_HTML)
         elif path == "/api/status":
-            self._send_json(self.service.status())
+            response = self.service.status()
+            account = getattr(self, "current_account", None)
+            if isinstance(account, AccountRecord):
+                response["account"] = account.to_public_dict()
+                if account.is_read_only:
+                    response["iq_recorder"] = self.service.redacted_iq_recorder_status()
+            self._send_json(response)
+        elif path == "/api/account/me":
+            account = getattr(self, "current_account", None)
+            self._send_json({"account": account.to_public_dict() if isinstance(account, AccountRecord) else None})
+        elif path == "/api/accounts":
+            self._send_json({"accounts": self.service.accounts.list_accounts()})
         elif path == "/api/rtl/diagnostics":
             try:
                 response = self.service.rtl_diagnostics()
@@ -3246,7 +4183,11 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(response)
         elif path == "/api/iq-recorder/status":
-            self._send_json(self.service.iq_recorder_status())
+            account = getattr(self, "current_account", None)
+            if isinstance(account, AccountRecord) and account.is_read_only:
+                self._send_json(self.service.redacted_iq_recorder_status())
+            else:
+                self._send_json(self.service.iq_recorder_status())
         elif path == "/api/iq-recordings":
             self._send_json(self.service.iq_recordings())
         elif path == "/api/iq-recording-download":
@@ -3255,7 +4196,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             fmt = query.get("format", ["cf"])[0]
             try:
                 recording, file_path, download_name, download_size = self.service.iq_recording_download_info(recording_id, fmt)
-                self._send_iq_recording(file_path, download_name, download_size, fmt, str(recording.get("id", "")))
+                account = getattr(self, "current_account", None)
+                self._send_iq_recording(
+                    file_path,
+                    download_name,
+                    download_size,
+                    fmt,
+                    str(recording.get("id", "")),
+                    account.id if isinstance(account, AccountRecord) else None,
+                )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -3264,6 +4213,86 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if not self._auth_ok_or_setup_response(path, "POST"):
+            return
+        if path == "/api/setup-account":
+            try:
+                payload = self._read_json()
+                self.service.accounts.create_admin(
+                    str(payload.get("username", "")),
+                    str(payload.get("password", "")),
+                    str(payload.get("confirm_password", "")),
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            LOG.info("created NWR Stream Manager administrator account")
+            self._send_json({"success": True})
+            return
+        if path == "/api/account/password":
+            try:
+                account = getattr(self, "current_account", None)
+                if not isinstance(account, AccountRecord):
+                    raise ValueError("authentication is required")
+                payload = self._read_json()
+                updated = self.service.accounts.change_password(
+                    account.id,
+                    str(payload.get("current_password", "")),
+                    str(payload.get("new_password", "")),
+                    str(payload.get("confirm_password", "")),
+                )
+                self.service.auth_sessions.invalidate_account(account.id)
+                self.service.revoke_account_long_lived_resources(
+                    account.id,
+                    stop_webrtc=True,
+                    abort_downloads=True,
+                    stop_iq_recording=True,
+                )
+                self._pending_auth_session_cookie = (
+                    f"{AUTH_SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            LOG.info("changed password for account %s", updated.get("username", ""))
+            self._send_json({"success": True, "account": updated})
+            return
+        if path == "/api/accounts":
+            try:
+                payload = self._read_json()
+                account, secret = self.service.accounts.create_account(
+                    str(payload.get("username", "")),
+                    bool(payload.get("read_only", False)),
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            LOG.info("created account %s", account.get("username", ""))
+            self._send_json({"success": True, "account": account, "secret": secret})
+            return
+        if path == "/api/account-reset-password":
+            try:
+                requester = getattr(self, "current_account", None)
+                if not isinstance(requester, AccountRecord):
+                    raise ValueError("authentication is required")
+                payload = self._read_json()
+                account_id = int(payload.get("account_id", 0))
+                if requester.id == account_id:
+                    raise ValueError("use change account password for your own account")
+                account, secret = self.service.accounts.reset_password(account_id)
+                self.service.auth_sessions.invalidate_account(account_id)
+                self.service.revoke_account_long_lived_resources(
+                    account_id,
+                    stop_webrtc=True,
+                    abort_downloads=True,
+                    stop_iq_recording=True,
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            LOG.info("reset password for account %s", account.get("username", ""))
+            self._send_json({"success": True, "account": account, "secret": secret})
+            return
         if path == "/api/eas-alert-delete":
             try:
                 payload = self._read_json()
@@ -3300,7 +4329,11 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == "/api/monitor/start":
             try:
                 payload = self._read_json()
-                response = self.service.start_monitor(payload)
+                account = getattr(self, "current_account", None)
+                response = self.service.start_monitor(
+                    payload,
+                    account.id if isinstance(account, AccountRecord) else None,
+                )
             except Exception as exc:
                 LOG.warning("API monitor start failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -3320,7 +4353,11 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == "/api/receiver/start":
             try:
                 payload = self._read_json()
-                response = self.service.start_receiver(payload)
+                account = getattr(self, "current_account", None)
+                response = self.service.start_receiver(
+                    payload,
+                    account.id if isinstance(account, AccountRecord) else None,
+                )
             except Exception as exc:
                 LOG.warning("API receiver start failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -3350,7 +4387,11 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == "/api/iq-recorder/start":
             try:
                 payload = self._read_json()
-                response = self.service.start_iq_recording(payload)
+                account = getattr(self, "current_account", None)
+                response = self.service.start_iq_recording(
+                    payload,
+                    account.id if isinstance(account, AccountRecord) else None,
+                )
             except Exception as exc:
                 LOG.warning("API I/Q recorder start failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -3397,6 +4438,28 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        if not self._auth_ok_or_setup_response(parsed.path, "DELETE"):
+            return
+        if parsed.path == "/api/accounts":
+            try:
+                requester = getattr(self, "current_account", None)
+                if not isinstance(requester, AccountRecord):
+                    raise ValueError("authentication is required")
+                account_id = int(parse_qs(parsed.query).get("account_id", ["0"])[0])
+                account = self.service.accounts.delete_account(account_id, requester.id)
+                self.service.auth_sessions.invalidate_account(account_id)
+                self.service.revoke_account_long_lived_resources(
+                    account_id,
+                    stop_webrtc=True,
+                    abort_downloads=True,
+                    stop_iq_recording=True,
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            LOG.info("deleted account %s", account.get("username", ""))
+            self._send_json({"success": True, "account": account})
+            return
         if parsed.path == "/api/eas-alert":
             try:
                 query = parse_qs(parsed.query)
@@ -3442,6 +4505,22 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         path = urlparse(self.path).path
+        if not self._auth_ok_or_setup_response(path, "PATCH"):
+            return
+        if path == "/api/account-read-only":
+            try:
+                payload = self._read_json()
+                account_id = int(payload.get("account_id", 0))
+                read_only = bool(payload.get("read_only", False))
+                account = self.service.accounts.set_read_only(account_id, read_only)
+                if read_only:
+                    self.service.revoke_account_long_lived_resources(account_id, stop_iq_recording=True)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            LOG.info("updated account %s role to %s", account.get("username", ""), account.get("role", ""))
+            self._send_json({"success": True, "account": account})
+            return
         if path == "/api/stream-output":
             try:
                 payload = self._read_json()
@@ -3517,6 +4596,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
+        self._send_pending_auth_session_cookie()
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -3528,6 +4608,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self._send_pending_auth_session_cookie()
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -3544,6 +4625,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(data_length))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Disposition", f'{disposition}; filename="{http_header_filename(download_name)}"')
+            self._send_pending_auth_session_cookie()
             self.end_headers()
             with path.open("rb") as source:
                 while True:
@@ -3559,24 +4641,42 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             if delete_after:
                 path.unlink(missing_ok=True)
 
-    def _send_iq_recording(self, path: Path, download_name: str, data_length: int, fmt: str, recording_id: str) -> None:
-        self.service.begin_iq_recording_download(recording_id)
+    def _send_iq_recording(
+        self,
+        path: Path,
+        download_name: str,
+        data_length: int,
+        fmt: str,
+        recording_id: str,
+        account_id: int | None = None,
+    ) -> None:
+        download_id = self.service.begin_iq_recording_download(recording_id, account_id)
         try:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(data_length))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Disposition", f'attachment; filename="{http_header_filename(download_name)}"')
+            self._send_pending_auth_session_cookie()
             self.end_headers()
             with path.open("rb") as source:
                 for chunk in convert_iq_recording_chunks(source, fmt):
+                    if self.service.iq_recording_download_aborted(download_id):
+                        LOG.info("I/Q recording download aborted after account revoke: %s", recording_id)
+                        break
                     try:
                         self.wfile.write(chunk)
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         LOG.info("I/Q recording download disconnected before completion: %s", recording_id)
                         break
         finally:
-            self.service.finish_iq_recording_download(recording_id)
+            self.service.finish_iq_recording_download(download_id)
+
+    def _send_pending_auth_session_cookie(self) -> None:
+        cookie = getattr(self, "_pending_auth_session_cookie", "")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+            self._pending_auth_session_cookie = ""
 
 
 def default_state_path() -> Path:
@@ -4218,10 +5318,9 @@ def smooth_iq_storage_remaining_seconds(
 
 def convert_iq_recording_chunks(source, fmt: str):
     fmt = validate_iq_download_format(fmt)
-    chunk_size = 1024 * 1024
     carry = b""
     while True:
-        raw = carry + source.read(chunk_size)
+        raw = carry + source.read(IQ_DOWNLOAD_CHUNK_BYTES)
         if not raw:
             break
         usable = len(raw) - (len(raw) % 4)
@@ -4230,6 +5329,7 @@ def convert_iq_recording_chunks(source, fmt: str):
             continue
         if fmt == "cf":
             yield raw[:usable]
+            time.sleep(IQ_DOWNLOAD_YIELD_SECONDS)
             continue
         floats = np.frombuffer(raw[:usable], dtype="<f4")
         clipped = np.clip(floats, -1.0, 1.0)
@@ -4237,6 +5337,7 @@ def convert_iq_recording_chunks(source, fmt: str):
             yield np.round(clipped * 32767.0).astype("<i2").tobytes()
         else:
             yield np.round(clipped * 127.5 + 127.5).astype(np.uint8).tobytes()
+        time.sleep(IQ_DOWNLOAD_YIELD_SECONDS)
     if carry:
         raise ValueError("I/Q recording file ended with a partial float32 sample")
 
@@ -4824,6 +5925,255 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+SETUP_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NWR Stream Manager Setup</title>
+<style>
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; background: #f6f7f9; color: #14181f; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 24px; }
+.panel { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 24px; }
+label { display: grid; gap: 6px; margin: 14px 0; font-weight: 700; }
+input { font: inherit; padding: 10px; border: 1px solid #aab2c0; border-radius: 6px; }
+.actions { display: flex; gap: 10px; margin-top: 18px; }
+button { font: inherit; padding: 10px 14px; border: 1px solid #9aa4b2; border-radius: 6px; background: #fff; color: #14181f; cursor: pointer; }
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+.primary { background: #174a98; color: #fff; border-color: #174a98; }
+.message { min-height: 1.5em; margin-top: 14px; font-weight: 700; }
+.error { color: #a61b1b; }
+.hint { color: #4b5563; }
+@media (prefers-color-scheme: dark) {
+  body { background: #111827; color: #f9fafb; }
+  .panel, button, input { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
+  .hint { color: #cbd5e1; }
+}
+</style>
+</head>
+<body>
+<main>
+  <section class="panel" aria-labelledby="setup_title">
+    <h1 id="setup_title">NWR Stream Manager Setup</h1>
+    <div id="setup_welcome">
+      <p>Welcome to NWR Stream Manager, an all new tool for streaming NOAA Weather Radio to online services! To ensure no one else on the network tampers with your streams, please set up an account. Press the next button to continue.</p>
+      <div class="actions">
+        <button id="welcome_next" class="primary" type="button">Next</button>
+      </div>
+    </div>
+    <form id="setup_form" hidden>
+      <p class="hint">Create the administrator account for this NWR Stream Manager.</p>
+      <label>
+        Username
+        <input id="setup_username" name="username" autocomplete="username" required pattern="[A-Za-z0-9_-]{1,64}">
+      </label>
+      <label>
+        Password
+        <input id="setup_password" name="password" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <label>
+        Confirm password
+        <input id="setup_confirm_password" name="confirm_password" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <div class="actions">
+        <button id="setup_next" class="primary" type="submit" disabled>Next</button>
+      </div>
+      <div id="setup_message" class="message" aria-live="polite"></div>
+    </form>
+    <div id="setup_done" hidden>
+      <p>You're all set up! Click the finish button to log in.</p>
+      <div class="actions">
+        <button id="setup_finish" class="primary" type="button">Finish</button>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+const usernamePattern = /^[A-Za-z0-9_-]{1,64}$/;
+const passwordPattern = /^[!-~]{8,256}$/;
+const welcome = document.getElementById("setup_welcome");
+const form = document.getElementById("setup_form");
+const done = document.getElementById("setup_done");
+const message = document.getElementById("setup_message");
+const next = document.getElementById("setup_next");
+const username = document.getElementById("setup_username");
+const password = document.getElementById("setup_password");
+const confirmPassword = document.getElementById("setup_confirm_password");
+
+function validateSetupForm() {
+  const valid = usernamePattern.test(username.value) &&
+    passwordPattern.test(password.value) &&
+    password.value === confirmPassword.value;
+  next.disabled = !valid;
+  if (!usernamePattern.test(username.value) && username.value) {
+    message.textContent = "Username may contain only letters, numbers, hyphen, and underscore.";
+    message.className = "message error";
+  } else if (!passwordPattern.test(password.value) && password.value) {
+    message.textContent = "Password must be at least 8 printable non-space characters.";
+    message.className = "message error";
+  } else if (confirmPassword.value && password.value !== confirmPassword.value) {
+    message.textContent = "Passwords do not match.";
+    message.className = "message error";
+  } else {
+    message.textContent = "";
+    message.className = "message";
+  }
+}
+
+document.getElementById("welcome_next").addEventListener("click", () => {
+  welcome.hidden = true;
+  form.hidden = false;
+  username.focus();
+});
+
+for (const input of [username, password, confirmPassword]) {
+  input.addEventListener("input", validateSetupForm);
+}
+
+form.addEventListener("submit", async event => {
+  event.preventDefault();
+  validateSetupForm();
+  if (next.disabled) return;
+  next.disabled = true;
+  try {
+    const response = await fetch("/api/setup-account", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        username: username.value,
+        password: password.value,
+        confirm_password: confirmPassword.value
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || response.statusText);
+    form.hidden = true;
+    done.hidden = false;
+    document.getElementById("setup_finish").focus();
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = "message error";
+    validateSetupForm();
+  }
+});
+
+document.getElementById("setup_finish").addEventListener("click", () => {
+  window.location.replace("/");
+});
+</script>
+</body>
+</html>
+"""
+
+
+MUST_CHANGE_PASSWORD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Change Account Password</title>
+<style>
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; background: #f6f7f9; color: #14181f; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 24px; }
+.panel { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 24px; }
+label { display: grid; gap: 6px; margin: 14px 0; font-weight: 700; }
+input { font: inherit; padding: 10px; border: 1px solid #aab2c0; border-radius: 6px; }
+.actions { display: flex; gap: 10px; margin-top: 18px; }
+button { font: inherit; padding: 10px 14px; border: 1px solid #9aa4b2; border-radius: 6px; background: #fff; color: #14181f; cursor: pointer; }
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+.primary { background: #174a98; color: #fff; border-color: #174a98; }
+.message { min-height: 1.5em; margin-top: 14px; font-weight: 700; }
+.error { color: #a61b1b; }
+.hint { color: #4b5563; }
+@media (prefers-color-scheme: dark) {
+  body { background: #111827; color: #f9fafb; }
+  .panel, button, input { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
+  .hint { color: #cbd5e1; }
+}
+</style>
+</head>
+<body>
+<main>
+  <section class="panel" aria-labelledby="password_title">
+    <h1 id="password_title">Change Account Password</h1>
+    <p class="hint">You must change your password to continue.</p>
+    <form id="password_form">
+      <label>
+        Current password
+        <input id="current_password" name="current_password" type="password" autocomplete="current-password" required>
+      </label>
+      <label>
+        New password
+        <input id="new_password" name="new_password" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <label>
+        Confirm new password
+        <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <div class="actions">
+        <button id="change_password" class="primary" type="submit" disabled>Change password</button>
+      </div>
+      <div id="password_message" class="message" aria-live="polite"></div>
+    </form>
+  </section>
+</main>
+<script>
+const passwordPattern = /^[!-~]{8,256}$/;
+const currentPassword = document.getElementById("current_password");
+const newPassword = document.getElementById("new_password");
+const confirmPassword = document.getElementById("confirm_password");
+const submit = document.getElementById("change_password");
+const message = document.getElementById("password_message");
+function validatePasswordForm() {
+  submit.disabled = !(currentPassword.value && passwordPattern.test(newPassword.value) && confirmPassword.value);
+  if (newPassword.value && !passwordPattern.test(newPassword.value)) {
+    message.textContent = "Password must be at least 8 printable non-space characters.";
+    message.className = "message error";
+  } else {
+    message.textContent = "";
+    message.className = "message";
+  }
+}
+for (const input of [currentPassword, newPassword, confirmPassword]) {
+  input.addEventListener("input", validatePasswordForm);
+}
+document.getElementById("password_form").addEventListener("submit", async event => {
+  event.preventDefault();
+  validatePasswordForm();
+  if (submit.disabled) return;
+  if (newPassword.value !== confirmPassword.value) {
+    message.textContent = "Passwords do not match.";
+    message.className = "message error";
+    return;
+  }
+  submit.disabled = true;
+  try {
+    const response = await fetch("/api/account/password", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        current_password: currentPassword.value,
+        new_password: newPassword.value,
+        confirm_password: confirmPassword.value
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || response.statusText);
+    window.location.replace("/");
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = "message error";
+    validatePasswordForm();
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -4942,6 +6292,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <a id="nav_receiver" href="/?view=receiver" data-view="receiver" role="menuitem">Weather Radio Receiver</a>
           <a id="nav_iq_recorder" href="/?view=iq_recorder" data-view="iq_recorder" role="menuitem">I/Q Recorder</a>
           <a id="nav_logs" href="/?view=logs" data-view="logs" role="menuitem">Logs</a>
+          <a id="nav_accounts" href="/?view=accounts" data-view="accounts" role="menuitem">Manage accounts</a>
+          <a id="nav_change_password" href="/?view=change_password" data-view="change_password" role="menuitem" hidden>Change account password</a>
         </span>
       </span>
     </nav>
@@ -4970,6 +6322,17 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <p>Your internet connection is too unstable for realtime listening of weather radio.</p>
   <div class="actions">
     <button id="dismiss_receiver_unstable" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="account_secret_dialog" class="notice-dialog" role="dialog" aria-labelledby="account_secret_title" aria-live="polite" hidden>
+  <h2 id="account_secret_title">Temporary password</h2>
+  <p>Copy it and share it with the user, you will not be able to see it again.</p>
+  <label>Temporary password
+    <input id="account_secret" readonly>
+  </label>
+  <div class="actions">
+    <button id="copy_account_secret" type="button">Copy to clipboard</button>
+    <button id="dismiss_account_secret" type="button">Dismiss</button>
   </div>
 </div>
 <div id="iq_recording_banner" class="global-status-banner" hidden>
@@ -5148,6 +6511,60 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       </div>
       <p id="capture-error" class="error"></p>
       <pre id="logs" aria-live="off" aria-label="Server log output"></pre>
+    </section>
+  </div>
+
+  <div id="view_accounts" class="view" hidden>
+    <section>
+      <h2>Manage Accounts</h2>
+      <div id="account-result" class="message"></div>
+      <div class="actions">
+        <button id="open_create_account" type="button">Create account</button>
+      </div>
+      <div id="create_account_panel" hidden>
+        <h3>Create Account</h3>
+        <label>Username
+          <input id="new_account_username" autocomplete="off" pattern="[A-Za-z0-9_-]{1,64}">
+        </label>
+        <label><input id="new_account_read_only" type="checkbox"> Read-only account</label>
+        <div class="actions">
+          <button id="create_account" type="button">Create account</button>
+          <button id="cancel_create_account" type="button">Cancel</button>
+        </div>
+      </div>
+      <table aria-label="Accounts">
+        <thead>
+          <tr>
+            <th>Username</th>
+            <th>Account type</th>
+            <th>Last accessed</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="accounts-body" aria-live="off">
+          <tr><td colspan="4" class="hint">No accounts.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  <div id="view_change_password" class="view" hidden>
+    <section>
+      <h2>Change Account Password</h2>
+      <div id="change-password-result" class="message"></div>
+      <label>Current password
+        <input id="account_current_password" type="password" autocomplete="current-password">
+      </label>
+      <label>New password
+        <input id="account_new_password" type="password" autocomplete="new-password">
+      </label>
+      <label>Confirm new password
+        <input id="account_confirm_password" type="password" autocomplete="new-password">
+      </label>
+      <div class="actions">
+        <button id="change_account_password" type="button">Change password</button>
+        <button id="cancel_change_password" type="button">Cancel</button>
+      </div>
     </section>
   </div>
 
@@ -5694,8 +7111,11 @@ let receiverStatsTimer = null;
 let receiverLastPacketCount = 0;
 let receiverLastPacketAt = 0;
 let unloadLiveAudioStopSent = false;
+let currentAccount = null;
+let accountsSignature = "";
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
+const WEBRTC_JITTER_BUFFER_TARGET_SECONDS = 0.2;
 const IQ_RECORDER_SAMPLE_RATES = [192000, 256000, 384000, 512000, 768000, 1024000, 1536000];
 const NWR_RECEIVER_CHANNELS = [
   {frequency_hz: 162400000, label: "162.400 MHz"},
@@ -5906,7 +7326,7 @@ async function startStreamMonitor(streamId) {
   const transceiver = peer.addTransceiver("audio", {direction: "recvonly"});
   if (transceiver.receiver && "jitterBufferTarget" in transceiver.receiver) {
     try {
-      transceiver.receiver.jitterBufferTarget = 0.05;
+      transceiver.receiver.jitterBufferTarget = WEBRTC_JITTER_BUFFER_TARGET_SECONDS;
     } catch (error) {
       console.debug("WebRTC receiver jitterBufferTarget is not writable", error);
     }
@@ -5914,7 +7334,7 @@ async function startStreamMonitor(streamId) {
   peer.addEventListener("track", event => {
     if (event.receiver && "jitterBufferTarget" in event.receiver) {
       try {
-        event.receiver.jitterBufferTarget = 0.05;
+        event.receiver.jitterBufferTarget = WEBRTC_JITTER_BUFFER_TARGET_SECONDS;
       } catch (error) {
         console.debug("WebRTC track jitterBufferTarget is not writable", error);
       }
@@ -6220,7 +7640,7 @@ async function startWeatherReceiver() {
   const transceiver = peer.addTransceiver("audio", {direction: "recvonly"});
   if (transceiver.receiver && "jitterBufferTarget" in transceiver.receiver) {
     try {
-      transceiver.receiver.jitterBufferTarget = 0.05;
+      transceiver.receiver.jitterBufferTarget = WEBRTC_JITTER_BUFFER_TARGET_SECONDS;
     } catch (error) {
       console.debug("WebRTC receiver jitterBufferTarget is not writable", error);
     }
@@ -6229,7 +7649,7 @@ async function startWeatherReceiver() {
     event.track.enabled = !receiverPaused;
     if (event.receiver && "jitterBufferTarget" in event.receiver) {
       try {
-        event.receiver.jitterBufferTarget = 0.05;
+        event.receiver.jitterBufferTarget = WEBRTC_JITTER_BUFFER_TARGET_SECONDS;
       } catch (error) {
         console.debug("WebRTC track jitterBufferTarget is not writable", error);
       }
@@ -6499,6 +7919,10 @@ function outputEditPayload() {
 }
 
 async function setStreamEnabled(streamId, enabled, resultHandler = setStreamResult) {
+  if (accountIsReadOnly()) {
+    resultHandler("This account is read-only.", "error");
+    return null;
+  }
   const data = await request("/api/streams", {
     method: "PATCH",
     headers: {"Content-Type": "application/json"},
@@ -7559,12 +8983,14 @@ function outputActionsCell(stream, output) {
   remove.dataset.action = "remove-output";
   remove.dataset.streamId = stream.id || "";
   remove.dataset.outputId = output.id || "";
-  if (output.enabled === false || canDisableIcecastOutput(stream, output)) {
-    menu.appendChild(toggle);
-  }
-  menu.appendChild(edit);
-  if (canRemoveIcecastOutput(stream, output)) {
-    menu.appendChild(remove);
+  if (!accountIsReadOnly()) {
+    if (output.enabled === false || canDisableIcecastOutput(stream, output)) {
+      menu.appendChild(toggle);
+    }
+    menu.appendChild(edit);
+    if (canRemoveIcecastOutput(stream, output)) {
+      menu.appendChild(remove);
+    }
   }
   cell.appendChild(button);
   cell.appendChild(menu);
@@ -7622,7 +9048,8 @@ function activeStreamSignature(rows) {
         type: output.type || "icecast"
       })),
       monitoring: monitorStreamId === stream.id,
-      status: normalizeStreamStatus(stream.status)
+      status: normalizeStreamStatus(stream.status),
+      read_only: accountIsReadOnly()
     };
   }));
 }
@@ -7844,10 +9271,14 @@ function streamActionsCell(stream) {
   remove.dataset.action = "remove-active-stream";
   remove.dataset.streamId = stream.id || "";
   remove.dataset.outputId = output.id || "";
-  menu.appendChild(toggle);
+  if (!accountIsReadOnly()) {
+    menu.appendChild(toggle);
+  }
   menu.appendChild(monitor);
-  menu.appendChild(edit);
-  menu.appendChild(remove);
+  if (!accountIsReadOnly()) {
+    menu.appendChild(edit);
+    menu.appendChild(remove);
+  }
   cell.appendChild(button);
   cell.appendChild(menu);
   return cell;
@@ -7893,7 +9324,7 @@ function closeStreamActionMenus() {
 
 function renderStreams(streams) {
   configuredStreams = streams || [];
-  renderActiveStreams([], configuredStreams);
+  renderActiveStreams(activeStreamSnapshots, configuredStreams);
   if (settingsStreamId) renderStreamSettings();
   const list = document.getElementById("streams-list");
   list.innerHTML = "";
@@ -7914,25 +9345,29 @@ function renderStreams(streams) {
     details.textContent = `${streamOutputCount(stream)} output${streamOutputCount(stream) === 1 ? "" : "s"}.`;
     const outputs = document.createElement("div");
     outputs.className = "actions";
-    for (const output of streamOutputs(stream)) {
-      const icecast = output.icecast || {};
-      const edit = document.createElement("button");
-      edit.type = "button";
-      edit.textContent = `Edit ${icecast.mount || "Icecast output"}`;
-      edit.dataset.action = "edit-output";
-      edit.dataset.streamId = stream.id;
-      edit.dataset.outputId = output.id;
-      outputs.appendChild(edit);
+    if (!accountIsReadOnly()) {
+      for (const output of streamOutputs(stream)) {
+        const icecast = output.icecast || {};
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.textContent = `Edit ${icecast.mount || "Icecast output"}`;
+        edit.dataset.action = "edit-output";
+        edit.dataset.streamId = stream.id;
+        edit.dataset.outputId = output.id;
+        outputs.appendChild(edit);
+      }
     }
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.textContent = "Remove";
-    remove.dataset.action = "remove-stream";
-    remove.dataset.streamId = stream.id;
     item.appendChild(title);
     item.appendChild(details);
-    item.appendChild(outputs);
-    item.appendChild(remove);
+    if (!accountIsReadOnly()) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "Remove";
+      remove.dataset.action = "remove-stream";
+      remove.dataset.streamId = stream.id;
+      item.appendChild(outputs);
+      item.appendChild(remove);
+    }
     list.appendChild(item);
   }
 }
@@ -7991,6 +9426,253 @@ function setText(id, value) {
   const element = document.getElementById(id);
   const text = String(value);
   if (element.textContent !== text) element.textContent = text;
+}
+
+function accountIsOwner() {
+  return currentAccount && currentAccount.role === "owner";
+}
+
+function accountIsReadOnly() {
+  return currentAccount && currentAccount.read_only;
+}
+
+function formatAccountDate(epochSeconds) {
+  const seconds = Number(epochSeconds || 0);
+  if (!seconds) return "Never";
+  return new Intl.DateTimeFormat(undefined, {month: "long", day: "numeric", year: "numeric"}).format(new Date(seconds * 1000));
+}
+
+function setAccountResult(message, kind = "") {
+  const element = document.getElementById("account-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setChangePasswordResult(message, kind = "") {
+  const element = document.getElementById("change-password-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function applyAccountUi(account) {
+  const previousRole = currentAccount ? currentAccount.role : "";
+  const previousReadOnly = currentAccount ? Boolean(currentAccount.read_only) : false;
+  currentAccount = account || currentAccount;
+  const owner = accountIsOwner();
+  const readOnly = accountIsReadOnly();
+  setHidden("nav_accounts", !owner);
+  setHidden("nav_change_password", owner);
+  setHidden("nav_rtl", readOnly);
+  setHidden("open_add_stream", readOnly);
+  setHidden("open_iq_start", readOnly);
+  setHidden("iq_stop_recording", readOnly);
+  setHidden("open_eas_delete", readOnly);
+  setHidden("eas_delete_alerts", readOnly);
+  setHidden("remove_eas_alert", readOnly);
+  if (previousRole !== (currentAccount ? currentAccount.role : "") || previousReadOnly !== readOnly) {
+    activeStreamsSignature = "";
+    outputTableSignature = "";
+    iqRecordingsSignature = "";
+    accountsSignature = "";
+    renderActiveStreams(activeStreamSnapshots, configuredStreams);
+    renderStreams(configuredStreams);
+    renderIqRecordings(iqRecordings);
+  }
+  if (readOnly && isReadOnlyRestrictedView(currentViewName())) {
+    navigateTo("dashboard", {}, true, true);
+  }
+  if (!owner && currentViewName() === "accounts") {
+    navigateTo("change_password", {}, true, true);
+  }
+}
+
+function isReadOnlyRestrictedView(view) {
+  return ["rtl", "add_stream", "stream_settings", "iq_recorder_start", "eas_alert_delete", "accounts"].includes(view);
+}
+
+function accountsTableSignature(accounts) {
+  return JSON.stringify((accounts || []).map(account => ({
+    id: account.id,
+    username: account.username,
+    role: account.role,
+    last_accessed_at: account.last_accessed_at,
+    must_change_password: account.must_change_password
+  })));
+}
+
+function renderAccounts(accounts) {
+  const tbody = document.getElementById("accounts-body");
+  if (!tbody) return;
+  const signature = accountsTableSignature(accounts);
+  if (signature === accountsSignature) return;
+  accountsSignature = signature;
+  tbody.innerHTML = "";
+  if (!accounts || accounts.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 4;
+    cell.className = "hint";
+    cell.textContent = "No accounts.";
+    row.appendChild(cell);
+    tbody.appendChild(row);
+    return;
+  }
+  for (const account of accounts) {
+    const row = document.createElement("tr");
+    row.appendChild(tableCell(account.username || ""));
+    row.appendChild(tableCell(account.account_type || "Administrator"));
+    row.appendChild(tableCell(formatAccountDate(account.last_accessed_at)));
+    row.appendChild(accountActionsCell(account));
+    tbody.appendChild(row);
+  }
+}
+
+function accountActionsCell(account) {
+  const cell = document.createElement("td");
+  cell.className = "menu-cell";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "More actions";
+  button.setAttribute("aria-haspopup", "menu");
+  button.setAttribute("aria-expanded", "false");
+  button.setAttribute("aria-label", `More actions for ${account.username || "account"}`);
+  button.dataset.accountMenu = String(account.id || "");
+  const menu = document.createElement("div");
+  menu.className = "stream-actions-menu";
+  menu.hidden = true;
+  menu.setAttribute("role", "menu");
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.textContent = currentAccount && currentAccount.id === account.id ? "Change account password" : "Reset password";
+  reset.setAttribute("role", "menuitem");
+  reset.dataset.action = currentAccount && currentAccount.id === account.id ? "change-own-password" : "reset-account-password";
+  reset.dataset.accountId = account.id || "";
+  menu.appendChild(reset);
+  if (!account.owner) {
+    const readOnly = document.createElement("button");
+    readOnly.type = "button";
+    readOnly.textContent = account.read_only ? "Read-only account checked" : "Read-only account unchecked";
+    readOnly.setAttribute("role", "menuitemcheckbox");
+    readOnly.setAttribute("aria-checked", account.read_only ? "true" : "false");
+    readOnly.dataset.action = "toggle-account-read-only";
+    readOnly.dataset.accountId = account.id || "";
+    readOnly.dataset.readOnly = account.read_only ? "0" : "1";
+    menu.appendChild(readOnly);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Delete account";
+    remove.setAttribute("role", "menuitem");
+    remove.dataset.action = "delete-account";
+    remove.dataset.accountId = account.id || "";
+    menu.appendChild(remove);
+  }
+  cell.appendChild(button);
+  cell.appendChild(menu);
+  return cell;
+}
+
+async function loadAccounts() {
+  const data = await request("/api/accounts");
+  renderAccounts(data.accounts || []);
+  return data;
+}
+
+function showAccountSecret(secret) {
+  setValue("account_secret", secret || "");
+  const dialog = document.getElementById("account_secret_dialog");
+  if (dialog) dialog.hidden = !secret;
+  const input = document.getElementById("account_secret");
+  if (input && secret) input.focus();
+}
+
+function dismissAccountSecret() {
+  const dialog = document.getElementById("account_secret_dialog");
+  if (dialog) dialog.hidden = true;
+  setValue("account_secret", "");
+}
+
+async function copyAccountSecret() {
+  const input = document.getElementById("account_secret");
+  const secret = input ? input.value : "";
+  if (!secret) return;
+  try {
+    await navigator.clipboard.writeText(secret);
+    setAccountResult("Temporary password copied to clipboard.", "success");
+  } catch (error) {
+    if (input) {
+      input.focus();
+      input.select();
+    }
+    setAccountResult("Copy failed. Select the temporary password and copy it manually.", "error");
+  }
+}
+
+async function createAccountFromForm() {
+  const data = await request("/api/accounts", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      username: document.getElementById("new_account_username").value,
+      read_only: document.getElementById("new_account_read_only").checked
+    })
+  });
+  document.getElementById("create_account_panel").hidden = true;
+  setValue("new_account_username", "");
+  setChecked("new_account_read_only", false);
+  showAccountSecret(data.secret || "");
+  await loadAccounts();
+  setAccountResult("Account created.", "success");
+}
+
+async function resetAccountPassword(accountId) {
+  const data = await request("/api/account-reset-password", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({account_id: Number(accountId)})
+  });
+  showAccountSecret(data.secret || "");
+  await loadAccounts();
+  setAccountResult("Password reset. The temporary password is shown below.", "success");
+}
+
+async function setAccountReadOnly(accountId, readOnly) {
+  await request("/api/account-read-only", {
+    method: "PATCH",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({account_id: Number(accountId), read_only: Boolean(readOnly)})
+  });
+  await loadAccounts();
+  setAccountResult("Account updated.", "success");
+}
+
+async function deleteAccount(accountId) {
+  await request(`/api/accounts?account_id=${encodeURIComponent(accountId)}`, {method: "DELETE"});
+  await loadAccounts();
+  setAccountResult("Account deleted.", "success");
+}
+
+async function changeOwnPasswordFromForm() {
+  const newPassword = document.getElementById("account_new_password").value;
+  const confirmPassword = document.getElementById("account_confirm_password").value;
+  if (newPassword !== confirmPassword) {
+    throw new Error("Passwords do not match.");
+  }
+  const data = await request("/api/account/password", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      current_password: document.getElementById("account_current_password").value,
+      new_password: newPassword,
+      confirm_password: confirmPassword
+    })
+  });
+  setChangePasswordResult("Password changed. Log in again with the new password.", "success");
+  window.location.replace("/");
+  return data;
 }
 
 function setStreamResult(message, kind = "") {
@@ -8340,6 +10022,10 @@ async function exportEasAlerts() {
 
 async function deleteEasAlerts() {
   if (!easAlertStreamId) return;
+  if (accountIsReadOnly()) {
+    navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
+    return;
+  }
   try {
     const count = await easBulkCount("delete");
     if (!count.count) {
@@ -8443,6 +10129,10 @@ async function loadEasAlertDetail() {
 
 async function removeCurrentEasAlert() {
   if (!easAlertStreamId || !easAlertDetailId) return;
+  if (accountIsReadOnly()) {
+    setEasAlertDetailResult("This account is read-only.", "error");
+    return;
+  }
   const button = document.getElementById("remove_eas_alert");
   setDisabled(button, true);
   try {
@@ -8470,7 +10160,9 @@ function showView(name) {
       item.dataset.view === name ||
       (item.dataset.view === "streams" && name === "stream_settings") ||
       (item.dataset.view === "iq_recorder" && ["iq_recorder_start", "iq_recording_download"].includes(name)) ||
-      (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name))
+      (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name)) ||
+      item.dataset.view === "accounts" && name === "accounts" ||
+      item.dataset.view === "change_password" && name === "change_password"
     ) {
       item.setAttribute("aria-current", "page");
     } else {
@@ -8478,7 +10170,7 @@ function showView(name) {
     }
   }
   if (moreButton) {
-    if (["receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs"].includes(name)) {
+    if (["receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "accounts", "change_password"].includes(name)) {
       moreButton.setAttribute("aria-current", "page");
     } else {
       moreButton.removeAttribute("aria-current");
@@ -8503,6 +10195,8 @@ function routeForView(name, params = {}) {
     if (params.recordingId) query.set("recording", params.recordingId);
   }
   if (name === "logs") query.set("view", "logs");
+  if (name === "accounts") query.set("view", "accounts");
+  if (name === "change_password") query.set("view", "change_password");
   if (name === "streams") query.set("view", "streams");
   if (name === "add_stream") query.set("view", "add_stream");
   if (name === "stream_settings") {
@@ -8537,7 +10231,7 @@ function routeForView(name, params = {}) {
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
-  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
+  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "accounts", "change_password", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
     return {
       view,
       streamId: query.get("stream") || "",
@@ -8560,6 +10254,10 @@ function routeState(view, params = {}) {
 }
 
 function applyRoute(route) {
+  if (accountIsReadOnly() && isReadOnlyRestrictedView(route.view)) {
+    showView("dashboard");
+    return;
+  }
   if (route.view === "stream_settings") {
     const streamId = route.streamId || settingsStreamId;
     const stream = configuredStreams.find(item => item.id === streamId);
@@ -8617,6 +10315,9 @@ function applyRoute(route) {
       .then(() => renderIqDownloadPage())
       .catch(error => setIqDownloadResult(error.message, "error"));
   }
+  if (route.view === "accounts") {
+    loadAccounts().catch(error => setAccountResult(error.message, "error"));
+  }
   showView(route.view);
 }
 
@@ -8670,6 +10371,11 @@ function toggleNavMoreMenu(focusFirst = false) {
 
 function navigateTo(view, params = {}, replace = false, force = false) {
   if (!replace && !force && !confirmDiscardNavigation()) return;
+  if (accountIsReadOnly() && isReadOnlyRestrictedView(view)) {
+    view = "dashboard";
+    params = {};
+    replace = true;
+  }
   closeNavMoreMenu();
   const url = routeForView(view, params);
   const state = routeState(view, params);
@@ -8781,6 +10487,7 @@ function iqRecorderSourceText(recorder) {
 
 function renderIqRecorder(recorder, storage) {
   recorder = recorder || {active: false, status: "idle"};
+  if (accountIsReadOnly()) recorder = {active: false, status: "idle"};
   populateIqSampleRates();
   renderIqStreamOptions();
   const active = Boolean(recorder.active);
@@ -8881,7 +10588,7 @@ function iqRecordingActionsCell(recording) {
   download.dataset.action = "download-iq-recording";
   download.dataset.recordingId = recording.id || "";
   menu.appendChild(download);
-  if (!recording.downloading) {
+  if (!recording.downloading && !accountIsReadOnly()) {
     const remove = document.createElement("button");
     remove.type = "button";
     remove.textContent = "Remove recording";
@@ -8902,6 +10609,10 @@ async function loadIqRecordings() {
 }
 
 async function startIqRecording() {
+  if (accountIsReadOnly()) {
+    setIqStartResult("This account is read-only.", "error");
+    return;
+  }
   const mode = currentIqMode();
   const rawMinutes = Number(document.getElementById("iq_duration_minutes").value || 0);
   const minutes = Math.max(0, Math.min(1440, Number.isFinite(rawMinutes) ? rawMinutes : 5));
@@ -8927,6 +10638,10 @@ async function startIqRecording() {
 }
 
 async function stopIqRecording() {
+  if (accountIsReadOnly()) {
+    setIqRecorderResult("This account is read-only.", "error");
+    return;
+  }
   setIqRecorderResult("Stopping I/Q recording...");
   const data = await request("/api/iq-recorder/stop", {
     method: "POST",
@@ -8954,7 +10669,23 @@ function renderIqDownloadPage() {
   );
 }
 
+function startBackgroundDownload(url) {
+  const iframe = document.createElement("iframe");
+  iframe.hidden = true;
+  iframe.setAttribute("aria-hidden", "true");
+  iframe.title = "";
+  iframe.src = url;
+  document.body.appendChild(iframe);
+  setTimeout(() => {
+    iframe.remove();
+  }, 10 * 60 * 1000);
+}
+
 async function removeIqRecording(recordingId) {
+  if (accountIsReadOnly()) {
+    setIqRecorderResult("This account is read-only.", "error");
+    return;
+  }
   const data = await request(`/api/iq-recording?id=${encodeURIComponent(recordingId)}`, {method: "DELETE"});
   renderIqRecordings(data.recordings || []);
   setIqRecorderResult("I/Q recording removed.", "success");
@@ -8967,7 +10698,7 @@ async function downloadSelectedIqRecording() {
     return;
   }
   const format = document.getElementById("iq_download_format").value || "cf";
-  window.location.href = `/api/iq-recording-download?id=${encodeURIComponent(recording.id)}&format=${encodeURIComponent(format)}`;
+  startBackgroundDownload(`/api/iq-recording-download?id=${encodeURIComponent(recording.id)}&format=${encodeURIComponent(format)}`);
   navigateTo("iq_recorder", {}, false, true);
   setIqRecorderResult("Download started.", "success");
   setTimeout(() => loadIqRecordings().catch(() => {}), 500);
@@ -9012,6 +10743,7 @@ function syncControls(data) {
 
 function applyStatus(data, options = {}) {
   applying = true;
+  if (data.account) applyAccountUi(data.account);
   const nextSignature = controlSignature(data);
   if (
     options.syncControls ||
@@ -9274,6 +11006,85 @@ document.getElementById("nav_more_menu").addEventListener("keydown", event => {
   }
 });
 
+document.getElementById("dismiss_account_secret").addEventListener("click", dismissAccountSecret);
+document.getElementById("copy_account_secret").addEventListener("click", copyAccountSecret);
+document.getElementById("open_create_account").addEventListener("click", () => {
+  setAccountResult("");
+  showAccountSecret("");
+  document.getElementById("create_account_panel").hidden = false;
+  document.getElementById("new_account_username").focus();
+});
+document.getElementById("cancel_create_account").addEventListener("click", () => {
+  document.getElementById("create_account_panel").hidden = true;
+});
+document.getElementById("create_account").addEventListener("click", async () => {
+  try {
+    await createAccountFromForm();
+  } catch (error) {
+    setAccountResult(error.message, "error");
+  }
+});
+document.getElementById("change_account_password").addEventListener("click", async () => {
+  try {
+    await changeOwnPasswordFromForm();
+  } catch (error) {
+    setChangePasswordResult(error.message, "error");
+  }
+});
+document.getElementById("cancel_change_password").addEventListener("click", () => {
+  navigateTo("dashboard");
+});
+document.getElementById("accounts-body").addEventListener("click", async event => {
+  const target = event.target;
+  if (!target || !target.dataset) return;
+  if (target.dataset.accountMenu !== undefined) {
+    const menu = target.nextElementSibling;
+    if (!menu) return;
+    if (menu.hidden) {
+      openStreamActionMenu(target, "first");
+    } else {
+      closeStreamActionMenu(menu, false);
+    }
+    return;
+  }
+  const accountId = target.dataset.accountId || "";
+  try {
+    if (target.dataset.action === "change-own-password") {
+      closeStreamActionMenus();
+      navigateTo("change_password");
+      return;
+    }
+    if (target.dataset.action === "reset-account-password") {
+      closeStreamActionMenus();
+      if (!window.confirm("Reset this account password?")) return;
+      await resetAccountPassword(accountId);
+      return;
+    }
+    if (target.dataset.action === "toggle-account-read-only") {
+      closeStreamActionMenus();
+      await setAccountReadOnly(accountId, target.dataset.readOnly === "1");
+      return;
+    }
+    if (target.dataset.action === "delete-account") {
+      closeStreamActionMenus();
+      if (!window.confirm("Delete this account?")) return;
+      await deleteAccount(accountId);
+    }
+  } catch (error) {
+    setAccountResult(error.message, "error");
+  }
+});
+document.getElementById("accounts-body").addEventListener("keydown", event => {
+  const target = event.target;
+  if (!target || !target.dataset) return;
+  if (target.dataset.accountMenu !== undefined) {
+    if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
+      event.preventDefault();
+      openStreamActionMenu(target, "first");
+    }
+  }
+});
+
 document.getElementById("dismiss_nwrorg_submission").addEventListener("click", dismissNwrOrgSubmissionDialog);
 document.getElementById("nwrorg_submission_link").addEventListener("click", dismissNwrOrgSubmissionDialog);
 document.getElementById("dismiss_monitor_unstable").addEventListener("click", dismissMonitorUnstableDialog);
@@ -9464,6 +11275,7 @@ window.addEventListener("popstate", event => {
 });
 
 document.getElementById("open_add_stream").addEventListener("click", () => {
+  if (accountIsReadOnly()) return;
   beginStreamWizard();
 });
 
@@ -9482,11 +11294,13 @@ document.getElementById("active-streams-body").addEventListener("click", async e
   }
   if (target.dataset.action === "edit-active-stream") {
     closeStreamActionMenus();
+    if (accountIsReadOnly()) return;
     editStreamSettings(target.dataset.streamId, target.dataset.outputId);
     return;
   }
   if (target.dataset.action === "toggle-active-stream") {
     closeStreamActionMenus();
+    if (accountIsReadOnly()) return;
     const stream = configuredStreams.find(item => item.id === target.dataset.streamId);
     if (!stream) {
       setStreamResult("Stream was not found.", "error");
@@ -9512,6 +11326,7 @@ document.getElementById("active-streams-body").addEventListener("click", async e
   }
   if (target.dataset.action === "remove-active-stream") {
     closeStreamActionMenus();
+    if (accountIsReadOnly()) return;
     try {
       const data = await request(`/api/streams?id=${encodeURIComponent(target.dataset.streamId)}`, {
         method: "DELETE"
@@ -10131,6 +11946,7 @@ document.getElementById("open_eas_export").addEventListener("click", () => {
 });
 
 document.getElementById("open_eas_delete").addEventListener("click", () => {
+  if (accountIsReadOnly()) return;
   easBulkOptionsSignature = "";
   navigateTo("eas_alert_delete", {streamId: easAlertStreamId, page: easAlertPage});
 });
@@ -10186,6 +12002,7 @@ document.getElementById("back_to_eas_alerts").addEventListener("click", () => {
 });
 
 document.getElementById("remove_eas_alert").addEventListener("click", async () => {
+  if (accountIsReadOnly()) return;
   if (!window.confirm("Remove this EAS alert and its audio file?")) return;
   await removeCurrentEasAlert();
 });
@@ -10202,7 +12019,9 @@ async function refresh() {
   renderReceiverControls();
   loadWebRtcSupport();
   const data = await request("/api/status");
-  await loadDevices(data.settings.serial);
+  if (!data.account || !data.account.read_only) {
+    await loadDevices(data.settings.serial);
+  }
   await searchStations();
   await loadStreams();
   await loadEasAlertStreams({preserve: true, quiet: true});
@@ -10219,6 +12038,10 @@ async function refresh() {
   setInterval(async () => {
     try {
       const status = await request("/api/status");
+      if (status.account && status.account.read_only) {
+        setText("device-errors", "");
+        return;
+      }
       await loadDevices(status.settings.serial);
     } catch (error) {
       setText("device-errors", error.message);

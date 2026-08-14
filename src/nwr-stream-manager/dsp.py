@@ -15,6 +15,9 @@ FloatArray = NDArray[np.float32]
 DEFAULT_OUTPUT_SAMPLE_RATE = 24_000
 DEFAULT_ALIAS_TRANSITION_HZ = 2_000.0
 DEFAULT_ALIAS_ATTENUATION_DB = 80.0
+WIDE_DECIMATOR_MIN_TRANSITION_HZ = 18_000.0
+WIDE_DECIMATOR_TRANSITION_FRACTION = 0.09375
+WIDE_DECIMATOR_ALIAS_ATTENUATION_DB = 70.0
 DEFAULT_DC_BLOCK_TIME_CONSTANT_SECONDS = 1.0
 STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE = 96_000.0
 STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE = 192_000.0
@@ -103,16 +106,6 @@ def _kaiser_beta(attenuation_db: float) -> float:
     return 0.0
 
 
-def _project_fir_windows(
-    windows: NDArray[np.complex64],
-    reversed_taps: FloatArray,
-) -> ComplexArray:
-    return np.sum(windows * reversed_taps, axis=1, dtype=np.complex64).astype(
-        np.complex64,
-        copy=False,
-    )
-
-
 def design_alias_filter_taps(
     input_rate: int,
     output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
@@ -178,18 +171,6 @@ class FirFilter:
         self._history = work[-keep:].copy() if keep else np.array([], dtype=np.complex64)
         return filtered
 
-    def project(self, samples: ComplexArray, local_indices: NDArray[np.int64]) -> ComplexArray:
-        samples = samples.astype(np.complex64, copy=False)
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
-        work = np.concatenate((self._history, samples))
-        keep = self.taps.size - 1
-        self._history = work[-keep:].copy() if keep else np.array([], dtype=np.complex64)
-        if local_indices.size == 0:
-            return np.array([], dtype=np.complex64)
-        windows = np.lib.stride_tricks.sliding_window_view(work, self.taps.size)[local_indices]
-        return _project_fir_windows(windows, self.taps[::-1])
-
 
 @dataclass
 class IntegerDecimator:
@@ -225,12 +206,10 @@ class IntegerDecimator:
         if samples.size == 0:
             return np.array([], dtype=np.complex64)
         start = self._filtered_samples_seen
-        end = start + int(samples.size)
-        first_position = start + ((-start) % self.factor)
-        positions = np.arange(first_position, end, self.factor, dtype=np.int64)
-        local_indices = positions - start
-        decimated = self.fir.project(samples, local_indices)
-        self._filtered_samples_seen = end
+        filtered = self.fir.process(samples)
+        offset = (-start) % self.factor
+        decimated = filtered[offset:: self.factor]
+        self._filtered_samples_seen = start + int(filtered.size)
         return decimated.astype(np.complex64, copy=False)
 
 
@@ -254,7 +233,7 @@ class RationalResampler:
     ratio: Fraction = field(init=False)
     _input_samples_seen: int = 0
     _next_output_position: float = 0.0
-    _history: ComplexArray = field(init=False)
+    _filtered_tail: ComplexArray = field(init=False)
 
     def __post_init__(self) -> None:
         if self.input_rate <= 0 or self.output_rate <= 0:
@@ -267,7 +246,7 @@ class RationalResampler:
             attenuation_db=self.attenuation_db,
         )
         self.fir = FirFilter(taps)
-        self._history = np.zeros(self.fir.taps.size, dtype=np.complex64)
+        self._filtered_tail = np.array([], dtype=np.complex64)
 
     @property
     def is_integer_decimation(self) -> bool:
@@ -277,10 +256,16 @@ class RationalResampler:
         samples = samples.astype(np.complex64, copy=False)
         if samples.size == 0:
             return np.array([], dtype=np.complex64)
-        work = np.concatenate((self._history, samples))
-        work_start = self._input_samples_seen - 1
-        work_end = self._input_samples_seen + int(samples.size)
-        max_position = work_end - 1
+        start = self._input_samples_seen
+        filtered = self.fir.process(samples)
+        end = start + int(filtered.size)
+        work = (
+            np.concatenate((self._filtered_tail, filtered))
+            if self._filtered_tail.size
+            else filtered
+        )
+        work_start = start - int(self._filtered_tail.size)
+        max_position = end - 1
         step = float(self.input_rate) / float(self.output_rate)
         position = self._next_output_position
         if position < work_start:
@@ -289,23 +274,21 @@ class RationalResampler:
 
         if position >= max_position:
             self._next_output_position = position
-            self._input_samples_seen = work_end
-            self._history = work[-self.fir.taps.size :].copy()
+            self._input_samples_seen = end
+            self._filtered_tail = work[-1:].copy()
             return np.array([], dtype=np.complex64)
 
         output_count = int(math.ceil((max_position - position) / step))
         positions = position + step * np.arange(output_count, dtype=np.float64)
         self._next_output_position = float(position + step * output_count)
-        self._input_samples_seen = work_end
-        self._history = work[-self.fir.taps.size :].copy()
+        self._input_samples_seen = end
+        self._filtered_tail = work[-1:].copy()
 
         local_positions = positions - float(work_start)
         indices = np.floor(local_positions).astype(np.int64)
         fractions = (local_positions - indices).astype(np.float32)
-        windows = np.lib.stride_tricks.sliding_window_view(work, self.fir.taps.size)
-        reversed_taps = self.fir.taps[::-1]
-        left = _project_fir_windows(windows[indices], reversed_taps)
-        right = _project_fir_windows(windows[indices + 1], reversed_taps)
+        left = work[indices]
+        right = work[indices + 1]
         return (left + (right - left) * fractions).astype(np.complex64, copy=False)
 
 
@@ -422,6 +405,8 @@ def create_decimator(
     if input_rate == output_rate:
         return IdentityDecimator()
     if output_rate >= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
+        transition_hz = _wide_decimator_transition_hz(output_rate, transition_hz)
+        attenuation_db = min(float(attenuation_db), WIDE_DECIMATOR_ALIAS_ATTENUATION_DB)
         if input_rate % output_rate == 0:
             return IntegerDecimator.create(
                 input_rate,
@@ -455,6 +440,16 @@ def create_decimator(
         transition_hz=transition_hz,
         attenuation_db=attenuation_db,
     )
+
+
+def _wide_decimator_transition_hz(output_rate: int, requested_transition_hz: float) -> float:
+    nyquist = float(output_rate) / 2.0
+    transition = max(
+        float(requested_transition_hz),
+        WIDE_DECIMATOR_MIN_TRANSITION_HZ,
+        float(output_rate) * WIDE_DECIMATOR_TRANSITION_FRACTION,
+    )
+    return min(transition, nyquist * 0.45)
 
 
 @dataclass
