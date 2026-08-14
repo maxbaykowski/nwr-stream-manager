@@ -45,6 +45,7 @@ if __package__:
     )
     from .dsp import (
         ComplexArray,
+        DEFAULT_ALIAS_ATTENUATION_DB,
         IqChannelizer,
         complex64_to_interleaved_f32,
         create_decimator,
@@ -106,6 +107,7 @@ else:
     IQ_SAMPLE_RATE = config_module.IQ_SAMPLE_RATE
     parse_audio_config = config_module.parse_audio_config
     ComplexArray = dsp.ComplexArray
+    DEFAULT_ALIAS_ATTENUATION_DB = dsp.DEFAULT_ALIAS_ATTENUATION_DB
     IqChannelizer = dsp.IqChannelizer
     complex64_to_interleaved_f32 = dsp.complex64_to_interleaved_f32
     create_decimator = dsp.create_decimator
@@ -221,7 +223,8 @@ CHANNEL_IQ_ALIAS_TRANSITION_HZ = 1_000.0
 ALIAS_FILTER_STRENGTH_MIN = 0
 ALIAS_FILTER_STRENGTH_MAX = 100
 ALIAS_FILTER_STRENGTH_DEFAULT = 100
-ALIAS_FILTER_EFFECTIVE_STRENGTH_MIN = 25
+ALIAS_FILTER_MIN_ATTENUATION_DB = 20.0
+ALIAS_FILTER_MAX_TRANSITION_SCALE = 16.0
 IQ_RECORDER_RAW_QUEUE_SECONDS = 2.0
 IQ_DOWNLOAD_CHUNK_BYTES = 256 * 1024
 IQ_DOWNLOAD_YIELD_SECONDS = 0.001
@@ -578,9 +581,17 @@ def validate_alias_filter_strength(value: Any) -> int:
 
 def alias_filter_transition_hz(base_transition_hz: float, strength: int | float) -> float:
     strength = validate_alias_filter_strength(strength)
-    effective_strength = max(ALIAS_FILTER_EFFECTIVE_STRENGTH_MIN, strength)
-    scale = ALIAS_FILTER_STRENGTH_MAX / float(effective_strength)
+    weak_fraction = 1.0 - (float(strength) / float(ALIAS_FILTER_STRENGTH_MAX))
+    scale = 1.0 + (ALIAS_FILTER_MAX_TRANSITION_SCALE - 1.0) * weak_fraction * weak_fraction
     return float(base_transition_hz) * scale
+
+
+def alias_filter_attenuation_db(base_attenuation_db: float, strength: int | float) -> float:
+    strength = validate_alias_filter_strength(strength)
+    strong_fraction = float(strength) / float(ALIAS_FILTER_STRENGTH_MAX)
+    return ALIAS_FILTER_MIN_ATTENUATION_DB + (
+        float(base_attenuation_db) - ALIAS_FILTER_MIN_ATTENUATION_DB
+    ) * strong_fraction
 
 
 class RawRtlFanout:
@@ -876,6 +887,10 @@ class IntermediateIqFanout:
                 INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
                 alias_filter_strength,
             )
+            attenuation_db = alias_filter_attenuation_db(
+                INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                alias_filter_strength,
+            )
             key = (raw_batch.sample_rate, self.output_rate)
             if decimator is None or decimator_key != key:
                 dc_blocker = IqDcBlocker(raw_batch.sample_rate)
@@ -883,7 +898,7 @@ class IntermediateIqFanout:
                     raw_batch.sample_rate,
                     self.output_rate,
                     transition_hz=transition_hz,
-                    attenuation_db=INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                    attenuation_db=attenuation_db,
                 )
                 decimator_key = key
                 decimator_alias_filter_strength = alias_filter_strength
@@ -893,7 +908,7 @@ class IntermediateIqFanout:
                     raw_batch.sample_rate,
                     self.output_rate,
                     transition_hz=transition_hz,
-                    attenuation_db=INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                    attenuation_db=attenuation_db,
                 )
                 decimator_alias_filter_strength = alias_filter_strength
             iq = rtl_u8_to_complex64(raw_batch.data)
@@ -1107,6 +1122,10 @@ def channel_audio_diagnostics(
         target_frequency_hz=frequency_hz,
         output_rate=IQ_SAMPLE_RATE,
         transition_hz=alias_filter_transition_hz(CHANNEL_IQ_ALIAS_TRANSITION_HZ, alias_filter_strength),
+        alias_attenuation_db=alias_filter_attenuation_db(
+            DEFAULT_ALIAS_ATTENUATION_DB,
+            alias_filter_strength,
+        ),
     )
     demodulator = ComplexNfmDemodulator()
     channel_iq = channelizer.process_complex(dc_blocker.process(iq))
@@ -1850,6 +1869,10 @@ class IcecastStreamWorker:
                 CHANNEL_IQ_ALIAS_TRANSITION_HZ,
                 alias_filter_strength,
             )
+            channel_attenuation_db = alias_filter_attenuation_db(
+                DEFAULT_ALIAS_ATTENUATION_DB,
+                alias_filter_strength,
+            )
             next_channelizer_key = (
                 batch.sample_rate,
                 batch.center_frequency_hz,
@@ -1861,13 +1884,17 @@ class IcecastStreamWorker:
                     target_frequency_hz=target_frequency_hz,
                     output_rate=IQ_SAMPLE_RATE,
                     transition_hz=channel_transition_hz,
+                    alias_attenuation_db=channel_attenuation_db,
                 )
                 channelizer_key = next_channelizer_key
                 channelizer_alias_filter_strength = alias_filter_strength
                 demodulator = ComplexNfmDemodulator()
                 frame_buffer.clear()
             elif channelizer_alias_filter_strength != alias_filter_strength:
-                channelizer.update_alias_filter(transition_hz=channel_transition_hz)
+                channelizer.update_alias_filter(
+                    transition_hz=channel_transition_hz,
+                    attenuation_db=channel_attenuation_db,
+                )
                 channelizer_alias_filter_strength = alias_filter_strength
             if channelizer is not None:
                 channelizer.set_target_frequency(target_frequency_hz)
@@ -2190,6 +2217,14 @@ class IqRecorderWorker:
                         if self.config.target_frequency_hz is None:
                             raise ValueError("stream recording target frequency is missing")
                         alias_filter_strength = self.alias_filter_strength_provider()
+                        channel_transition_hz = alias_filter_transition_hz(
+                            CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                            alias_filter_strength,
+                        )
+                        channel_attenuation_db = alias_filter_attenuation_db(
+                            DEFAULT_ALIAS_ATTENUATION_DB,
+                            alias_filter_strength,
+                        )
                         next_key = (
                             batch.sample_rate,
                             batch.center_frequency_hz,
@@ -2200,19 +2235,15 @@ class IqRecorderWorker:
                                 center_frequency_hz=batch.center_frequency_hz,
                                 target_frequency_hz=int(self.config.target_frequency_hz),
                                 output_rate=IQ_SAMPLE_RATE,
-                                transition_hz=alias_filter_transition_hz(
-                                    CHANNEL_IQ_ALIAS_TRANSITION_HZ,
-                                    alias_filter_strength,
-                                ),
+                                transition_hz=channel_transition_hz,
+                                alias_attenuation_db=channel_attenuation_db,
                             )
                             channelizer_key = next_key
                             channelizer_alias_filter_strength = alias_filter_strength
                         elif channelizer_alias_filter_strength != alias_filter_strength:
                             channelizer.update_alias_filter(
-                                transition_hz=alias_filter_transition_hz(
-                                    CHANNEL_IQ_ALIAS_TRANSITION_HZ,
-                                    alias_filter_strength,
-                                ),
+                                transition_hz=channel_transition_hz,
+                                attenuation_db=channel_attenuation_db,
                             )
                             channelizer_alias_filter_strength = alias_filter_strength
                         if channelizer is not None:
@@ -2229,13 +2260,17 @@ class IqRecorderWorker:
                                 INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
                                 alias_filter_strength,
                             )
+                            attenuation_db = alias_filter_attenuation_db(
+                                INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                                alias_filter_strength,
+                            )
                             next_key = (batch.sample_rate, self.config.sample_rate)
                             if decimator is None or decimator_key != next_key:
                                 decimator = create_decimator(
                                     batch.sample_rate,
                                     self.config.sample_rate,
                                     transition_hz=transition_hz,
-                                    attenuation_db=INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                                    attenuation_db=attenuation_db,
                                 )
                                 decimator_key = next_key
                                 decimator_alias_filter_strength = alias_filter_strength
@@ -2245,7 +2280,7 @@ class IqRecorderWorker:
                                     batch.sample_rate,
                                     self.config.sample_rate,
                                     transition_hz=transition_hz,
-                                    attenuation_db=INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                                    attenuation_db=attenuation_db,
                                 )
                                 decimator_alias_filter_strength = alias_filter_strength
                             recorded_iq = decimator.process(iq)
@@ -2535,6 +2570,14 @@ class WeatherReceiverWorker:
                 continue
             target_frequency_hz = self._frequency_hz()
             alias_filter_strength = self.alias_filter_strength_provider()
+            channel_transition_hz = alias_filter_transition_hz(
+                CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                alias_filter_strength,
+            )
+            channel_attenuation_db = alias_filter_attenuation_db(
+                DEFAULT_ALIAS_ATTENUATION_DB,
+                alias_filter_strength,
+            )
             next_channelizer_key = (batch.sample_rate, batch.center_frequency_hz)
             if channelizer is None or channelizer_key != next_channelizer_key:
                 channelizer = IqChannelizer(
@@ -2542,10 +2585,8 @@ class WeatherReceiverWorker:
                     center_frequency_hz=batch.center_frequency_hz,
                     target_frequency_hz=target_frequency_hz,
                     output_rate=IQ_SAMPLE_RATE,
-                    transition_hz=alias_filter_transition_hz(
-                        CHANNEL_IQ_ALIAS_TRANSITION_HZ,
-                        alias_filter_strength,
-                    ),
+                    transition_hz=channel_transition_hz,
+                    alias_attenuation_db=channel_attenuation_db,
                 )
                 channelizer_key = next_channelizer_key
                 channelizer_alias_filter_strength = alias_filter_strength
@@ -2553,10 +2594,8 @@ class WeatherReceiverWorker:
                 frame_buffer.clear()
             elif channelizer_alias_filter_strength != alias_filter_strength:
                 channelizer.update_alias_filter(
-                    transition_hz=alias_filter_transition_hz(
-                        CHANNEL_IQ_ALIAS_TRANSITION_HZ,
-                        alias_filter_strength,
-                    ),
+                    transition_hz=channel_transition_hz,
+                    attenuation_db=channel_attenuation_db,
                 )
                 channelizer_alias_filter_strength = alias_filter_strength
             if channelizer is not None:
@@ -6563,17 +6602,18 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <label>PPM Correction
           <input id="ppm_correction" type="number" min="-200" max="200" step="1">
         </label>
-        <label>Alias filter strength
+        <div>
+          <label for="alias_filter_strength">Alias filter strength</label>
           <input id="alias_filter_strength" type="range" min="0" max="100" step="1" value="100" aria-describedby="alias_filter_strength_hint">
-          <span id="alias_filter_strength_label" class="hint">100%</span>
-        </label>
+          <span id="alias_filter_strength_label" class="hint" aria-hidden="true">100%</span>
+        </div>
         <div class="row">
           <label><input id="gain_auto" type="checkbox"> Automatic gain</label>
           <label><input id="bias_tee" type="checkbox"> Bias tee</label>
         </div>
       </div>
       <div id="alias_filter_strength_hint" class="hint">
-        100% uses the strongest alias filters. Lower values reduce CPU by widening transition bands, but more unwanted energy may alias into the passband.
+        100% uses the strongest alias filters. 0% uses the weakest filters. Lower values reduce CPU by widening transition bands and reducing stopband rejection, but more unwanted energy may alias into the passband.
       </div>
     </section>
   </div>

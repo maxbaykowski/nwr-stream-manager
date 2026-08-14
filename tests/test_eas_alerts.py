@@ -204,11 +204,19 @@ class EasAlertTests(unittest.TestCase):
         )
         self.assertEqual(
             web_control.alias_filter_transition_hz(web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ, 50),
-            web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ * 2,
+            web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ * 4.75,
         )
         self.assertEqual(
             web_control.alias_filter_transition_hz(web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ, 0),
-            web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ * 4,
+            web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ * web_control.ALIAS_FILTER_MAX_TRANSITION_SCALE,
+        )
+        self.assertEqual(
+            web_control.alias_filter_attenuation_db(web_control.INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB, 100),
+            web_control.INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+        )
+        self.assertEqual(
+            web_control.alias_filter_attenuation_db(web_control.INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB, 0),
+            web_control.ALIAS_FILTER_MIN_ATTENUATION_DB,
         )
 
     def test_storage_monitor_reports_decimal_used_and_total_storage(self) -> None:
