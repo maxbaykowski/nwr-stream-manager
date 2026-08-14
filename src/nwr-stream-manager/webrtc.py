@@ -29,10 +29,12 @@ WEBRTC_TARGET_BITRATE_KBPS = 128
 WEBRTC_MIN_BITRATE_KBPS = 32
 WEBRTC_BITRATE_STEP_KBPS = 8
 WEBRTC_RECOVERY_STABLE_FEEDBACKS = 12
-WEBRTC_MONITOR_PREBUFFER_FRAMES = 15
-WEBRTC_MONITOR_TARGET_LATENCY_FRAMES = 15
-WEBRTC_MONITOR_LOW_WATER_FRAMES = 6
-WEBRTC_MONITOR_MAX_BUFFER_FRAMES = 48
+WEBRTC_MONITOR_PREBUFFER_FRAMES = 30
+WEBRTC_MONITOR_TARGET_LATENCY_FRAMES = 30
+WEBRTC_MONITOR_LOW_WATER_FRAMES = 12
+WEBRTC_MONITOR_MAX_BUFFER_FRAMES = 96
+WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS = 1.0
+WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS = 0.25
 
 
 class WebRtcError(RuntimeError):
@@ -298,11 +300,15 @@ class WebRtcAudioSource:
         prebuffer_frames: int = WEBRTC_MONITOR_PREBUFFER_FRAMES,
         target_latency_frames: int = WEBRTC_MONITOR_TARGET_LATENCY_FRAMES,
         low_water_frames: int = WEBRTC_MONITOR_LOW_WATER_FRAMES,
+        prebuffer_timeout_seconds: float = WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS,
+        refill_timeout_seconds: float = WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS,
     ) -> None:
         self.max_frames = max(1, int(max_frames))
         self.prebuffer_frames = max(0, min(int(prebuffer_frames), self.max_frames))
         self.target_latency_frames = max(1, min(int(target_latency_frames), self.max_frames))
         self.low_water_frames = max(0, min(int(low_water_frames), self.max_frames))
+        self.prebuffer_timeout_seconds = max(0.0, float(prebuffer_timeout_seconds))
+        self.refill_timeout_seconds = max(0.0, float(refill_timeout_seconds))
         self.frame_bytes = round(IQ_SAMPLE_RATE * WEBRTC_FRAME_SECONDS) * 2
         self.buffer: deque[bytes] = deque()
         self.lock = threading.Lock()
@@ -339,17 +345,24 @@ class WebRtcAudioSource:
     async def read_pcm(self, timeout: float = 0.25) -> bytes:
         self._bind_loop(asyncio.get_running_loop())
         if not self._prebuffered and self.prebuffer_frames:
-            await self._wait_for_buffer(self.prebuffer_frames, timeout)
+            await self._wait_for_buffer(
+                self.prebuffer_frames,
+                max(timeout, self.prebuffer_timeout_seconds),
+            )
             self._prebuffered = True
         elif self.low_water_frames:
             with self.lock:
                 buffered = len(self.buffer)
             if 0 < buffered < self.low_water_frames:
-                await self._wait_for_buffer(self.low_water_frames, WEBRTC_FRAME_SECONDS)
+                await self._wait_for_buffer(
+                    self.low_water_frames,
+                    max(WEBRTC_FRAME_SECONDS, self.refill_timeout_seconds),
+                )
         self._drop_stale_frames()
         frame = await self._pop_frame(timeout)
         if frame is None:
             self.underrun_frames += 1
+            self._prebuffered = False
             return b"\x00" * self.frame_bytes
         self.read_frames += 1
         return frame

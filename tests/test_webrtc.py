@@ -93,14 +93,66 @@ class WebRtcTests(unittest.TestCase):
         source = self.webrtc.WebRtcAudioSource()
         stats = source.stats()
 
-        self.assertEqual(stats["prebuffer_frames"], 15)
-        self.assertEqual(stats["target_latency_frames"], 15)
-        self.assertEqual(stats["low_water_frames"], 6)
-        self.assertEqual(stats["max_frames"], 48)
+        self.assertEqual(stats["prebuffer_frames"], 30)
+        self.assertEqual(stats["target_latency_frames"], 30)
+        self.assertEqual(stats["low_water_frames"], 12)
+        self.assertEqual(stats["max_frames"], 96)
         self.assertAlmostEqual(
             stats["target_latency_frames"] * self.webrtc.WEBRTC_FRAME_SECONDS,
-            0.3,
+            0.6,
         )
+
+    def test_audio_source_startup_prebuffer_is_not_limited_by_track_frame_timeout(self) -> None:
+        async def run_test():
+            source = self.webrtc.WebRtcAudioSource(
+                max_frames=4,
+                prebuffer_frames=2,
+                target_latency_frames=4,
+                low_water_frames=0,
+                prebuffer_timeout_seconds=0.2,
+            )
+
+            async def delayed_push():
+                await asyncio.sleep(0.03)
+                source.push_pcm(b"a" * source.frame_bytes)
+                source.push_pcm(b"b" * source.frame_bytes)
+
+            task = asyncio.create_task(delayed_push())
+            first = await source.read_pcm(timeout=self_webrtc.WEBRTC_FRAME_SECONDS)
+            await task
+            return first, source.stats()
+
+        self_webrtc = self.webrtc
+        first, stats = asyncio.run(run_test())
+        self.assertEqual(first, b"a" * len(first))
+        self.assertEqual(stats["underrun_frames"], 0)
+
+    def test_audio_source_rebuffers_after_underrun(self) -> None:
+        async def run_test():
+            source = self.webrtc.WebRtcAudioSource(
+                max_frames=4,
+                prebuffer_frames=2,
+                target_latency_frames=4,
+                low_water_frames=0,
+                prebuffer_timeout_seconds=0.2,
+            )
+            first = await source.read_pcm(timeout=0.01)
+
+            async def delayed_push():
+                await asyncio.sleep(0.03)
+                source.push_pcm(b"a" * source.frame_bytes)
+                source.push_pcm(b"b" * source.frame_bytes)
+
+            task = asyncio.create_task(delayed_push())
+            second = await source.read_pcm(timeout=self_webrtc.WEBRTC_FRAME_SECONDS)
+            await task
+            return first, second, source.stats()
+
+        self_webrtc = self.webrtc
+        first, second, stats = asyncio.run(run_test())
+        self.assertEqual(first, b"\x00" * len(first))
+        self.assertEqual(second, b"a" * len(second))
+        self.assertEqual(stats["underrun_frames"], 1)
 
     def test_audio_source_discards_stale_frames_to_hold_low_latency(self) -> None:
         async def run_test():
