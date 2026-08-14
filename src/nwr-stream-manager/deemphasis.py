@@ -43,6 +43,10 @@ class DeemphasisFilter:
     def process_float(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         return self._filter(samples)
 
+    def update_tau(self, tau: float) -> None:
+        self.tau = float(tau)
+        self._update_curve(generate_deemphasis_curve(self.sample_rate, self.tau))
+
     def flush(self) -> bytes:
         self._pending_byte = b""
         return b""
@@ -56,6 +60,20 @@ class DeemphasisFilter:
         stop = start + len(samples)
         self._history = window[-len(self._history) :]
         return filtered[start:stop].astype(np.float32, copy=False)
+
+    def _update_curve(self, curve: NDArray[np.float32]) -> None:
+        curve = np.asarray(curve, dtype=np.float32)
+        keep = max(len(curve) - 1, 0)
+        if keep <= 0:
+            history = np.array([], dtype=np.float32)
+        elif len(self._history) >= keep:
+            history = self._history[-keep:].copy()
+        else:
+            history = np.zeros(keep, dtype=np.float32)
+            if len(self._history):
+                history[-len(self._history) :] = self._history
+        self.curve = curve
+        self._history = history
 
 
 def generate_deemphasis_curve(sample_rate: int, tau: float) -> NDArray[np.float32]:

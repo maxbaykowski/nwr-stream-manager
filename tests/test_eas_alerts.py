@@ -159,6 +159,7 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertEqual(settings.sample_rate, web_control.DEFAULT_RTL_SAMPLE_RATE)
         self.assertEqual(settings.to_rtl_config().sample_rate, web_control.DEFAULT_RTL_SAMPLE_RATE)
+        self.assertEqual(settings.alias_filter_strength, web_control.ALIAS_FILTER_STRENGTH_DEFAULT)
 
     def test_rtl_settings_reject_sample_rate_update_payloads(self) -> None:
         web_control = self.web_control
@@ -167,6 +168,48 @@ class EasAlertTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "sample rate is fixed"):
             service._merged_settings({"sample_rate": 1_024_000})
+
+    def test_rtl_settings_validate_alias_filter_strength_update_payloads(self) -> None:
+        web_control = self.web_control
+        service = object.__new__(web_control.RtlControlService)
+        service.settings = web_control.RtlControlSettings(serial="12345678")
+
+        settings = service._merged_settings({"alias_filter_strength": 50})
+
+        self.assertEqual(settings.alias_filter_strength, 50)
+        settings = service._merged_settings({"alias_filter_strength": 0})
+        self.assertEqual(settings.alias_filter_strength, 0)
+        with self.assertRaisesRegex(ValueError, "alias_filter_strength"):
+            service._merged_settings({"alias_filter_strength": -1})
+
+    def test_rtl_settings_persist_alias_filter_strength(self) -> None:
+        web_control = self.web_control
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "rtl-control.json"
+            web_control.save_settings(
+                settings_path,
+                web_control.RtlControlSettings(serial="12345678", alias_filter_strength=50),
+            )
+
+            settings = web_control.load_settings(settings_path)
+
+        self.assertEqual(settings.alias_filter_strength, 50)
+
+    def test_alias_filter_strength_scales_all_transition_widths_from_current_default(self) -> None:
+        web_control = self.web_control
+
+        self.assertEqual(
+            web_control.alias_filter_transition_hz(web_control.INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ, 100),
+            web_control.INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
+        )
+        self.assertEqual(
+            web_control.alias_filter_transition_hz(web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ, 50),
+            web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ * 2,
+        )
+        self.assertEqual(
+            web_control.alias_filter_transition_hz(web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ, 0),
+            web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ * 4,
+        )
 
     def test_storage_monitor_reports_decimal_used_and_total_storage(self) -> None:
         web_control = self.web_control
@@ -921,7 +964,7 @@ class EasAlertTests(unittest.TestCase):
         self.assertIs(processor.lowpass, lowpass)
         self.assertIs(processor.notch, notch)
 
-    def test_audio_effects_processor_rebuilds_only_changed_fir_filter(self) -> None:
+    def test_audio_effects_processor_retunes_changed_fir_filter_in_place(self) -> None:
         config = self.config
         processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
             highpass=config.FilterConfig(enabled=True, frequency=300, sharpness=1),
@@ -931,6 +974,7 @@ class EasAlertTests(unittest.TestCase):
         highpass = processor.highpass
         lowpass = processor.lowpass
         notch = processor.notch
+        highpass_kernel = highpass.kernel.copy()
         comfort_noise = processor.comfort_noise
         deemphasis = processor.deemphasis
         deemphasis_makeup = processor.deemphasis_makeup
@@ -942,12 +986,33 @@ class EasAlertTests(unittest.TestCase):
         ))
 
         self.assertEqual(changed, ("highpass",))
-        self.assertIsNot(processor.highpass, highpass)
+        self.assertIs(processor.highpass, highpass)
+        self.assertFalse(np.array_equal(processor.highpass.kernel, highpass_kernel))
         self.assertIs(processor.lowpass, lowpass)
         self.assertIs(processor.notch, notch)
         self.assertIs(processor.comfort_noise, comfort_noise)
         self.assertIs(processor.deemphasis, deemphasis)
         self.assertIs(processor.deemphasis_makeup, deemphasis_makeup)
+
+    def test_audio_effects_processor_retunes_deemphasis_in_place(self) -> None:
+        config = self.config
+        processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
+            deemphasis=config.DeemphasisConfig(enabled=True, tau=300),
+        ))
+        deemphasis = processor.deemphasis
+        curve = deemphasis.curve.copy()
+        makeup = processor.deemphasis_makeup
+
+        changed = processor.update_config(config.AudioConfig(
+            deemphasis=config.DeemphasisConfig(enabled=True, tau=500),
+        ))
+
+        self.assertEqual(changed, ("deemphasis",))
+        self.assertIs(processor.deemphasis, deemphasis)
+        self.assertIs(processor.deemphasis_makeup, makeup)
+        self.assertNotEqual(processor.deemphasis.curve.tobytes(), curve.tobytes())
+        self.assertEqual(processor.deemphasis.tau, 500.0)
+        self.assertEqual(processor.deemphasis_makeup.tau, 500.0)
 
     def test_audio_dc_blocker_tracks_dc_without_damaging_audio_tone(self) -> None:
         sample_rate = 24_000
@@ -1082,6 +1147,7 @@ class EasAlertTests(unittest.TestCase):
                 stream={"id": "stream-1", "station": {"callsign": "WXN99", "frequency": "162.475"}, "outputs": []},
                 fanout=Fanout(),
                 fallback_settings_provider=lambda: None,
+                alias_filter_strength_provider=lambda: self.web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
                 state_directory=Path(tempfile.gettempdir()),
             )
             first = worker.encoder_group_for(icecast_a)
@@ -1153,6 +1219,7 @@ class EasAlertTests(unittest.TestCase):
                 stream=stream,
                 fanout=Fanout(),
                 fallback_settings_provider=lambda: None,
+                alias_filter_strength_provider=lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
                 state_directory=Path(tempfile.gettempdir()),
             )
             worker.sync_stream(stream)
@@ -1214,6 +1281,7 @@ class EasAlertTests(unittest.TestCase):
                     frequency_hz=162_475_000,
                 ),
                 storage_monitor=Storage(),
+                alias_filter_strength_provider=lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
             )
             worker.start()
             fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=sample_rate, center_frequency_hz=162_475_000))
@@ -1273,6 +1341,7 @@ class EasAlertTests(unittest.TestCase):
                             frequency_hz=162_475_000,
                         ),
                         storage_monitor=Storage(),
+                        alias_filter_strength_provider=lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
                     )
                     worker.start()
                     fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=input_rate, center_frequency_hz=162_475_000))
@@ -1399,6 +1468,7 @@ class EasAlertTests(unittest.TestCase):
                     target_frequency_hz=162_475_000,
                 ),
                 storage_monitor=Storage(),
+                alias_filter_strength_provider=lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
             )
             worker.start()
             fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=sample_rate, center_frequency_hz=162_475_000))

@@ -39,6 +39,20 @@ class FirFilter:
     def __post_init__(self) -> None:
         self.history = np.zeros(max(len(self.kernel) - 1, 0), dtype=np.float32)
 
+    def update_kernel(self, kernel: NDArray[np.float32]) -> None:
+        kernel = np.asarray(kernel, dtype=np.float32)
+        keep = max(len(kernel) - 1, 0)
+        if keep <= 0:
+            history = np.array([], dtype=np.float32)
+        elif len(self.history) >= keep:
+            history = self.history[-keep:].copy()
+        else:
+            history = np.zeros(keep, dtype=np.float32)
+            if len(self.history):
+                history[-len(self.history) :] = self.history
+        self.kernel = kernel
+        self.history = history
+
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         if len(samples) == 0:
             return samples
@@ -139,20 +153,35 @@ class AudioEffectsProcessor:
             changed.append("comfort_noise")
 
         if config.deemphasis != self.config.deemphasis:
-            self.deemphasis = DeemphasisFilter(self.sample_rate, config.deemphasis_tau)
+            self.deemphasis.update_tau(config.deemphasis_tau)
             self.deemphasis_makeup.tau = config.deemphasis_tau
             changed.append("deemphasis")
 
         if config.highpass != self.config.highpass:
-            self.highpass = _build_filter("highpass", config.highpass, self.sample_rate)
+            self.highpass = _update_or_build_filter(
+                self.highpass,
+                "highpass",
+                config.highpass,
+                self.sample_rate,
+            )
             changed.append("highpass")
 
         if config.lowpass != self.config.lowpass:
-            self.lowpass = _build_filter("lowpass", config.lowpass, self.sample_rate)
+            self.lowpass = _update_or_build_filter(
+                self.lowpass,
+                "lowpass",
+                config.lowpass,
+                self.sample_rate,
+            )
             changed.append("lowpass")
 
         if config.notch != self.config.notch:
-            self.notch = _build_filter("notch", config.notch, self.sample_rate)
+            self.notch = _update_or_build_filter(
+                self.notch,
+                "notch",
+                config.notch,
+                self.sample_rate,
+            )
             changed.append("notch")
 
         if config.volume != self.config.volume:
@@ -211,22 +240,46 @@ def _build_filter(
     config: FilterConfig,
     sample_rate: int,
 ) -> FirFilter | None:
+    kernel = _filter_kernel(kind, config, sample_rate)
+    return None if kernel is None else FirFilter(kernel)
+
+
+def _update_or_build_filter(
+    current: FirFilter | None,
+    kind: str,
+    config: FilterConfig,
+    sample_rate: int,
+) -> FirFilter | None:
+    kernel = _filter_kernel(kind, config, sample_rate)
+    if kernel is None:
+        return None
+    if current is None:
+        return FirFilter(kernel)
+    current.update_kernel(kernel)
+    return current
+
+
+def _filter_kernel(
+    kind: str,
+    config: FilterConfig,
+    sample_rate: int,
+) -> NDArray[np.float32] | None:
     if not config.enabled:
         return None
     if kind == "highpass":
         taps = highpass_tap_count_for_sharpness(config.sharpness)
         cutoff = highpass_design_cutoff(config.frequency, config.sharpness)
-        return FirFilter(_highpass_kernel(cutoff, sample_rate, taps))
+        return _highpass_kernel(cutoff, sample_rate, taps)
     taps = tap_count_for_sharpness(config.sharpness)
     if kind == "lowpass":
         if config.frequency >= sample_rate / 2:
             return None
-        return FirFilter(_lowpass_kernel(config.frequency, sample_rate, taps))
+        return _lowpass_kernel(config.frequency, sample_rate, taps)
     if kind == "notch":
         width = _notch_width(config.sharpness)
         low = max(1.0, config.frequency - width / 2)
         high = min(sample_rate / 2 - 1.0, config.frequency + width / 2)
-        return FirFilter(_notch_kernel(low, high, sample_rate, taps))
+        return _notch_kernel(low, high, sample_rate, taps)
     raise ValueError(f"unsupported filter kind: {kind}")
 
 

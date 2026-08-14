@@ -43,7 +43,13 @@ if __package__:
         IQ_SAMPLE_RATE,
         parse_audio_config,
     )
-    from .dsp import ComplexArray, IqChannelizer, complex64_to_interleaved_f32, create_decimator
+    from .dsp import (
+        ComplexArray,
+        IqChannelizer,
+        complex64_to_interleaved_f32,
+        create_decimator,
+        update_decimator_alias_filter,
+    )
     from .eas_recording import EasRecorderOutput
     from .encoder import PcmResampler, create_audio_encoder
     from .fallback_audio import load_fallback_audio
@@ -103,6 +109,7 @@ else:
     IqChannelizer = dsp.IqChannelizer
     complex64_to_interleaved_f32 = dsp.complex64_to_interleaved_f32
     create_decimator = dsp.create_decimator
+    update_decimator_alias_filter = dsp.update_decimator_alias_filter
     EasRecorderOutput = eas_recording.EasRecorderOutput
     PcmResampler = encoder.PcmResampler
     create_audio_encoder = encoder.create_audio_encoder
@@ -211,6 +218,10 @@ INTERMEDIATE_IQ_SAMPLE_RATE = 192_000
 INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ = 8_000.0
 INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB = 70.0
 CHANNEL_IQ_ALIAS_TRANSITION_HZ = 1_000.0
+ALIAS_FILTER_STRENGTH_MIN = 0
+ALIAS_FILTER_STRENGTH_MAX = 100
+ALIAS_FILTER_STRENGTH_DEFAULT = 100
+ALIAS_FILTER_EFFECTIVE_STRENGTH_MIN = 25
 IQ_RECORDER_RAW_QUEUE_SECONDS = 2.0
 IQ_DOWNLOAD_CHUNK_BYTES = 256 * 1024
 IQ_DOWNLOAD_YIELD_SECONDS = 0.001
@@ -264,6 +275,7 @@ class RtlControlSettings:
     gain: float | None = None
     ppm_correction: int = 0
     bias_tee: bool = False
+    alias_filter_strength: int = ALIAS_FILTER_STRENGTH_DEFAULT
 
     def to_rtl_config(self) -> RtlConfig:
         if not self.serial:
@@ -555,6 +567,22 @@ def format_storage_bytes(value: int | float) -> str:
     return f"{value:.1f} {units[unit_index]}"
 
 
+def validate_alias_filter_strength(value: Any) -> int:
+    strength = int(value)
+    if not ALIAS_FILTER_STRENGTH_MIN <= strength <= ALIAS_FILTER_STRENGTH_MAX:
+        raise ValueError(
+            f"alias_filter_strength must be between {ALIAS_FILTER_STRENGTH_MIN} and {ALIAS_FILTER_STRENGTH_MAX}"
+        )
+    return strength
+
+
+def alias_filter_transition_hz(base_transition_hz: float, strength: int | float) -> float:
+    strength = validate_alias_filter_strength(strength)
+    effective_strength = max(ALIAS_FILTER_EFFECTIVE_STRENGTH_MIN, strength)
+    scale = ALIAS_FILTER_STRENGTH_MAX / float(effective_strength)
+    return float(base_transition_hz) * scale
+
+
 class RawRtlFanout:
     def __init__(self, source: RtlCaptureSource) -> None:
         self.source = source
@@ -724,9 +752,16 @@ class RawRtlFanout:
 
 
 class IntermediateIqFanout:
-    def __init__(self, raw_fanout: RawRtlFanout, output_rate: int = INTERMEDIATE_IQ_SAMPLE_RATE) -> None:
+    def __init__(
+        self,
+        raw_fanout: RawRtlFanout,
+        output_rate: int = INTERMEDIATE_IQ_SAMPLE_RATE,
+        *,
+        alias_filter_strength: int = ALIAS_FILTER_STRENGTH_DEFAULT,
+    ) -> None:
         self.raw_fanout = raw_fanout
         self.output_rate = int(output_rate)
+        self.alias_filter_strength = validate_alias_filter_strength(alias_filter_strength)
         self.raw_queue = subscribe_raw_fanout(
             raw_fanout,
             max_chunks=INTERMEDIATE_SOURCE_QUEUE_CHUNKS,
@@ -748,6 +783,11 @@ class IntermediateIqFanout:
         self.total_dropped_samples = 0
         self.last_output_at = 0.0
         self.last_drop_log_at = 0.0
+
+    def set_alias_filter_strength(self, value: int) -> None:
+        value = validate_alias_filter_strength(value)
+        with self.subscribers_lock:
+            self.alias_filter_strength = value
 
     def subscribe(
         self,
@@ -795,6 +835,7 @@ class IntermediateIqFanout:
             subscribers = [self._subscriber_stats_locked(subscriber) for subscriber in self.subscribers]
             return {
                 "sample_rate": self.output_rate,
+                "alias_filter_strength": self.alias_filter_strength,
                 "read_batches": self.read_batches,
                 "read_samples": self.read_samples,
                 "output_batches": self.output_batches,
@@ -820,6 +861,7 @@ class IntermediateIqFanout:
         dc_blocker: IqDcBlocker | None = None
         decimator = None
         decimator_key: tuple[int, int] | None = None
+        decimator_alias_filter_strength: int | None = None
         while not self.stop_event.is_set():
             try:
                 raw_batch: RtlSampleBatch = self.raw_queue.get(timeout=0.5)
@@ -828,16 +870,32 @@ class IntermediateIqFanout:
             except Exception as exc:
                 LOG.warning("intermediate IQ fanout failed to read RTL-SDR samples: %s", exc)
                 continue
+            with self.subscribers_lock:
+                alias_filter_strength = self.alias_filter_strength
+            transition_hz = alias_filter_transition_hz(
+                INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
+                alias_filter_strength,
+            )
             key = (raw_batch.sample_rate, self.output_rate)
             if decimator is None or decimator_key != key:
                 dc_blocker = IqDcBlocker(raw_batch.sample_rate)
                 decimator = create_decimator(
                     raw_batch.sample_rate,
                     self.output_rate,
-                    transition_hz=INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
+                    transition_hz=transition_hz,
                     attenuation_db=INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
                 )
                 decimator_key = key
+                decimator_alias_filter_strength = alias_filter_strength
+            elif decimator_alias_filter_strength != alias_filter_strength:
+                update_decimator_alias_filter(
+                    decimator,
+                    raw_batch.sample_rate,
+                    self.output_rate,
+                    transition_hz=transition_hz,
+                    attenuation_db=INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                )
+                decimator_alias_filter_strength = alias_filter_strength
             iq = rtl_u8_to_complex64(raw_batch.data)
             if iq.size == 0:
                 continue
@@ -1040,6 +1098,7 @@ def channel_audio_diagnostics(
     sample_rate: int,
     center_frequency_hz: int,
     frequency_hz: int,
+    alias_filter_strength: int = ALIAS_FILTER_STRENGTH_DEFAULT,
 ) -> dict[str, Any]:
     dc_blocker = IqDcBlocker(sample_rate)
     channelizer = IqChannelizer(
@@ -1047,7 +1106,7 @@ def channel_audio_diagnostics(
         center_frequency_hz=center_frequency_hz,
         target_frequency_hz=frequency_hz,
         output_rate=IQ_SAMPLE_RATE,
-        transition_hz=CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+        transition_hz=alias_filter_transition_hz(CHANNEL_IQ_ALIAS_TRANSITION_HZ, alias_filter_strength),
     )
     demodulator = ComplexNfmDemodulator()
     channel_iq = channelizer.process_complex(dc_blocker.process(iq))
@@ -1609,12 +1668,14 @@ class IcecastStreamWorker:
         stream: dict[str, Any],
         fanout: RawRtlFanout | IntermediateIqFanout,
         fallback_settings_provider,
+        alias_filter_strength_provider,
         state_directory: Path,
         storage_monitor: StorageMonitor | None = None,
     ) -> None:
         self.stream = stream
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
+        self.alias_filter_strength_provider = alias_filter_strength_provider
         self.state_directory = state_directory
         self.storage_monitor = storage_monitor or StorageMonitor([state_directory])
         station = stream.get("station", {})
@@ -1734,10 +1795,9 @@ class IcecastStreamWorker:
             return bool(self.monitor_sources)
 
     def _run_pcm_producer(self) -> None:
-        station = self.stream["station"]
-        target_frequency_hz = float(station["frequency"]) * 1_000_000
         channelizer: IqChannelizer | None = None
-        channelizer_key: tuple[int, int, int] | None = None
+        channelizer_key: tuple[int, int] | None = None
+        channelizer_alias_filter_strength: int | None = None
         demodulator = ComplexNfmDemodulator()
         audio_config = self.audio_config()
         effects = AudioEffectsProcessor(audio_config)
@@ -1772,26 +1832,45 @@ class IcecastStreamWorker:
                     continue
                 if not fallback_state.active:
                     fallback_state.active = True
-                    LOG.info("starting fallback audio for %s after %.1f seconds without IQ", station.get("callsign"), idle_seconds)
+                    with self.lock:
+                        fallback_station = self.stream.get("station", {})
+                    LOG.info(
+                        "starting fallback audio for %s after %.1f seconds without IQ",
+                        fallback_station.get("callsign"),
+                        idle_seconds,
+                    )
                 self._write_pcm(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds))
                 continue
             idle_output_active = False
+            with self.lock:
+                station = self.stream["station"]
+            target_frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
+            alias_filter_strength = self.alias_filter_strength_provider()
+            channel_transition_hz = alias_filter_transition_hz(
+                CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                alias_filter_strength,
+            )
             next_channelizer_key = (
                 batch.sample_rate,
                 batch.center_frequency_hz,
-                int(round(target_frequency_hz)),
             )
             if channelizer is None or channelizer_key != next_channelizer_key:
                 channelizer = IqChannelizer(
                     input_rate=batch.sample_rate,
                     center_frequency_hz=batch.center_frequency_hz,
-                    target_frequency_hz=int(round(target_frequency_hz)),
+                    target_frequency_hz=target_frequency_hz,
                     output_rate=IQ_SAMPLE_RATE,
-                    transition_hz=CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                    transition_hz=channel_transition_hz,
                 )
                 channelizer_key = next_channelizer_key
+                channelizer_alias_filter_strength = alias_filter_strength
                 demodulator = ComplexNfmDemodulator()
                 frame_buffer.clear()
+            elif channelizer_alias_filter_strength != alias_filter_strength:
+                channelizer.update_alias_filter(transition_hz=channel_transition_hz)
+                channelizer_alias_filter_strength = alias_filter_strength
+            if channelizer is not None:
+                channelizer.set_target_frequency(target_frequency_hz)
             iq = iq_batch_complex(batch)
             audio = demodulator.process(channelizer.process_complex(iq))
             if len(audio) == 0:
@@ -1980,6 +2059,7 @@ class IqRecorderConfig:
     stream_id: str = ""
     stream_label: str = ""
     target_frequency_hz: int | None = None
+    alias_filter_strength: int = ALIAS_FILTER_STRENGTH_DEFAULT
 
 
 class IqRecorderWorker:
@@ -1989,10 +2069,12 @@ class IqRecorderWorker:
         fanout: RawRtlFanout | IntermediateIqFanout,
         config: IqRecorderConfig,
         storage_monitor: StorageMonitor,
+        alias_filter_strength_provider,
     ) -> None:
         self.fanout = fanout
         self.config = config
         self.storage_monitor = storage_monitor
+        self.alias_filter_strength_provider = alias_filter_strength_provider
         self.queue = subscribe_raw_fanout(
             fanout,
             max_chunks=IQ_RECORDER_QUEUE_CHUNKS,
@@ -2082,9 +2164,11 @@ class IqRecorderWorker:
 
     def _run(self) -> None:
         channelizer: IqChannelizer | None = None
-        channelizer_key: tuple[int, int, int] | None = None
+        channelizer_key: tuple[int, int] | None = None
+        channelizer_alias_filter_strength: int | None = None
         decimator = None
         decimator_key: tuple[int, int] | None = None
+        decimator_alias_filter_strength: int | None = None
         try:
             with self.config.output_path.open("wb") as output:
                 while not self.stop_event.is_set():
@@ -2105,15 +2189,34 @@ class IqRecorderWorker:
                     if self.config.mode == IQ_RECORDER_MODE_STREAM:
                         if self.config.target_frequency_hz is None:
                             raise ValueError("stream recording target frequency is missing")
-                        next_key = (batch.sample_rate, batch.center_frequency_hz, int(self.config.target_frequency_hz))
+                        alias_filter_strength = self.alias_filter_strength_provider()
+                        next_key = (
+                            batch.sample_rate,
+                            batch.center_frequency_hz,
+                        )
                         if channelizer is None or channelizer_key != next_key:
                             channelizer = IqChannelizer(
                                 input_rate=batch.sample_rate,
                                 center_frequency_hz=batch.center_frequency_hz,
                                 target_frequency_hz=int(self.config.target_frequency_hz),
                                 output_rate=IQ_SAMPLE_RATE,
+                                transition_hz=alias_filter_transition_hz(
+                                    CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                                    alias_filter_strength,
+                                ),
                             )
                             channelizer_key = next_key
+                            channelizer_alias_filter_strength = alias_filter_strength
+                        elif channelizer_alias_filter_strength != alias_filter_strength:
+                            channelizer.update_alias_filter(
+                                transition_hz=alias_filter_transition_hz(
+                                    CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                                    alias_filter_strength,
+                                ),
+                            )
+                            channelizer_alias_filter_strength = alias_filter_strength
+                        if channelizer is not None:
+                            channelizer.set_target_frequency(int(self.config.target_frequency_hz))
                         recorded_iq = channelizer.process_complex(iq)
                     else:
                         if self.config.sample_rate > batch.sample_rate:
@@ -2121,10 +2224,30 @@ class IqRecorderWorker:
                         if self.config.sample_rate == batch.sample_rate:
                             recorded_iq = iq
                         else:
+                            alias_filter_strength = self.alias_filter_strength_provider()
+                            transition_hz = alias_filter_transition_hz(
+                                INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
+                                alias_filter_strength,
+                            )
                             next_key = (batch.sample_rate, self.config.sample_rate)
                             if decimator is None or decimator_key != next_key:
-                                decimator = create_decimator(batch.sample_rate, self.config.sample_rate)
+                                decimator = create_decimator(
+                                    batch.sample_rate,
+                                    self.config.sample_rate,
+                                    transition_hz=transition_hz,
+                                    attenuation_db=INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                                )
                                 decimator_key = next_key
+                                decimator_alias_filter_strength = alias_filter_strength
+                            elif decimator_alias_filter_strength != alias_filter_strength:
+                                update_decimator_alias_filter(
+                                    decimator,
+                                    batch.sample_rate,
+                                    self.config.sample_rate,
+                                    transition_hz=transition_hz,
+                                    attenuation_db=INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
+                                )
+                                decimator_alias_filter_strength = alias_filter_strength
                             recorded_iq = decimator.process(iq)
                     if recorded_iq.size == 0:
                         continue
@@ -2335,9 +2458,11 @@ class WeatherReceiverWorker:
         client_id: str,
         fanout: RawRtlFanout | IntermediateIqFanout,
         frequency_hz: int,
+        alias_filter_strength_provider,
     ) -> None:
         self.client_id = client_id
         self.fanout = fanout
+        self.alias_filter_strength_provider = alias_filter_strength_provider
         self.queue = subscribe_raw_fanout(
             fanout,
             max_chunks=LIVE_IQ_QUEUE_CHUNKS,
@@ -2396,6 +2521,7 @@ class WeatherReceiverWorker:
     def _run(self) -> None:
         channelizer: IqChannelizer | None = None
         channelizer_key: tuple[int, int] | None = None
+        channelizer_alias_filter_strength: int | None = None
         demodulator = ComplexNfmDemodulator()
         effects = AudioEffectsProcessor(RECEIVER_AUDIO_CONFIG)
         frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
@@ -2408,6 +2534,7 @@ class WeatherReceiverWorker:
                 LOG.warning("weather receiver RTL-SDR source failed for client %s: %s", self.client_id, exc)
                 continue
             target_frequency_hz = self._frequency_hz()
+            alias_filter_strength = self.alias_filter_strength_provider()
             next_channelizer_key = (batch.sample_rate, batch.center_frequency_hz)
             if channelizer is None or channelizer_key != next_channelizer_key:
                 channelizer = IqChannelizer(
@@ -2415,14 +2542,25 @@ class WeatherReceiverWorker:
                     center_frequency_hz=batch.center_frequency_hz,
                     target_frequency_hz=target_frequency_hz,
                     output_rate=IQ_SAMPLE_RATE,
-                    transition_hz=CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                    transition_hz=alias_filter_transition_hz(
+                        CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                        alias_filter_strength,
+                    ),
                 )
                 channelizer_key = next_channelizer_key
+                channelizer_alias_filter_strength = alias_filter_strength
                 demodulator = ComplexNfmDemodulator()
                 frame_buffer.clear()
-            else:
-                channelizer.target_frequency_hz = target_frequency_hz
-                channelizer.shifter.offset_hz = float(batch.center_frequency_hz - target_frequency_hz)
+            elif channelizer_alias_filter_strength != alias_filter_strength:
+                channelizer.update_alias_filter(
+                    transition_hz=alias_filter_transition_hz(
+                        CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                        alias_filter_strength,
+                    ),
+                )
+                channelizer_alias_filter_strength = alias_filter_strength
+            if channelizer is not None:
+                channelizer.set_target_frequency(target_frequency_hz)
             iq = iq_batch_complex(batch)
             audio = demodulator.process(channelizer.process_complex(iq))
             if len(audio) == 0:
@@ -2778,6 +2916,7 @@ class RtlControlService:
                 fanout=fanout,
                 config=config,
                 storage_monitor=self.storage_monitor,
+                alias_filter_strength_provider=self._alias_filter_strength,
             )
             self.iq_recorder = worker
             self.iq_recorder_account_id = int(account_id or 0) if account_id is not None else None
@@ -2843,11 +2982,13 @@ class RtlControlService:
             stream_id=stream_id,
             stream_label=stream_label,
             target_frequency_hz=target_frequency_hz,
+            alias_filter_strength=self.settings.alias_filter_strength,
         )
 
     def rtl_diagnostics(self) -> dict[str, Any]:
         with self.lock:
             fanout = self.raw_fanout
+            alias_filter_strength = self.settings.alias_filter_strength
         if fanout is None:
             raise ValueError("RTL-SDR capture is not active")
         queue_depth = max(RTL_DIAGNOSTIC_MIN_BATCHES, min(RTL_DIAGNOSTIC_MAX_BATCHES, 16))
@@ -2896,7 +3037,13 @@ class RtlControlService:
             iq = iq[-target_samples:]
         raw_stats = raw_iq_diagnostics(iq, sample_rate, center_frequency_hz, raw)
         channels = [
-            channel_audio_diagnostics(iq, sample_rate, center_frequency_hz, frequency_hz)
+            channel_audio_diagnostics(
+                iq,
+                sample_rate,
+                center_frequency_hz,
+                frequency_hz,
+                alias_filter_strength=alias_filter_strength,
+            )
             for frequency_hz in NWR_RECEIVER_CHANNELS_HZ
         ]
         strongest = max(
@@ -3357,6 +3504,7 @@ class RtlControlService:
                 client_id=client_id,
                 fanout=fanout,
                 frequency_hz=frequency_hz,
+                alias_filter_strength_provider=self._alias_filter_strength,
             )
             self.receiver_workers[client_id] = worker
             self.receiver_accounts_by_client[client_id] = int(account_id or 0) if account_id is not None else 0
@@ -3621,12 +3769,13 @@ class RtlControlService:
             self.settings = settings
             save_settings(self.state_path, settings)
             LOG.info(
-                "saved RTL settings: serial=%s sample_rate=%s gain=%s ppm=%s bias_tee=%s",
+                "saved RTL settings: serial=%s sample_rate=%s gain=%s ppm=%s bias_tee=%s alias_filter_strength=%s",
                 settings.serial or "<none>",
                 settings.sample_rate,
                 "auto" if settings.gain is None else f"{settings.gain:g} dB",
                 settings.ppm_correction,
                 settings.bias_tee,
+                settings.alias_filter_strength,
             )
             if settings.serial:
                 self._start_or_update_capture_locked()
@@ -3648,6 +3797,8 @@ class RtlControlService:
         if "gain" in payload:
             gain = payload["gain"]
             changes["gain"] = None if gain is None or gain == "" else float(gain)
+        if "alias_filter_strength" in payload:
+            changes["alias_filter_strength"] = validate_alias_filter_strength(payload["alias_filter_strength"])
         return replace(settings, **changes)
 
     def _start_or_update_capture_locked(self) -> None:
@@ -3662,7 +3813,10 @@ class RtlControlService:
                 max_chunks=64,
                 name="web-status-drain",
             )
-            self.intermediate_fanout = IntermediateIqFanout(self.raw_fanout)
+            self.intermediate_fanout = IntermediateIqFanout(
+                self.raw_fanout,
+                alias_filter_strength=self.settings.alias_filter_strength,
+            )
             self.intermediate_fanout.start()
             self.raw_fanout.start()
             self.drain_stop.clear()
@@ -3675,10 +3829,17 @@ class RtlControlService:
             self._sync_stream_workers_locked()
             LOG.info("started RTL-SDR control capture for serial %s", config.serial)
             return
-        self.capture.apply_config(config)
+        if config != self.capture.config:
+            self.capture.apply_config(config)
+        if self.intermediate_fanout is not None:
+            self.intermediate_fanout.set_alias_filter_strength(self.settings.alias_filter_strength)
         self.settings = self._effective_settings_locked()
         save_settings(self.state_path, self.settings)
         self._sync_stream_workers_locked()
+
+    def _alias_filter_strength(self) -> int:
+        with self.lock:
+            return self.settings.alias_filter_strength
 
     def _effective_settings_locked(self) -> RtlControlSettings:
         if self.capture is None:
@@ -3813,6 +3974,7 @@ class RtlControlService:
                 stream=stream,
                 fanout=fanout,
                 fallback_settings_provider=self.fallback_settings_snapshot,
+                alias_filter_strength_provider=self._alias_filter_strength,
                 state_directory=self.state_path.parent,
                 storage_monitor=self.storage_monitor,
             )
@@ -4731,6 +4893,9 @@ def load_settings(path: Path) -> RtlControlSettings:
             gain=None if raw.get("gain") is None else float(raw["gain"]),
             ppm_correction=validate_ppm_correction(int(raw.get("ppm_correction", 0))),
             bias_tee=bool(raw.get("bias_tee", False)),
+            alias_filter_strength=validate_alias_filter_strength(
+                raw.get("alias_filter_strength", ALIAS_FILTER_STRENGTH_DEFAULT)
+            ),
         )
     except Exception as exc:
         LOG.warning("RTL control settings in %s are invalid: %s", path, exc)
@@ -6398,10 +6563,17 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <label>PPM Correction
           <input id="ppm_correction" type="number" min="-200" max="200" step="1">
         </label>
+        <label>Alias filter strength
+          <input id="alias_filter_strength" type="range" min="0" max="100" step="1" value="100" aria-describedby="alias_filter_strength_hint">
+          <span id="alias_filter_strength_label" class="hint">100%</span>
+        </label>
         <div class="row">
           <label><input id="gain_auto" type="checkbox"> Automatic gain</label>
           <label><input id="bias_tee" type="checkbox"> Bias tee</label>
         </div>
+      </div>
+      <div id="alias_filter_strength_hint" class="hint">
+        100% uses the strongest alias filters. Lower values reduce CPU by widening transition bands, but more unwanted energy may alias into the passband.
       </div>
     </section>
   </div>
@@ -7037,7 +7209,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <audio id="stream_monitor_audio" autoplay playsinline hidden></audio>
 </main>
 <script>
-const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto"];
+const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto", "alias_filter_strength"];
 const DEFAULT_STREAM_SAMPLE_RATE = 24000;
 const DEFAULT_STREAM_BITRATES = {mp3: 64, ogg: 48};
 const STREAM_SERVICE_CUSTOM = "custom";
@@ -9408,6 +9580,7 @@ function controlSignature(data) {
     gain: s.gain,
     ppm_correction: s.ppm_correction,
     bias_tee: s.bias_tee,
+    alias_filter_strength: s.alias_filter_strength,
     gain_values: data.gain_values || []
   });
 }
@@ -10755,6 +10928,8 @@ function syncControls(data) {
   }
   setValue("ppm_correction", s.ppm_correction);
   setChecked("bias_tee", s.bias_tee);
+  setValue("alias_filter_strength", s.alias_filter_strength);
+  setText("alias_filter_strength_label", `${s.alias_filter_strength}%`);
   lastControlSignature = controlSignature(data);
 }
 
@@ -10798,7 +10973,8 @@ function currentPayload() {
     serial: document.getElementById("serial").value,
     gain: auto || gainValues.length === 0 ? null : gainValues[gainIndex],
     ppm_correction: Number(document.getElementById("ppm_correction").value),
-    bias_tee: document.getElementById("bias_tee").checked
+    bias_tee: document.getElementById("bias_tee").checked,
+    alias_filter_strength: Number(document.getElementById("alias_filter_strength").value)
   };
 }
 

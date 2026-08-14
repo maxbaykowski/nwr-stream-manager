@@ -205,6 +205,43 @@ class DspTests(unittest.TestCase):
         self.assertGreater(float(np.mean(np.abs(desired_output[-2048:]))), 0.65)
         self.assertLess(float(np.mean(np.abs(rejected_output[-2048:]))), 0.05)
 
+    def test_channelizer_alias_filter_update_retunes_existing_decimator(self) -> None:
+        channelizer = self.dsp.IqChannelizer(
+            input_rate=192_000,
+            center_frequency_hz=162_475_000,
+            target_frequency_hz=162_475_000,
+            output_rate=24_000,
+            transition_hz=1_000,
+        )
+        decimator = channelizer.decimator
+        fir = decimator.fir
+        original_taps = fir.taps.copy()
+
+        channelizer.update_alias_filter(transition_hz=4_000)
+
+        self.assertIs(channelizer.decimator, decimator)
+        self.assertIs(decimator.fir, fir)
+        self.assertFalse(np.array_equal(fir.taps, original_taps))
+
+    def test_channelizer_target_frequency_update_keeps_existing_dsp_stages(self) -> None:
+        channelizer = self.dsp.IqChannelizer(
+            input_rate=192_000,
+            center_frequency_hz=162_475_000,
+            target_frequency_hz=162_475_000,
+            output_rate=24_000,
+        )
+        shifter = channelizer.shifter
+        decimator = channelizer.decimator
+        shifter._phase = 1.25
+
+        channelizer.set_target_frequency(162_550_000)
+
+        self.assertIs(channelizer.shifter, shifter)
+        self.assertIs(channelizer.decimator, decimator)
+        self.assertEqual(channelizer.target_frequency_hz, 162_550_000)
+        self.assertEqual(channelizer.shifter.offset_hz, -75_000.0)
+        self.assertEqual(channelizer.shifter._phase, 1.25)
+
     def test_identity_decimator_for_matching_spectrum_rate(self) -> None:
         decimator = self.dsp.create_decimator(1_536_000, 1_536_000)
 

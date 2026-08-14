@@ -162,6 +162,22 @@ class FirFilter:
         self.taps = taps
         self._history = np.zeros(taps.size - 1, dtype=np.complex64)
 
+    def update_taps(self, taps: FloatArray) -> None:
+        taps = np.asarray(taps, dtype=np.float32)
+        if taps.ndim != 1 or taps.size == 0:
+            raise ValueError("FIR taps must be a non-empty one-dimensional array")
+        keep = taps.size - 1
+        if keep <= 0:
+            history = np.array([], dtype=np.complex64)
+        elif self._history.size >= keep:
+            history = self._history[-keep:].copy()
+        else:
+            history = np.zeros(keep, dtype=np.complex64)
+            if self._history.size:
+                history[-self._history.size :] = self._history
+        self.taps = taps
+        self._history = history
+
     def process(self, samples: ComplexArray) -> ComplexArray:
         if samples.size == 0:
             return np.array([], dtype=np.complex64)
@@ -211,6 +227,28 @@ class IntegerDecimator:
         decimated = filtered[offset:: self.factor]
         self._filtered_samples_seen = start + int(filtered.size)
         return decimated.astype(np.complex64, copy=False)
+
+    def update_alias_filter(
+        self,
+        input_rate: int,
+        output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
+        *,
+        transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ,
+        attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
+    ) -> None:
+        if input_rate % output_rate != 0:
+            raise ValueError("input_rate is not an integer multiple of output_rate")
+        factor = input_rate // output_rate
+        if factor != self.factor:
+            raise ValueError("integer decimation factor cannot change during alias filter update")
+        self.fir.update_taps(
+            design_alias_filter_taps(
+                input_rate,
+                output_rate,
+                transition_hz=transition_hz,
+                attenuation_db=attenuation_db,
+            )
+        )
 
 
 @dataclass
@@ -291,6 +329,27 @@ class RationalResampler:
         right = work[indices + 1]
         return (left + (right - left) * fractions).astype(np.complex64, copy=False)
 
+    def update_alias_filter(
+        self,
+        input_rate: int,
+        output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
+        *,
+        transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ,
+        attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
+    ) -> None:
+        if float(input_rate) != float(self.input_rate) or int(output_rate) != int(self.output_rate):
+            raise ValueError("rational resampler rates cannot change during alias filter update")
+        self.transition_hz = float(transition_hz)
+        self.attenuation_db = float(attenuation_db)
+        self.fir.update_taps(
+            design_alias_filter_taps(
+                input_rate,
+                output_rate,
+                transition_hz=transition_hz,
+                attenuation_db=attenuation_db,
+            )
+        )
+
 
 @dataclass
 class StagedDecimator:
@@ -340,6 +399,26 @@ class StagedDecimator:
         if samples.size == 0:
             return np.array([], dtype=np.complex64)
         return self.final_stage.process(self.first_stage.process(samples))
+
+    def update_alias_filter(
+        self,
+        input_rate: int,
+        output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
+        *,
+        transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ,
+        attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
+    ) -> None:
+        if int(input_rate) != int(self.input_rate) or int(output_rate) != int(self.output_rate):
+            raise ValueError("staged decimator rates cannot change during alias filter update")
+        self.transition_hz = float(transition_hz)
+        self.attenuation_db = float(attenuation_db)
+        update_decimator_alias_filter(
+            self.final_stage,
+            int(round(self.intermediate_rate)),
+            output_rate,
+            transition_hz=transition_hz,
+            attenuation_db=attenuation_db,
+        )
 
     @staticmethod
     def _choose_first_stage_factor(input_rate: int, output_rate: int) -> int:
@@ -442,6 +521,27 @@ def create_decimator(
     )
 
 
+def update_decimator_alias_filter(
+    decimator: IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator,
+    input_rate: int,
+    output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
+    *,
+    transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ,
+    attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
+) -> None:
+    if isinstance(decimator, IdentityDecimator):
+        return
+    if output_rate >= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
+        transition_hz = _wide_decimator_transition_hz(output_rate, transition_hz)
+        attenuation_db = min(float(attenuation_db), WIDE_DECIMATOR_ALIAS_ATTENUATION_DB)
+    decimator.update_alias_filter(
+        input_rate,
+        output_rate,
+        transition_hz=transition_hz,
+        attenuation_db=attenuation_db,
+    )
+
+
 def _wide_decimator_transition_hz(output_rate: int, requested_transition_hz: float) -> float:
     nyquist = float(output_rate) / 2.0
     transition = max(
@@ -483,3 +583,24 @@ class IqChannelizer:
     def process_complex(self, samples: ComplexArray) -> ComplexArray:
         shifted = self.shifter.process(samples)
         return self.decimator.process(shifted)
+
+    def set_target_frequency(self, target_frequency_hz: int | float) -> None:
+        self.target_frequency_hz = int(round(float(target_frequency_hz)))
+        self.shifter.offset_hz = float(self.center_frequency_hz - self.target_frequency_hz)
+
+    def update_alias_filter(
+        self,
+        *,
+        transition_hz: float,
+        attenuation_db: float | None = None,
+    ) -> None:
+        self.transition_hz = float(transition_hz)
+        if attenuation_db is not None:
+            self.alias_attenuation_db = float(attenuation_db)
+        update_decimator_alias_filter(
+            self.decimator,
+            self.input_rate,
+            self.output_rate,
+            transition_hz=self.transition_hz,
+            attenuation_db=self.alias_attenuation_db,
+        )
