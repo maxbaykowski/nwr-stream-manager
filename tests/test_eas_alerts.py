@@ -204,7 +204,7 @@ class EasAlertTests(unittest.TestCase):
         )
         self.assertEqual(
             web_control.alias_filter_transition_hz(web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ, 50),
-            web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ * 4.75,
+            web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ * 1.5,
         )
         self.assertEqual(
             web_control.alias_filter_transition_hz(web_control.CHANNEL_IQ_ALIAS_TRANSITION_HZ, 0),
