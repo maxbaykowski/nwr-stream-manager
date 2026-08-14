@@ -89,17 +89,17 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(stats["dropped_frames"], 0)
         self.assertEqual(stats["buffered_frames"], 0)
 
-    def test_audio_source_defaults_hold_moderate_monitor_latency(self) -> None:
+    def test_audio_source_defaults_prebuffer_more_than_steady_latency(self) -> None:
         source = self.webrtc.WebRtcAudioSource()
         stats = source.stats()
 
         self.assertEqual(stats["prebuffer_frames"], 30)
-        self.assertEqual(stats["target_latency_frames"], 30)
+        self.assertEqual(stats["target_latency_frames"], 15)
         self.assertEqual(stats["low_water_frames"], 12)
         self.assertEqual(stats["max_frames"], 96)
         self.assertAlmostEqual(
             stats["target_latency_frames"] * self.webrtc.WEBRTC_FRAME_SECONDS,
-            0.6,
+            0.3,
         )
 
     def test_audio_source_startup_prebuffer_is_not_limited_by_track_frame_timeout(self) -> None:
