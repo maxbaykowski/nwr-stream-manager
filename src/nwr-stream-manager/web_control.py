@@ -9815,8 +9815,6 @@ function showAccountSecret(secret) {
   setValue("account_secret", secret || "");
   const dialog = document.getElementById("account_secret_dialog");
   if (dialog) dialog.hidden = !secret;
-  const input = document.getElementById("account_secret");
-  if (input && secret) input.focus();
 }
 
 function dismissAccountSecret() {
@@ -9829,16 +9827,37 @@ async function copyAccountSecret() {
   const input = document.getElementById("account_secret");
   const secret = input ? input.value : "";
   if (!secret) return;
+  const button = document.getElementById("copy_account_secret");
   try {
-    await navigator.clipboard.writeText(secret);
-    setAccountResult("Temporary password copied to clipboard.", "success");
-  } catch (error) {
-    if (input) {
-      input.focus();
-      input.select();
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(secret);
+    } else if (!copyTextWithSelectionFallback(input)) {
+      throw new Error("clipboard API is unavailable");
     }
+    setAccountResult("Temporary password copied to clipboard.", "success");
+    if (button) button.focus();
+  } catch (error) {
     setAccountResult("Copy failed. Select the temporary password and copy it manually.", "error");
   }
+}
+
+function copyTextWithSelectionFallback(input) {
+  if (!input || !document.queryCommandSupported || !document.queryCommandSupported("copy")) {
+    return false;
+  }
+  const active = document.activeElement;
+  input.focus();
+  input.select();
+  input.setSelectionRange(0, input.value.length);
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (error) {
+    copied = false;
+  }
+  input.setSelectionRange(input.value.length, input.value.length);
+  if (active && active.focus && active !== input) active.focus();
+  return copied;
 }
 
 async function createAccountFromForm() {
