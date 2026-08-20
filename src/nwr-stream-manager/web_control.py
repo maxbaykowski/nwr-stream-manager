@@ -213,7 +213,7 @@ STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
 STREAM_WORKER_RAW_QUEUE_SECONDS = 1.50
 STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS = 8
 STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 96
-LIVE_IQ_QUEUE_CHUNKS = 2
+LIVE_IQ_QUEUE_SECONDS = 0.75
 INTERMEDIATE_SOURCE_QUEUE_CHUNKS = 2
 IQ_RECORDER_QUEUE_CHUNKS = 2
 INTERMEDIATE_IQ_SAMPLE_RATE = 192_000
@@ -807,10 +807,7 @@ class IntermediateIqFanout:
         name: str = "subscriber",
     ) -> queue.Queue:
         if max_chunks is None:
-            max_chunks = max(
-                STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS,
-                min(STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS, int(math.ceil((max_seconds or STREAM_WORKER_RAW_QUEUE_SECONDS) / 0.02))),
-            )
+            max_chunks = self._chunks_for_seconds(max_seconds or STREAM_WORKER_RAW_QUEUE_SECONDS)
         subscriber: queue.Queue = queue.Queue(maxsize=max_chunks)
         with self.subscribers_lock:
             self.subscribers.add(subscriber)
@@ -827,6 +824,18 @@ class IntermediateIqFanout:
             self.subscriber_drops.pop(subscriber, None)
             self.subscriber_drop_samples.pop(subscriber, None)
             self.subscriber_max_depth.pop(subscriber, None)
+
+    def _chunks_for_seconds(self, seconds: float) -> int:
+        raw_chunks_for_seconds = getattr(self.raw_fanout, "_chunks_for_seconds", None)
+        if callable(raw_chunks_for_seconds):
+            return int(raw_chunks_for_seconds(seconds))
+        return max(
+            STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS,
+            min(
+                STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS,
+                int(math.ceil(max(0.0, seconds) / 0.10)),
+            ),
+        )
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -1005,6 +1014,59 @@ def subscribe_raw_fanout(
         return fanout.subscribe(max_chunks=max_chunks, max_seconds=max_seconds, name=name)
     except TypeError:
         return fanout.subscribe(max_chunks=max_chunks, max_seconds=max_seconds)
+
+
+def fanout_channel_profile(fanout: RawRtlFanout | IntermediateIqFanout) -> tuple[int, int] | None:
+    if not isinstance(fanout, IntermediateIqFanout):
+        return None
+    center_frequency_hz = NWR_CENTER_FREQUENCY_HZ
+    raw_fanout = getattr(fanout, "raw_fanout", None)
+    source = getattr(raw_fanout, "source", None)
+    config = getattr(source, "config", None)
+    if config is not None:
+        center_frequency_hz = int(getattr(config, "center_frequency_hz", center_frequency_hz))
+    return int(fanout.output_rate), center_frequency_hz
+
+
+def make_live_channelizer(
+    *,
+    fanout: RawRtlFanout | IntermediateIqFanout,
+    target_frequency_hz: int,
+    alias_filter_strength: int,
+) -> tuple[IqChannelizer, tuple[int, int], int] | None:
+    profile = fanout_channel_profile(fanout)
+    if profile is None:
+        return None
+    input_rate, center_frequency_hz = profile
+    transition_hz = alias_filter_transition_hz(
+        CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+        alias_filter_strength,
+    )
+    attenuation_db = alias_filter_attenuation_db(
+        DEFAULT_ALIAS_ATTENUATION_DB,
+        alias_filter_strength,
+    )
+    return (
+        IqChannelizer(
+            input_rate=input_rate,
+            center_frequency_hz=center_frequency_hz,
+            target_frequency_hz=target_frequency_hz,
+            output_rate=IQ_SAMPLE_RATE,
+            transition_hz=transition_hz,
+            alias_attenuation_db=attenuation_db,
+        ),
+        (input_rate, center_frequency_hz),
+        alias_filter_strength,
+    )
+
+
+def drain_queue_to_latest(source: queue.Queue, first_item: Any) -> Any:
+    latest = first_item
+    while True:
+        try:
+            latest = source.get_nowait()
+        except queue.Empty:
+            return latest
 
 
 def iq_batch_complex(batch: RtlSampleBatch | IqSampleBatch) -> ComplexArray:
@@ -1699,9 +1761,21 @@ class IcecastStreamWorker:
         self.storage_monitor = storage_monitor or StorageMonitor([state_directory])
         station = stream.get("station", {})
         stream_label = station.get("callsign") or stream.get("id", "stream")
+        try:
+            target_frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
+        except Exception:
+            target_frequency_hz = NWR_CENTER_FREQUENCY_HZ
+        prebuilt = make_live_channelizer(
+            fanout=fanout,
+            target_frequency_hz=target_frequency_hz,
+            alias_filter_strength=self.alias_filter_strength_provider(),
+        )
+        self._initial_channelizer = prebuilt[0] if prebuilt is not None else None
+        self._initial_channelizer_key = prebuilt[1] if prebuilt is not None else None
+        self._initial_channelizer_alias_filter_strength = prebuilt[2] if prebuilt is not None else None
         self.queue = subscribe_raw_fanout(
             fanout,
-            max_chunks=LIVE_IQ_QUEUE_CHUNKS,
+            max_seconds=LIVE_IQ_QUEUE_SECONDS,
             name=f"stream:{stream_label}",
         )
         self.stop_event = threading.Event()
@@ -1814,9 +1888,11 @@ class IcecastStreamWorker:
             return bool(self.monitor_sources)
 
     def _run_pcm_producer(self) -> None:
-        channelizer: IqChannelizer | None = None
-        channelizer_key: tuple[int, int] | None = None
-        channelizer_alias_filter_strength: int | None = None
+        channelizer: IqChannelizer | None = self._initial_channelizer
+        channelizer_key: tuple[int, int] | None = self._initial_channelizer_key
+        channelizer_alias_filter_strength: int | None = self._initial_channelizer_alias_filter_strength
+        startup_backlog_drained = False
+        last_slow_batch_log_at = 0.0
         demodulator = ComplexNfmDemodulator()
         audio_config = self.audio_config()
         effects = AudioEffectsProcessor(audio_config)
@@ -1860,6 +1936,9 @@ class IcecastStreamWorker:
                     )
                 self._write_pcm(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds))
                 continue
+            if not startup_backlog_drained:
+                batch = drain_queue_to_latest(self.queue, batch)
+                startup_backlog_drained = True
             idle_output_active = False
             with self.lock:
                 station = self.stream["station"]
@@ -1899,7 +1978,18 @@ class IcecastStreamWorker:
             if channelizer is not None:
                 channelizer.set_target_frequency(target_frequency_hz)
             iq = iq_batch_complex(batch)
+            process_started_at = time.monotonic()
             audio = demodulator.process(channelizer.process_complex(iq))
+            process_seconds = time.monotonic() - process_started_at
+            batch_seconds = float(iq.size) / float(max(1, batch.sample_rate))
+            if process_seconds > batch_seconds and process_started_at - last_slow_batch_log_at >= 60.0:
+                last_slow_batch_log_at = process_started_at
+                LOG.warning(
+                    "stream DSP is slower than realtime for %s: processed %.3fs IQ in %.3fs",
+                    station.get("callsign"),
+                    batch_seconds,
+                    process_seconds,
+                )
             if len(audio) == 0:
                 continue
             last_real_audio = time.monotonic()
@@ -2498,13 +2588,22 @@ class WeatherReceiverWorker:
         self.client_id = client_id
         self.fanout = fanout
         self.alias_filter_strength_provider = alias_filter_strength_provider
+        frequency_hz = validate_receiver_frequency(frequency_hz)
+        prebuilt = make_live_channelizer(
+            fanout=fanout,
+            target_frequency_hz=frequency_hz,
+            alias_filter_strength=self.alias_filter_strength_provider(),
+        )
+        self._initial_channelizer = prebuilt[0] if prebuilt is not None else None
+        self._initial_channelizer_key = prebuilt[1] if prebuilt is not None else None
+        self._initial_channelizer_alias_filter_strength = prebuilt[2] if prebuilt is not None else None
         self.queue = subscribe_raw_fanout(
             fanout,
-            max_chunks=LIVE_IQ_QUEUE_CHUNKS,
+            max_seconds=LIVE_IQ_QUEUE_SECONDS,
             name=f"receiver:{client_id}",
         )
         self.source = WebRtcAudioSource(sample_rate=IQ_SAMPLE_RATE)
-        self.frequency_hz = validate_receiver_frequency(frequency_hz)
+        self.frequency_hz = frequency_hz
         self.stop_event = threading.Event()
         self.thread = threading.Thread(
             target=self._run,
@@ -2554,9 +2653,11 @@ class WeatherReceiverWorker:
             return self.frequency_hz
 
     def _run(self) -> None:
-        channelizer: IqChannelizer | None = None
-        channelizer_key: tuple[int, int] | None = None
-        channelizer_alias_filter_strength: int | None = None
+        channelizer: IqChannelizer | None = self._initial_channelizer
+        channelizer_key: tuple[int, int] | None = self._initial_channelizer_key
+        channelizer_alias_filter_strength: int | None = self._initial_channelizer_alias_filter_strength
+        startup_backlog_drained = False
+        last_slow_batch_log_at = 0.0
         demodulator = ComplexNfmDemodulator()
         effects = AudioEffectsProcessor(RECEIVER_AUDIO_CONFIG)
         frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
@@ -2568,6 +2669,9 @@ class WeatherReceiverWorker:
             except Exception as exc:
                 LOG.warning("weather receiver RTL-SDR source failed for client %s: %s", self.client_id, exc)
                 continue
+            if not startup_backlog_drained:
+                batch = drain_queue_to_latest(self.queue, batch)
+                startup_backlog_drained = True
             target_frequency_hz = self._frequency_hz()
             alias_filter_strength = self.alias_filter_strength_provider()
             channel_transition_hz = alias_filter_transition_hz(
@@ -2601,7 +2705,18 @@ class WeatherReceiverWorker:
             if channelizer is not None:
                 channelizer.set_target_frequency(target_frequency_hz)
             iq = iq_batch_complex(batch)
+            process_started_at = time.monotonic()
             audio = demodulator.process(channelizer.process_complex(iq))
+            process_seconds = time.monotonic() - process_started_at
+            batch_seconds = float(iq.size) / float(max(1, batch.sample_rate))
+            if process_seconds > batch_seconds and process_started_at - last_slow_batch_log_at >= 60.0:
+                last_slow_batch_log_at = process_started_at
+                LOG.warning(
+                    "weather receiver DSP is slower than realtime for client %s: processed %.3fs IQ in %.3fs",
+                    self.client_id,
+                    batch_seconds,
+                    process_seconds,
+                )
             if len(audio) == 0:
                 continue
             for frame in frame_buffer.push(audio):

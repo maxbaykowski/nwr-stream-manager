@@ -246,6 +246,96 @@ class WebRtcTests(unittest.TestCase):
         self.assertGreaterEqual(source.timeouts[0], 0)
         self.assertLessEqual(source.timeouts[0], self.webrtc.WEBRTC_FRAME_SECONDS)
 
+    def test_webrtc_track_starts_media_clock_after_startup_read(self) -> None:
+        class Source:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            async def read_pcm(self, timeout=0.25):
+                self.reads += 1
+                if self.reads == 1:
+                    await asyncio.sleep(0.03)
+                return b"\x00" * 960
+
+        class FullFrameResampler:
+            def __init__(self, _input_rate, _output_rate) -> None:
+                pass
+
+            def process(self, _pcm: bytes) -> bytes:
+                return b"\x00" * (self_webrtc.WEBRTC_OPUS_FRAME_SAMPLES * 2)
+
+        async def run_test():
+            track = self_webrtc.create_webrtc_pcm_audio_track(Source())
+            started = asyncio.get_running_loop().time()
+            await track.recv()
+            after_first = asyncio.get_running_loop().time()
+            await track.recv()
+            after_second = asyncio.get_running_loop().time()
+            return after_first - started, after_second - after_first
+
+        self_webrtc = self.webrtc
+        original_resampler = self.webrtc.PcmResampler
+        self.webrtc.PcmResampler = FullFrameResampler
+        try:
+            try:
+                first_elapsed, second_elapsed = asyncio.run(run_test())
+            except self.webrtc.WebRtcError as exc:
+                self.skipTest(str(exc))
+        finally:
+            self.webrtc.PcmResampler = original_resampler
+
+        self.assertGreaterEqual(first_elapsed, 0.025)
+        self.assertLess(second_elapsed, 0.03)
+
+    def test_webrtc_track_rebases_media_clock_after_rebuffer_wait(self) -> None:
+        class Source:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            async def read_pcm(self, timeout=0.25):
+                self.reads += 1
+                if self.reads == 3:
+                    await asyncio.sleep(0.06)
+                return b"\x00" * 960
+
+        class FullFrameResampler:
+            def __init__(self, _input_rate, _output_rate) -> None:
+                pass
+
+            def process(self, _pcm: bytes) -> bytes:
+                return b"\x00" * (self_webrtc.WEBRTC_OPUS_FRAME_SAMPLES * 2)
+
+        async def run_test():
+            track = self_webrtc.create_webrtc_pcm_audio_track(Source())
+            await track.recv()
+            before_second = asyncio.get_running_loop().time()
+            await track.recv()
+            after_second = asyncio.get_running_loop().time()
+            await track.recv()
+            after_third = asyncio.get_running_loop().time()
+            await track.recv()
+            after_fourth = asyncio.get_running_loop().time()
+            return (
+                after_second - before_second,
+                after_third - after_second,
+                after_fourth - after_third,
+            )
+
+        self_webrtc = self.webrtc
+        original_resampler = self.webrtc.PcmResampler
+        self.webrtc.PcmResampler = FullFrameResampler
+        try:
+            try:
+                second_elapsed, third_elapsed, fourth_elapsed = asyncio.run(run_test())
+            except self.webrtc.WebRtcError as exc:
+                self.skipTest(str(exc))
+        finally:
+            self.webrtc.PcmResampler = original_resampler
+
+        self.assertGreaterEqual(second_elapsed, 0.015)
+        self.assertGreaterEqual(third_elapsed, 0.055)
+        self.assertGreaterEqual(fourth_elapsed, 0.015)
+
     def test_server_capability_report_has_expected_shape(self) -> None:
         report = self.webrtc.server_webrtc_capabilities().to_dict()
         self.assertIn("available", report)

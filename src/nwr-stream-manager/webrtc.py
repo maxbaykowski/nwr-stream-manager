@@ -495,9 +495,8 @@ def create_webrtc_pcm_audio_track(source: WebRtcAudioSource):
 
         async def recv(self):
             needed_bytes = WEBRTC_OPUS_FRAME_SAMPLES * WEBRTC_OPUS_CHANNELS * 2
-            if self._started_at is None:
-                self._started_at = time.monotonic()
             attempts = 0
+            read_started_at = time.monotonic()
             deadline = time.monotonic() + WEBRTC_FRAME_SECONDS
             while len(self._pending) < needed_bytes and attempts < 4:
                 timeout = max(0.0, deadline - time.monotonic())
@@ -520,6 +519,11 @@ def create_webrtc_pcm_audio_track(source: WebRtcAudioSource):
             frame.sample_rate = WEBRTC_OPUS_SAMPLE_RATE
             frame.pts = self._pts
             frame.time_base = Fraction(1, WEBRTC_OPUS_SAMPLE_RATE)
+            read_seconds = time.monotonic() - read_started_at
+            if self._started_at is None or read_seconds > (WEBRTC_FRAME_SECONDS * 1.5):
+                self._started_at = time.monotonic() - (
+                    (self._pts + WEBRTC_OPUS_FRAME_SAMPLES) / WEBRTC_OPUS_SAMPLE_RATE
+                )
             self._pts += WEBRTC_OPUS_FRAME_SAMPLES
             target_time = self._started_at + self._pts / WEBRTC_OPUS_SAMPLE_RATE
             delay = target_time - time.monotonic()

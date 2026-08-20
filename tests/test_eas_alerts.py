@@ -1429,6 +1429,24 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(stats["queue_capacity"], 1)
         self.assertEqual(stats["dropped_batches"], 1)
 
+    def test_intermediate_iq_fanout_seconds_use_raw_chunk_duration(self) -> None:
+        web_control = self.web_control
+
+        class RawFanout:
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return web_control.queue.Queue(maxsize=max_chunks)
+
+            def unsubscribe(self, subscriber):
+                pass
+
+            def _chunks_for_seconds(self, seconds):
+                return 8 if seconds == 0.75 else 99
+
+        intermediate = web_control.IntermediateIqFanout(RawFanout())
+        subscriber = intermediate.subscribe(max_seconds=0.75)
+
+        self.assertEqual(subscriber.maxsize, 8)
+
     def test_iq_recorder_writes_stream_channel_cf32_from_synthetic_rtl_iq(self) -> None:
         web_control = self.web_control
 
