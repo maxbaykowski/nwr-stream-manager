@@ -7468,10 +7468,13 @@ let receiverStatsTimer = null;
 let receiverLastPacketCount = 0;
 let receiverLastPacketAt = 0;
 let unloadLiveAudioStopSent = false;
+let liveAudioHiddenAt = 0;
+let liveAudioNeedsRestart = false;
 let currentAccount = null;
 let accountsSignature = "";
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
+const LIVE_AUDIO_BACKGROUND_RESTART_MS = 30000;
 const WEBRTC_JITTER_BUFFER_TARGET_SECONDS = 0.1;
 const IQ_RECORDER_SAMPLE_RATES = [192000, 256000, 384000, 512000, 768000, 1024000, 1536000];
 const NWR_RECEIVER_CHANNELS = [
@@ -7570,6 +7573,58 @@ function pageMonitorClientId() {
   return monitorClientId;
 }
 
+function liveAudioPeerIsUnusable(peer) {
+  if (!peer) return false;
+  return (
+    ["closed", "failed", "disconnected"].includes(peer.connectionState) ||
+    ["closed", "failed", "disconnected"].includes(peer.iceConnectionState)
+  );
+}
+
+function resetLiveAudioElement() {
+  const audio = document.getElementById("stream_monitor_audio");
+  if (!audio) return;
+  audio.pause();
+  audio.srcObject = null;
+  try {
+    audio.load();
+  } catch (error) {
+    console.debug("live audio element reset failed", error);
+  }
+}
+
+function markLiveAudioHidden() {
+  if (!monitorPeerConnection && !receiverPeerConnection) return;
+  liveAudioHiddenAt = Date.now();
+}
+
+function markLiveAudioVisible() {
+  if (!liveAudioHiddenAt) return false;
+  const hiddenForMs = Date.now() - liveAudioHiddenAt;
+  liveAudioHiddenAt = 0;
+  if (hiddenForMs >= LIVE_AUDIO_BACKGROUND_RESTART_MS) {
+    liveAudioNeedsRestart = true;
+    logClientEvent("info", "live-audio", "live audio marked stale after page background", {hidden_ms: hiddenForMs});
+    return true;
+  }
+  return false;
+}
+
+async function recoverLiveAudioAfterPageRestore() {
+  const stale = markLiveAudioVisible();
+  scheduleReceiverMediaSessionRefresh();
+  if (!stale) return;
+  if (monitorPeerConnection) {
+    await stopStreamMonitor({notifyServer: true});
+    setStreamResult("Monitoring was paused after the page was backgrounded. Start monitoring again to reconnect.");
+  }
+  if (receiverPeerConnection) {
+    await stopWeatherReceiver({notifyServer: true});
+    setReceiverResult("Receiver paused after the page was backgrounded. Press Play to reconnect.");
+  }
+  liveAudioNeedsRestart = false;
+}
+
 function showMonitorUnstableDialog() {
   const dialog = document.getElementById("monitor_unstable_dialog");
   if (!dialog) return;
@@ -7663,7 +7718,15 @@ function startMonitorPacketStats() {
 }
 
 async function startStreamMonitor(streamId) {
-  if (monitorStreamId === streamId && monitorPeerConnection) return;
+  if (monitorStreamId === streamId && monitorPeerConnection) {
+    if (!liveAudioNeedsRestart && !liveAudioPeerIsUnusable(monitorPeerConnection)) {
+      resumeMonitorPlayback();
+      return;
+    }
+    logClientEvent("info", "monitor", "restarting stale monitor WebRTC session", {stream_id: streamId});
+    await stopStreamMonitor({notifyServer: true});
+    liveAudioNeedsRestart = false;
+  }
   logClientEvent("info", "monitor", "monitor start requested", {stream_id: streamId});
   await stopWeatherReceiver({notifyServer: true});
   await stopStreamMonitor({notifyServer: true});
@@ -7764,11 +7827,7 @@ async function stopStreamMonitor(options = {}) {
   monitorPeerConnection = null;
   monitorStreamId = "";
   clearMonitorWatchdogs();
-  const audio = document.getElementById("stream_monitor_audio");
-  if (audio) {
-    audio.pause();
-    audio.srcObject = null;
-  }
+  resetLiveAudioElement();
   if (peer) peer.close();
   if (notifyServer) {
     try {
@@ -7939,6 +7998,19 @@ function updateReceiverMediaSession() {
   }
 }
 
+function refreshReceiverMediaSession() {
+  if (!receiverPeerConnection) return;
+  updateReceiverMediaSession();
+}
+
+function scheduleReceiverMediaSessionRefresh() {
+  if (!receiverPeerConnection) return;
+  refreshReceiverMediaSession();
+  for (const delay of [50, 250, 1000]) {
+    window.setTimeout(refreshReceiverMediaSession, delay);
+  }
+}
+
 function clearReceiverMediaSession() {
   if (!("mediaSession" in navigator)) return;
   try {
@@ -7962,20 +8034,26 @@ function setReceiverAudioTracksEnabled(enabled) {
 
 async function startWeatherReceiver() {
   if (receiverPeerConnection) {
-    logClientEvent("info", "receiver", "receiver resume requested", {frequency: currentReceiverChannel().label});
-    receiverPlaying = true;
-    receiverPaused = false;
-    clearReceiverUnstableTimer();
-    setReceiverAudioTracksEnabled(true);
-    const audio = document.getElementById("stream_monitor_audio");
-    if (audio && audio.srcObject) {
-      await audio.play();
+    if (liveAudioNeedsRestart || liveAudioPeerIsUnusable(receiverPeerConnection)) {
+      logClientEvent("info", "receiver", "restarting stale receiver WebRTC session", {frequency: currentReceiverChannel().label});
+      await stopWeatherReceiver({notifyServer: true});
+      liveAudioNeedsRestart = false;
+    } else {
+      logClientEvent("info", "receiver", "receiver resume requested", {frequency: currentReceiverChannel().label});
+      receiverPlaying = true;
+      receiverPaused = false;
+      clearReceiverUnstableTimer();
+      setReceiverAudioTracksEnabled(true);
+      const audio = document.getElementById("stream_monitor_audio");
+      if (audio && audio.srcObject) {
+        await audio.play();
+      }
+      startReceiverPacketStats();
+      updateReceiverMediaSession();
+      renderReceiverControls();
+      setReceiverResult(`Listening to ${currentReceiverChannel().label}.`, "success");
+      return;
     }
-    startReceiverPacketStats();
-    updateReceiverMediaSession();
-    renderReceiverControls();
-    setReceiverResult(`Listening to ${currentReceiverChannel().label}.`, "success");
-    return;
   }
   logClientEvent("info", "receiver", "receiver start requested", {frequency: currentReceiverChannel().label});
   await stopStreamMonitor({notifyServer: true});
@@ -8092,19 +8170,15 @@ async function stopWeatherReceiver(options = {}) {
   clearReceiverWatchdogs();
   const audio = document.getElementById("stream_monitor_audio");
   if (preserveMediaSession && peer) {
-    setReceiverAudioTracksEnabled(false);
     if (audio) audio.pause();
-    updateReceiverMediaSession();
+    scheduleReceiverMediaSessionRefresh();
     renderReceiverControls();
     return;
   }
   receiverPeerConnection = null;
   receiverPaused = false;
   clearReceiverMediaSession();
-  if (audio) {
-    audio.pause();
-    audio.srcObject = null;
-  }
+  resetLiveAudioElement();
   if (peer) peer.close();
   if (notifyServer) {
     try {
@@ -12444,25 +12518,51 @@ document.getElementById("wizard_finish").addEventListener("click", async () => {
   }
 });
 
-function sendLiveAudioStopBeacon() {
-  if (unloadLiveAudioStopSent || !navigator.sendBeacon) return;
+function sendLiveAudioStopBeacon(options = {}) {
+  const forceReceiverStop = options.forceReceiverStop === true;
+  if ((unloadLiveAudioStopSent && !forceReceiverStop) || !navigator.sendBeacon) return;
   unloadLiveAudioStopSent = true;
   if (monitorStreamId && navigator.sendBeacon) {
     const payload = JSON.stringify({client_id: pageMonitorClientId()});
     navigator.sendBeacon("/api/monitor/stop", new Blob([payload], {type: "application/json"}));
   }
-  if (receiverPeerConnection && navigator.sendBeacon) {
+  if (receiverPeerConnection && (!receiverPaused || forceReceiverStop) && navigator.sendBeacon) {
     const payload = JSON.stringify({client_id: pageReceiverClientId()});
     navigator.sendBeacon("/api/receiver/stop", new Blob([payload], {type: "application/json"}));
   }
 }
 
-window.addEventListener("pagehide", () => {
+window.addEventListener("pagehide", event => {
+  markLiveAudioHidden();
+  scheduleReceiverMediaSessionRefresh();
+  if (event.persisted) return;
+  if (document.visibilityState === "hidden") return;
   sendLiveAudioStopBeacon();
 });
 
+window.addEventListener("pageshow", () => {
+  unloadLiveAudioStopSent = false;
+  recoverLiveAudioAfterPageRestore().catch(error => console.debug("live audio page restore recovery failed", error));
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    markLiveAudioHidden();
+    scheduleReceiverMediaSessionRefresh();
+    return;
+  }
+  recoverLiveAudioAfterPageRestore().catch(error => console.debug("live audio visibility recovery failed", error));
+});
+
+const liveAudioElement = document.getElementById("stream_monitor_audio");
+if (liveAudioElement) {
+  liveAudioElement.addEventListener("pause", () => {
+    if (receiverPaused && receiverPeerConnection) scheduleReceiverMediaSessionRefresh();
+  });
+}
+
 window.addEventListener("beforeunload", event => {
-  sendLiveAudioStopBeacon();
+  sendLiveAudioStopBeacon({forceReceiverStop: true});
   if (!hasUnsavedNavigationState()) return;
   event.preventDefault();
   event.returnValue = "";
