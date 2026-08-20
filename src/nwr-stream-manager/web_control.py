@@ -6595,10 +6595,12 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
     <section>
       <div class="grid">
-        <label>Gain
+        <div>
+          <label for="gain">Gain</label>
           <input id="gain" type="range" min="0" max="0" step="1" value="0" disabled>
           <span id="gain_label" class="hint">Automatic</span>
-        </label>
+          <label><input id="gain_auto" type="checkbox"> Automatic gain control</label>
+        </div>
         <label>PPM Correction
           <input id="ppm_correction" type="number" min="-200" max="200" step="1">
         </label>
@@ -6608,7 +6610,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <span id="alias_filter_strength_label" class="hint" aria-hidden="true">100%</span>
         </div>
         <div class="row">
-          <label><input id="gain_auto" type="checkbox"> Automatic gain</label>
           <label><input id="bias_tee" type="checkbox"> Bias tee</label>
         </div>
       </div>
@@ -6750,17 +6751,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div class="actions">
         <button id="open_create_account" type="button">Create account</button>
       </div>
-      <div id="create_account_panel" hidden>
-        <h3>Create Account</h3>
-        <label>Username
-          <input id="new_account_username" autocomplete="off" pattern="[A-Za-z0-9_-]{1,64}">
-        </label>
-        <label><input id="new_account_read_only" type="checkbox"> Read-only account</label>
-        <div class="actions">
-          <button id="create_account" type="button">Create account</button>
-          <button id="cancel_create_account" type="button">Cancel</button>
-        </div>
-      </div>
       <table aria-label="Accounts">
         <thead>
           <tr>
@@ -6774,6 +6764,21 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <tr><td colspan="4" class="hint">No accounts.</td></tr>
         </tbody>
       </table>
+    </section>
+  </div>
+
+  <div id="view_create_account" class="view" hidden>
+    <section>
+      <h2>Create Account</h2>
+      <div id="create-account-result" class="message"></div>
+      <label>Username
+        <input id="new_account_username" autocomplete="off" pattern="[A-Za-z0-9_-]{1,64}">
+      </label>
+      <label><input id="new_account_read_only" type="checkbox"> Read-only account</label>
+      <div class="actions">
+        <button id="create_account" type="button">Create account</button>
+        <button id="cancel_create_account" type="button">Cancel</button>
+      </div>
     </section>
   </div>
 
@@ -6932,7 +6937,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 
   <div id="view_stream_settings" class="view" hidden>
     <section>
-      <h2>Stream Settings</h2>
+      <h2 id="stream_settings_title">Stream Settings</h2>
       <div id="stream_settings_station" class="hint"></div>
       <label class="checkbox-row">
         <input id="stream_enabled" type="checkbox">
@@ -6971,75 +6976,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             </tr>
           </tbody>
         </table>
-        <div id="output_form_panel" hidden>
-          <h3 id="output_form_title">Add output</h3>
-          <label>Streaming service
-            <select id="settings_icecast_service">
-              <option value="custom">Custom Icecast server</option>
-              <option value="gwes">GWES Weather Radio</option>
-              <option value="weatherusa">WeatherUSA</option>
-              <option value="nwrorg">NOAA Weather Radio Org</option>
-            </select>
-          </label>
-          <div id="settings_icecast_service_help" class="hint"></div>
-          <fieldset>
-            <legend>Icecast output</legend>
-            <div class="grid">
-              <label id="settings_icecast_host_label">Host
-                <input id="settings_icecast_host" type="text" autocomplete="off">
-              </label>
-              <label id="settings_icecast_port_label">Port
-                <input id="settings_icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000">
-              </label>
-              <label id="settings_icecast_username_label">Username
-                <input id="settings_icecast_username" type="text" autocomplete="username">
-              </label>
-              <label id="settings_icecast_password_label">Password
-                <input id="settings_icecast_password" type="password" autocomplete="current-password">
-              </label>
-              <label id="settings_show_icecast_password_label" class="checkbox-row">
-                <input id="settings_show_icecast_password" type="checkbox">
-                Show password
-              </label>
-              <label id="settings_icecast_mount_label">Mountpoint
-                <input id="settings_icecast_mount" type="text" placeholder="/station.mp3">
-              </label>
-              <label id="settings_icecast_alt_label" class="checkbox-row" hidden>
-                <input id="settings_icecast_alt_enabled" type="checkbox">
-                Alternate stream
-              </label>
-              <label id="settings_icecast_alt_number_label" hidden>Alternate stream number
-                <input id="settings_icecast_alt_number" type="number" min="1" max="9" step="1" value="1">
-              </label>
-              <fieldset id="settings_icecast_format_fieldset">
-                <legend>Format</legend>
-                <label><input id="settings_icecast_format_mp3" name="settings_icecast_format" type="radio" value="mp3" checked> MP3</label>
-                <label><input id="settings_icecast_format_ogg" name="settings_icecast_format" type="radio" value="ogg"> OGG</label>
-              </fieldset>
-              <label id="settings_icecast_sample_rate_label">Sample rate
-                <select id="settings_icecast_sample_rate">
-                  <option value="8000">8000 Hz</option>
-                  <option value="11025">11025 Hz</option>
-                  <option value="16000">16000 Hz</option>
-                  <option value="22050">22050 Hz</option>
-                  <option value="24000" selected>24000 Hz</option>
-                  <option value="32000">32000 Hz</option>
-                  <option value="44100">44100 Hz</option>
-                  <option value="48000">48000 Hz</option>
-                </select>
-              </label>
-              <label id="settings_icecast_bitrate_label">Bitrate
-                <select id="settings_icecast_bitrate"></select>
-              </label>
-            </div>
-          </fieldset>
-          <div class="actions">
-            <button id="cancel_output_form" type="button">Cancel</button>
-            <button id="add_output" type="button">Add output</button>
-            <button id="save_output_settings" type="button" hidden>Save changes</button>
-          </div>
-        </div>
-        <div id="output-result" class="message"></div>
+        <div id="output-list-result" class="message"></div>
       </div>
       <div id="panel_audio" class="tabpanel" role="tabpanel" aria-labelledby="tab_audio" hidden>
         <h3>Audio effects</h3>
@@ -7172,6 +7109,81 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
+  <div id="view_stream_output" class="view" hidden>
+    <section>
+      <div id="output_form_panel">
+          <h2 id="output_form_title">Add output</h2>
+          <label>Streaming service
+            <select id="settings_icecast_service">
+              <option value="custom">Custom Icecast server</option>
+              <option value="gwes">GWES Weather Radio</option>
+              <option value="weatherusa">WeatherUSA</option>
+              <option value="nwrorg">NOAA Weather Radio Org</option>
+            </select>
+          </label>
+          <div id="settings_icecast_service_help" class="hint"></div>
+          <fieldset>
+            <legend>Icecast output</legend>
+            <div class="grid">
+              <label id="settings_icecast_host_label">Host
+                <input id="settings_icecast_host" type="text" autocomplete="off">
+              </label>
+              <label id="settings_icecast_port_label">Port
+                <input id="settings_icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000">
+              </label>
+              <label id="settings_icecast_username_label">Username
+                <input id="settings_icecast_username" type="text" autocomplete="username">
+              </label>
+              <label id="settings_icecast_password_label">Password
+                <input id="settings_icecast_password" type="password" autocomplete="current-password">
+              </label>
+              <label id="settings_show_icecast_password_label" class="checkbox-row">
+                <input id="settings_show_icecast_password" type="checkbox">
+                Show password
+              </label>
+              <label id="settings_icecast_mount_label">Mountpoint
+                <input id="settings_icecast_mount" type="text" placeholder="/station.mp3">
+              </label>
+              <label id="settings_icecast_alt_label" class="checkbox-row" hidden>
+                <input id="settings_icecast_alt_enabled" type="checkbox">
+                Alternate stream
+              </label>
+              <label id="settings_icecast_alt_number_label" hidden>Alternate stream number
+                <input id="settings_icecast_alt_number" type="number" min="1" max="9" step="1" value="1">
+              </label>
+              <fieldset id="settings_icecast_format_fieldset">
+                <legend>Format</legend>
+                <label><input id="settings_icecast_format_mp3" name="settings_icecast_format" type="radio" value="mp3" checked> MP3</label>
+                <label><input id="settings_icecast_format_ogg" name="settings_icecast_format" type="radio" value="ogg"> OGG</label>
+              </fieldset>
+              <label id="settings_icecast_sample_rate_label">Sample rate
+                <select id="settings_icecast_sample_rate">
+                  <option value="8000">8000 Hz</option>
+                  <option value="11025">11025 Hz</option>
+                  <option value="16000">16000 Hz</option>
+                  <option value="22050">22050 Hz</option>
+                  <option value="24000" selected>24000 Hz</option>
+                  <option value="32000">32000 Hz</option>
+                  <option value="44100">44100 Hz</option>
+                  <option value="48000">48000 Hz</option>
+                </select>
+              </label>
+              <label id="settings_icecast_bitrate_label">Bitrate
+                <select id="settings_icecast_bitrate"></select>
+              </label>
+            </div>
+          </fieldset>
+          <div class="actions">
+            <button id="cancel_output_form" type="button">Cancel</button>
+            <button id="add_output" type="button">Add output</button>
+            <button id="save_output_settings" type="button" hidden>Save changes</button>
+          </div>
+        </div>
+        <div id="output-result" class="message"></div>
+      </div>
+    </section>
+  </div>
+
   <div id="view_eas_alerts" class="view" hidden>
     <section>
       <h2>EAS alerts</h2>
@@ -7275,6 +7287,7 @@ const STREAM_SERVICE_HELP = {
 let applying = false;
 let timer = null;
 let gainValues = [];
+let lastManualGain = null;
 let lastControlSignature = "";
 let stationResults = [];
 let selectedStationKey = "";
@@ -8047,24 +8060,19 @@ async function loadDevices(selected, options = {}) {
   const needsChoice = !selected && data.devices.length !== 1;
   const signature = JSON.stringify({options: optionSignature, needsChoice});
   if (options.force || select.dataset.signature !== signature) {
-    select.innerHTML = "";
+    const selectOptions = [];
     if (selected && !selectedDevice) {
-      const option = document.createElement("option");
-      option.value = selected;
-      option.textContent = configuredDeviceLabel(selected);
-      select.appendChild(option);
+      selectOptions.push({value: selected, label: configuredDeviceLabel(selected)});
     } else if (needsChoice) {
-      const option = document.createElement("option");
-      option.value = "";
-      option.textContent = data.devices.length === 0 ? "No RTL-SDR devices found" : "Select an RTL-SDR...";
-      select.appendChild(option);
+      selectOptions.push({
+        value: "",
+        label: data.devices.length === 0 ? "No RTL-SDR devices found" : "Select an RTL-SDR..."
+      });
     }
     for (const device of data.devices) {
-      const option = document.createElement("option");
-      option.value = device.serial;
-      option.textContent = deviceLabel(device);
-      select.appendChild(option);
+      selectOptions.push({value: device.serial, label: deviceLabel(device)});
     }
+    syncSelectOptions(select, selectOptions);
     select.dataset.signature = signature;
   }
   const fallback = !selected && data.devices.length === 1 ? data.devices[0].serial : "";
@@ -8083,19 +8091,14 @@ async function searchStations() {
   const data = await request(`/api/stations?q=${encodeURIComponent(query)}&limit=75`);
   stationResults = data.stations || [];
   const select = document.getElementById("station_results");
-  select.innerHTML = "";
+  const selectOptions = [];
   if (stationResults.length === 0) {
-    const option = document.createElement("option");
-    option.value = "";
-    option.textContent = "No stations found";
-    select.appendChild(option);
+    selectOptions.push({value: "", label: "No stations found"});
   }
   for (const station of stationResults) {
-    const option = document.createElement("option");
-    option.value = station.key;
-    option.textContent = stationLabel(station);
-    select.appendChild(option);
+    selectOptions.push({value: station.key, label: stationLabel(station)});
   }
+  syncSelectOptions(select, selectOptions);
   selectedStationKey = "";
   setText("selected_station", "Select a station to continue.");
   renderWizard();
@@ -8531,10 +8534,14 @@ function clearSettingsIcecastForm() {
 
 function setOutputResult(message, kind = "") {
   const element = document.getElementById("output-result");
+  const listElement = document.getElementById("output-list-result");
   const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
-  if (element.className !== className) element.className = className;
   const text = String(message || "");
-  if (element.textContent !== text) element.textContent = text;
+  for (const target of [element, listElement]) {
+    if (!target) continue;
+    if (target.className !== className) target.className = className;
+    if (target.textContent !== text) target.textContent = text;
+  }
 }
 
 function dismissNwrOrgSubmissionDialog() {
@@ -8893,21 +8900,29 @@ function currentSettingsStream() {
   return configuredStreams.find(stream => stream.id === settingsStreamId) || null;
 }
 
-function beginAddOutput() {
+function prepareAddOutput() {
   outputFormMode = "add";
   editingOutputId = "";
   clearSettingsIcecastForm();
+  outputFormOriginalSignature = outputFormSignature();
+  outputFormDirty = false;
   setText("output_form_title", "Add output");
   document.getElementById("output_form_panel").hidden = false;
   setOutputResult("");
   updateOutputFormButtons();
 }
 
-function beginEditOutput(outputId) {
+function beginAddOutput() {
+  if (!settingsStreamId) return;
+  prepareAddOutput();
+  navigateTo("stream_output", {streamId: settingsStreamId});
+}
+
+function prepareEditOutput(outputId) {
   const selected = findConfiguredOutput(settingsStreamId, outputId);
   if (!selected) {
     setOutputResult("Stream output was not found.", "error");
-    return;
+    return false;
   }
   outputFormMode = "edit";
   editingOutputId = outputId;
@@ -8918,14 +8933,28 @@ function beginEditOutput(outputId) {
   document.getElementById("output_form_panel").hidden = false;
   setOutputResult("");
   updateOutputFormButtons();
+  return true;
 }
 
-function cancelOutputForm() {
+function beginEditOutput(outputId) {
+  if (!settingsStreamId || !prepareEditOutput(outputId)) return;
+  navigateTo("stream_output", {streamId: settingsStreamId, outputId});
+}
+
+function closeOutputForm() {
   document.getElementById("output_form_panel").hidden = true;
   outputFormDirty = false;
   outputFormOriginalSignature = "";
   editingOutputId = "";
   setOutputResult("");
+}
+
+function cancelOutputForm() {
+  const streamId = settingsStreamId;
+  closeOutputForm();
+  if (currentViewName() === "stream_output" && streamId) {
+    navigateTo("stream_settings", {streamId}, false, true);
+  }
 }
 
 function clearIcecastForm() {
@@ -8983,6 +9012,7 @@ function renderWizard() {
   setServiceHelp("icecast_service_help", service);
   applyServiceControls("icecast", service);
   setText("stream_wizard_title", editMode ? "Edit Stream Output" : "Add Stream");
+  if (currentViewName() === "add_stream") setPageTitle(editMode ? "Edit Stream Output" : "Add Stream");
   setWizardPanel("wizard_step_station", !editMode && wizardStep === 0);
   setWizardPanel("wizard_step_service", !editMode && wizardStep === 1);
   setWizardPanel("wizard_step_codec", !editMode && wizardStep === 2 && needsCodecStep);
@@ -9062,8 +9092,12 @@ function editOutput(streamId, outputId) {
 }
 
 function editStreamSettings(streamId, outputId = "") {
+  if (outputId) {
+    settingsStreamId = streamId;
+    if (prepareEditOutput(outputId)) navigateTo("stream_output", {streamId, outputId});
+    return;
+  }
   showStreamSettings(streamId);
-  if (outputId) beginEditOutput(outputId);
 }
 
 function showStreamSettings(streamId) {
@@ -9077,7 +9111,7 @@ function showStreamSettings(streamId) {
   easSignature = "";
   audioEffectsSignature = "";
   selectAudioEffect(selectedAudioEffect, false);
-  cancelOutputForm();
+  closeOutputForm();
   const station = stream.station || {};
   setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
   renderStreamSettings();
@@ -9146,6 +9180,7 @@ function renderIcecastOutputsTable(stream) {
   const rows = outputRows(stream);
   const nextSignature = outputTableNextSignature(rows);
   if (nextSignature === outputTableSignature) return;
+  if (containsFocusedElement(tbody)) return;
   outputTableSignature = nextSignature;
   tbody.innerHTML = "";
   if (rows.length === 0) {
@@ -9290,6 +9325,7 @@ function renderActiveStreams(activeStreams, configured = configuredStreams) {
   if (nextSignature === activeStreamsSignature) {
     return;
   }
+  if (containsFocusedElement(tbody)) return;
   activeStreamsSignature = nextSignature;
   tbody.innerHTML = "";
 
@@ -9461,7 +9497,6 @@ function tableCell(value) {
 function streamActionsCell(stream) {
   const cell = document.createElement("td");
   cell.className = "menu-cell";
-  const output = stream.outputs && stream.outputs.length ? stream.outputs[0] : {};
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = "More actions";
@@ -9469,7 +9504,6 @@ function streamActionsCell(stream) {
   button.setAttribute("aria-expanded", "false");
   button.setAttribute("aria-label", `More actions for ${stationLabelForActionMenu(stream)}`);
   button.dataset.activeStreamMenu = stream.id || "";
-  button.dataset.outputId = output.id || "";
   const menu = document.createElement("div");
   menu.className = "stream-actions-menu";
   menu.hidden = true;
@@ -9492,14 +9526,12 @@ function streamActionsCell(stream) {
   edit.setAttribute("role", "menuitem");
   edit.dataset.action = "edit-active-stream";
   edit.dataset.streamId = stream.id || "";
-  edit.dataset.outputId = output.id || "";
   const remove = document.createElement("button");
   remove.type = "button";
   remove.textContent = "Remove stream";
   remove.setAttribute("role", "menuitem");
   remove.dataset.action = "remove-active-stream";
   remove.dataset.streamId = stream.id || "";
-  remove.dataset.outputId = output.id || "";
   if (!accountIsReadOnly()) {
     menu.appendChild(toggle);
   }
@@ -9556,6 +9588,7 @@ function renderStreams(streams) {
   renderActiveStreams(activeStreamSnapshots, configuredStreams);
   if (settingsStreamId) renderStreamSettings();
   const list = document.getElementById("streams-list");
+  if (containsFocusedElement(list)) return;
   list.innerHTML = "";
   if (configuredStreams.length === 0) {
     const empty = document.createElement("div");
@@ -9611,6 +9644,76 @@ function gainIndexFor(value) {
   if (value === null || gainValues.length === 0) return 0;
   return gainValues.reduce((best, gain, index) =>
     Math.abs(gain - value) < Math.abs(gainValues[best] - value) ? index : best, 0);
+}
+
+function storedManualGain() {
+  if (lastManualGain !== null) return lastManualGain;
+  try {
+    const stored = Number(window.localStorage.getItem("nwr-stream-manager:last-manual-gain"));
+    if (Number.isFinite(stored)) {
+      lastManualGain = stored;
+      return stored;
+    }
+  } catch (error) {
+    return null;
+  }
+  return null;
+}
+
+function rememberManualGain(value) {
+  const gain = Number(value);
+  if (!Number.isFinite(gain)) return;
+  lastManualGain = gain;
+  try {
+    window.localStorage.setItem("nwr-stream-manager:last-manual-gain", String(gain));
+  } catch (error) {
+    // localStorage may be unavailable; keeping the in-memory value is enough.
+  }
+}
+
+function rememberManualGainFromSlider() {
+  if (!gainValues.length) return;
+  const index = Number(document.getElementById("gain").value);
+  if (!Number.isInteger(index) || index < 0 || index >= gainValues.length) return;
+  rememberManualGain(gainValues[index]);
+}
+
+function restoreRememberedManualGain() {
+  if (!gainValues.length) return;
+  const remembered = storedManualGain();
+  if (remembered === null) return;
+  setValue("gain", gainIndexFor(remembered));
+}
+
+function syncSelectOptions(select, options) {
+  const active = document.activeElement;
+  const existing = new Map(Array.from(select.options).map(option => [option.value, option]));
+  const wanted = new Set(options.map(option => String(option.value)));
+  for (const option of Array.from(select.options)) {
+    if (!wanted.has(option.value)) option.remove();
+  }
+  let cursor = select.firstChild;
+  for (const spec of options) {
+    const value = String(spec.value);
+    const label = String(spec.label);
+    let option = existing.get(value);
+    if (!option || option.parentElement !== select) {
+      option = document.createElement("option");
+      option.value = value;
+    }
+    if (option.textContent !== label) option.textContent = label;
+    if (option !== cursor) {
+      select.insertBefore(option, cursor);
+    } else {
+      cursor = cursor.nextSibling;
+    }
+  }
+  if (active === select && document.activeElement !== select) select.focus();
+}
+
+function containsFocusedElement(element) {
+  const active = document.activeElement;
+  return Boolean(active && element && element.contains(active));
 }
 
 function controlSignature(data) {
@@ -9680,6 +9783,14 @@ function setAccountResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setCreateAccountResult(message, kind = "") {
+  const element = document.getElementById("create-account-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
 function setChangePasswordResult(message, kind = "") {
   const element = document.getElementById("change-password-result");
   const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
@@ -9721,7 +9832,7 @@ function applyAccountUi(account) {
 }
 
 function isReadOnlyRestrictedView(view) {
-  return ["rtl", "add_stream", "stream_settings", "iq_recorder_start", "eas_alert_delete", "accounts"].includes(view);
+  return ["rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "accounts", "create_account"].includes(view);
 }
 
 function accountsTableSignature(accounts) {
@@ -9739,6 +9850,7 @@ function renderAccounts(accounts) {
   if (!tbody) return;
   const signature = accountsTableSignature(accounts);
   if (signature === accountsSignature) return;
+  if (containsFocusedElement(tbody)) return;
   accountsSignature = signature;
   tbody.innerHTML = "";
   if (!accounts || accounts.length === 0) {
@@ -9869,11 +9981,11 @@ async function createAccountFromForm() {
       read_only: document.getElementById("new_account_read_only").checked
     })
   });
-  document.getElementById("create_account_panel").hidden = true;
   setValue("new_account_username", "");
   setChecked("new_account_read_only", false);
   showAccountSecret(data.secret || "");
   await loadAccounts();
+  navigateTo("accounts", {}, false, true);
   setAccountResult("Account created.", "success");
 }
 
@@ -10016,13 +10128,10 @@ function renderEasAlertStreamSelector(streams, preserve = true) {
   const select = document.getElementById("eas_alert_stream");
   const nextSignature = easAlertStreamsNextSignature(streams);
   if (select.dataset.signature !== nextSignature) {
-    select.innerHTML = "";
-    for (const stream of streams) {
-      const option = document.createElement("option");
-      option.value = stream.id || "";
-      option.textContent = easAlertStreamLabel(stream);
-      select.appendChild(option);
-    }
+    syncSelectOptions(
+      select,
+      streams.map(stream => ({value: stream.id || "", label: easAlertStreamLabel(stream)}))
+    );
     select.dataset.signature = nextSignature;
   }
   if (!streams.length) {
@@ -10317,6 +10426,7 @@ function renderEasAlertList(data) {
   setDisabled(document.getElementById("eas_alert_prev"), easAlertPage <= 1);
   setDisabled(document.getElementById("eas_alert_next"), easAlertPage >= easAlertTotalPages);
   if (nextSignature === easAlertListSignature) return;
+  if (containsFocusedElement(list)) return;
   easAlertListSignature = nextSignature;
   list.innerHTML = "";
   const alerts = data.alerts || [];
@@ -10370,6 +10480,7 @@ async function loadEasAlertDetail() {
     setText("eas_detail_expires", alert.expires_at || "Unknown");
     document.getElementById("eas_alert_audio").src = alert.audio_url || "";
     document.getElementById("eas_alert_download").href = alert.download_url || "#";
+    setPageTitle(`Details for alert ${alert.event_type || "EAS alert"} issued on ${alert.issued_at || "an unknown time"}`);
     setEasAlertDetailResult("");
   } catch (error) {
     setEasAlertDetailResult(error.message, "error");
@@ -10399,18 +10510,70 @@ async function removeCurrentEasAlert() {
   }
 }
 
+function setPageTitle(title) {
+  const text = String(title || "NWR Stream Manager").trim() || "NWR Stream Manager";
+  const full = text === "NWR Stream Manager" ? text : `${text} - NWR Stream Manager`;
+  if (document.title !== full) document.title = full;
+}
+
+function defaultViewTitle(name) {
+  const titles = {
+    dashboard: "Dashboard",
+    rtl: "Configure RTL-SDR",
+    receiver: "Weather Radio Receiver",
+    iq_recorder: "I/Q Recorder",
+    iq_recorder_start: "New I/Q Recording",
+    iq_recording_download: "Download I/Q Recording",
+    logs: "Logs",
+    accounts: "Manage Accounts",
+    create_account: "Create Account",
+    change_password: "Change Account Password",
+    streams: "Manage Streams",
+    add_stream: "Add Stream",
+    stream_settings: "Stream Settings",
+    stream_output: "Icecast Output",
+    eas_alerts: "EAS Alerts",
+    eas_alert_export: "Export Alerts",
+    eas_alert_delete: "Delete Alerts",
+    eas_alert_detail: "EAS Alert Details"
+  };
+  return titles[name] || "NWR Stream Manager";
+}
+
+function streamCallsign(stream) {
+  const station = stream && stream.station ? stream.station : {};
+  return station.callsign || "stream";
+}
+
+function focusViewHeading(name) {
+  const view = document.getElementById(`view_${name}`);
+  if (!view) return;
+  const heading = view.querySelector("h1, h2");
+  if (!heading) return;
+  if (!heading.hasAttribute("tabindex")) heading.setAttribute("tabindex", "-1");
+  window.requestAnimationFrame(() => {
+    try {
+      heading.focus({preventScroll: true});
+    } catch (error) {
+      heading.focus();
+    }
+  });
+}
+
 function showView(name) {
   for (const view of document.querySelectorAll(".view")) {
     view.hidden = view.id !== `view_${name}`;
   }
+  setPageTitle(defaultViewTitle(name));
+  focusViewHeading(name);
   const moreButton = document.getElementById("nav_more_button");
   for (const item of document.querySelectorAll("nav [data-view]")) {
     if (
       item.dataset.view === name ||
-      (item.dataset.view === "streams" && name === "stream_settings") ||
+      (item.dataset.view === "streams" && ["stream_settings", "stream_output"].includes(name)) ||
       (item.dataset.view === "iq_recorder" && ["iq_recorder_start", "iq_recording_download"].includes(name)) ||
       (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name)) ||
-      item.dataset.view === "accounts" && name === "accounts" ||
+      item.dataset.view === "accounts" && ["accounts", "create_account"].includes(name) ||
       item.dataset.view === "change_password" && name === "change_password"
     ) {
       item.setAttribute("aria-current", "page");
@@ -10419,7 +10582,7 @@ function showView(name) {
     }
   }
   if (moreButton) {
-    if (["receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "accounts", "change_password"].includes(name)) {
+    if (["receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "accounts", "create_account", "change_password"].includes(name)) {
       moreButton.setAttribute("aria-current", "page");
     } else {
       moreButton.removeAttribute("aria-current");
@@ -10445,12 +10608,18 @@ function routeForView(name, params = {}) {
   }
   if (name === "logs") query.set("view", "logs");
   if (name === "accounts") query.set("view", "accounts");
+  if (name === "create_account") query.set("view", "create_account");
   if (name === "change_password") query.set("view", "change_password");
   if (name === "streams") query.set("view", "streams");
   if (name === "add_stream") query.set("view", "add_stream");
   if (name === "stream_settings") {
     query.set("view", "stream_settings");
     if (params.streamId) query.set("stream", params.streamId);
+  }
+  if (name === "stream_output") {
+    query.set("view", "stream_output");
+    if (params.streamId) query.set("stream", params.streamId);
+    if (params.outputId) query.set("output", params.outputId);
   }
   if (name === "eas_alerts") {
     query.set("view", "eas_alerts");
@@ -10480,22 +10649,24 @@ function routeForView(name, params = {}) {
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
-  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "accounts", "change_password", "streams", "add_stream", "stream_settings", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
+  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "accounts", "create_account", "change_password", "streams", "add_stream", "stream_settings", "stream_output", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
     return {
       view,
       streamId: query.get("stream") || "",
+      outputId: query.get("output") || "",
       alertId: query.get("alert") || "",
       recordingId: query.get("recording") || "",
       page: Math.max(1, Number(query.get("page") || 1))
     };
   }
-  return {view: "dashboard", streamId: "", alertId: "", page: 1};
+  return {view: "dashboard", streamId: "", outputId: "", alertId: "", page: 1};
 }
 
 function routeState(view, params = {}) {
   return {
     view,
     streamId: params.streamId || "",
+    outputId: params.outputId || "",
     alertId: params.alertId || "",
     recordingId: params.recordingId || "",
     page: Math.max(1, Number(params.page || 1))
@@ -10515,14 +10686,39 @@ function applyRoute(route) {
       outputTableSignature = "";
       easSignature = "";
       audioEffectsSignature = "";
-      cancelOutputForm();
+      closeOutputForm();
       const station = stream.station || {};
+      setText("stream_settings_title", `Edit stream ${streamCallsign(stream)}`);
       setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
       renderStreamSettings();
       showView("stream_settings");
+      setPageTitle(`Edit stream ${streamCallsign(stream)}`);
       return;
     }
     showView("streams");
+    return;
+  }
+  if (route.view === "stream_output") {
+    const streamId = route.streamId || settingsStreamId;
+    const stream = configuredStreams.find(item => item.id === streamId);
+    if (!stream) {
+      closeOutputForm();
+      showView("streams");
+      return;
+    }
+    settingsStreamId = streamId;
+    const station = stream.station || {};
+    setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
+    if (route.outputId) {
+      if (editingOutputId !== route.outputId || outputFormMode !== "edit") {
+        prepareEditOutput(route.outputId);
+      }
+    } else if (outputFormMode !== "add" || !outputFormIsOpen()) {
+      prepareAddOutput();
+    }
+    setText("output_form_title", `${route.outputId ? "Edit output" : "Add output"} for ${streamCallsign(stream)}`);
+    showView("stream_output");
+    setPageTitle(`${route.outputId ? "Edit output" : "Add output"} for ${streamCallsign(stream)}`);
     return;
   }
   if (route.view === "eas_alerts") {
@@ -10567,11 +10763,20 @@ function applyRoute(route) {
   if (route.view === "accounts") {
     loadAccounts().catch(error => setAccountResult(error.message, "error"));
   }
+  if (route.view === "create_account") {
+    if (!accountIsOwner()) {
+      showView("change_password");
+      return;
+    }
+    setCreateAccountResult("");
+    showView("create_account");
+    return;
+  }
   showView(route.view);
 }
 
 function outputFormHasUnsavedChanges() {
-  return currentViewName() === "stream_settings" && outputFormDirty;
+  return currentViewName() === "stream_output" && outputFormDirty;
 }
 
 function wizardHasUnsavedChanges() {
@@ -10620,6 +10825,8 @@ function toggleNavMoreMenu(focusFirst = false) {
 
 function navigateTo(view, params = {}, replace = false, force = false) {
   if (!replace && !force && !confirmDiscardNavigation()) return;
+  const leavingOutputForm = currentViewName() === "stream_output" && view !== "stream_output";
+  if (leavingOutputForm) closeOutputForm();
   if (accountIsReadOnly() && isReadOnlyRestrictedView(view)) {
     view = "dashboard";
     params = {};
@@ -10639,6 +10846,7 @@ function navigateTo(view, params = {}, replace = false, force = false) {
 function currentRouteParams() {
   const view = currentViewName();
   if (view === "stream_settings") return {streamId: settingsStreamId};
+  if (view === "stream_output") return {streamId: settingsStreamId, outputId: editingOutputId};
   if (view === "eas_alerts") return {streamId: easAlertStreamId, page: easAlertPage};
   if (view === "eas_alert_export" || view === "eas_alert_delete") return {streamId: easAlertStreamId, page: easAlertPage};
   if (view === "eas_alert_detail") return {streamId: easAlertStreamId, alertId: easAlertDetailId, page: easAlertReturnPage};
@@ -10700,13 +10908,7 @@ function renderIqStreamOptions(force = false) {
   const signature = JSON.stringify(options);
   if (!force && signature === iqStreamOptionsSignature) return;
   const current = select.value;
-  select.replaceChildren();
-  for (const item of options) {
-    const option = document.createElement("option");
-    option.value = item.id;
-    option.textContent = item.label;
-    select.appendChild(option);
-  }
+  syncSelectOptions(select, options.map(item => ({value: item.id, label: item.label})));
   if (options.some(item => item.id === current)) {
     select.value = current;
   }
@@ -10789,6 +10991,7 @@ function renderIqRecordings(recordings) {
   if (!tbody) return;
   const signature = iqRecordingTableSignature(iqRecordings);
   if (signature === iqRecordingsSignature) return;
+  if (containsFocusedElement(tbody)) return;
   iqRecordingsSignature = signature;
   tbody.innerHTML = "";
   if (!iqRecordings.length) {
@@ -10910,12 +11113,14 @@ function renderIqDownloadPage() {
   const recording = selectedIqRecording();
   if (!recording) {
     setText("iq_download_recording_label", "I/Q recording was not found.");
+    setPageTitle("Download I/Q Recording");
     return;
   }
   setText(
     "iq_download_recording_label",
     `${recording.recorded_at || "Unknown"}; ${recording.sample_rate || 0} S/s; ${recording.frequency_hz || 0} Hz`
   );
+  setPageTitle(`Download I/Q recording from ${recording.recorded_at || "unknown time"}`);
 }
 
 function startBackgroundDownload(url) {
@@ -10976,7 +11181,9 @@ function syncControls(data) {
   const gain = document.getElementById("gain");
   setAttributeIfChanged(gain, "max", Math.max(0, gainValues.length - 1));
   setDisabled(gain, s.gain === null || gainValues.length === 0);
-  const gainIndex = gainIndexFor(s.gain);
+  if (s.gain !== null) rememberManualGain(s.gain);
+  const displayedGain = s.gain === null ? storedManualGain() : s.gain;
+  const gainIndex = gainIndexFor(displayedGain);
   if (gain.value !== String(gainIndex)) gain.value = String(gainIndex);
   if (s.gain === null) {
     setText("gain_label", "Automatic");
@@ -11124,10 +11331,18 @@ function scheduleAudioEffectsUpdate() {
 
 for (const id of controls) {
   document.addEventListener("input", event => {
-    if (event.target && event.target.id === id) scheduleUpdate();
+    if (event.target && event.target.id === id) {
+      if (id === "gain") rememberManualGainFromSlider();
+      if (id === "gain_auto" && !event.target.checked) restoreRememberedManualGain();
+      scheduleUpdate();
+    }
   });
   document.addEventListener("change", event => {
-    if (event.target && event.target.id === id) scheduleUpdate();
+    if (event.target && event.target.id === id) {
+      if (id === "gain") rememberManualGainFromSlider();
+      if (id === "gain_auto" && !event.target.checked) restoreRememberedManualGain();
+      scheduleUpdate();
+    }
   });
 }
 
@@ -11262,18 +11477,20 @@ document.getElementById("dismiss_account_secret").addEventListener("click", dism
 document.getElementById("copy_account_secret").addEventListener("click", copyAccountSecret);
 document.getElementById("open_create_account").addEventListener("click", () => {
   setAccountResult("");
+  setCreateAccountResult("");
   showAccountSecret("");
-  document.getElementById("create_account_panel").hidden = false;
-  document.getElementById("new_account_username").focus();
+  setValue("new_account_username", "");
+  setChecked("new_account_read_only", false);
+  navigateTo("create_account");
 });
 document.getElementById("cancel_create_account").addEventListener("click", () => {
-  document.getElementById("create_account_panel").hidden = true;
+  navigateTo("accounts");
 });
 document.getElementById("create_account").addEventListener("click", async () => {
   try {
     await createAccountFromForm();
   } catch (error) {
-    setAccountResult(error.message, "error");
+    setCreateAccountResult(error.message, "error");
   }
 });
 document.getElementById("change_account_password").addEventListener("click", async () => {
@@ -11517,13 +11734,15 @@ document.getElementById("audio_effects_back").addEventListener("click", () => {
 });
 
 window.addEventListener("popstate", event => {
+  const nextRoute = event.state || routeFromLocation();
   if (!confirmDiscardNavigation()) {
     const currentView = currentViewName();
     const currentParams = currentRouteParams();
     history.pushState(routeState(currentView, currentParams), "", routeForView(currentView, currentParams));
     return;
   }
-  applyRoute(event.state || routeFromLocation());
+  if (currentViewName() === "stream_output" && nextRoute.view !== "stream_output") closeOutputForm();
+  applyRoute(nextRoute);
 });
 
 document.getElementById("open_add_stream").addEventListener("click", () => {
@@ -11547,7 +11766,7 @@ document.getElementById("active-streams-body").addEventListener("click", async e
   if (target.dataset.action === "edit-active-stream") {
     closeStreamActionMenus();
     if (accountIsReadOnly()) return;
-    editStreamSettings(target.dataset.streamId, target.dataset.outputId);
+    editStreamSettings(target.dataset.streamId);
     return;
   }
   if (target.dataset.action === "toggle-active-stream") {
@@ -11660,7 +11879,7 @@ document.getElementById("rescan_devices").addEventListener("click", async () => 
   setDisabled(button, true);
   try {
     const status = await request("/api/status");
-    await loadDevices(status.settings.serial, {force: true});
+    await loadDevices(status.settings.serial);
   } catch (error) {
     setText("device-errors", error.message);
   } finally {
@@ -11829,11 +12048,11 @@ document.getElementById("add_output").addEventListener("click", async () => {
     });
     outputTableSignature = "";
     renderStreams(data.streams || []);
-    setOutputResult(data.message, data.success ? "success" : "error");
     if (data.success) {
       cancelOutputForm();
       maybeShowNwrOrgSubmissionNotice(icecast);
     }
+    setOutputResult(data.message, data.success ? "success" : "error");
   } catch (error) {
     setOutputResult(error.message, "error");
   } finally {
@@ -11869,11 +12088,11 @@ document.getElementById("save_output_settings").addEventListener("click", async 
       })
     });
     renderStreams(data.streams || []);
-    setOutputResult(data.message, data.success ? "success" : "error");
     if (data.success) {
       cancelOutputForm();
       if (oldService !== STREAM_SERVICE_NWRORG) maybeShowNwrOrgSubmissionNotice(icecast);
     }
+    setOutputResult(data.message, data.success ? "success" : "error");
   } catch (error) {
     setOutputResult(error.message, "error");
   } finally {
