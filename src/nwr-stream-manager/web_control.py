@@ -5094,14 +5094,26 @@ def eas_recording_settings_from_stream(stream: dict[str, Any]) -> WebEasRecordin
         return WebEasRecordingSettings()
 
 
+def whole_seconds(value: Any, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a whole number of seconds")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a whole number of seconds") from exc
+    if not math.isfinite(number) or not number.is_integer():
+        raise ValueError(f"{label} must be a whole number of seconds")
+    return int(number)
+
+
 def validate_eas_recording_payload(raw: Any) -> WebEasRecordingSettings:
     if not isinstance(raw, dict):
         raise ValueError("EAS recording settings are required")
     enabled = bool(raw.get("enabled", False))
-    pre_seconds = float(raw.get("pre_seconds", 2.0))
-    post_seconds = float(raw.get("post_seconds", 5.0))
-    max_seconds = raw.get("max_seconds", 120)
-    if not isinstance(max_seconds, int) or isinstance(max_seconds, bool):
+    pre_seconds = whole_seconds(raw.get("pre_seconds", 2), "Pre-recording time")
+    post_seconds = whole_seconds(raw.get("post_seconds", 5), "Post-recording time")
+    max_seconds = whole_seconds(raw.get("max_seconds", 120), "Maximum recording time")
+    if isinstance(max_seconds, bool):
         raise ValueError("Maximum recording time must be a whole number of seconds")
     if not 0 <= pre_seconds <= 10:
         raise ValueError("Pre-recording time must be from 0 through 10 seconds")
@@ -5704,8 +5716,8 @@ def validate_fallback_settings_payload(raw: Any) -> WebFallbackSettings:
     if not isinstance(raw, dict):
         raise ValueError("fallback audio settings are required")
     enabled = bool(raw.get("enabled", False))
-    silence_timeout_seconds = float(raw.get("silence_timeout_seconds", 30.0))
-    loop_delay_seconds = float(raw.get("loop_delay_seconds", 5.0))
+    silence_timeout_seconds = whole_seconds(raw.get("silence_timeout_seconds", 30), "Fallback delay")
+    loop_delay_seconds = whole_seconds(raw.get("loop_delay_seconds", 5), "Seconds before restart")
     if not 30 <= silence_timeout_seconds <= 120:
         raise ValueError("Fallback delay must be from 30 through 120 seconds")
     if not 0 <= loop_delay_seconds <= 10:
@@ -6703,8 +6715,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <section>
       <h2>Configure RTL-SDR</h2>
       <label>Active SDR
-        <select id="serial"></select>
+        <select id="serial" aria-describedby="serial_hint"></select>
       </label>
+      <span id="serial_hint" class="hint">Select the SDR dongle by serial number.</span>
       <button id="rescan_devices" type="button">Rescan</button>
       <div id="device-errors" class="error"></div>
     </section>
@@ -6712,24 +6725,28 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div class="grid">
         <div>
           <label for="gain">Gain</label>
-          <input id="gain" type="range" min="0" max="0" step="1" value="0" disabled>
+          <input id="gain" type="range" min="0" max="0" step="1" value="0" disabled aria-describedby="gain_hint">
           <span id="gain_label" class="hint">Automatic</span>
-          <label><input id="gain_auto" type="checkbox"> Automatic gain control</label>
+          <span id="gain_hint" class="hint">Controls how strongly the SDR amplifies received signals. Generally this should be kept around 30-35 dB. Setting gain too high can cause interference, setting it too low can significantly degrade reception.</span>
+          <label><input id="gain_auto" type="checkbox" aria-describedby="gain_auto_hint"> Automatic gain control</label>
+          <span id="gain_auto_hint" class="hint">Automatically adjusts the tuner gain based on signal strength. It is best to keep this setting switched off as it can increase the gain too high, causing interference.</span>
         </div>
         <label>PPM Correction
-          <input id="ppm_correction" type="number" min="-200" max="200" step="1">
+          <input id="ppm_correction" type="number" min="-200" max="200" step="1" aria-describedby="ppm_correction_hint">
         </label>
+        <span id="ppm_correction_hint" class="hint">Controls hardware frequency correction for dongles that experience frequency drift.</span>
         <div>
           <label for="alias_filter_strength">Alias filter strength</label>
           <input id="alias_filter_strength" type="range" min="0" max="100" step="1" value="100" aria-describedby="alias_filter_strength_hint">
           <span id="alias_filter_strength_label" class="hint" aria-hidden="true">100%</span>
         </div>
         <div class="row">
-          <label><input id="bias_tee" type="checkbox"> Bias tee</label>
+          <label><input id="bias_tee" type="checkbox" aria-describedby="bias_tee_hint"> Bias tee</label>
+          <span id="bias_tee_hint" class="hint">Enable the RTL-SDR bias tee. Only enable this if attached hardware expects DC power.</span>
         </div>
       </div>
       <div id="alias_filter_strength_hint" class="hint">
-        100% uses the strongest alias filters. 0% uses the weakest filters. Lower values reduce CPU by widening transition bands and reducing stopband rejection, but more unwanted energy may alias into the passband.
+        Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.
       </div>
     </section>
   </div>
@@ -6952,12 +6969,12 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <input id="station_search" type="search" placeholder="Callsign, city, state, or frequency" autocomplete="off">
         </label>
         <div class="actions">
-          <button id="station_search_button" type="button">Search</button>
+          <button id="station_search_button" type="button" disabled>Search</button>
         </div>
-        <label>Matching Stations
+        <label id="station_results_label" hidden>Matching Stations
           <select id="station_results" size="8"></select>
         </label>
-        <div id="selected_station" class="hint">Select a station to continue.</div>
+        <div id="selected_station" class="hint">Enter search text to find a station.</div>
       </div>
       <div id="wizard_step_credentials" class="wizard-step" hidden>
         <p id="icecast_credentials_intro">The next step is to enter your icecast credentials for the service you want to stream to. Enter them below, then click next.</p>
@@ -6966,24 +6983,29 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <legend>Icecast Credentials</legend>
           <div class="grid">
             <label id="icecast_host_label">Host
-              <input id="icecast_host" type="text" autocomplete="off">
+              <input id="icecast_host" type="text" autocomplete="off" aria-describedby="icecast_host_hint">
             </label>
+            <span id="icecast_host_hint" class="hint">The hostname, IP address, or web URL of the Icecast server.</span>
             <label id="icecast_port_label">Port
-              <input id="icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000">
+              <input id="icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="icecast_port_hint">
             </label>
+            <span id="icecast_port_hint" class="hint">The port the Icecast server listens on.</span>
             <label id="icecast_username_label">Username
-              <input id="icecast_username" type="text" autocomplete="username">
+              <input id="icecast_username" type="text" autocomplete="username" aria-describedby="icecast_username_hint">
             </label>
+            <span id="icecast_username_hint" class="hint">The username for authentication to the server.</span>
             <label id="icecast_password_label">Password
-              <input id="icecast_password" type="password" autocomplete="current-password">
+              <input id="icecast_password" type="password" autocomplete="current-password" aria-describedby="icecast_password_hint">
             </label>
+            <span id="icecast_password_hint" class="hint">The password for authentication to the server.</span>
             <label id="show_icecast_password_label" class="checkbox-row">
               <input id="show_icecast_password" type="checkbox">
               Show password
             </label>
             <label id="icecast_mount_label">Mountpoint
-              <input id="icecast_mount" type="text" placeholder="/station.mp3">
+              <input id="icecast_mount" type="text" placeholder="/station.mp3" aria-describedby="icecast_mount_hint">
             </label>
+            <span id="icecast_mount_hint" class="hint">The mountpoint where the stream will be accessible to listeners.</span>
             <label id="icecast_alt_label" class="checkbox-row" hidden>
               <input id="icecast_alt_enabled" type="checkbox">
               Alternate stream
@@ -7009,6 +7031,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <p>What audio codec would you like to use for the stream format? MP3 is generally more compatible, while OGG may give better audio quality at lower internet usage.</p>
         <fieldset id="icecast_format_fieldset">
           <legend>Stream Format</legend>
+          <div class="hint">Encoding format for this Icecast mountpoint.</div>
           <label><input id="icecast_format_mp3" name="icecast_format" type="radio" value="mp3" checked> MP3</label>
           <label><input id="icecast_format_ogg" name="icecast_format" type="radio" value="ogg"> OGG</label>
         </fieldset>
@@ -7019,7 +7042,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <legend>Audio Settings</legend>
         <div class="grid">
           <label id="icecast_sample_rate_label">Sample Rate
-            <select id="icecast_sample_rate">
+            <select id="icecast_sample_rate" aria-describedby="icecast_sample_rate_hint">
               <option value="8000">8000 Hz</option>
               <option value="11025">11025 Hz</option>
               <option value="16000">16000 Hz</option>
@@ -7030,10 +7053,13 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               <option value="48000">48000 Hz</option>
             </select>
           </label>
+          <span id="icecast_sample_rate_hint" class="hint">The audio sample rate to encode at for this Icecast mountpoint.</span>
           <label id="icecast_bitrate_label">Bitrate
-            <select id="icecast_bitrate"></select>
+            <select id="icecast_bitrate" aria-describedby="icecast_bitrate_hint"></select>
           </label>
-          <label id="output_enabled_label"><input id="output_enabled" type="checkbox" checked> Output enabled</label>
+          <span id="icecast_bitrate_hint" class="hint">Encoder bitrate in Kbps for this Icecast mountpoint.</span>
+          <label id="output_enabled_label"><input id="output_enabled" type="checkbox" checked aria-describedby="output_enabled_hint"> Output enabled</label>
+          <span id="output_enabled_hint" class="hint">Enable or disable this Icecast output.</span>
         </div>
       </fieldset>
       </div>
@@ -7056,12 +7082,13 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div id="stream_settings_station" class="hint"></div>
       <label class="checkbox-row">
         <input id="stream_enabled" type="checkbox">
-        Stream enabled
+        Enable this stream
       </label>
       <label class="checkbox-row">
-        <input id="stream_monitor_enabled" type="checkbox">
+        <input id="stream_monitor_enabled" type="checkbox" aria-describedby="stream_monitor_hint">
         Monitor
       </label>
+      <span id="stream_monitor_hint" class="hint">Listen to this stream's audio in your browser.</span>
       <div id="stream-settings-result" class="message"></div>
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
         <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
@@ -7109,71 +7136,86 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             <div id="audio_effect_volume" class="audio-effect-panel">
               <h4>Volume multiplier</h4>
               <label class="checkbox-row">
-                <input id="audio_volume_enabled" type="checkbox">
+                <input id="audio_volume_enabled" type="checkbox" aria-describedby="audio_volume_enabled_hint">
                 Enable volume multiplier
               </label>
+              <span id="audio_volume_enabled_hint" class="hint">Controls the stream volume.</span>
               <label>Multiplier
-                <input id="audio_volume_multiplier" type="number" min="0" step="0.1">
+                <input id="audio_volume_multiplier" type="number" min="0" step="0.1" aria-describedby="audio_volume_multiplier_hint">
               </label>
+              <span id="audio_volume_multiplier_hint" class="hint">The volume multiplier.</span>
             </div>
             <div id="audio_effect_comfort_noise" class="audio-effect-panel" hidden>
               <h4>Comfort noise</h4>
               <label class="checkbox-row">
-                <input id="audio_comfort_noise_enabled" type="checkbox">
+                <input id="audio_comfort_noise_enabled" type="checkbox" aria-describedby="audio_comfort_noise_enabled_hint">
                 Enable comfort noise
               </label>
+              <span id="audio_comfort_noise_enabled_hint" class="hint">Mixes very quiet white noise into demodulated audio, similar to some analog receivers.</span>
               <label>Level
-                <input id="audio_comfort_noise_level" type="number" min="-80" max="-20" step="1">
+                <input id="audio_comfort_noise_level" type="number" min="-80" max="-20" step="1" aria-describedby="audio_comfort_noise_level_hint">
               </label>
+              <span id="audio_comfort_noise_level_hint" class="hint">Noise level in dB below full scale. Valid range is -80 through -20.</span>
             </div>
             <div id="audio_effect_deemphasis" class="audio-effect-panel" hidden>
               <h4>NFM deemphasis</h4>
               <label class="checkbox-row">
-                <input id="audio_deemphasis_enabled" type="checkbox">
+                <input id="audio_deemphasis_enabled" type="checkbox" aria-describedby="audio_deemphasis_enabled_hint">
                 Enable NFM deemphasis
               </label>
+              <span id="audio_deemphasis_enabled_hint" class="hint">NFM deemphasis filter for reducing high frequency content.</span>
               <label>Time constant
-                <input id="audio_deemphasis_tau" type="number" min="0" max="530" step="1">
+                <input id="audio_deemphasis_tau" type="number" min="0" max="530" step="1" aria-describedby="audio_deemphasis_tau_hint">
               </label>
+              <span id="audio_deemphasis_tau_hint" class="hint">Time constant in microseconds. Valid range is 0 through 530. Higher values deemphasize audio more aggressively.</span>
             </div>
             <div id="audio_effect_highpass" class="audio-effect-panel" hidden>
               <h4>Highpass</h4>
               <label class="checkbox-row">
-                <input id="audio_highpass_enabled" type="checkbox">
+                <input id="audio_highpass_enabled" type="checkbox" aria-describedby="audio_highpass_enabled_hint">
                 Enable highpass
               </label>
+              <span id="audio_highpass_enabled_hint" class="hint">Gets rid of low-frequency audio, such as 60 Hz hums.</span>
               <label>Frequency
-                <input id="audio_highpass_frequency" type="number" min="1" max="900" step="1">
+                <input id="audio_highpass_frequency" type="number" min="1" max="900" step="1" aria-describedby="audio_highpass_frequency_hint">
               </label>
+              <span id="audio_highpass_frequency_hint" class="hint">Frequency in Hz. Frequencies below this value will be attenuated. To protect the 1050 Hz attention tone, this cannot be set above 900 Hz.</span>
               <label>Sharpness
-                <input id="audio_highpass_sharpness" type="number" min="0" max="10" step="0.1">
+                <input id="audio_highpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_highpass_sharpness_hint">
               </label>
+              <span id="audio_highpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
             </div>
             <div id="audio_effect_lowpass" class="audio-effect-panel" hidden>
               <h4>Lowpass</h4>
               <label class="checkbox-row">
-                <input id="audio_lowpass_enabled" type="checkbox">
+                <input id="audio_lowpass_enabled" type="checkbox" aria-describedby="audio_lowpass_enabled_hint">
                 Enable lowpass
               </label>
+              <span id="audio_lowpass_enabled_hint" class="hint">Gets rid of high-frequency audio. This is different from the NFM deemphasis filter.</span>
               <label>Frequency
-                <input id="audio_lowpass_frequency" type="number" min="2200" max="12000" step="1">
+                <input id="audio_lowpass_frequency" type="number" min="2200" max="12000" step="1" aria-describedby="audio_lowpass_frequency_hint">
               </label>
+              <span id="audio_lowpass_frequency_hint" class="hint">Frequency in Hz. Frequencies above this value will be attenuated. To protect SAME tones, this cannot be set below 2200 Hz.</span>
               <label>Sharpness
-                <input id="audio_lowpass_sharpness" type="number" min="0" max="10" step="0.1">
+                <input id="audio_lowpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_lowpass_sharpness_hint">
               </label>
+              <span id="audio_lowpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
             </div>
             <div id="audio_effect_notch" class="audio-effect-panel" hidden>
               <h4>Notch filter</h4>
               <label class="checkbox-row">
-                <input id="audio_notch_enabled" type="checkbox">
+                <input id="audio_notch_enabled" type="checkbox" aria-describedby="audio_notch_enabled_hint">
                 Enable notch filter
               </label>
+              <span id="audio_notch_enabled_hint" class="hint">Removes a narrow tone, useful for analog whines.</span>
               <label>Frequency
-                <input id="audio_notch_frequency" type="number" min="1" max="12000" step="1">
+                <input id="audio_notch_frequency" type="number" min="1" max="12000" step="1" aria-describedby="audio_notch_frequency_hint">
               </label>
+              <span id="audio_notch_frequency_hint" class="hint">Frequency in Hz. Frequencies of and near this value will be attenuated. To protect the 1050 Hz attention tone and SAME tones, this cannot be within 900-1100, 1400-1600, or 2000-2200 Hz.</span>
               <label>Sharpness
-                <input id="audio_notch_sharpness" type="number" min="0" max="10" step="0.1">
+                <input id="audio_notch_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_notch_sharpness_hint">
               </label>
+              <span id="audio_notch_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
             </div>
           </div>
         </div>
@@ -7183,20 +7225,25 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <h3>EAS recording</h3>
         <div class="grid">
           <label id="eas_enabled_label" class="checkbox-row">
-            <input id="eas_enabled" type="checkbox">
+            <input id="eas_enabled" type="checkbox" aria-describedby="eas_enabled_hint">
             Enable EAS recording
           </label>
-          <label>Pre-recording time
-            <input id="eas_pre_seconds" type="number" min="0" max="10" step="0.1">
+          <span id="eas_enabled_hint" class="hint">Record EAS alerts received from this station.</span>
+          <label>Pre-recording time in seconds
+            <input id="eas_pre_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_pre_seconds_hint">
           </label>
-          <label>Post-recording time
-            <input id="eas_post_seconds" type="number" min="0" max="10" step="0.1">
+          <span id="eas_pre_seconds_hint" class="hint">Seconds of audio to prepend before the decoded SAME header. Valid range is 0 through 10.</span>
+          <label>Post-recording time in seconds
+            <input id="eas_post_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_post_seconds_hint">
           </label>
-          <label>Maximum recording time
-            <input id="eas_max_seconds" type="number" min="1" max="3600" step="1">
+          <span id="eas_post_seconds_hint" class="hint">Seconds of audio to append after EOM. Valid range is 0 through 10.</span>
+          <label>Maximum recording time in seconds
+            <input id="eas_max_seconds" type="number" min="1" max="3600" step="1" aria-describedby="eas_max_seconds_hint">
           </label>
+          <span id="eas_max_seconds_hint" class="hint">Maximum recording length for a single alert, in seconds.</span>
           <fieldset>
             <legend>Recording format</legend>
+            <div class="hint">Recording format for saved alert audio.</div>
             <label><input id="eas_format_wav" name="eas_format" type="radio" value="wav" checked> WAV</label>
             <label><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
           </fieldset>
@@ -7208,15 +7255,18 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <h3>Fallback audio</h3>
         <div class="grid">
           <label class="checkbox-row">
-            <input id="fallback_enabled" type="checkbox">
+            <input id="fallback_enabled" type="checkbox" aria-describedby="fallback_enabled_hint">
             Enable fallback audio
           </label>
-          <label>Fallback delay
-            <input id="fallback_delay" type="number" min="30" max="120" step="0.1">
+          <span id="fallback_enabled_hint" class="hint">Fallback audio is played when the stream stops receiving radio audio so listeners are not left with silence.</span>
+          <label>Fallback delay in seconds
+            <input id="fallback_delay" type="number" min="30" max="120" step="1" aria-describedby="fallback_delay_hint">
           </label>
+          <span id="fallback_delay_hint" class="hint">The time, in seconds, to wait before fallback audio starts playing. Valid range is 30 through 120 seconds.</span>
           <label>Seconds before restart
-            <input id="fallback_loop_delay" type="number" min="0" max="10" step="0.1">
+            <input id="fallback_loop_delay" type="number" min="0" max="10" step="1" aria-describedby="fallback_loop_delay_hint">
           </label>
+          <span id="fallback_loop_delay_hint" class="hint">How long to wait after the fallback audio finishes before starting it again. Set to 0 for a continuous loop with no gap.</span>
         </div>
         <div class="hint">Uses the packaged default fallback.wav audio file.</div>
         <div id="fallback-result" class="message"></div>
@@ -7241,24 +7291,29 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             <legend>Icecast output</legend>
             <div class="grid">
               <label id="settings_icecast_host_label">Host
-                <input id="settings_icecast_host" type="text" autocomplete="off">
+                <input id="settings_icecast_host" type="text" autocomplete="off" aria-describedby="settings_icecast_host_hint">
               </label>
+              <span id="settings_icecast_host_hint" class="hint">The hostname, IP address, or web URL of the Icecast server.</span>
               <label id="settings_icecast_port_label">Port
-                <input id="settings_icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000">
+                <input id="settings_icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="settings_icecast_port_hint">
               </label>
+              <span id="settings_icecast_port_hint" class="hint">The port the Icecast server listens on.</span>
               <label id="settings_icecast_username_label">Username
-                <input id="settings_icecast_username" type="text" autocomplete="username">
+                <input id="settings_icecast_username" type="text" autocomplete="username" aria-describedby="settings_icecast_username_hint">
               </label>
+              <span id="settings_icecast_username_hint" class="hint">The username for authentication to the server.</span>
               <label id="settings_icecast_password_label">Password
-                <input id="settings_icecast_password" type="password" autocomplete="current-password">
+                <input id="settings_icecast_password" type="password" autocomplete="current-password" aria-describedby="settings_icecast_password_hint">
               </label>
+              <span id="settings_icecast_password_hint" class="hint">The password for authentication to the server.</span>
               <label id="settings_show_icecast_password_label" class="checkbox-row">
                 <input id="settings_show_icecast_password" type="checkbox">
                 Show password
               </label>
               <label id="settings_icecast_mount_label">Mountpoint
-                <input id="settings_icecast_mount" type="text" placeholder="/station.mp3">
+                <input id="settings_icecast_mount" type="text" placeholder="/station.mp3" aria-describedby="settings_icecast_mount_hint">
               </label>
+              <span id="settings_icecast_mount_hint" class="hint">The mountpoint where the stream will be accessible to listeners.</span>
               <label id="settings_icecast_alt_label" class="checkbox-row" hidden>
                 <input id="settings_icecast_alt_enabled" type="checkbox">
                 Alternate stream
@@ -7268,11 +7323,12 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               </label>
               <fieldset id="settings_icecast_format_fieldset">
                 <legend>Format</legend>
+                <div class="hint">Encoding format for this Icecast mountpoint.</div>
                 <label><input id="settings_icecast_format_mp3" name="settings_icecast_format" type="radio" value="mp3" checked> MP3</label>
                 <label><input id="settings_icecast_format_ogg" name="settings_icecast_format" type="radio" value="ogg"> OGG</label>
               </fieldset>
               <label id="settings_icecast_sample_rate_label">Sample rate
-                <select id="settings_icecast_sample_rate">
+                <select id="settings_icecast_sample_rate" aria-describedby="settings_icecast_sample_rate_hint">
                   <option value="8000">8000 Hz</option>
                   <option value="11025">11025 Hz</option>
                   <option value="16000">16000 Hz</option>
@@ -7283,9 +7339,11 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                   <option value="48000">48000 Hz</option>
                 </select>
               </label>
+              <span id="settings_icecast_sample_rate_hint" class="hint">The audio sample rate to encode at for this Icecast mountpoint.</span>
               <label id="settings_icecast_bitrate_label">Bitrate
-                <select id="settings_icecast_bitrate"></select>
+                <select id="settings_icecast_bitrate" aria-describedby="settings_icecast_bitrate_hint"></select>
               </label>
+              <span id="settings_icecast_bitrate_hint" class="hint">Encoder bitrate in Kbps for this Icecast mountpoint.</span>
             </div>
           </fieldset>
           <div class="actions">
@@ -8275,8 +8333,34 @@ function stationLabel(station) {
   return `${station.callsign} ${station.frequency} MHz, ${place}${site}`;
 }
 
+function stationSearchQuery() {
+  const input = document.getElementById("station_search");
+  return input ? input.value.trim() : "";
+}
+
+function updateStationSearchControls() {
+  const button = document.getElementById("station_search_button");
+  if (button) setDisabled(button, stationSearchQuery() === "");
+}
+
+function clearStationResults(message = "Enter search text to find a station.") {
+  stationResults = [];
+  selectedStationKey = "";
+  const select = document.getElementById("station_results");
+  if (select) syncSelectOptions(select, []);
+  const label = document.getElementById("station_results_label");
+  if (label) label.hidden = true;
+  setText("selected_station", message);
+  renderWizard();
+}
+
 async function searchStations() {
-  const query = document.getElementById("station_search").value;
+  const query = stationSearchQuery();
+  updateStationSearchControls();
+  if (query === "") {
+    clearStationResults();
+    return;
+  }
   const data = await request(`/api/stations?q=${encodeURIComponent(query)}&limit=75`);
   stationResults = data.stations || [];
   const select = document.getElementById("station_results");
@@ -8288,9 +8372,21 @@ async function searchStations() {
     selectOptions.push({value: station.key, label: stationLabel(station)});
   }
   syncSelectOptions(select, selectOptions);
+  const label = document.getElementById("station_results_label");
+  if (label) label.hidden = false;
   selectedStationKey = "";
   setText("selected_station", "Select a station to continue.");
   renderWizard();
+}
+
+async function runStationSearchFromUi() {
+  if (stationSearchQuery() === "") {
+    updateStationSearchControls();
+    clearStationResults();
+    return;
+  }
+  await searchStations();
+  setStreamResult("");
 }
 
 function selectedStation() {
@@ -8823,20 +8919,17 @@ function setAudioEffectsResult(message, kind = "") {
 function fallbackPayload() {
   return {
     enabled: document.getElementById("fallback_enabled").checked,
-    silence_timeout_seconds: Number(document.getElementById("fallback_delay").value),
-    loop_delay_seconds: Number(document.getElementById("fallback_loop_delay").value)
+    silence_timeout_seconds: numericControlValue("fallback_delay"),
+    loop_delay_seconds: numericControlValue("fallback_loop_delay")
   };
 }
 
 function filterPayload(name) {
   const frequencyElement = document.getElementById(`audio_${name}_frequency`);
-  const frequencyValue = frequencyElement.dataset.userEditing === "1"
-    ? Number(frequencyElement.dataset.previousValue || frequencyElement.defaultValue || frequencyElement.value)
-    : Number(frequencyElement.value);
   return {
     enabled: document.getElementById(`audio_${name}_enabled`).checked,
-    frequency: frequencyValue,
-    sharpness: Number(document.getElementById(`audio_${name}_sharpness`).value)
+    frequency: numericControlValue(frequencyElement),
+    sharpness: numericControlValue(`audio_${name}_sharpness`)
   };
 }
 
@@ -8851,9 +8944,45 @@ function previousNumberValue(element) {
   return Number.isFinite(previous) ? previous : 0;
 }
 
-function normalizeAudioFrequencyControl(name) {
-  const element = document.getElementById(`audio_${name}_frequency`);
+function numericControlValue(elementOrId) {
+  const element = typeof elementOrId === "string" ? document.getElementById(elementOrId) : elementOrId;
+  if (!element) return 0;
+  const raw = element.dataset.userEditing === "1"
+    ? element.dataset.previousValue || element.defaultValue || element.value
+    : element.value;
+  const value = Number(raw);
+  if (Number.isFinite(value)) return value;
+  return previousNumberValue(element);
+}
+
+function normalizeNumericControl(elementOrId) {
+  const element = typeof elementOrId === "string" ? document.getElementById(elementOrId) : elementOrId;
+  if (!element || element.value === "") {
+    if (element) delete element.dataset.userEditing;
+    return;
+  }
+  const number = Number(element.value);
+  if (!Number.isFinite(number)) {
+    delete element.dataset.userEditing;
+    return;
+  }
+  const min = element.min === "" ? -Infinity : Number(element.min);
+  const max = element.max === "" ? Infinity : Number(element.max);
+  const minimum = Number.isFinite(min) ? min : -Infinity;
+  const maximum = Number.isFinite(max) ? max : Infinity;
+  const clamped = Math.min(maximum, Math.max(minimum, number));
+  const step = Number(element.step);
+  const normalized = Number.isFinite(step) && step > 0 && step < 1 ? String(clamped) : String(Math.round(clamped));
+  if (element.value !== normalized) element.value = normalized;
+  element.dataset.previousValue = normalized;
+  delete element.dataset.userEditing;
+}
+
+function normalizeAudioFrequencyControl(nameOrElement) {
+  const element = typeof nameOrElement === "string" ? document.getElementById(`audio_${nameOrElement}_frequency`) : nameOrElement;
   if (!element || element.value === "") return;
+  const name = audioFrequencyNameForElement(element);
+  if (!name) return;
   const previous = previousNumberValue(element);
   let value = Number(element.value);
   if (!Number.isFinite(value)) return;
@@ -8909,10 +9038,43 @@ function isTextEditingKey(event) {
   return event.key.length === 1 || ["Backspace", "Delete"].includes(event.key);
 }
 
+function isNumericControl(element) {
+  return Boolean(element && element.tagName === "INPUT" && element.type === "number");
+}
+
+function beginNumericTextEdit(element) {
+  if (!isNumericControl(element)) return false;
+  if (element.dataset.userEditing !== "1") {
+    element.dataset.previousValue = element.value || element.dataset.previousValue || element.defaultValue || element.min || "0";
+  }
+  element.dataset.userEditing = "1";
+  return true;
+}
+
+function commitNumericControlElement(element, saveCallback = null) {
+  if (!isNumericControl(element)) return false;
+  if (audioFrequencyNameForElement(element)) {
+    commitAudioFrequencyElement(element, false);
+  } else {
+    normalizeNumericControl(element);
+  }
+  if (typeof saveCallback === "function") saveCallback();
+  return true;
+}
+
+function numericSaveCallbackForElement(element) {
+  if (!element || !element.id) return null;
+  if (controls.includes(element.id)) return scheduleUpdate;
+  if (["fallback_delay", "fallback_loop_delay"].includes(element.id)) return scheduleFallbackUpdate;
+  if (["eas_pre_seconds", "eas_post_seconds", "eas_max_seconds"].includes(element.id)) return scheduleEasUpdate;
+  if (element.id.startsWith("audio_")) return scheduleAudioEffectsUpdate;
+  return null;
+}
+
 function commitAudioFrequencyElement(element, save = true) {
   const name = audioFrequencyNameForElement(element);
   if (!name) return false;
-  normalizeAudioFrequencyControl(name);
+  normalizeAudioFrequencyControl(element);
   delete element.dataset.userEditing;
   if (save) scheduleAudioEffectsUpdate();
   return true;
@@ -8922,15 +9084,15 @@ function audioEffectsPayload() {
   return {
     volume: {
       enabled: document.getElementById("audio_volume_enabled").checked,
-      multiplier: Number(document.getElementById("audio_volume_multiplier").value)
+      multiplier: numericControlValue("audio_volume_multiplier")
     },
     comfort_noise: {
       enabled: document.getElementById("audio_comfort_noise_enabled").checked,
-      level_db: Number(document.getElementById("audio_comfort_noise_level").value)
+      level_db: numericControlValue("audio_comfort_noise_level")
     },
     deemphasis: {
       enabled: document.getElementById("audio_deemphasis_enabled").checked,
-      tau: Number(document.getElementById("audio_deemphasis_tau").value)
+      tau: numericControlValue("audio_deemphasis_tau")
     },
     highpass: filterPayload("highpass"),
     lowpass: filterPayload("lowpass"),
@@ -8942,9 +9104,9 @@ function easPayload() {
   const selectedFormat = document.querySelector("input[name='eas_format']:checked");
   return {
     enabled: document.getElementById("eas_enabled").checked,
-    pre_seconds: Number(document.getElementById("eas_pre_seconds").value),
-    post_seconds: Number(document.getElementById("eas_post_seconds").value),
-    max_seconds: Number(document.getElementById("eas_max_seconds").value),
+    pre_seconds: numericControlValue("eas_pre_seconds"),
+    post_seconds: numericControlValue("eas_post_seconds"),
+    max_seconds: numericControlValue("eas_max_seconds"),
     format: selectedFormat ? selectedFormat.value : "wav"
   };
 }
@@ -9236,10 +9398,10 @@ function beginStreamWizard() {
   editingStreamId = "";
   editingOutputId = "";
   selectedStationKey = "";
-  const stationResultsElement = document.getElementById("station_results");
-  if (stationResultsElement) stationResultsElement.value = "";
+  setValue("station_search", "");
+  updateStationSearchControls();
+  clearStationResults();
   clearIcecastForm();
-  setText("selected_station", "Select a station to continue.");
   setStreamResult("");
   renderWizard();
   navigateTo("add_stream", {}, false, true);
@@ -9835,6 +9997,20 @@ function gainIndexFor(value) {
     Math.abs(gain - value) < Math.abs(gainValues[best] - value) ? index : best, 0);
 }
 
+function gainTextForIndex(index) {
+  if (!gainValues.length) return "No manual gain values available";
+  const safeIndex = Math.max(0, Math.min(gainValues.length - 1, Number(index) || 0));
+  return `${gainValues[safeIndex]} dB`;
+}
+
+function updateGainSliderText() {
+  const gain = document.getElementById("gain");
+  const automatic = document.getElementById("gain_auto").checked;
+  const text = automatic ? "Automatic" : gainTextForIndex(gain.value);
+  setText("gain_label", text);
+  setAttributeIfChanged(gain, "aria-valuetext", automatic ? "Automatic gain control" : text);
+}
+
 function storedManualGain() {
   if (lastManualGain !== null) return lastManualGain;
   try {
@@ -9926,6 +10102,9 @@ function setValue(id, value) {
   const element = document.getElementById(id);
   const text = String(value);
   if (element.value !== text) element.value = text;
+  if (element.type === "number" && element.dataset.userEditing !== "1") {
+    element.dataset.previousValue = text;
+  }
 }
 
 function setChecked(id, value) {
@@ -9937,6 +10116,18 @@ function setChecked(id, value) {
 function setDisabled(element, value) {
   const disabled = Boolean(value);
   if (element.disabled !== disabled) element.disabled = disabled;
+}
+
+function setControlBusy(element, value) {
+  if (!element) return;
+  const busy = Boolean(value);
+  if (busy) {
+    element.dataset.busy = "true";
+    element.setAttribute("aria-disabled", "true");
+  } else {
+    delete element.dataset.busy;
+    element.removeAttribute("aria-disabled");
+  }
 }
 
 function setAttributeIfChanged(element, name, value) {
@@ -11374,13 +11565,7 @@ function syncControls(data) {
   const displayedGain = s.gain === null ? storedManualGain() : s.gain;
   const gainIndex = gainIndexFor(displayedGain);
   if (gain.value !== String(gainIndex)) gain.value = String(gainIndex);
-  if (s.gain === null) {
-    setText("gain_label", "Automatic");
-  } else if (gainValues.length === 0) {
-    setText("gain_label", `${s.gain} dB`);
-  } else {
-    setText("gain_label", `${gainValues[gainIndex]} dB`);
-  }
+  updateGainSliderText();
   setValue("ppm_correction", s.ppm_correction);
   setChecked("bias_tee", s.bias_tee);
   setValue("alias_filter_strength", s.alias_filter_strength);
@@ -11427,7 +11612,7 @@ function currentPayload() {
   return {
     serial: document.getElementById("serial").value,
     gain: auto || gainValues.length === 0 ? null : gainValues[gainIndex],
-    ppm_correction: Number(document.getElementById("ppm_correction").value),
+    ppm_correction: numericControlValue("ppm_correction"),
     bias_tee: document.getElementById("bias_tee").checked,
     alias_filter_strength: Number(document.getElementById("alias_filter_strength").value)
   };
@@ -11521,15 +11706,22 @@ function scheduleAudioEffectsUpdate() {
 for (const id of controls) {
   document.addEventListener("input", event => {
     if (event.target && event.target.id === id) {
+      if (isNumericControl(event.target) && isTextEditingInputEvent(event)) {
+        beginNumericTextEdit(event.target);
+        return;
+      }
       if (id === "gain") rememberManualGainFromSlider();
       if (id === "gain_auto" && !event.target.checked) restoreRememberedManualGain();
+      if (id === "gain" || id === "gain_auto") updateGainSliderText();
       scheduleUpdate();
     }
   });
   document.addEventListener("change", event => {
     if (event.target && event.target.id === id) {
+      if (isNumericControl(event.target)) commitNumericControlElement(event.target, null);
       if (id === "gain") rememberManualGainFromSlider();
       if (id === "gain_auto" && !event.target.checked) restoreRememberedManualGain();
+      if (id === "gain" || id === "gain_auto") updateGainSliderText();
       scheduleUpdate();
     }
   });
@@ -11537,19 +11729,37 @@ for (const id of controls) {
 
 for (const id of ["fallback_enabled", "fallback_delay", "fallback_loop_delay"]) {
   document.addEventListener("input", event => {
-    if (event.target && event.target.id === id) scheduleFallbackUpdate();
+    if (event.target && event.target.id === id) {
+      if (isNumericControl(event.target) && isTextEditingInputEvent(event)) {
+        beginNumericTextEdit(event.target);
+        return;
+      }
+      scheduleFallbackUpdate();
+    }
   });
   document.addEventListener("change", event => {
-    if (event.target && event.target.id === id) scheduleFallbackUpdate();
+    if (event.target && event.target.id === id) {
+      if (isNumericControl(event.target)) commitNumericControlElement(event.target, null);
+      scheduleFallbackUpdate();
+    }
   });
 }
 
 for (const id of ["eas_enabled", "eas_pre_seconds", "eas_post_seconds", "eas_max_seconds"]) {
   document.addEventListener("input", event => {
-    if (event.target && event.target.id === id) scheduleEasUpdate();
+    if (event.target && event.target.id === id) {
+      if (isNumericControl(event.target) && isTextEditingInputEvent(event)) {
+        beginNumericTextEdit(event.target);
+        return;
+      }
+      scheduleEasUpdate();
+    }
   });
   document.addEventListener("change", event => {
-    if (event.target && event.target.id === id) scheduleEasUpdate();
+    if (event.target && event.target.id === id) {
+      if (isNumericControl(event.target)) commitNumericControlElement(event.target, null);
+      scheduleEasUpdate();
+    }
   });
 }
 
@@ -11576,8 +11786,21 @@ for (const id of [
 ]) {
   document.addEventListener("input", event => {
     if (event.target && event.target.id === id) {
-      if (audioFrequencyNameForElement(event.target)) {
-        if (isTextEditingInputEvent(event) || event.target.dataset.userEditing === "1") return;
+      if (isNumericControl(event.target)) {
+        if (isTextEditingInputEvent(event) || event.target.dataset.userEditing === "1") {
+          beginNumericTextEdit(event.target);
+          return;
+        }
+        if (audioFrequencyNameForElement(event.target)) {
+          commitAudioFrequencyElement(event.target, false);
+        } else {
+          normalizeNumericControl(event.target);
+        }
+      } else if (audioFrequencyNameForElement(event.target)) {
+        if (isTextEditingInputEvent(event) || event.target.dataset.userEditing === "1") {
+          beginNumericTextEdit(event.target);
+          return;
+        }
         commitAudioFrequencyElement(event.target, false);
       }
       scheduleAudioEffectsUpdate();
@@ -11585,30 +11808,35 @@ for (const id of [
   });
   document.addEventListener("change", event => {
     if (event.target && event.target.id === id) {
-      commitAudioFrequencyElement(event.target, false);
+      if (isNumericControl(event.target)) {
+        commitNumericControlElement(event.target, null);
+      } else {
+        commitAudioFrequencyElement(event.target, false);
+      }
       scheduleAudioEffectsUpdate();
     }
   });
 }
 
 document.addEventListener("keydown", event => {
-  if (!audioFrequencyNameForElement(event.target)) return;
+  if (!isNumericControl(event.target)) return;
   if (isTextEditingKey(event)) {
-    event.target.dataset.userEditing = "1";
+    beginNumericTextEdit(event.target);
     return;
   }
   if (event.key === "Enter") {
     event.preventDefault();
-    commitAudioFrequencyElement(event.target, true);
+    commitNumericControlElement(event.target, numericSaveCallbackForElement(event.target));
     return;
   }
   if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) {
-    setTimeout(() => commitAudioFrequencyElement(event.target, true), 0);
+    setTimeout(() => commitNumericControlElement(event.target, numericSaveCallbackForElement(event.target)), 0);
   }
 });
 
 document.addEventListener("blur", event => {
-  commitAudioFrequencyElement(event.target, true);
+  if (!isNumericControl(event.target)) return;
+  commitNumericControlElement(event.target, numericSaveCallbackForElement(event.target));
 }, true);
 
 document.addEventListener("click", event => {
@@ -12078,19 +12306,22 @@ document.getElementById("rescan_devices").addEventListener("click", async () => 
 
 document.getElementById("station_search_button").addEventListener("click", async () => {
   try {
-    await searchStations();
-    setStreamResult("");
+    await runStationSearchFromUi();
   } catch (error) {
     setStreamResult(error.message, "error");
   }
+});
+
+document.getElementById("station_search").addEventListener("input", () => {
+  updateStationSearchControls();
+  clearStationResults(stationSearchQuery() === "" ? "Enter search text to find a station." : "Press Search to find matching stations.");
 });
 
 document.getElementById("station_search").addEventListener("keydown", async event => {
   if (event.key !== "Enter") return;
   event.preventDefault();
   try {
-    await searchStations();
-    setStreamResult("");
+    await runStationSearchFromUi();
   } catch (error) {
     setStreamResult(error.message, "error");
   }
@@ -12189,8 +12420,12 @@ document.getElementById("cancel_output_form").addEventListener("click", cancelOu
 
 document.getElementById("stream_enabled").addEventListener("change", async event => {
   if (!settingsStreamId || applying) return;
+  if (event.target.dataset.busy === "true") {
+    renderStreamSettings();
+    return;
+  }
   const enabled = event.target.checked;
-  setDisabled(event.target, true);
+  setControlBusy(event.target, true);
   try {
     await setStreamEnabled(settingsStreamId, enabled, setOutputResult);
   } catch (error) {
@@ -12198,13 +12433,17 @@ document.getElementById("stream_enabled").addEventListener("change", async event
     const stream = currentSettingsStream();
     if (stream) setChecked("stream_enabled", stream.enabled !== false);
   } finally {
-    setDisabled(event.target, false);
+    setControlBusy(event.target, false);
   }
 });
 
 document.getElementById("stream_monitor_enabled").addEventListener("change", async event => {
   if (!settingsStreamId || applying) return;
-  setDisabled(event.target, true);
+  if (event.target.dataset.busy === "true") {
+    renderStreamSettings();
+    return;
+  }
+  setControlBusy(event.target, true);
   try {
     if (event.target.checked) {
       await toggleStreamMonitor(settingsStreamId, setStreamSettingsResult);
@@ -12215,7 +12454,7 @@ document.getElementById("stream_monitor_enabled").addEventListener("change", asy
   } catch (error) {
     setStreamSettingsResult(error.message, "error");
   } finally {
-    setDisabled(event.target, false);
+    setControlBusy(event.target, false);
     renderStreamSettings();
   }
 });

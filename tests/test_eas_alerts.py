@@ -68,6 +68,40 @@ class EasAlertTests(unittest.TestCase):
                 }
             )
 
+    def test_seconds_settings_require_whole_numbers(self) -> None:
+        web_control = self.web_control
+
+        fallback = web_control.validate_fallback_settings_payload({
+            "enabled": True,
+            "silence_timeout_seconds": 30.0,
+            "loop_delay_seconds": 5,
+        })
+        self.assertEqual(fallback.silence_timeout_seconds, 30)
+        self.assertEqual(fallback.loop_delay_seconds, 5)
+
+        eas = web_control.validate_eas_recording_payload({
+            "enabled": True,
+            "pre_seconds": 2,
+            "post_seconds": 5.0,
+            "max_seconds": 120,
+            "format": "wav",
+        })
+        self.assertEqual(eas.pre_seconds, 2)
+        self.assertEqual(eas.post_seconds, 5)
+        self.assertEqual(eas.max_seconds, 120)
+
+        with self.assertRaisesRegex(ValueError, "Fallback delay must be a whole number of seconds"):
+            web_control.validate_fallback_settings_payload({
+                "silence_timeout_seconds": 30.5,
+                "loop_delay_seconds": 5,
+            })
+        with self.assertRaisesRegex(ValueError, "Pre-recording time must be a whole number of seconds"):
+            web_control.validate_eas_recording_payload({
+                "pre_seconds": 2.5,
+                "post_seconds": 5,
+                "max_seconds": 120,
+            })
+
     def test_raw_rtl_fanout_reports_subscriber_drops(self) -> None:
         web_control = self.web_control
 
