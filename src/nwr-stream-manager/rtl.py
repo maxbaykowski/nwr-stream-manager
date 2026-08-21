@@ -7,6 +7,9 @@ import importlib
 import logging
 import os
 import queue
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from ctypes import c_ubyte
@@ -25,6 +28,7 @@ DEFAULT_READ_CHUNK_BYTES = 131_072
 DEFAULT_READ_TIMEOUT_SECONDS = 5.0
 RTL_ASYNC_BUFFER_COUNT = 15
 RTL_ASYNC_BUFFER_SECONDS = 0.10
+USBDEVFS_RESET = ord("U") << (4 * 2) | 20
 RTL_SAMPLE_RATE_RANGES = (
     (225_001, 300_000),
     (900_001, 3_200_000),
@@ -64,6 +68,10 @@ class RtlDeviceAccessFatalError(RtlDeviceError):
 
 class RtlDeviceBusyRetryableError(RtlDeviceError):
     """Raised when the configured RTL-SDR is present but opened elsewhere."""
+
+
+class RtlUsbResetError(RtlDeviceError):
+    """Raised when an RTL-SDR USB device reset cannot be completed."""
 
 
 class RtlConfigError(RtlError):
@@ -160,6 +168,16 @@ def _read_sysfs_text(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8").strip()
     except OSError:
+        return None
+
+
+def _read_sysfs_int(path: Path) -> int | None:
+    text = _read_sysfs_text(path)
+    if text is None:
+        return None
+    try:
+        return int(text)
+    except ValueError:
         return None
 
 
@@ -500,6 +518,25 @@ class RtlCaptureSource:
                 self.output_queue.put_nowait(None)
             except queue.Empty:
                 pass
+
+    def restart_reader(self) -> None:
+        """Cancel the active async read so the capture thread reopens the SDR.
+
+        This intentionally does not stop the capture source or signal EOF to
+        downstream consumers. Fanouts and channel workers should simply wait for
+        new I/Q batches while the configured SDR disappears and reappears.
+        """
+        self._cancel_sdr_async()
+
+    def wait_until_reader_released(self, timeout: float = 2.0) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            with self.sdr_lock:
+                if self.sdr is None:
+                    return True
+            time.sleep(0.02)
+        with self.sdr_lock:
+            return self.sdr is None
 
     def read(self, timeout: float | None = None) -> RtlSampleBatch:
         item = self.output_queue.get(timeout=timeout)
@@ -1053,6 +1090,110 @@ def list_usb_rtl_devices() -> list[UsbDeviceInfo]:
             )
         )
     return devices
+
+
+def _communicate_reset_process(
+    process: subprocess.Popen,
+    *,
+    timeout_seconds: float,
+    label: str,
+) -> tuple[str, str]:
+    try:
+        stdout, stderr = process.communicate(timeout=max(0.1, float(timeout_seconds)))
+    except subprocess.TimeoutExpired as exc:
+        with contextlib.suppress(Exception):
+            process.kill()
+        for stream in (process.stdout, process.stderr):
+            with contextlib.suppress(Exception):
+                if stream is not None:
+                    stream.close()
+        threading.Thread(
+            target=lambda: process.wait(),
+            name=f"usb-reset-reap-{process.pid}",
+            daemon=True,
+        ).start()
+        raise RtlUsbResetError(f"{label} did not finish within {timeout_seconds:g} seconds") from exc
+    return str(stdout or ""), str(stderr or "")
+
+
+def _reset_usb_node_with_child_python(usb_node: Path, timeout_seconds: float) -> None:
+    code = (
+        "import fcntl, os, sys\n"
+        f"USBDEVFS_RESET = {USBDEVFS_RESET!r}\n"
+        "fd = os.open(sys.argv[1], os.O_WRONLY)\n"
+        "try:\n"
+        "    fcntl.ioctl(fd, USBDEVFS_RESET, 0)\n"
+        "finally:\n"
+        "    os.close(fd)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", code, str(usb_node)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = _communicate_reset_process(
+        process,
+        timeout_seconds=timeout_seconds,
+        label=f"USB reset helper for {usb_node}",
+    )
+    if process.returncode != 0:
+        detail = (stderr or stdout).strip()
+        suffix = f": {detail}" if detail else ""
+        raise RtlUsbResetError(f"USB reset helper failed for {usb_node}{suffix}")
+
+
+def _reset_usb_node(usb_node: Path, timeout_seconds: float) -> str:
+    usbreset = shutil.which("usbreset") if os.environ.get("NWR_STREAM_MANAGER_USE_USBRESET") == "1" else None
+    if usbreset is not None:
+        process = subprocess.Popen(
+            [usbreset, str(usb_node)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = _communicate_reset_process(
+            process,
+            timeout_seconds=timeout_seconds,
+            label=f"usbreset for {usb_node}",
+        )
+        if process.returncode != 0:
+            detail = (stderr or stdout).strip()
+            suffix = f": {detail}" if detail else ""
+            raise RtlUsbResetError(f"usbreset failed for {usb_node}{suffix}")
+        return "usbreset"
+    _reset_usb_node_with_child_python(usb_node, timeout_seconds)
+    return "python-helper"
+
+
+def reset_usb_rtl_device(serial: str, *, timeout_seconds: float = 5.0) -> tuple[UsbDeviceInfo, str]:
+    serial = str(serial).strip()
+    if not serial:
+        raise RtlUsbResetError("RTL-SDR serial is required to reset a device")
+    matches = [device for device in list_usb_rtl_devices() if device.serial == serial]
+    if not matches:
+        raise RtlUsbResetError(f"RTL-SDR serial {serial} was not found on USB")
+    if len(matches) > 1:
+        raise RtlUsbResetError(
+            f"Multiple USB RTL-SDR devices were found with serial {serial}. "
+            "Assign unique serial numbers to each device using rtl_eeprom."
+        )
+    device = matches[0]
+    busnum = _read_sysfs_int(device.path / "busnum")
+    devnum = _read_sysfs_int(device.path / "devnum")
+    if busnum is None or devnum is None:
+        raise RtlUsbResetError(f"USB bus/device numbers were not available for RTL-SDR serial {serial}")
+    usb_node = Path("/dev/bus/usb") / f"{busnum:03d}" / f"{devnum:03d}"
+    try:
+        method = _reset_usb_node(usb_node, timeout_seconds)
+    except PermissionError as exc:
+        raise RtlDeviceAccessFatalError(
+            f"Access denied while resetting RTL-SDR serial {serial}. "
+            "Check udev permissions for the service user."
+        ) from exc
+    except OSError as exc:
+        raise RtlUsbResetError(f"USB reset failed for RTL-SDR serial {serial}: {exc}") from exc
+    return device, method
 
 
 def run_processed_iq_loop(

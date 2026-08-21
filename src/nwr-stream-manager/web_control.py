@@ -66,6 +66,7 @@ if __package__:
         RtlSampleBatch,
         list_rtl_devices,
         list_usb_rtl_devices,
+        reset_usb_rtl_device,
         rtl_u8_to_complex64,
         validate_ppm_correction,
     )
@@ -127,6 +128,7 @@ else:
     RtlSampleBatch = rtl.RtlSampleBatch
     list_rtl_devices = rtl.list_rtl_devices
     list_usb_rtl_devices = rtl.list_usb_rtl_devices
+    reset_usb_rtl_device = rtl.reset_usb_rtl_device
     rtl_u8_to_complex64 = rtl.rtl_u8_to_complex64
     validate_ppm_correction = rtl.validate_ppm_correction
     lookup_event = same_data.lookup_event
@@ -210,6 +212,8 @@ STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
 STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
+RTL_RESET_COMMAND_TIMEOUT_SECONDS = 5.0
+RTL_RESET_REAPPEAR_TIMEOUT_SECONDS = 10.0
 STREAM_WORKER_RAW_QUEUE_SECONDS = 1.50
 STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS = 8
 STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 96
@@ -2499,12 +2503,16 @@ class IcecastOutputWriter:
         self.error: str | None = None
         self.started_at: float | None = None
         self.lock = threading.Lock()
+        self.connection_lock = threading.Lock()
+        self.current_source: IcecastSource | None = None
+        self.current_sink = None
 
     def start(self) -> None:
         self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
+        self._close_current_connection()
         if self.thread.ident is not None:
             self.thread.join(timeout=2.0)
         self._set_status("disabled")
@@ -2527,6 +2535,28 @@ class IcecastOutputWriter:
             "raw_queue": self.runtime.raw_queue_stats(),
         }
 
+    def _set_current_connection(self, source, sink) -> None:
+        with self.connection_lock:
+            self.current_source = source
+            self.current_sink = sink
+
+    def _close_current_connection(self) -> None:
+        with self.connection_lock:
+            source = self.current_source
+            sink = self.current_sink
+            self.current_source = None
+            self.current_sink = None
+        if sink is not None:
+            try:
+                sink.close()
+            except Exception:
+                pass
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
+
     def _set_status(self, status: str, error: str | None = None) -> None:
         with self.lock:
             self.status = status
@@ -2543,6 +2573,7 @@ class IcecastOutputWriter:
                 config = icecast_config_from_output(self.output)
                 source = IcecastSource(config, config.content_type)
                 sink = source.connect()
+                self._set_current_connection(source, sink)
                 encoder_group = self.runtime.encoder_group_for(config)
                 header = encoder_group.header()
                 if header:
@@ -2566,13 +2597,17 @@ class IcecastOutputWriter:
                 if encoder_group is not None:
                     encoder_group.remove_output(self)
                     self.runtime._stop_unused_encoder_groups()
+                self._close_current_connection()
                 if sink is not None:
                     try:
                         sink.close()
                     except Exception:
                         pass
                 if source is not None:
-                    source.close()
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
         self._set_status("disabled")
 
 
@@ -2765,6 +2800,7 @@ class RtlControlService:
         self.webrtc_runner = WebRtcAsyncRunner()
         self.webrtc_sessions = AiortcSessionManager()
         self.icecast_auth_cache: dict[str, float] = {}
+        self.reset_lock = threading.Lock()
         self.capture_error: str | None = None
         self.last_batch_at: float | None = None
         self.received_chunks = 0
@@ -2925,6 +2961,115 @@ class RtlControlService:
             entry["librtlsdr_index"] = device.index
         devices = sorted(by_serial.values(), key=lambda item: (item["name"], item["serial"]))
         return {"devices": devices, "errors": errors}
+
+    def reset_rtl_device(self, serial: str) -> dict[str, Any]:
+        if not self.reset_lock.acquire(blocking=False):
+            raise ValueError("An RTL-SDR reset is already in progress.")
+        try:
+            return self._reset_rtl_device(serial)
+        finally:
+            self.reset_lock.release()
+
+    def _reset_rtl_device(self, serial: str) -> dict[str, Any]:
+        serial = str(serial or "").strip()
+        with self.lock:
+            configured_serial = self.settings.serial
+            should_restart_capture = bool(configured_serial and configured_serial == serial)
+            capture = self.capture if should_restart_capture else None
+        if not serial:
+            raise ValueError("Select an RTL-SDR to reset.")
+        if capture is not None:
+            LOG.info("pausing RTL-SDR reader before USB reset for serial %s", serial)
+            capture.restart_reader()
+            if not capture.wait_until_reader_released(timeout=2.0):
+                LOG.warning(
+                    "RTL-SDR serial %s did not release before reset; forcing USB reset anyway",
+                    serial,
+                )
+        LOG.info("resetting RTL-SDR USB device with serial %s", serial)
+        reset_queue: queue.Queue = queue.Queue(maxsize=1)
+
+        def run_reset() -> None:
+            try:
+                reset_queue.put((reset_usb_rtl_device(serial, timeout_seconds=RTL_RESET_COMMAND_TIMEOUT_SECONDS), None))
+            except BaseException as exc:
+                reset_queue.put((None, exc))
+
+        reset_thread = threading.Thread(
+            target=run_reset,
+            name=f"rtl-usb-reset-{serial}",
+            daemon=True,
+        )
+        reset_thread.start()
+        try:
+            reset_result, reset_error = reset_queue.get(timeout=RTL_RESET_COMMAND_TIMEOUT_SECONDS + 1.0)
+        except queue.Empty:
+            message = (
+                f"RTL-SDR serial {serial} did not finish its USB reset command. "
+                "The dongle may be locked up; physically unplug and replug it if it does not recover."
+            )
+            LOG.warning("%s", message)
+            with self.lock:
+                if self.settings.serial == serial:
+                    self.capture_error = message
+            return {
+                "success": False,
+                "serial": serial,
+                "reappeared": False,
+                "device": None,
+                "message": message,
+                "status": self.status(),
+            }
+        if reset_error is not None:
+            if should_restart_capture:
+                with self.lock:
+                    if self.settings.serial == serial and self.capture is None:
+                        self._start_or_update_capture_locked()
+            raise reset_error
+        if reset_result is None:
+            raise RuntimeError("RTL-SDR reset failed without an error")
+        reset_device, reset_method = reset_result
+        reappeared = False
+        deadline = time.monotonic() + RTL_RESET_REAPPEAR_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if any(device.serial == serial for device in list_usb_rtl_devices()):
+                    reappeared = True
+                    break
+            except Exception as exc:
+                LOG.debug("USB probe after RTL-SDR reset failed: %s", exc)
+            time.sleep(0.25)
+        with self.lock:
+            if self.settings.serial == serial:
+                self.capture_error = None if reappeared else (
+                    f"RTL-SDR serial {serial} did not reappear after USB reset. "
+                    "Physically unplug and replug the dongle if it remains unavailable."
+                )
+                if self.capture is None:
+                    self._start_or_update_capture_locked()
+        if reappeared:
+            message = f"RTL-SDR serial {serial} was reset using {reset_method} and reappeared."
+            LOG.info("%s", message)
+        else:
+            message = (
+                f"RTL-SDR serial {serial} was reset using {reset_method}, but it did not reappear. "
+                "Physically unplug and replug the dongle if it remains unavailable."
+            )
+            LOG.warning("%s", message)
+        return {
+            "success": True,
+            "serial": serial,
+            "reappeared": reappeared,
+            "device": {
+                "serial": reset_device.serial,
+                "name": reset_device.description,
+                "vendor": USB_VENDOR_NAMES.get(reset_device.vendor_id.lower(), reset_device.vendor_id),
+                "vendor_id": reset_device.vendor_id,
+                "product_id": reset_device.product_id,
+            },
+            "message": message,
+            "status": self.status(),
+        }
 
     def search_stations(self, query: str, limit: int = 50) -> dict[str, Any]:
         query = query.strip().lower()
@@ -4736,6 +4881,16 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 response = self.service.stop_iq_recording()
             except Exception as exc:
                 LOG.warning("API I/Q recorder stop failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/rtl-reset":
+            try:
+                payload = self._read_json()
+                response = self.service.reset_rtl_device(str(payload.get("serial", "")))
+            except Exception as exc:
+                LOG.warning("API RTL-SDR reset failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -6719,6 +6874,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       </label>
       <span id="serial_hint" class="hint">Select the SDR dongle by serial number.</span>
       <button id="rescan_devices" type="button">Rescan</button>
+      <button id="reset_rtl_device" type="button">Reset SDR</button>
       <div id="device-errors" class="error"></div>
     </section>
     <section>
@@ -7556,6 +7712,21 @@ async function request(path, options = {}) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || response.statusText);
   return data;
+}
+
+async function requestWithTimeout(path, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await request(path, {...options, signal: controller.signal});
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error("The RTL-SDR reset did not finish. Physically unplug and replug the dongle if it does not recover.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function logClientEvent(level, area, message, details = {}) {
@@ -12297,6 +12468,31 @@ document.getElementById("rescan_devices").addEventListener("click", async () => 
   try {
     const status = await request("/api/status");
     await loadDevices(status.settings.serial);
+  } catch (error) {
+    setText("device-errors", error.message);
+  } finally {
+    setDisabled(button, false);
+  }
+});
+
+document.getElementById("reset_rtl_device").addEventListener("click", async () => {
+  const button = document.getElementById("reset_rtl_device");
+  const serial = document.getElementById("serial").value;
+  if (!serial) {
+    setText("device-errors", "Select an RTL-SDR to reset.");
+    return;
+  }
+  setDisabled(button, true);
+  setText("device-errors", "Resetting RTL-SDR...");
+  try {
+    const data = await requestWithTimeout("/api/rtl-reset", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({serial})
+    }, 15000);
+    setText("device-errors", data.message || "RTL-SDR reset finished.");
+    applyStatus(data.status || await request("/api/status"), {syncControls: true});
+    await loadDevices(serial);
   } catch (error) {
     setText("device-errors", error.message);
   } finally {
