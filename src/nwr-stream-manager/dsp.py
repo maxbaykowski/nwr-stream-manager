@@ -21,6 +21,8 @@ WIDE_DECIMATOR_ALIAS_ATTENUATION_DB = 70.0
 DEFAULT_DC_BLOCK_TIME_CONSTANT_SECONDS = 1.0
 STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE = 96_000.0
 STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE = 192_000.0
+RATIONAL_INTERPOLATOR_TAPS = 16
+RATIONAL_INTERPOLATOR_ATTENUATION_DB = 60.0
 
 
 def rtl_u8_to_complex64(chunk: bytes | bytearray | memoryview) -> ComplexArray:
@@ -187,6 +189,41 @@ class FirFilter:
         self._history = work[-keep:].copy() if keep else np.array([], dtype=np.complex64)
         return filtered
 
+    def process_decimated(self, samples: ComplexArray, *, factor: int, offset: int) -> ComplexArray:
+        samples = samples.astype(np.complex64, copy=False)
+        if samples.size == 0:
+            return np.array([], dtype=np.complex64)
+        factor = max(1, int(factor))
+        offset = int(offset) % factor
+        if factor == 1:
+            return self.process(samples)
+        work = np.concatenate((self._history, samples))
+        taps = self.taps[::-1]
+        valid_count = int(samples.size)
+        if offset >= valid_count:
+            keep = self.taps.size - 1
+            self._history = work[-keep:].copy() if keep else np.array([], dtype=np.complex64)
+            return np.array([], dtype=np.complex64)
+        output_count = 1 + ((valid_count - 1 - offset) // factor)
+        output = np.empty(output_count, dtype=np.complex64)
+        sample_stride = work.strides[0]
+        block_rows = 2048
+        written = 0
+        for row_start in range(0, output_count, block_rows):
+            rows = min(block_rows, output_count - row_start)
+            start_index = offset + (row_start * factor)
+            windows = np.lib.stride_tricks.as_strided(
+                work[start_index:],
+                shape=(rows, taps.size),
+                strides=(sample_stride * factor, sample_stride),
+                writeable=False,
+            )
+            output[written : written + rows] = windows @ taps
+            written += rows
+        keep = self.taps.size - 1
+        self._history = work[-keep:].copy() if keep else np.array([], dtype=np.complex64)
+        return output
+
 
 @dataclass
 class IntegerDecimator:
@@ -222,10 +259,9 @@ class IntegerDecimator:
         if samples.size == 0:
             return np.array([], dtype=np.complex64)
         start = self._filtered_samples_seen
-        filtered = self.fir.process(samples)
         offset = (-start) % self.factor
-        decimated = filtered[offset:: self.factor]
-        self._filtered_samples_seen = start + int(filtered.size)
+        decimated = self.fir.process_decimated(samples, factor=self.factor, offset=offset)
+        self._filtered_samples_seen = start + int(samples.size)
         return decimated.astype(np.complex64, copy=False)
 
     def update_alias_filter(
@@ -272,6 +308,8 @@ class RationalResampler:
     _input_samples_seen: int = 0
     _next_output_position: float = 0.0
     _filtered_tail: ComplexArray = field(init=False)
+    _interp_offsets: NDArray[np.int64] = field(init=False)
+    _interp_window: NDArray[np.float32] = field(init=False)
 
     def __post_init__(self) -> None:
         if self.input_rate <= 0 or self.output_rate <= 0:
@@ -285,6 +323,13 @@ class RationalResampler:
         )
         self.fir = FirFilter(taps)
         self._filtered_tail = np.array([], dtype=np.complex64)
+        left_taps = (RATIONAL_INTERPOLATOR_TAPS // 2) - 1
+        right_taps = RATIONAL_INTERPOLATOR_TAPS - left_taps - 1
+        self._interp_offsets = np.arange(-left_taps, right_taps + 1, dtype=np.int64)
+        self._interp_window = np.kaiser(
+            RATIONAL_INTERPOLATOR_TAPS,
+            _kaiser_beta(RATIONAL_INTERPOLATOR_ATTENUATION_DB),
+        ).astype(np.float32)
 
     @property
     def is_integer_decimation(self) -> bool:
@@ -303,31 +348,35 @@ class RationalResampler:
             else filtered
         )
         work_start = start - int(self._filtered_tail.size)
-        max_position = end - 1
+        left_taps = int(-self._interp_offsets[0])
+        right_taps = int(self._interp_offsets[-1])
+        first_position = work_start + left_taps
+        max_position = work_start + work.size - right_taps
         step = float(self.input_rate) / float(self.output_rate)
         position = self._next_output_position
-        if position < work_start:
-            missed = math.ceil((work_start - position) / step)
+        if position < first_position:
+            missed = math.ceil((first_position - position) / step)
             position += missed * step
 
         if position >= max_position:
             self._next_output_position = position
             self._input_samples_seen = end
-            self._filtered_tail = work[-1:].copy()
+            self._filtered_tail = work[-RATIONAL_INTERPOLATOR_TAPS:].copy()
             return np.array([], dtype=np.complex64)
 
         output_count = int(math.ceil((max_position - position) / step))
         positions = position + step * np.arange(output_count, dtype=np.float64)
         self._next_output_position = float(position + step * output_count)
         self._input_samples_seen = end
-        self._filtered_tail = work[-1:].copy()
+        self._filtered_tail = work[-RATIONAL_INTERPOLATOR_TAPS:].copy()
 
         local_positions = positions - float(work_start)
-        indices = np.floor(local_positions).astype(np.int64)
-        fractions = (local_positions - indices).astype(np.float32)
-        left = work[indices]
-        right = work[indices + 1]
-        return (left + (right - left) * fractions).astype(np.complex64, copy=False)
+        centers = np.floor(local_positions).astype(np.int64)
+        indices = centers[:, None] + self._interp_offsets[None, :]
+        relative = local_positions[:, None] - indices.astype(np.float64)
+        weights = (np.sinc(relative) * self._interp_window[None, :]).astype(np.float32)
+        weights /= np.sum(weights, axis=1, keepdims=True)
+        return np.sum(work[indices] * weights, axis=1).astype(np.complex64, copy=False)
 
     def update_alias_filter(
         self,
@@ -368,7 +417,14 @@ class StagedDecimator:
         self.intermediate_rate = float(self.input_rate) / float(factor)
         self.first_stage = IntegerDecimator(
             factor=factor,
-            fir=FirFilter(self._design_first_stage_taps(self.input_rate, self.intermediate_rate)),
+            fir=FirFilter(
+                self._design_first_stage_taps(
+                    self.input_rate,
+                    self.intermediate_rate,
+                    self.output_rate,
+                    self.transition_hz,
+                )
+            ),
         )
         if _is_integer_multiple(self.intermediate_rate, self.output_rate):
             final_factor = int(round(self.intermediate_rate / self.output_rate))
@@ -422,21 +478,24 @@ class StagedDecimator:
 
     @staticmethod
     def _choose_first_stage_factor(input_rate: int, output_rate: int) -> int:
-        if input_rate <= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
+        min_intermediate = max(STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE, float(output_rate))
+        max_intermediate = max(STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE, float(output_rate) * 1.5)
+        if input_rate <= max_intermediate:
             return 1
-        target = max(1, int(input_rate // STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE))
+        target = max(1, int(input_rate // min_intermediate))
         best_factor = 1
         best_score = float("inf")
         best_integer_factor = 1
         best_integer_score = float("inf")
+        target_intermediate = (min_intermediate + max_intermediate) / 2.0
         for factor in range(1, target + 1):
             intermediate = float(input_rate) / float(factor)
-            if intermediate < STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE:
+            if intermediate < min_intermediate:
                 continue
-            if intermediate > STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
-                score = intermediate - STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE
+            if intermediate > max_intermediate:
+                score = intermediate - max_intermediate
             else:
-                score = abs(intermediate - ((STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE + STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE) / 2.0))
+                score = abs(intermediate - target_intermediate)
                 if _is_integer_multiple(intermediate, output_rate) and score < best_integer_score:
                     best_integer_score = score
                     best_integer_factor = factor
@@ -448,12 +507,23 @@ class StagedDecimator:
         return max(1, best_factor)
 
     @staticmethod
-    def _design_first_stage_taps(input_rate: int, intermediate_rate: float) -> FloatArray:
+    def _design_first_stage_taps(
+        input_rate: int,
+        intermediate_rate: float,
+        output_rate: int,
+        requested_transition_hz: float,
+    ) -> FloatArray:
         if intermediate_rate >= input_rate:
             return np.array([1.0], dtype=np.float32)
         intermediate_nyquist = intermediate_rate / 2.0
-        cutoff = min(20_000.0, intermediate_nyquist * 0.45)
-        cutoff = max(14_000.0, cutoff)
+        output_nyquist = float(output_rate) / 2.0
+        if output_rate >= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
+            guard_hz = max(8_000.0, float(requested_transition_hz))
+            cutoff = max(1_000.0, output_nyquist - (guard_hz / 2.0))
+            cutoff = min(cutoff, intermediate_nyquist * 0.9)
+        else:
+            cutoff = min(20_000.0, intermediate_nyquist * 0.45)
+            cutoff = max(14_000.0, cutoff)
         transition = max(8_000.0, intermediate_nyquist - cutoff)
         if cutoff + transition >= intermediate_nyquist:
             transition = max(1_000.0, intermediate_nyquist - cutoff)
@@ -488,6 +558,13 @@ def create_decimator(
         attenuation_db = min(float(attenuation_db), WIDE_DECIMATOR_ALIAS_ATTENUATION_DB)
         if input_rate % output_rate == 0:
             return IntegerDecimator.create(
+                input_rate,
+                output_rate,
+                transition_hz=transition_hz,
+                attenuation_db=attenuation_db,
+            )
+        if input_rate > output_rate * 2:
+            return StagedDecimator(
                 input_rate,
                 output_rate,
                 transition_hz=transition_hz,

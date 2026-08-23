@@ -89,17 +89,19 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(stats["dropped_frames"], 0)
         self.assertEqual(stats["buffered_frames"], 0)
 
-    def test_audio_source_defaults_hold_half_second_pcm_buffer(self) -> None:
+    def test_audio_source_defaults_hold_low_latency_pcm_buffer(self) -> None:
         source = self.webrtc.WebRtcAudioSource()
         stats = source.stats()
 
-        self.assertEqual(stats["prebuffer_frames"], 25)
-        self.assertEqual(stats["target_latency_frames"], 25)
-        self.assertEqual(stats["low_water_frames"], 16)
-        self.assertEqual(stats["max_frames"], 96)
+        self.assertEqual(stats["prebuffer_frames"], 12)
+        self.assertEqual(stats["target_latency_frames"], 12)
+        self.assertEqual(stats["low_water_frames"], 8)
+        self.assertEqual(stats["latency_high_water_frames"], 32)
+        self.assertEqual(stats["latency_trim_to_frames"], 24)
+        self.assertEqual(stats["max_frames"], 64)
         self.assertAlmostEqual(
             stats["target_latency_frames"] * self.webrtc.WEBRTC_FRAME_SECONDS,
-            0.5,
+            0.24,
         )
 
     def test_audio_source_frame_size_uses_configured_sample_rate(self) -> None:
@@ -160,13 +162,15 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(second, b"a" * len(second))
         self.assertEqual(stats["underrun_frames"], 1)
 
-    def test_audio_source_discards_stale_frames_to_hold_low_latency(self) -> None:
+    def test_audio_source_preserves_bursty_pcm_above_target_latency(self) -> None:
         async def run_test():
             source = self.webrtc.WebRtcAudioSource(
                 max_frames=8,
                 prebuffer_frames=0,
                 target_latency_frames=2,
                 low_water_frames=0,
+                latency_high_water_frames=6,
+                latency_trim_to_frames=4,
             )
             for value in (b"a", b"b", b"c", b"d", b"e"):
                 source.push_pcm(value)
@@ -175,9 +179,34 @@ class WebRtcTests(unittest.TestCase):
             return first, stats, source.frame_bytes
 
         first, stats, frame_bytes = asyncio.run(run_test())
-        self.assertEqual(first, b"d" + b"\x00" * (frame_bytes - 1))
-        self.assertEqual(stats["stale_frames"], 3)
-        self.assertEqual(stats["buffered_frames"], 1)
+        self.assertEqual(first, b"a" + b"\x00" * (frame_bytes - 1))
+        self.assertEqual(stats["stale_frames"], 0)
+        self.assertEqual(stats["buffered_frames"], 4)
+
+    def test_audio_source_trims_only_after_latency_high_watermark(self) -> None:
+        async def run_test():
+            source = self.webrtc.WebRtcAudioSource(
+                max_frames=8,
+                prebuffer_frames=0,
+                target_latency_frames=2,
+                low_water_frames=0,
+                latency_high_water_frames=5,
+                latency_trim_to_frames=4,
+            )
+            for value in (b"a", b"b", b"c", b"d", b"e"):
+                source.push_pcm(value)
+            before = source.stats()
+            source.push_pcm(b"f")
+            after = source.stats()
+            first = await source.read_pcm()
+            return before, after, first, source.frame_bytes
+
+        before, after, first, frame_bytes = asyncio.run(run_test())
+        self.assertEqual(before["stale_frames"], 0)
+        self.assertEqual(before["buffered_frames"], 5)
+        self.assertEqual(after["stale_frames"], 2)
+        self.assertEqual(after["buffered_frames"], 4)
+        self.assertEqual(first, b"c" + b"\x00" * (frame_bytes - 1))
 
     def test_webrtc_track_waits_for_complete_resampled_frame_before_padding(self) -> None:
         class Source:

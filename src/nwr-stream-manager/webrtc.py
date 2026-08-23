@@ -4,7 +4,9 @@ import ctypes
 import ctypes.util
 import asyncio
 import importlib.util
+import json
 import logging
+import queue
 import threading
 import time
 from collections import deque
@@ -29,12 +31,14 @@ WEBRTC_TARGET_BITRATE_KBPS = 128
 WEBRTC_MIN_BITRATE_KBPS = 32
 WEBRTC_BITRATE_STEP_KBPS = 8
 WEBRTC_RECOVERY_STABLE_FEEDBACKS = 12
-WEBRTC_MONITOR_PREBUFFER_FRAMES = 25
-WEBRTC_MONITOR_TARGET_LATENCY_FRAMES = 25
-WEBRTC_MONITOR_LOW_WATER_FRAMES = 16
-WEBRTC_MONITOR_MAX_BUFFER_FRAMES = 96
-WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS = 1.0
-WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS = 0.25
+WEBRTC_MONITOR_PREBUFFER_FRAMES = 12
+WEBRTC_MONITOR_TARGET_LATENCY_FRAMES = 12
+WEBRTC_MONITOR_LOW_WATER_FRAMES = 8
+WEBRTC_MONITOR_LATENCY_HIGH_WATER_FRAMES = 32
+WEBRTC_MONITOR_LATENCY_TRIM_TO_FRAMES = 24
+WEBRTC_MONITOR_MAX_BUFFER_FRAMES = 64
+WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS = 0.5
+WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS = 0.12
 
 
 class WebRtcError(RuntimeError):
@@ -300,6 +304,8 @@ class WebRtcAudioSource:
         prebuffer_frames: int = WEBRTC_MONITOR_PREBUFFER_FRAMES,
         target_latency_frames: int = WEBRTC_MONITOR_TARGET_LATENCY_FRAMES,
         low_water_frames: int = WEBRTC_MONITOR_LOW_WATER_FRAMES,
+        latency_high_water_frames: int = WEBRTC_MONITOR_LATENCY_HIGH_WATER_FRAMES,
+        latency_trim_to_frames: int = WEBRTC_MONITOR_LATENCY_TRIM_TO_FRAMES,
         prebuffer_timeout_seconds: float = WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS,
         refill_timeout_seconds: float = WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS,
         sample_rate: int = IQ_SAMPLE_RATE,
@@ -309,6 +315,14 @@ class WebRtcAudioSource:
         self.prebuffer_frames = max(0, min(int(prebuffer_frames), self.max_frames))
         self.target_latency_frames = max(1, min(int(target_latency_frames), self.max_frames))
         self.low_water_frames = max(0, min(int(low_water_frames), self.max_frames))
+        self.latency_high_water_frames = max(
+            self.target_latency_frames + 1,
+            min(int(latency_high_water_frames), self.max_frames),
+        )
+        self.latency_trim_to_frames = max(
+            self.target_latency_frames,
+            min(int(latency_trim_to_frames), self.latency_high_water_frames - 1),
+        )
         self.prebuffer_timeout_seconds = max(0.0, float(prebuffer_timeout_seconds))
         self.refill_timeout_seconds = max(0.0, float(refill_timeout_seconds))
         self.frame_bytes = round(self.sample_rate * WEBRTC_FRAME_SECONDS) * 2
@@ -322,6 +336,7 @@ class WebRtcAudioSource:
         self.underrun_frames = 0
         self.max_buffered_frames = 0
         self.last_frame_at = 0.0
+        self.last_underrun_log_at = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._event: asyncio.Event | None = None
         self._prebuffered = False
@@ -342,6 +357,10 @@ class WebRtcAudioSource:
                 self.pushed_frames += 1
                 self.max_buffered_frames = max(self.max_buffered_frames, len(self.buffer))
                 self.last_frame_at = now
+            if len(self.buffer) > self.latency_high_water_frames:
+                while len(self.buffer) > self.latency_trim_to_frames:
+                    self.buffer.popleft()
+                    self.stale_frames += 1
         self._notify_loop()
 
     async def read_pcm(self, timeout: float = 0.25) -> bytes:
@@ -360,10 +379,10 @@ class WebRtcAudioSource:
                     self.low_water_frames,
                     max(WEBRTC_FRAME_SECONDS, self.refill_timeout_seconds),
                 )
-        self._drop_stale_frames()
         frame = await self._pop_frame(timeout)
         if frame is None:
             self.underrun_frames += 1
+            self._log_underrun()
             self._prebuffered = False
             return b"\x00" * self.frame_bytes
         self.read_frames += 1
@@ -380,6 +399,7 @@ class WebRtcAudioSource:
                 break
             time.sleep(min(0.005, max(0.0, deadline - time.monotonic())))
         self.underrun_frames += 1
+        self._log_underrun()
         return b"\x00" * self.frame_bytes
 
     def stats(self) -> dict[str, Any]:
@@ -395,6 +415,8 @@ class WebRtcAudioSource:
                 "prebuffer_frames": self.prebuffer_frames,
                 "target_latency_frames": self.target_latency_frames,
                 "low_water_frames": self.low_water_frames,
+                "latency_high_water_frames": self.latency_high_water_frames,
+                "latency_trim_to_frames": self.latency_trim_to_frames,
                 "sample_rate": self.sample_rate,
                 "pushed_frames": self.pushed_frames,
                 "read_frames": self.read_frames,
@@ -419,12 +441,6 @@ class WebRtcAudioSource:
             if frame:
                 frames.append(frame)
         return frames
-
-    def _drop_stale_frames(self) -> None:
-        with self.lock:
-            while len(self.buffer) > self.target_latency_frames:
-                self.buffer.popleft()
-                self.stale_frames += 1
 
     def _bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         if self._loop is loop and self._event is not None:
@@ -473,6 +489,30 @@ class WebRtcAudioSource:
             self._loop.call_soon_threadsafe(self._event.set)
         except RuntimeError:
             pass
+
+    def _log_underrun(self) -> None:
+        now = time.monotonic()
+        if now - self.last_underrun_log_at < 10.0:
+            return
+        self.last_underrun_log_at = now
+        with self.lock:
+            buffered = len(self.buffer)
+            pushed = self.pushed_frames
+            read = self.read_frames
+            dropped = self.dropped_frames
+            stale = self.stale_frames
+            underruns = self.underrun_frames
+            last_frame_at = self.last_frame_at
+        LOG.warning(
+            "WebRTC PCM source underrun: buffered=%s pushed=%s read=%s dropped=%s stale=%s underruns=%s last_frame_age=%.3fs",
+            buffered,
+            pushed,
+            read,
+            dropped,
+            stale,
+            underruns,
+            (now - last_frame_at) if last_frame_at else -1.0,
+        )
 
 
 def create_webrtc_pcm_audio_track(source: WebRtcAudioSource):
@@ -553,6 +593,7 @@ class AiortcSessionManager:
         sdp: str,
         type: str = "offer",
         tracks: tuple[Any, ...] = (),
+        event_queue: queue.Queue[dict[str, Any]] | None = None,
         on_peer_closed: Callable[[str, str], None] | None = None,
     ) -> dict[str, str]:
         aiortc = _load_aiortc()
@@ -560,6 +601,46 @@ class AiortcSessionManager:
         peer = aiortc.RTCPeerConnection(configuration=configuration)
         stale_close_task: asyncio.Task[Any] | None = None
         stale_close_delay: float | None = None
+        event_task: asyncio.Task[Any] | None = None
+        event_channel = None
+
+        async def drain_event_queue() -> None:
+            if event_queue is None or event_channel is None:
+                return
+            while True:
+                if peer_is_unhealthy():
+                    return
+                if getattr(event_channel, "readyState", "") != "open":
+                    await asyncio.sleep(0.05)
+                    continue
+                try:
+                    event = await asyncio.to_thread(event_queue.get, True, 0.25)
+                except queue.Empty:
+                    continue
+                if event is None:
+                    return
+                try:
+                    event_channel.send(json.dumps(event, separators=(",", ":")))
+                except Exception as exc:
+                    LOG.debug("WebRTC event channel send failed for %s: %s", session_id, exc)
+
+        if event_queue is not None:
+            @peer.on("datachannel")
+            def on_datachannel(channel: Any) -> None:
+                nonlocal event_channel, event_task
+                if getattr(channel, "label", "") != "nwr-events":
+                    return
+                event_channel = channel
+                LOG.debug("WebRTC event data channel opened by client for %s", session_id)
+
+                @channel.on("open")
+                def on_event_channel_open() -> None:
+                    nonlocal event_task
+                    if event_task is None or event_task.done():
+                        event_task = asyncio.create_task(drain_event_queue())
+
+                if getattr(channel, "readyState", "") == "open" and (event_task is None or event_task.done()):
+                    event_task = asyncio.create_task(drain_event_queue())
 
         def peer_is_unhealthy() -> bool:
             return getattr(peer, "connectionState", "") in {"failed", "closed", "disconnected"} or getattr(
@@ -576,6 +657,7 @@ class AiortcSessionManager:
             stale_close_delay = None
 
         async def close_if_current(reason: str, delay: float = 0.0) -> None:
+            nonlocal event_task
             if delay > 0:
                 try:
                     await asyncio.sleep(delay)
@@ -589,6 +671,9 @@ class AiortcSessionManager:
                 self.sessions.pop(session_id, None)
             if on_peer_closed is not None:
                 on_peer_closed(session_id, reason)
+            if event_task is not None:
+                event_task.cancel()
+                event_task = None
             await peer.close()
 
         def schedule_stale_close(reason: str, delay: float) -> None:
@@ -640,6 +725,8 @@ class AiortcSessionManager:
             self.sessions[session_id] = peer
         if old_peer is not None:
             await old_peer.close()
+        if event_queue is not None and event_channel is not None and event_task is None:
+            event_task = asyncio.create_task(drain_event_queue())
         return {
             "sdp": peer.localDescription.sdp,
             "type": peer.localDescription.type,

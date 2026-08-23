@@ -71,6 +71,7 @@ if __package__:
         validate_ppm_correction,
     )
     from .same_data import lookup_event, lookup_location
+    from .same_live import SameEventQueue, SameSuppressionProcessor
     from .webrtc import (
         AiortcSessionManager,
         WebRtcAsyncRunner,
@@ -98,6 +99,7 @@ else:
     nfm = importlib.import_module(f"{package_name}.nfm")
     rtl = importlib.import_module(f"{package_name}.rtl")
     same_data = importlib.import_module(f"{package_name}.same_data")
+    same_live = importlib.import_module(f"{package_name}.same_live")
     webrtc = importlib.import_module(f"{package_name}.webrtc")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
     deemphasis_makeup_gain = audio_effects.deemphasis_makeup_gain
@@ -133,6 +135,8 @@ else:
     validate_ppm_correction = rtl.validate_ppm_correction
     lookup_event = same_data.lookup_event
     lookup_location = same_data.lookup_location
+    SameEventQueue = same_live.SameEventQueue
+    SameSuppressionProcessor = same_live.SameSuppressionProcessor
     AiortcSessionManager = webrtc.AiortcSessionManager
     WebRtcAsyncRunner = webrtc.WebRtcAsyncRunner
     WebRtcAudioSource = webrtc.WebRtcAudioSource
@@ -235,6 +239,9 @@ IQ_DOWNLOAD_YIELD_SECONDS = 0.001
 IQ_RECORDER_MODE_STREAM = "stream"
 IQ_RECORDER_MODE_SPECTRUM = "spectrum"
 IQ_RECORDER_SAMPLE_RATES = (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_000, DEFAULT_RTL_SAMPLE_RATE)
+IQ_TEST_SOURCES_DIRECTORY_NAME = "iq-test-sources"
+IQ_TEST_SOURCE_CHUNK_SECONDS = 0.05
+IQ_TEST_SOURCE_MIN_SAMPLE_RATE = INTERMEDIATE_IQ_SAMPLE_RATE
 IQ_RECORDER_DEFAULT_DURATION_SECONDS = 300
 IQ_RECORDER_MIN_DURATION_SECONDS = 0
 IQ_RECORDER_MAX_DURATION_SECONDS = 24 * 60 * 60
@@ -331,6 +338,13 @@ class IqSampleBatch:
     sample_rate: int
     center_frequency_hz: int
     captured_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass(frozen=True)
+class IqFileSourceConfig:
+    path: Path
+    sample_rate: int
+    center_frequency_hz: int = NWR_CENTER_FREQUENCY_HZ
 
 
 class RingLogHandler(logging.Handler):
@@ -598,9 +612,283 @@ def alias_filter_attenuation_db(base_attenuation_db: float, strength: int | floa
     ) * strong_fraction
 
 
+def iq_batch_byte_count(batch: RtlSampleBatch | IqSampleBatch) -> int:
+    data = batch.data
+    if isinstance(data, np.ndarray):
+        return int(data.nbytes)
+    return len(data)
+
+
+def iq_batch_sample_count(batch: RtlSampleBatch | IqSampleBatch) -> int:
+    data = batch.data
+    if isinstance(data, np.ndarray):
+        return int(data.size)
+    return len(data) // 2
+
+
+def iq_batch_sample_count_from_bytes(byte_count: int, source: Any) -> int:
+    if isinstance(source, IqFileCaptureSource):
+        return int(byte_count) // 8
+    return int(byte_count) // 2
+
+
+def clear_queue_items(target: queue.Queue) -> int:
+    cleared = 0
+    while True:
+        try:
+            target.get_nowait()
+            cleared += 1
+        except queue.Empty:
+            return cleared
+
+
+def set_batch_generation(batch: Any, generation: int) -> Any:
+    try:
+        setattr(batch, "source_generation", int(generation))
+    except Exception:
+        object.__setattr__(batch, "source_generation", int(generation))
+    return batch
+
+
+def batch_generation(batch: Any) -> int:
+    return int(getattr(batch, "source_generation", 0))
+
+
+class IqFileCaptureSource:
+    def __init__(
+        self,
+        config: IqFileSourceConfig,
+        *,
+        chunk_seconds: float = IQ_TEST_SOURCE_CHUNK_SECONDS,
+    ) -> None:
+        if int(config.sample_rate) < IQ_TEST_SOURCE_MIN_SAMPLE_RATE:
+            raise ValueError(
+                f"I/Q file sample rate must be at least {IQ_TEST_SOURCE_MIN_SAMPLE_RATE} S/s"
+            )
+        self.config = config
+        self.chunk_seconds = max(0.01, float(chunk_seconds))
+        self.output_queue: queue.Queue[IqSampleBatch | Exception | None] = queue.Queue(maxsize=32)
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.stats_lock = threading.Lock()
+        self.offered_batches = 0
+        self.offered_bytes = 0
+        self.dropped_batches = 0
+        self.dropped_bytes = 0
+        self.last_offer_at = 0.0
+        self.file_size_bytes = 0
+        self.seek_lock = threading.Lock()
+        self.pending_seek_samples = 0
+        self.current_sample_offset = 0
+
+    @property
+    def label(self) -> str:
+        return self.config.path.name
+
+    def start(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+        path = self.config.path
+        if not path.is_file():
+            raise FileNotFoundError(f"I/Q source file was not found: {path.name}")
+        self.file_size_bytes = path.stat().st_size
+        if self.file_size_bytes < 8:
+            raise ValueError("I/Q source file must contain at least one complex float32 sample")
+        if self.file_size_bytes % 8 != 0:
+            LOG.warning(
+                "I/Q source file %s has trailing bytes that do not form a complete complex float32 sample",
+                path,
+            )
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, name="iq-file-source", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self._offer(None)
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+
+    def read(self, timeout: float | None = None) -> IqSampleBatch:
+        item = self.output_queue.get(timeout=timeout)
+        if item is None:
+            raise EOFError("I/Q file source stopped")
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def stats(self) -> dict[str, int | float | None]:
+        with self.stats_lock:
+            duration_seconds = (
+                (self.file_size_bytes // 8) / float(self.config.sample_rate)
+                if self.file_size_bytes > 0 and self.config.sample_rate > 0
+                else 0.0
+            )
+            return {
+                "offered_batches": self.offered_batches,
+                "offered_bytes": self.offered_bytes,
+                "offered_samples": self.offered_bytes // 8,
+                "dropped_batches": self.dropped_batches,
+                "dropped_bytes": self.dropped_bytes,
+                "dropped_samples": self.dropped_bytes // 8,
+                "queue_depth": self.output_queue.qsize(),
+                "queue_capacity": self.output_queue.maxsize,
+                "file_size_bytes": self.file_size_bytes,
+                "position_samples": self.current_sample_offset,
+                "position_seconds": round(self.current_sample_offset / float(self.config.sample_rate), 3),
+                "duration_seconds": round(duration_seconds, 3),
+                "last_offer_age_seconds": (
+                    round(time.monotonic() - self.last_offer_at, 3)
+                    if self.last_offer_at
+                    else None
+                ),
+            }
+
+    def get_gain_values(self) -> list[float]:
+        return []
+
+    def seek_relative(self, seconds: float) -> dict[str, int | float]:
+        delta_samples = int(round(float(seconds) * float(self.config.sample_rate)))
+        with self.seek_lock:
+            self.pending_seek_samples += delta_samples
+        self._clear_output_queue()
+        return self.stats()
+
+    @staticmethod
+    def _rtl_async_buffer_size(config: IqFileSourceConfig) -> int:
+        sample_rate = max(1, int(config.sample_rate))
+        samples = max(1, int(round(sample_rate * IQ_TEST_SOURCE_CHUNK_SECONDS)))
+        return samples * 8
+
+    def _run(self) -> None:
+        samples_per_chunk = max(1, int(round(self.config.sample_rate * self.chunk_seconds)))
+        floats_per_chunk = samples_per_chunk * 2
+        chunk_bytes = floats_per_chunk * 4
+        next_emit_at = time.monotonic()
+        try:
+            with self.config.path.open("rb") as handle:
+                while not self.stop_event.is_set():
+                    self._apply_pending_seek(handle)
+                    raw = self._read_looping_chunk(handle, chunk_bytes)
+                    if not raw:
+                        raise ValueError("I/Q source file is empty")
+                    float_count = len(raw) // 4
+                    if float_count < 2:
+                        continue
+                    if float_count % 2:
+                        raw = raw[: (float_count - 1) * 4]
+                    values = np.frombuffer(raw, dtype="<f4")
+                    iq = (values[0::2] + 1j * values[1::2]).astype(np.complex64, copy=False)
+                    if iq.size == 0:
+                        continue
+                    self._offer(
+                        IqSampleBatch(
+                            data=iq,
+                            sample_rate=self.config.sample_rate,
+                            center_frequency_hz=self.config.center_frequency_hz,
+                        )
+                    )
+                    with self.stats_lock:
+                        self.current_sample_offset = handle.tell() // 8
+                    next_emit_at += float(iq.size) / float(self.config.sample_rate)
+                    delay = next_emit_at - time.monotonic()
+                    if delay > 0:
+                        self.stop_event.wait(delay)
+                    elif delay < -1.0:
+                        next_emit_at = time.monotonic()
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self._offer(exc)
+
+    def _apply_pending_seek(self, handle) -> None:
+        with self.seek_lock:
+            delta_samples = self.pending_seek_samples
+            self.pending_seek_samples = 0
+        if not delta_samples:
+            return
+        total_samples = self.file_size_bytes // 8
+        if total_samples <= 0:
+            return
+        current_samples = handle.tell() // 8
+        target_samples = current_samples + delta_samples
+        if target_samples >= total_samples:
+            target_samples = 0
+        elif target_samples < 0:
+            target_samples = 0
+        handle.seek(target_samples * 8)
+        with self.stats_lock:
+            self.current_sample_offset = target_samples
+        LOG.info(
+            "seeked I/Q test source %s to %.3f seconds",
+            self.config.path.name,
+            target_samples / float(self.config.sample_rate),
+        )
+
+    def _read_looping_chunk(self, handle, size: int) -> bytes:
+        parts: list[bytes] = []
+        remaining = size
+        while remaining > 0 and not self.stop_event.is_set():
+            data = handle.read(remaining)
+            if data:
+                parts.append(data)
+                remaining -= len(data)
+                continue
+            handle.seek(0)
+            if not parts and handle.tell() != 0:
+                break
+            if self.file_size_bytes <= 0:
+                break
+            if self.file_size_bytes < remaining and parts:
+                break
+        return b"".join(parts)
+
+    def _offer(self, item: IqSampleBatch | Exception | None) -> None:
+        try:
+            self.output_queue.put_nowait(item)
+            if isinstance(item, IqSampleBatch):
+                self._record_offered_item(item)
+            return
+        except queue.Full:
+            pass
+        try:
+            dropped = self.output_queue.get_nowait()
+            if isinstance(dropped, IqSampleBatch):
+                self._record_dropped_item(dropped)
+        except queue.Empty:
+            pass
+        try:
+            self.output_queue.put_nowait(item)
+            if isinstance(item, IqSampleBatch):
+                self._record_offered_item(item)
+        except queue.Full:
+            if isinstance(item, IqSampleBatch):
+                self._record_dropped_item(item)
+
+    def _clear_output_queue(self) -> None:
+        while True:
+            try:
+                dropped = self.output_queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(dropped, IqSampleBatch):
+                self._record_dropped_item(dropped)
+
+    def _record_offered_item(self, item: IqSampleBatch) -> None:
+        with self.stats_lock:
+            self.offered_batches += 1
+            self.offered_bytes += item.data.nbytes
+            self.last_offer_at = time.monotonic()
+
+    def _record_dropped_item(self, item: IqSampleBatch) -> None:
+        with self.stats_lock:
+            self.dropped_batches += 1
+            self.dropped_bytes += item.data.nbytes
+
+
 class RawRtlFanout:
-    def __init__(self, source: RtlCaptureSource) -> None:
+    def __init__(self, source: RtlCaptureSource | IqFileCaptureSource) -> None:
         self.source = source
+        self.source_lock = threading.Lock()
         self.subscribers: set[queue.Queue] = set()
         self.subscriber_names: dict[queue.Queue, str] = {}
         self.subscriber_drops: dict[queue.Queue, int] = {}
@@ -615,6 +903,7 @@ class RawRtlFanout:
         self.total_dropped_bytes = 0
         self.last_read_at = 0.0
         self.last_drop_log_at = 0.0
+        self.generation = 0
 
     def subscribe(
         self,
@@ -653,9 +942,23 @@ class RawRtlFanout:
         if self.thread is not None:
             self.thread.join(timeout=2.0)
 
+    def set_source(self, source: RtlCaptureSource | IqFileCaptureSource) -> None:
+        with self.source_lock:
+            if source is self.source:
+                return
+            self.source = source
+        with self.subscribers_lock:
+            self.generation += 1
+            cleared = 0
+            for subscriber in self.subscribers:
+                cleared += clear_queue_items(subscriber)
+        LOG.info("RTL-SDR raw fanout switched source generation to %s; cleared %s queued batches", self.generation, cleared)
+
     def _chunks_for_seconds(self, seconds: float) -> int:
-        sample_rate = max(1, int(self.source.config.sample_rate))
-        chunk_bytes = max(512, self.source._rtl_async_buffer_size(self.source.config))
+        with self.source_lock:
+            source = self.source
+        sample_rate = max(1, int(source.config.sample_rate))
+        chunk_bytes = max(512, source._rtl_async_buffer_size(source.config))
         chunk_seconds = max(0.001, chunk_bytes / (2.0 * float(sample_rate)))
         return max(
             STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS,
@@ -667,20 +970,27 @@ class RawRtlFanout:
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
+            with self.source_lock:
+                source = self.source
             try:
-                batch = self.source.read(timeout=0.5)
+                batch = source.read(timeout=0.5)
             except queue.Empty:
                 continue
             except EOFError:
-                return
+                with self.source_lock:
+                    if source is self.source:
+                        return
+                continue
             except Exception as exc:
                 LOG.warning("RTL-SDR raw fanout read failed: %s", exc)
                 continue
             with self.subscribers_lock:
                 subscribers = list(self.subscribers)
+                generation = self.generation
                 self.read_batches += 1
-                self.read_bytes += len(batch.data)
+                self.read_bytes += iq_batch_byte_count(batch)
                 self.last_read_at = time.monotonic()
+            batch = set_batch_generation(batch, generation)
             for subscriber in subscribers:
                 try:
                     subscriber.put_nowait(batch)
@@ -706,15 +1016,17 @@ class RawRtlFanout:
 
     def stats(self) -> dict[str, Any]:
         with self.subscribers_lock:
+            with self.source_lock:
+                source = self.source
             subscribers = [self._subscriber_stats_locked(subscriber) for subscriber in self.subscribers]
             return {
                 "read_batches": self.read_batches,
                 "read_bytes": self.read_bytes,
-                "read_samples": self.read_bytes // 2,
+                "read_samples": iq_batch_sample_count_from_bytes(self.read_bytes, source),
                 "subscriber_count": len(self.subscribers),
                 "total_dropped_batches": self.total_dropped_batches,
                 "total_dropped_bytes": self.total_dropped_bytes,
-                "total_dropped_samples": self.total_dropped_bytes // 2,
+                "total_dropped_samples": iq_batch_sample_count_from_bytes(self.total_dropped_bytes, source),
                 "last_read_age_seconds": (
                     round(time.monotonic() - self.last_read_at, 3)
                     if self.last_read_at
@@ -724,6 +1036,8 @@ class RawRtlFanout:
             }
 
     def _subscriber_stats_locked(self, subscriber: queue.Queue) -> dict[str, Any]:
+        with self.source_lock:
+            source = self.source
         return {
             "name": self.subscriber_names.get(subscriber, "subscriber"),
             "queue_depth": subscriber.qsize(),
@@ -731,7 +1045,10 @@ class RawRtlFanout:
             "max_queue_depth": self.subscriber_max_depth.get(subscriber, 0),
             "dropped_batches": self.subscriber_drops.get(subscriber, 0),
             "dropped_bytes": self.subscriber_drop_bytes.get(subscriber, 0),
-            "dropped_samples": self.subscriber_drop_bytes.get(subscriber, 0) // 2,
+            "dropped_samples": iq_batch_sample_count_from_bytes(
+                self.subscriber_drop_bytes.get(subscriber, 0),
+                source,
+            ),
         }
 
     def _record_subscriber_depth(self, subscriber: queue.Queue) -> None:
@@ -743,14 +1060,15 @@ class RawRtlFanout:
                 subscriber.qsize(),
             )
 
-    def _record_subscriber_drop(self, subscriber: queue.Queue, batch: RtlSampleBatch) -> None:
+    def _record_subscriber_drop(self, subscriber: queue.Queue, batch: RtlSampleBatch | IqSampleBatch) -> None:
         with self.subscribers_lock:
             if subscriber not in self.subscribers:
                 return
             self.subscriber_drops[subscriber] = self.subscriber_drops.get(subscriber, 0) + 1
-            self.subscriber_drop_bytes[subscriber] = self.subscriber_drop_bytes.get(subscriber, 0) + len(batch.data)
+            bytes_count = iq_batch_byte_count(batch)
+            self.subscriber_drop_bytes[subscriber] = self.subscriber_drop_bytes.get(subscriber, 0) + bytes_count
             self.total_dropped_batches += 1
-            self.total_dropped_bytes += len(batch.data)
+            self.total_dropped_bytes += bytes_count
             name = self.subscriber_names.get(subscriber, "subscriber")
             drops = self.subscriber_drops[subscriber]
             now = time.monotonic()
@@ -798,6 +1116,7 @@ class IntermediateIqFanout:
         self.total_dropped_samples = 0
         self.last_output_at = 0.0
         self.last_drop_log_at = 0.0
+        self.generation = 0
 
     def set_alias_filter_strength(self, value: int) -> None:
         value = validate_alias_filter_strength(value)
@@ -886,14 +1205,36 @@ class IntermediateIqFanout:
         decimator = None
         decimator_key: tuple[int, int] | None = None
         decimator_alias_filter_strength: int | None = None
+        raw_generation = getattr(self.raw_fanout, "generation", 0)
+        last_slow_batch_log_at = 0.0
         while not self.stop_event.is_set():
             try:
-                raw_batch: RtlSampleBatch = self.raw_queue.get(timeout=0.5)
+                raw_batch: RtlSampleBatch | IqSampleBatch = self.raw_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             except Exception as exc:
                 LOG.warning("intermediate IQ fanout failed to read RTL-SDR samples: %s", exc)
                 continue
+            current_raw_generation = getattr(self.raw_fanout, "generation", raw_generation)
+            incoming_generation = batch_generation(raw_batch)
+            if incoming_generation < current_raw_generation:
+                continue
+            if incoming_generation != raw_generation:
+                raw_generation = incoming_generation
+                dc_blocker = None
+                decimator = None
+                decimator_key = None
+                decimator_alias_filter_strength = None
+                with self.subscribers_lock:
+                    self.generation += 1
+                    cleared = 0
+                    for subscriber in self.subscribers:
+                        cleared += clear_queue_items(subscriber)
+                LOG.info(
+                    "intermediate IQ fanout switched source generation to %s; cleared %s queued batches",
+                    self.generation,
+                    cleared,
+                )
             with self.subscribers_lock:
                 alias_filter_strength = self.alias_filter_strength
             transition_hz = alias_filter_transition_hz(
@@ -924,12 +1265,24 @@ class IntermediateIqFanout:
                     attenuation_db=attenuation_db,
                 )
                 decimator_alias_filter_strength = alias_filter_strength
-            iq = rtl_u8_to_complex64(raw_batch.data)
+            iq = iq_batch_complex(raw_batch)
             if iq.size == 0:
                 continue
             if dc_blocker is None:
                 dc_blocker = IqDcBlocker(raw_batch.sample_rate)
+            process_started_at = time.monotonic()
             output = decimator.process(dc_blocker.process(iq))
+            process_seconds = time.monotonic() - process_started_at
+            batch_seconds = float(iq.size) / float(max(1, raw_batch.sample_rate))
+            if process_seconds > batch_seconds and process_started_at - last_slow_batch_log_at >= 10.0:
+                last_slow_batch_log_at = process_started_at
+                LOG.warning(
+                    "intermediate IQ decimator is slower than realtime: source_rate=%s output_rate=%s processed %.3fs IQ in %.3fs",
+                    raw_batch.sample_rate,
+                    self.output_rate,
+                    batch_seconds,
+                    process_seconds,
+                )
             with self.subscribers_lock:
                 self.read_batches += 1
                 self.read_samples += int(iq.size)
@@ -941,6 +1294,7 @@ class IntermediateIqFanout:
                 center_frequency_hz=raw_batch.center_frequency_hz,
                 captured_at=raw_batch.captured_at,
             )
+            batch = set_batch_generation(batch, self.generation)
             self._publish(batch)
 
     def _publish(self, batch: IqSampleBatch) -> None:
@@ -1746,6 +2100,48 @@ class AuthSessionStore:
                 self.sessions.pop(token, None)
 
 
+class SameAwareWebRtcAudioSource:
+    def __init__(self, *, sample_rate: int = IQ_SAMPLE_RATE, event_queue: SameEventQueue | None = None) -> None:
+        self.audio_source = WebRtcAudioSource(sample_rate=sample_rate)
+        self.sample_rate = sample_rate
+        self.frame_bytes = self.audio_source.frame_bytes
+        self.event_queue = event_queue
+        self.suppressor = (
+            SameSuppressionProcessor(
+                sample_rate=sample_rate,
+                event_sink=event_queue.put,
+            )
+            if event_queue is not None
+            else None
+        )
+
+    def push_pcm(self, pcm: bytes) -> None:
+        if self.suppressor is None:
+            self.audio_source.push_pcm(pcm)
+            return
+        for frame in self.suppressor.process_pcm(pcm):
+            self.audio_source.push_pcm(frame)
+
+    async def read_pcm(self, timeout: float = 0.25) -> bytes:
+        return await self.audio_source.read_pcm(timeout=timeout)
+
+    def get_latest_pcm(self, timeout: float = 0.02) -> bytes:
+        return self.audio_source.get_latest_pcm(timeout=timeout)
+
+    def stats(self) -> dict[str, Any]:
+        stats = self.audio_source.stats()
+        suppressor = self.suppressor
+        if suppressor is not None:
+            stats["same_suppression_state"] = suppressor.state
+            stats["same_suppression_pending_frames"] = len(suppressor.pending)
+        return stats
+
+    def close(self) -> None:
+        if self.suppressor is not None:
+            self.suppressor.close()
+        self.audio_source.close()
+
+
 class IcecastStreamWorker:
     def __init__(
         self,
@@ -1786,7 +2182,7 @@ class IcecastStreamWorker:
         self.thread = threading.Thread(target=self._run_pcm_producer, name=f"icecast-stream-{stream['id']}", daemon=True)
         self.outputs: dict[str, IcecastOutputWriter] = {}
         self.encoder_groups: dict[tuple[str, int, int], IcecastEncoderGroup] = {}
-        self.monitor_sources: dict[str, WebRtcAudioSource] = {}
+        self.monitor_sources: dict[str, SameAwareWebRtcAudioSource] = {}
         self.eas_config: EasRecordingConfig | None = None
         self.eas_recorder: EasRecorderOutput | None = None
         self.eas_status = "disabled"
@@ -1867,8 +2263,8 @@ class IcecastStreamWorker:
             "directory": config.directory,
         }
 
-    def add_monitor_source(self, client_id: str) -> WebRtcAudioSource:
-        source = WebRtcAudioSource(sample_rate=IQ_SAMPLE_RATE)
+    def add_monitor_source(self, client_id: str, event_queue: SameEventQueue | None = None) -> SameAwareWebRtcAudioSource:
+        source = SameAwareWebRtcAudioSource(sample_rate=IQ_SAMPLE_RATE, event_queue=event_queue)
         with self.lock:
             old_source = self.monitor_sources.pop(client_id, None)
             self.monitor_sources[client_id] = source
@@ -1905,6 +2301,7 @@ class IcecastStreamWorker:
         fallback_state = WebFallbackPlaybackState()
         last_real_audio = time.monotonic()
         idle_output_active = False
+        source_generation = getattr(self.fanout, "generation", 0)
         while not self.stop_event.is_set():
             if not self._has_connected_outputs():
                 try:
@@ -1943,6 +2340,22 @@ class IcecastStreamWorker:
             if not startup_backlog_drained:
                 batch = drain_queue_to_latest(self.queue, batch)
                 startup_backlog_drained = True
+            current_generation = getattr(self.fanout, "generation", source_generation)
+            incoming_generation = batch_generation(batch)
+            if incoming_generation < current_generation:
+                continue
+            if incoming_generation != source_generation:
+                source_generation = incoming_generation
+                channelizer = None
+                channelizer_key = None
+                channelizer_alias_filter_strength = None
+                demodulator = ComplexNfmDemodulator()
+                frame_buffer.clear()
+                fallback_state.reset()
+                LOG.info(
+                    "stream DSP source generation changed for %s; reset channel state",
+                    self.stream.get("station", {}).get("callsign"),
+                )
             idle_output_active = False
             with self.lock:
                 station = self.stream["station"]
@@ -2619,6 +3032,7 @@ class WeatherReceiverWorker:
         fanout: RawRtlFanout | IntermediateIqFanout,
         frequency_hz: int,
         alias_filter_strength_provider,
+        event_queue: SameEventQueue | None = None,
     ) -> None:
         self.client_id = client_id
         self.fanout = fanout
@@ -2637,7 +3051,7 @@ class WeatherReceiverWorker:
             max_seconds=LIVE_IQ_QUEUE_SECONDS,
             name=f"receiver:{client_id}",
         )
-        self.source = WebRtcAudioSource(sample_rate=IQ_SAMPLE_RATE)
+        self.source = SameAwareWebRtcAudioSource(sample_rate=IQ_SAMPLE_RATE, event_queue=event_queue)
         self.frequency_hz = frequency_hz
         self.stop_event = threading.Event()
         self.thread = threading.Thread(
@@ -2696,6 +3110,7 @@ class WeatherReceiverWorker:
         demodulator = ComplexNfmDemodulator()
         effects = AudioEffectsProcessor(RECEIVER_AUDIO_CONFIG)
         frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
+        source_generation = getattr(self.fanout, "generation", 0)
         while not self.stop_event.is_set():
             try:
                 batch: RtlSampleBatch = self.queue.get(timeout=0.5)
@@ -2707,6 +3122,18 @@ class WeatherReceiverWorker:
             if not startup_backlog_drained:
                 batch = drain_queue_to_latest(self.queue, batch)
                 startup_backlog_drained = True
+            current_generation = getattr(self.fanout, "generation", source_generation)
+            incoming_generation = batch_generation(batch)
+            if incoming_generation < current_generation:
+                continue
+            if incoming_generation != source_generation:
+                source_generation = incoming_generation
+                channelizer = None
+                channelizer_key = None
+                channelizer_alias_filter_strength = None
+                demodulator = ComplexNfmDemodulator()
+                frame_buffer.clear()
+                LOG.info("weather receiver source generation changed for client %s; reset channel state", self.client_id)
             target_frequency_hz = self._frequency_hz()
             alias_filter_strength = self.alias_filter_strength_provider()
             channel_transition_hz = alias_filter_transition_hz(
@@ -2767,6 +3194,7 @@ class RtlControlService:
         self.streams_directory = state_path.parent / STREAMS_DIRECTORY_NAME
         self.iq_recordings_directory = state_path.parent / IQ_RECORDINGS_DIRECTORY_NAME
         self.iq_recordings_index_path = self.iq_recordings_directory / IQ_RECORDINGS_INDEX_FILE_NAME
+        self.iq_test_sources_directory = state_path.parent / IQ_TEST_SOURCES_DIRECTORY_NAME
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.accounts = AccountStore(state_path.parent / ACCOUNTS_DATABASE_FILE_NAME)
         self.auth_sessions = AuthSessionStore()
@@ -2780,7 +3208,8 @@ class RtlControlService:
         self.streams = load_streams(self.streams_directory, self.streams_state_path)
         self.fallback_settings = load_fallback_settings(self.fallback_state_path)
         self.stations = load_station_database()
-        self.capture: RtlCaptureSource | None = None
+        self.capture: RtlCaptureSource | IqFileCaptureSource | None = None
+        self.iq_file_source_config: IqFileSourceConfig | None = None
         self.raw_fanout: RawRtlFanout | None = None
         self.intermediate_fanout: IntermediateIqFanout | None = None
         self.monitor_queue: queue.Queue | None = None
@@ -2893,14 +3322,30 @@ class RtlControlService:
             capture = self.capture
             settings = self._effective_settings_locked()
             active = capture is not None
-            gain_values = capture.get_gain_values() if capture is not None else []
+            gain_values = capture.get_gain_values() if isinstance(capture, RtlCaptureSource) else []
             capture_stats = capture.stats() if capture is not None else {}
             fanout_stats = self.raw_fanout.stats() if self.raw_fanout is not None else {}
             intermediate_stats = self.intermediate_fanout.stats() if self.intermediate_fanout is not None else {}
+            source_kind = "iq_file" if self.iq_file_source_config is not None else "rtl"
+            source_name = (
+                self.iq_file_source_config.path.name
+                if self.iq_file_source_config is not None
+                else (settings.serial or "")
+            )
             return {
                 "settings": asdict(settings),
                 "gain_values": gain_values,
                 "active": active,
+                "source": {
+                    "kind": source_kind,
+                    "name": source_name,
+                    "sample_rate": (
+                        self.iq_file_source_config.sample_rate
+                        if self.iq_file_source_config is not None
+                        else settings.sample_rate
+                    ),
+                    "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
+                },
                 "capture_error": self.capture_error,
                 "capture_stats": capture_stats,
                 "raw_fanout_stats": fanout_stats,
@@ -3669,6 +4114,7 @@ class RtlControlService:
                 + (capabilities.transport_error or capabilities.opus_error or "server WebRTC support is incomplete")
             )
 
+        event_queue = SameEventQueue()
         self.stop_receiver({"client_id": client_id})
         self.stop_monitor({"client_id": client_id})
         with self.lock:
@@ -3685,7 +4131,7 @@ class RtlControlService:
                 self.monitor_accounts_by_client.pop(client_id, None)
                 LOG.warning("WebRTC monitor rejected for client %s: worker unavailable for stream %s", client_id, stream_id)
                 raise ValueError("stream worker could not be started for monitoring")
-            source = worker.add_monitor_source(client_id)
+            source = worker.add_monitor_source(client_id, event_queue)
             station = stream.get("station", {})
 
         try:
@@ -3696,6 +4142,7 @@ class RtlControlService:
                     sdp=sdp,
                     type=offer_type,
                     tracks=(track,),
+                    event_queue=event_queue.queue,
                     on_peer_closed=self._handle_webrtc_session_closed,
                 )
             )
@@ -3794,6 +4241,7 @@ class RtlControlService:
             )
         self.stop_monitor({"client_id": client_id})
         self.stop_receiver({"client_id": client_id})
+        event_queue = SameEventQueue()
         with self.lock:
             fanout = self.intermediate_fanout
             if fanout is None:
@@ -3804,6 +4252,7 @@ class RtlControlService:
                 fanout=fanout,
                 frequency_hz=frequency_hz,
                 alias_filter_strength_provider=self._alias_filter_strength,
+                event_queue=event_queue,
             )
             self.receiver_workers[client_id] = worker
             self.receiver_accounts_by_client[client_id] = int(account_id or 0) if account_id is not None else 0
@@ -3816,6 +4265,7 @@ class RtlControlService:
                     sdp=sdp,
                     type=offer_type,
                     tracks=(track,),
+                    event_queue=event_queue.queue,
                     on_peer_closed=self._handle_webrtc_session_closed,
                 )
             )
@@ -4076,6 +4526,10 @@ class RtlControlService:
                 settings.bias_tee,
                 settings.alias_filter_strength,
             )
+            if self.iq_file_source_config is not None:
+                if self.intermediate_fanout is not None:
+                    self.intermediate_fanout.set_alias_filter_strength(settings.alias_filter_strength)
+                return self.status()
             if settings.serial:
                 self._start_or_update_capture_locked()
             else:
@@ -4102,29 +4556,26 @@ class RtlControlService:
 
     def _start_or_update_capture_locked(self) -> None:
         config = self.settings.to_rtl_config()
+        if self.iq_file_source_config is not None or (
+            self.capture is not None and not isinstance(self.capture, RtlCaptureSource)
+        ):
+            old_capture = self.capture
+            source = RtlCaptureSource(config)
+            source.start()
+            self.capture = source
+            self.iq_file_source_config = None
+            self.capture_error = None
+            self._ensure_capture_pipeline_locked()
+            self._sync_stream_workers_locked()
+            if old_capture is not None:
+                self._stop_capture_async(old_capture, None)
+            LOG.info("switched capture source back to RTL-SDR serial %s", config.serial)
+            return
         if self.capture is None:
             self.capture_error = None
             self.capture = RtlCaptureSource(config)
             self.capture.start()
-            self.raw_fanout = RawRtlFanout(self.capture)
-            self.monitor_queue = subscribe_raw_fanout(
-                self.raw_fanout,
-                max_chunks=64,
-                name="web-status-drain",
-            )
-            self.intermediate_fanout = IntermediateIqFanout(
-                self.raw_fanout,
-                alias_filter_strength=self.settings.alias_filter_strength,
-            )
-            self.intermediate_fanout.start()
-            self.raw_fanout.start()
-            self.drain_stop.clear()
-            self.drain_thread = threading.Thread(
-                target=self._drain_capture,
-                name="rtl-web-drain",
-                daemon=True,
-            )
-            self.drain_thread.start()
+            self._ensure_capture_pipeline_locked()
             self._sync_stream_workers_locked()
             LOG.info("started RTL-SDR control capture for serial %s", config.serial)
             return
@@ -4141,7 +4592,7 @@ class RtlControlService:
             return self.settings.alias_filter_strength
 
     def _effective_settings_locked(self) -> RtlControlSettings:
-        if self.capture is None:
+        if not isinstance(self.capture, RtlCaptureSource):
             return self.settings
         config = self.capture.config
         return replace(
@@ -4152,6 +4603,156 @@ class RtlControlService:
             ppm_correction=config.ppm_correction,
             bias_tee=config.bias_tee,
         )
+
+    def iq_test_sources(self) -> dict[str, Any]:
+        directory = self.iq_test_sources_directory
+        directory.mkdir(parents=True, exist_ok=True)
+        files: list[dict[str, Any]] = []
+        for path in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            files.append(
+                {
+                    "name": path.name,
+                    "size_bytes": stat.st_size,
+                }
+            )
+        with self.lock:
+            active = self.iq_file_source_config
+            return {
+                "directory": str(directory),
+                "files": files,
+                "active": (
+                    {
+                        "name": active.path.name,
+                        "sample_rate": active.sample_rate,
+                        "center_frequency_hz": active.center_frequency_hz,
+                        "stats": self.capture.stats() if isinstance(self.capture, IqFileCaptureSource) else {},
+                    }
+                    if active is not None
+                    else None
+                ),
+            }
+
+    def start_iq_test_source(self, payload: dict[str, Any]) -> dict[str, Any]:
+        file_name = str(payload.get("file_name", "")).strip()
+        sample_rate = int(payload.get("sample_rate", 0))
+        if not file_name:
+            raise ValueError("select an I/Q source file")
+        if sample_rate < IQ_TEST_SOURCE_MIN_SAMPLE_RATE:
+            raise ValueError(f"I/Q source sample rate must be at least {IQ_TEST_SOURCE_MIN_SAMPLE_RATE} S/s")
+        path = self._iq_test_source_path(file_name)
+        config = IqFileSourceConfig(
+            path=path,
+            sample_rate=sample_rate,
+            center_frequency_hz=NWR_CENTER_FREQUENCY_HZ,
+        )
+        with self.lock:
+            self.capture_error = None
+            source = IqFileCaptureSource(config)
+            source.start()
+            old_capture = self.capture
+            self.capture = source
+            self.iq_file_source_config = config
+            self._ensure_capture_pipeline_locked()
+            self._sync_stream_workers_locked()
+            if old_capture is not None:
+                self._stop_capture_async(old_capture, None)
+        LOG.info("started CF32 I/Q test source %s at %s S/s", path.name, sample_rate)
+        return self.status()
+
+    def seek_iq_test_source(self, payload: dict[str, Any]) -> dict[str, Any]:
+        seconds = float(payload.get("seconds", 0.0))
+        if seconds == 0.0:
+            return self.status()
+        with self.lock:
+            if self.iq_file_source_config is None or not isinstance(self.capture, IqFileCaptureSource):
+                raise ValueError("I/Q file source is not active")
+            stats = self.capture.seek_relative(seconds)
+            name = self.iq_file_source_config.path.name
+        LOG.info("seeked CF32 I/Q test source %s by %.3f seconds", name, seconds)
+        response = self.status()
+        response["iq_test_source_seek"] = stats
+        return response
+
+    def stop_iq_test_source(self) -> dict[str, Any]:
+        with self.lock:
+            if self.iq_file_source_config is None:
+                return self.status()
+            self.iq_file_source_config = None
+            if self.settings.serial:
+                config = self.settings.to_rtl_config()
+                old_capture = self.capture
+                source = RtlCaptureSource(config)
+                source.start()
+                self.capture = source
+                self.capture_error = None
+                self._ensure_capture_pipeline_locked()
+                self._sync_stream_workers_locked()
+                if old_capture is not None:
+                    self._stop_capture_async(old_capture, None)
+            return self.status()
+
+    def _iq_test_source_path(self, file_name: str) -> Path:
+        directory = self.iq_test_sources_directory.resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = (directory / file_name).resolve()
+        if path.parent != directory:
+            raise ValueError("invalid I/Q source file")
+        if not path.is_file():
+            raise FileNotFoundError("I/Q source file was not found")
+        return path
+
+    def _stop_capture_async(
+        self,
+        capture: RtlCaptureSource | IqFileCaptureSource,
+        drain_thread: threading.Thread | None,
+    ) -> None:
+        threading.Thread(
+            target=self._stop_detached_capture,
+            args=(capture, drain_thread),
+            name="rtl-web-stop",
+            daemon=True,
+        ).start()
+
+    def _ensure_capture_pipeline_locked(self) -> None:
+        if self.capture is None:
+            return
+        if self.raw_fanout is None:
+            self.raw_fanout = RawRtlFanout(self.capture)
+            self.raw_fanout.start()
+        elif self.raw_fanout.source is not self.capture:
+            self.raw_fanout.set_source(self.capture)
+            self.raw_fanout.start()
+        else:
+            self.raw_fanout.start()
+        if self.monitor_queue is None:
+            self.monitor_queue = subscribe_raw_fanout(
+                self.raw_fanout,
+                max_chunks=64,
+                name="web-status-drain",
+            )
+        if self.intermediate_fanout is None:
+            self.intermediate_fanout = IntermediateIqFanout(
+                self.raw_fanout,
+                alias_filter_strength=self.settings.alias_filter_strength,
+            )
+            self.intermediate_fanout.start()
+        else:
+            self.intermediate_fanout.set_alias_filter_strength(self.settings.alias_filter_strength)
+            self.intermediate_fanout.start()
+        if self.drain_thread is None or not self.drain_thread.is_alive():
+            self.drain_stop.clear()
+            self.drain_thread = threading.Thread(
+                target=self._drain_capture,
+                name="iq-web-drain",
+                daemon=True,
+            )
+            self.drain_thread.start()
 
     def _detach_capture_locked(self) -> None:
         self.drain_stop.set()
@@ -4196,6 +4797,7 @@ class RtlControlService:
             self.monitor_queue = None
             capture = self.capture
             self.capture = None
+            self.iq_file_source_config = None
             drain_thread = self.drain_thread
             self.drain_thread = None
         if recorder is not None:
@@ -4212,7 +4814,7 @@ class RtlControlService:
 
     @staticmethod
     def _stop_detached_capture(
-        capture: RtlCaptureSource,
+        capture: RtlCaptureSource | IqFileCaptureSource,
         drain_thread: threading.Thread | None,
     ) -> None:
         capture.stop()
@@ -4238,7 +4840,7 @@ class RtlControlService:
                 self.capture_error = None
                 self.last_batch_at = batch.captured_at
                 self.received_chunks += 1
-                self.received_bytes += len(batch.data)
+                self.received_bytes += iq_batch_byte_count(batch)
 
     def _sync_stream_workers_locked(self) -> None:
         fanout = self.intermediate_fanout
@@ -4562,6 +5164,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_json(response)
         elif path == "/api/devices":
             self._send_json(self.service.devices())
+        elif path == "/api/iq-test-sources":
+            self._send_json(self.service.iq_test_sources())
         elif path == "/api/stations":
             query = parse_qs(parsed.query)
             search = query.get("q", [""])[0]
@@ -4891,6 +5495,35 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 response = self.service.reset_rtl_device(str(payload.get("serial", "")))
             except Exception as exc:
                 LOG.warning("API RTL-SDR reset failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/iq-test-source":
+            try:
+                payload = self._read_json()
+                response = self.service.start_iq_test_source(payload)
+            except Exception as exc:
+                LOG.warning("API I/Q test source start failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/iq-test-source/stop":
+            try:
+                response = self.service.stop_iq_test_source()
+            except Exception as exc:
+                LOG.warning("API I/Q test source stop failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/iq-test-source/seek":
+            try:
+                payload = self._read_json()
+                response = self.service.seek_iq_test_source(payload)
+            except Exception as exc:
+                LOG.warning("API I/Q test source seek failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -6905,6 +7538,33 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.
       </div>
     </section>
+    <section>
+      <h3>I/Q test source</h3>
+      <p class="hint">Use an interleaved complex float32 I/Q file as the receiver source for testing. Files loop until you switch back to the RTL-SDR.</p>
+      <div class="grid">
+        <label>Source file
+          <select id="iq_test_source_file"></select>
+        </label>
+        <label>File sample rate in samples per second
+          <input id="iq_test_source_sample_rate" type="number" min="192000" step="1" value="1536000">
+        </label>
+      </div>
+      <div id="iq_test_source_directory" class="hint"></div>
+      <div id="iq_test_source_seek_controls" class="hint" tabindex="0" role="group" aria-label="I/Q file seek controls">
+        Use Up Arrow to seek forward 10 seconds, Down Arrow to seek backward 10 seconds, Page Up to seek forward 1 minute, and Page Down to seek backward 1 minute.
+      </div>
+      <div id="iq_test_source_position" class="hint"></div>
+      <div id="iq-test-source-result" class="message"></div>
+      <div class="actions">
+        <button id="rescan_iq_test_sources" type="button">Rescan I/Q files</button>
+        <button id="start_iq_test_source" type="button">Use I/Q file source</button>
+        <button id="seek_iq_test_source_back_60" type="button">Back 1 minute</button>
+        <button id="seek_iq_test_source_back_10" type="button">Back 10 seconds</button>
+        <button id="seek_iq_test_source_forward_10" type="button">Forward 10 seconds</button>
+        <button id="seek_iq_test_source_forward_60" type="button">Forward 1 minute</button>
+        <button id="stop_iq_test_source" type="button">Return to RTL-SDR</button>
+      </div>
+    </section>
   </div>
 
   <div id="view_receiver" class="view" hidden>
@@ -7661,6 +8321,7 @@ let iqRecordings = [];
 let iqRecordingsSignature = "";
 let selectedIqRecordingId = "";
 let lastIqRecordingsRefreshAt = 0;
+let iqTestSourcesSignature = "";
 let webRtcSupport = {
   browser: {webrtc: false, opus: false},
   server: {available: false}
@@ -7690,6 +8351,14 @@ const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
 const LIVE_AUDIO_BACKGROUND_RESTART_MS = 30000;
 const WEBRTC_JITTER_BUFFER_TARGET_SECONDS = 0.1;
+const SAME_MARK_HZ = 2083.3;
+const SAME_SPACE_HZ = 1562.5;
+const SAME_BAUD = 520.83;
+const SAME_PREAMBLE_BYTE = 0xAB;
+const SAME_PREAMBLE_BYTES = 16;
+const SAME_TRAILING_NUL_BYTES = 3;
+const SAME_CLIENT_PLAYOUT_DELAY_SECONDS = 0.45;
+const SAME_LIVE_AUDIO_MUTE_TAIL_SECONDS = 1.0;
 const IQ_RECORDER_SAMPLE_RATES = [192000, 256000, 384000, 512000, 768000, 1024000, 1536000];
 const NWR_RECEIVER_CHANNELS = [
   {frequency_hz: 162400000, label: "162.400 MHz"},
@@ -7706,6 +8375,201 @@ const PROTECTED_AUDIO_BANDS = [
   {min: 1400, max: 1600},
   {min: 2000, max: 2200}
 ];
+let sameAudioContext = null;
+let sameLiveAudioMuteTimer = null;
+let sameLiveAudioMutedBySame = false;
+let sameActiveSources = new Set();
+
+async function ensureSameAudioContext() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return null;
+  if (!sameAudioContext) sameAudioContext = new AudioContextClass();
+  if (sameAudioContext.state === "suspended") {
+    try {
+      await sameAudioContext.resume();
+    } catch (error) {
+      logClientEvent("warning", "same", "SAME audio context resume failed", {error: error.message});
+      console.debug("SAME audio context resume failed", error);
+    }
+  }
+  return sameAudioContext;
+}
+
+function samePayloadBytes(payload) {
+  const bytes = [];
+  for (let index = 0; index < SAME_PREAMBLE_BYTES; index += 1) bytes.push(SAME_PREAMBLE_BYTE);
+  const text = String(payload || "");
+  for (let index = 0; index < text.length; index += 1) bytes.push(text.charCodeAt(index) & 0x7f);
+  for (let index = 0; index < SAME_TRAILING_NUL_BYTES; index += 1) bytes.push(0);
+  return bytes;
+}
+
+function generateSameBurst(payload, sampleRate) {
+  const samplesPerBit = sampleRate / SAME_BAUD;
+  const bytes = samePayloadBytes(payload);
+  let totalSamples = 0;
+  let sampleCursor = 0;
+  let sampleTarget = 0;
+  for (const byte of bytes) {
+    for (let bitIndex = 0; bitIndex < 8; bitIndex += 1) {
+      sampleTarget += samplesPerBit;
+      const bitSamples = Math.round(sampleTarget) - sampleCursor;
+      sampleCursor += bitSamples;
+      totalSamples += bitSamples;
+    }
+  }
+  const output = new Float32Array(totalSamples);
+  let phase = 0;
+  let offset = 0;
+  sampleCursor = 0;
+  sampleTarget = 0;
+  for (const byte of bytes) {
+    for (let bitIndex = 0; bitIndex < 8; bitIndex += 1) {
+      sampleTarget += samplesPerBit;
+      const bitSamples = Math.round(sampleTarget) - sampleCursor;
+      sampleCursor += bitSamples;
+      const frequency = ((byte >> bitIndex) & 1) ? SAME_MARK_HZ : SAME_SPACE_HZ;
+      const step = 2 * Math.PI * frequency / sampleRate;
+      for (let index = 0; index < bitSamples; index += 1) {
+        output[offset] = 0.73 * Math.sin(phase);
+        offset += 1;
+        phase += step;
+        if (phase >= 2 * Math.PI) phase -= 2 * Math.PI;
+      }
+    }
+  }
+  return output;
+}
+
+function concatenateFloatAudio(parts) {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const output = new Float32Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+
+function generateSameMessageAudio(payload, sampleRate, repetitions = 3, gapSeconds = 1.0) {
+  const burst = generateSameBurst(payload, sampleRate);
+  const gap = new Float32Array(Math.round(sampleRate * Number(gapSeconds || 0)));
+  const parts = [];
+  for (let index = 0; index < repetitions; index += 1) {
+    if (index) parts.push(gap);
+    parts.push(burst);
+  }
+  return concatenateFloatAudio(parts);
+}
+
+function shouldSuppressLiveSamePlayback() {
+  return Boolean(receiverPeerConnection && receiverPaused && !monitorStreamId);
+}
+
+function clearSameLiveAudioMute() {
+  if (sameLiveAudioMuteTimer) {
+    clearTimeout(sameLiveAudioMuteTimer);
+    sameLiveAudioMuteTimer = null;
+  }
+  if (!sameLiveAudioMutedBySame) return;
+  sameLiveAudioMutedBySame = false;
+  const audio = document.getElementById("stream_monitor_audio");
+  if (audio && (monitorStreamId || (receiverPeerConnection && receiverPlaying && !receiverPaused))) {
+    audio.muted = false;
+  }
+}
+
+function stopGeneratedSameAudio() {
+  for (const source of Array.from(sameActiveSources)) {
+    try {
+      source.stop();
+    } catch (error) {
+      console.debug("generated SAME source stop failed", error);
+    }
+  }
+  sameActiveSources.clear();
+}
+
+function muteLiveAudioForSame(durationSeconds) {
+  const audio = document.getElementById("stream_monitor_audio");
+  if (!audio) return;
+  const muteMs = Math.max(0, Math.ceil(Number(durationSeconds || 0) * 1000));
+  audio.muted = true;
+  sameLiveAudioMutedBySame = true;
+  if (sameLiveAudioMuteTimer) clearTimeout(sameLiveAudioMuteTimer);
+  sameLiveAudioMuteTimer = setTimeout(() => {
+    sameLiveAudioMuteTimer = null;
+    clearSameLiveAudioMute();
+  }, muteMs);
+}
+
+async function playSamePayload(payload, repetitions = 3, gapSeconds = 1.0) {
+  if (shouldSuppressLiveSamePlayback()) {
+    logClientEvent("info", "same", "skipped live SAME playback while receiver is paused", {payload});
+    return;
+  }
+  const context = await ensureSameAudioContext();
+  if (!context) return;
+  if (context.state === "suspended") {
+    logClientEvent("warning", "same", "SAME audio context is still suspended", {payload});
+    return;
+  }
+  const samples = generateSameMessageAudio(payload, context.sampleRate, repetitions, gapSeconds);
+  const durationSeconds = samples.length / context.sampleRate;
+  muteLiveAudioForSame(SAME_CLIENT_PLAYOUT_DELAY_SECONDS + durationSeconds + SAME_LIVE_AUDIO_MUTE_TAIL_SECONDS);
+  const buffer = context.createBuffer(1, samples.length, context.sampleRate);
+  buffer.copyToChannel(samples, 0);
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  source.connect(context.destination);
+  sameActiveSources.add(source);
+  source.addEventListener("ended", () => {
+    sameActiveSources.delete(source);
+  });
+  source.start(context.currentTime + SAME_CLIENT_PLAYOUT_DELAY_SECONDS);
+}
+
+function handleLiveSameEvent(event) {
+  if (!event || typeof event !== "object") return;
+  if (event.type === "same_header") {
+    const rawHeader = event.payload && event.payload.raw_header;
+    if (!rawHeader) return;
+    logClientEvent("info", "same", "received live SAME header event", {id: event.id, header: rawHeader});
+    playSamePayload(rawHeader, Number(event.payload.repetitions || 3), Number(event.payload.gap_seconds || 1.0)).catch(error => {
+      logClientEvent("warning", "same", "SAME header playback failed", {error: error.message});
+    });
+  } else if (event.type === "same_eom") {
+    logClientEvent("info", "same", "received live SAME EOM event", {id: event.id});
+    playSamePayload("NNNN", Number(event.payload && event.payload.repetitions || 3), Number(event.payload && event.payload.gap_seconds || 1.0)).catch(error => {
+      logClientEvent("warning", "same", "SAME EOM playback failed", {error: error.message});
+    });
+  }
+}
+
+function attachLiveEventChannel(channel) {
+  if (!channel) return null;
+  channel.addEventListener("open", () => {
+    logClientEvent("info", "same", "live SAME event channel opened");
+  });
+  channel.addEventListener("close", () => {
+    logClientEvent("info", "same", "live SAME event channel closed");
+  });
+  channel.addEventListener("message", message => {
+    try {
+      handleLiveSameEvent(JSON.parse(message.data));
+    } catch (error) {
+      logClientEvent("warning", "same", "invalid live SAME event", {error: error.message});
+      console.debug("invalid live SAME event", error);
+    }
+  });
+  return channel;
+}
+
+function createLiveEventChannel(peer) {
+  if (!peer || typeof peer.createDataChannel !== "function") return null;
+  return attachLiveEventChannel(peer.createDataChannel("nwr-events", {ordered: true}));
+}
 
 async function request(path, options = {}) {
   const response = await fetch(path, options);
@@ -7811,6 +8675,8 @@ function liveAudioPeerIsUnusable(peer) {
 }
 
 function resetLiveAudioElement() {
+  stopGeneratedSameAudio();
+  clearSameLiveAudioMute();
   const audio = document.getElementById("stream_monitor_audio");
   if (!audio) return;
   audio.pause();
@@ -7959,6 +8825,7 @@ async function startStreamMonitor(streamId) {
   logClientEvent("info", "monitor", "monitor start requested", {stream_id: streamId});
   await stopWeatherReceiver({notifyServer: true});
   await stopStreamMonitor({notifyServer: true});
+  await ensureSameAudioContext();
   if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
     logClientEvent("warning", "monitor", "browser does not support WebRTC Opus monitoring", webRtcSupport.browser);
     throw new Error("This browser does not support WebRTC Opus audio monitoring.");
@@ -7969,6 +8836,7 @@ async function startStreamMonitor(streamId) {
     throw new Error(error);
   }
   const peer = new RTCPeerConnection({iceServers: []});
+  createLiveEventChannel(peer);
   monitorPeerConnection = peer;
   monitorStreamId = streamId;
   const audio = document.getElementById("stream_monitor_audio");
@@ -8272,11 +9140,12 @@ async function startWeatherReceiver() {
       receiverPlaying = true;
       receiverPaused = false;
       clearReceiverUnstableTimer();
-      setReceiverAudioTracksEnabled(true);
-      const audio = document.getElementById("stream_monitor_audio");
-      if (audio && audio.srcObject) {
-        await audio.play();
-      }
+	      setReceiverAudioTracksEnabled(true);
+	      const audio = document.getElementById("stream_monitor_audio");
+	      if (audio && audio.srcObject) {
+	        audio.muted = false;
+	        await audio.play();
+	      }
       startReceiverPacketStats();
       updateReceiverMediaSession();
       renderReceiverControls();
@@ -8286,6 +9155,7 @@ async function startWeatherReceiver() {
   }
   logClientEvent("info", "receiver", "receiver start requested", {frequency: currentReceiverChannel().label});
   await stopStreamMonitor({notifyServer: true});
+  await ensureSameAudioContext();
   if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
     logClientEvent("warning", "receiver", "browser does not support WebRTC Opus receiver", webRtcSupport.browser);
     throw new Error("This browser does not support WebRTC Opus audio.");
@@ -8296,6 +9166,7 @@ async function startWeatherReceiver() {
     throw new Error(error);
   }
   const peer = new RTCPeerConnection({iceServers: []});
+  createLiveEventChannel(peer);
   receiverPeerConnection = peer;
   receiverPlaying = true;
   receiverPaused = false;
@@ -8396,11 +9267,13 @@ async function stopWeatherReceiver(options = {}) {
   const peer = receiverPeerConnection;
   receiverPlaying = false;
   receiverPaused = preserveMediaSession && !!peer;
-  clearReceiverWatchdogs();
-  const audio = document.getElementById("stream_monitor_audio");
-  if (preserveMediaSession && peer) {
-    if (audio) audio.pause();
-    scheduleReceiverMediaSessionRefresh();
+	  clearReceiverWatchdogs();
+	  const audio = document.getElementById("stream_monitor_audio");
+	  if (preserveMediaSession && peer) {
+	    stopGeneratedSameAudio();
+	    clearSameLiveAudioMute();
+	    if (audio) audio.pause();
+	    scheduleReceiverMediaSessionRefresh();
     renderReceiverControls();
     return;
   }
@@ -8496,6 +9369,70 @@ async function loadDevices(selected, options = {}) {
   const fallback = !selected && data.devices.length === 1 ? data.devices[0].serial : "";
   setValue("serial", selected || fallback);
   setText("device-errors", data.errors.join(" | "));
+}
+
+async function loadIqTestSources(options = {}) {
+  const data = await request("/api/iq-test-sources");
+  const select = document.getElementById("iq_test_source_file");
+  const sourceOptions = data.files.map(file => ({
+    value: file.name,
+    label: `${file.name} (${formatDecimalBytes(file.size_bytes)})`
+  }));
+  if (sourceOptions.length === 0) {
+    sourceOptions.push({value: "", label: "No I/Q files found"});
+  }
+  const signature = JSON.stringify(sourceOptions);
+  if (options.force || iqTestSourcesSignature !== signature) {
+    syncSelectOptions(select, sourceOptions);
+    iqTestSourcesSignature = signature;
+  }
+  const active = data.active || null;
+  if (active && data.files.some(file => file.name === active.name)) {
+    setValue("iq_test_source_file", active.name);
+    setValue("iq_test_source_sample_rate", active.sample_rate);
+  }
+  setText(
+    "iq_test_source_directory",
+    `Place interleaved complex float32 I/Q files in ${data.directory}.`
+  );
+  setDisabled(document.getElementById("start_iq_test_source"), sourceOptions.length === 0 || !sourceOptions[0].value);
+  return data;
+}
+
+function renderIqTestSourceStatus(data) {
+  const source = data.source || {};
+  const active = source.kind === "iq_file";
+  const stats = data.capture_stats || {};
+  setText(
+    "iq-test-source-result",
+    active ? `Using I/Q file source ${source.name} at ${source.sample_rate} S/s.` : ""
+  );
+  setText(
+    "iq_test_source_position",
+    active && stats.duration_seconds
+      ? `Position: ${formatDuration(Number(stats.position_seconds || 0))} of ${formatDuration(Number(stats.duration_seconds || 0))}.`
+      : ""
+  );
+  setDisabled(document.getElementById("stop_iq_test_source"), !active);
+  for (const id of [
+    "seek_iq_test_source_back_60",
+    "seek_iq_test_source_back_10",
+    "seek_iq_test_source_forward_10",
+    "seek_iq_test_source_forward_60",
+  ]) {
+    setDisabled(document.getElementById(id), !active);
+  }
+}
+
+async function seekIqTestSource(seconds) {
+  setText("iq-test-source-result", seconds > 0 ? `Seeking forward ${formatDuration(seconds)}...` : `Seeking backward ${formatDuration(Math.abs(seconds))}...`);
+  const data = await request("/api/iq-test-source/seek", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({seconds})
+  });
+  applyStatus(data, {syncControls: true});
+  await loadIqTestSources({force: true});
 }
 
 function stationLabel(station) {
@@ -11296,6 +12233,9 @@ function applyRoute(route) {
     return;
   }
   if (route.view !== "stream_settings") settingsStreamId = "";
+  if (route.view === "rtl") {
+    loadIqTestSources({force: true}).catch(error => setText("iq-test-source-result", error.message));
+  }
   if (route.view === "receiver") renderReceiverControls();
   if (route.view === "iq_recorder") {
     loadIqRecordings().catch(error => setIqRecorderResult(error.message, "error"));
@@ -11763,6 +12703,7 @@ function applyStatus(data, options = {}) {
   setText("last", data.last_batch_at ? `${data.last_batch_at.toFixed(3)}s` : "never");
   setText("capture-error", data.capture_error || "");
   setText("logs", data.logs.join("\\n"));
+  renderIqTestSourceStatus(data);
   setFallbackControls(data.fallback);
   updateDashboard(data);
   const now = Date.now();
@@ -12497,6 +13438,107 @@ document.getElementById("reset_rtl_device").addEventListener("click", async () =
     setText("device-errors", error.message);
   } finally {
     setDisabled(button, false);
+  }
+});
+
+document.getElementById("rescan_iq_test_sources").addEventListener("click", async () => {
+  const button = document.getElementById("rescan_iq_test_sources");
+  setDisabled(button, true);
+  try {
+    await loadIqTestSources({force: true});
+    setText("iq-test-source-result", "I/Q source file list updated.");
+  } catch (error) {
+    setText("iq-test-source-result", error.message);
+  } finally {
+    setDisabled(button, false);
+  }
+});
+
+document.getElementById("start_iq_test_source").addEventListener("click", async () => {
+  const button = document.getElementById("start_iq_test_source");
+  const fileName = document.getElementById("iq_test_source_file").value;
+  const sampleRate = Number(document.getElementById("iq_test_source_sample_rate").value);
+  if (!fileName) {
+    setText("iq-test-source-result", "Select an I/Q source file.");
+    return;
+  }
+  setDisabled(button, true);
+  setText("iq-test-source-result", "Starting I/Q file source...");
+  try {
+    const data = await request("/api/iq-test-source", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({file_name: fileName, sample_rate: sampleRate})
+    });
+    applyStatus(data, {syncControls: true});
+    await loadIqTestSources({force: true});
+  } catch (error) {
+    setText("iq-test-source-result", error.message);
+  } finally {
+    setDisabled(button, false);
+  }
+});
+
+document.getElementById("stop_iq_test_source").addEventListener("click", async () => {
+  const button = document.getElementById("stop_iq_test_source");
+  setDisabled(button, true);
+  setText("iq-test-source-result", "Returning to RTL-SDR...");
+  try {
+    const data = await request("/api/iq-test-source/stop", {method: "POST"});
+    applyStatus(data, {syncControls: true});
+    await loadIqTestSources({force: true});
+  } catch (error) {
+    setText("iq-test-source-result", error.message);
+  } finally {
+    setDisabled(button, false);
+  }
+});
+
+document.getElementById("seek_iq_test_source_back_60").addEventListener("click", async () => {
+  try {
+    await seekIqTestSource(-60);
+  } catch (error) {
+    setText("iq-test-source-result", error.message);
+  }
+});
+
+document.getElementById("seek_iq_test_source_back_10").addEventListener("click", async () => {
+  try {
+    await seekIqTestSource(-10);
+  } catch (error) {
+    setText("iq-test-source-result", error.message);
+  }
+});
+
+document.getElementById("seek_iq_test_source_forward_10").addEventListener("click", async () => {
+  try {
+    await seekIqTestSource(10);
+  } catch (error) {
+    setText("iq-test-source-result", error.message);
+  }
+});
+
+document.getElementById("seek_iq_test_source_forward_60").addEventListener("click", async () => {
+  try {
+    await seekIqTestSource(60);
+  } catch (error) {
+    setText("iq-test-source-result", error.message);
+  }
+});
+
+document.getElementById("iq_test_source_seek_controls").addEventListener("keydown", async event => {
+  const keyMap = {
+    ArrowUp: 10,
+    ArrowDown: -10,
+    PageUp: 60,
+    PageDown: -60
+  };
+  if (!(event.key in keyMap)) return;
+  event.preventDefault();
+  try {
+    await seekIqTestSource(keyMap[event.key]);
+  } catch (error) {
+    setText("iq-test-source-result", error.message);
   }
 });
 

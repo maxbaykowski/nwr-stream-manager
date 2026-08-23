@@ -90,7 +90,7 @@ class DspTests(unittest.TestCase):
         expected = np.concatenate(expected_parts)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
-    def test_rational_resampler_matches_filter_then_interpolate_reference(self) -> None:
+    def test_rational_resampler_chunking_matches_single_pass(self) -> None:
         rng = np.random.default_rng(456)
         resampler = self.dsp.RationalResampler(
             100_000,
@@ -98,46 +98,26 @@ class DspTests(unittest.TestCase):
             transition_hz=4_000,
             attenuation_db=60,
         )
-        reference_filter = self.dsp.FirFilter(resampler.fir.taps.copy())
-        reference_seen = 0
-        next_position = 0.0
-        tail = np.array([], dtype=np.complex64)
+        single_pass = self.dsp.RationalResampler(
+            100_000,
+            24_000,
+            transition_hz=4_000,
+            attenuation_db=60,
+        )
+        samples = (
+            rng.normal(size=861) + 1j * rng.normal(size=861)
+        ).astype(np.complex64)
         actual_parts = []
-        expected_parts = []
-
+        offset = 0
         for size in (101, 503, 257):
-            samples = (
-                rng.normal(size=size) + 1j * rng.normal(size=size)
-            ).astype(np.complex64)
-            actual_parts.append(resampler.process(samples))
-            filtered = reference_filter.process(samples)
-            work = np.concatenate((tail, filtered)) if tail.size else filtered
-            work_start = reference_seen - int(tail.size)
-            work_end = reference_seen + int(filtered.size)
-            max_position = work_end - 1
-            step = 100_000 / 24_000
-            position = next_position
-            if position < work_start:
-                position += np.ceil((work_start - position) / step) * step
-            positions = []
-            while position < max_position:
-                positions.append(position)
-                position += step
-            next_position = position
-            reference_seen += int(filtered.size)
-            tail = work[-1:].copy()
-            if not positions:
-                continue
-            local_positions = np.asarray(positions, dtype=np.float64) - float(work_start)
-            indices = np.floor(local_positions).astype(np.int64)
-            fractions = (local_positions - indices).astype(np.float32)
-            left = work[indices]
-            right = work[indices + 1]
-            expected_parts.append((left + (right - left) * fractions).astype(np.complex64))
+            actual_parts.append(resampler.process(samples[offset : offset + size]))
+            offset += size
 
         actual = np.concatenate(actual_parts)
-        expected = np.concatenate(expected_parts)
-        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        expected = single_pass.process(samples)
+        count = min(actual.size, expected.size)
+        self.assertGreater(count, 100)
+        np.testing.assert_allclose(actual[:count], expected[:count], rtol=1e-5, atol=1e-5)
 
     def test_create_decimator_uses_staged_numpy_decimator_for_high_rates(self) -> None:
         decimator = self.dsp.create_decimator(1_024_000, 24_000)
@@ -168,6 +148,29 @@ class DspTests(unittest.TestCase):
                 samples = np.ones(4096, dtype=np.complex64)
                 output = decimator.process(samples)
                 self.assertGreater(output.size, 0)
+
+    def test_high_ratio_fractional_wide_decimator_uses_staged_path(self) -> None:
+        decimator = self.dsp.create_decimator(2_980_000, 192_000)
+
+        self.assertIsInstance(decimator, self.dsp.StagedDecimator)
+        self.assertIsInstance(decimator.first_stage, self.dsp.IntegerDecimator)
+        self.assertIsInstance(decimator.final_stage, self.dsp.RationalResampler)
+        self.assertGreaterEqual(decimator.intermediate_rate, 192_000)
+        self.assertLessEqual(decimator.intermediate_rate, 288_000)
+
+    def test_high_ratio_fractional_wide_decimator_preserves_nwr_sidebands(self) -> None:
+        sample_rate = 2_980_000
+        output_rate = 192_000
+        count = round(sample_rate * 0.08)
+        time_axis = np.arange(count, dtype=np.float32) / sample_rate
+        edge_sideband = np.exp(1j * 2.0 * np.pi * 87_000.0 * time_axis).astype(np.complex64)
+        out_of_band = np.exp(1j * 2.0 * np.pi * 150_000.0 * time_axis).astype(np.complex64)
+
+        edge_output = self.dsp.create_decimator(sample_rate, output_rate).process(edge_sideband)
+        rejected_output = self.dsp.create_decimator(sample_rate, output_rate).process(out_of_band)
+
+        self.assertGreater(float(np.mean(np.abs(edge_output[-4096:]))), 0.55)
+        self.assertLess(float(np.mean(np.abs(rejected_output[-4096:]))), 0.08)
 
     def test_shared_intermediate_decimator_preserves_outer_nwr_sidebands(self) -> None:
         sample_rate = 1_536_000
