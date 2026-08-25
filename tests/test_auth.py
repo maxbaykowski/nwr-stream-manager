@@ -373,6 +373,9 @@ class AuthTests(unittest.TestCase):
         self.assertNotIn("bytes_written", redacted)
         self.assertNotIn("elapsed_seconds", redacted)
 
+    def test_iq_recorder_default_duration_is_manual_stop(self) -> None:
+        self.assertEqual(self.web_control.IQ_RECORDER_DEFAULT_DURATION_SECONDS, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("User=nwr-stream-manager", unit)
         self.assertIn("StateDirectory=nwr-stream-manager", unit)
         self.assertIn("LogsDirectory=nwr-stream-manager", unit)
+        self.assertIn("SupplementaryGroups=plugdev audio", unit)
         self.assertIn("ExecStart=/usr/local/bin/nwr-stream-manager --host 0.0.0.0 --port 8080", unit)
 
     def test_systemd_unit_is_included_in_source_distribution_manifest(self) -> None:
@@ -113,6 +114,16 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("outputId: link.dataset.outputId || \"\"", script)
         self.assertIn("recordingId: link.dataset.recordingId || \"\"", script)
         self.assertIn("function replaceCurrentRoute", script)
+
+    def test_iq_recorder_defaults_and_preferences_are_in_ui(self) -> None:
+        script = self.web_control.INDEX_HTML
+
+        self.assertIn('id="iq_duration_minutes" type="number" min="0" max="1440" step="1" value="0"', script)
+        self.assertIn("const IQ_RECORDER_DEFAULT_SAMPLE_RATE = 192000", script)
+        self.assertIn("const IQ_RECORDER_DEFAULT_DURATION_MINUTES = 0", script)
+        self.assertIn("nwr-stream-manager:iq-recorder-preferences", script)
+        self.assertIn("function restoreIqRecorderPreferences", script)
+        self.assertIn("rememberIqRecorderPreferences();", script)
 
 
 if __name__ == "__main__":

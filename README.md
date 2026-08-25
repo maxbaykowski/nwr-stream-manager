@@ -13,7 +13,7 @@ need:
 
 - `librtlsdr` and its command-line tools/udev rules for RTL-SDR access
 - `multimon-ng` for EAS/SAME decoding support
-- PortAudio runtime/development libraries for optional soundcard support
+- ALSA runtime/development libraries for optional soundcard output support
 - `libogg`, `libvorbis`, and `libvorbisenc` runtime libraries for OGG streaming
 - `libopus` runtime libraries for browser stream monitoring and the weather
   radio receiver
@@ -96,11 +96,12 @@ Create the service user:
 sudo useradd --system --home /var/lib/nwr-stream-manager --shell /usr/sbin/nologin nwr-stream-manager
 ```
 
-Give that user access to the RTL-SDR device. The exact group depends on your
-distribution and udev rules; many systems use `plugdev`:
+Give that user access to the RTL-SDR device and ALSA sound cards. The exact
+groups depend on your distribution and udev rules; many systems use `plugdev`
+for USB device access and `audio` for sound card playback:
 
 ```bash
-sudo usermod -aG plugdev nwr-stream-manager
+sudo usermod -aG plugdev,audio nwr-stream-manager
 ```
 
 Install and start the example service:
@@ -119,6 +120,8 @@ The example unit uses:
 - `LogsDirectory=nwr-stream-manager`, so the rotating server log is
   `/var/log/nwr-stream-manager/nwr-stream-manager.log`.
 - `ExecStart=/usr/local/bin/nwr-stream-manager --host 0.0.0.0 --port 8080`.
+- `SupplementaryGroups=plugdev audio`, so the service user can access common
+  RTL-SDR udev group permissions and ALSA playback devices.
 
 If your Python package manager installs console scripts somewhere else, edit the
 `ExecStart` path before enabling the service. You can inspect logs with:

@@ -273,7 +273,7 @@ IQ_RECORDER_SAMPLE_RATES = (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_0
 IQ_TEST_SOURCES_DIRECTORY_NAME = "iq-test-sources"
 IQ_TEST_SOURCE_CHUNK_SECONDS = 0.05
 IQ_TEST_SOURCE_MIN_SAMPLE_RATE = INTERMEDIATE_IQ_SAMPLE_RATE
-IQ_RECORDER_DEFAULT_DURATION_SECONDS = 300
+IQ_RECORDER_DEFAULT_DURATION_SECONDS = 0
 IQ_RECORDER_MIN_DURATION_SECONDS = 0
 IQ_RECORDER_MAX_DURATION_SECONDS = 24 * 60 * 60
 IQ_STORAGE_ESTIMATE_MIN_CORRECTION_SECONDS = 30.0
@@ -8411,7 +8411,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <div class="hint">Records spectrum I/Q centered at 162.475 MHz after RTL-SDR float conversion.</div>
         </div>
         <label>Stop recording after
-          <input id="iq_duration_minutes" type="number" min="0" max="1440" step="1" value="5" aria-describedby="iq_duration_hint">
+          <input id="iq_duration_minutes" type="number" min="0" max="1440" step="1" value="0" aria-describedby="iq_duration_hint">
         </label>
         <div id="iq_duration_hint" class="hint">Minutes. Set to 0 to record until you manually stop it.</div>
         <div class="actions">
@@ -8532,7 +8532,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </thead>
         <tbody id="active-streams-body" aria-live="off">
           <tr id="active-streams-empty">
-            <td colspan="5" class="hint">No active streams.</td>
+            <td colspan="5" class="hint">No streams configured.</td>
           </tr>
         </tbody>
       </table>
@@ -9221,6 +9221,9 @@ const SAME_TRAILING_NUL_BYTES = 3;
 const SAME_CLIENT_PLAYOUT_DELAY_SECONDS = 0.45;
 const SAME_LIVE_AUDIO_MUTE_TAIL_SECONDS = 1.0;
 const IQ_RECORDER_SAMPLE_RATES = [192000, 256000, 384000, 512000, 768000, 1024000, 1536000];
+const IQ_RECORDER_DEFAULT_SAMPLE_RATE = 192000;
+const IQ_RECORDER_DEFAULT_DURATION_MINUTES = 0;
+const IQ_RECORDER_PREFS_KEY = "nwr-stream-manager:iq-recorder-preferences";
 const NWR_RECEIVER_CHANNELS = [
   {frequency_hz: 162400000, label: "162.400 MHz"},
   {frequency_hz: 162425000, label: "162.425 MHz"},
@@ -12400,7 +12403,7 @@ function renderActiveStreams(activeStreams, configured = configuredStreams) {
     const cell = document.createElement("td");
     cell.colSpan = 5;
     cell.className = "hint";
-    cell.textContent = "No active streams.";
+    cell.textContent = "No streams configured.";
     row.appendChild(cell);
     tbody.appendChild(row);
     return;
@@ -13890,9 +13893,7 @@ function applyRoute(route) {
     loadIqRecordings().catch(error => setIqRecorderResult(error.message, "error"));
   }
   if (route.view === "iq_recorder_start") {
-    populateIqSampleRates();
-    renderIqStreamOptions(true);
-    renderIqModeFields();
+    restoreIqRecorderPreferences();
   }
   if (route.view === "iq_recording_download") {
     selectedIqRecordingId = route.recordingId || selectedIqRecordingId;
@@ -14027,9 +14028,69 @@ function populateIqSampleRates() {
     const option = document.createElement("option");
     option.value = String(rate);
     option.textContent = `${rate} S/s`;
-    if (rate === 192000) option.selected = true;
+    if (rate === IQ_RECORDER_DEFAULT_SAMPLE_RATE) option.selected = true;
     select.appendChild(option);
   }
+}
+
+function defaultIqRecorderPreferences() {
+  return {
+    mode: "stream",
+    stream_id: "",
+    sample_rate: IQ_RECORDER_DEFAULT_SAMPLE_RATE,
+    duration_minutes: IQ_RECORDER_DEFAULT_DURATION_MINUTES
+  };
+}
+
+function loadIqRecorderPreferences() {
+  const defaults = defaultIqRecorderPreferences();
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(IQ_RECORDER_PREFS_KEY) || "{}");
+    if (!parsed || typeof parsed !== "object") return defaults;
+    const sampleRate = Number(parsed.sample_rate);
+    const durationMinutes = Number(parsed.duration_minutes);
+    const mode = parsed.mode === "spectrum" ? "spectrum" : "stream";
+    return {
+      mode,
+      stream_id: String(parsed.stream_id || ""),
+      sample_rate: IQ_RECORDER_SAMPLE_RATES.includes(sampleRate) ? sampleRate : defaults.sample_rate,
+      duration_minutes: Number.isFinite(durationMinutes)
+        ? Math.max(0, Math.min(1440, Math.round(durationMinutes)))
+        : defaults.duration_minutes
+    };
+  } catch (error) {
+    return defaults;
+  }
+}
+
+function rememberIqRecorderPreferences() {
+  const prefs = {
+    mode: currentIqMode(),
+    stream_id: document.getElementById("iq_stream_select").value || "",
+    sample_rate: Number(document.getElementById("iq_sample_rate").value) || IQ_RECORDER_DEFAULT_SAMPLE_RATE,
+    duration_minutes: Math.max(0, Math.min(1440, Number(document.getElementById("iq_duration_minutes").value || 0) || 0))
+  };
+  try {
+    window.localStorage.setItem(IQ_RECORDER_PREFS_KEY, JSON.stringify(prefs));
+  } catch (error) {
+    // localStorage may be unavailable; the form still works with in-page values.
+  }
+}
+
+function restoreIqRecorderPreferences() {
+  populateIqSampleRates();
+  renderIqStreamOptions(true);
+  const prefs = loadIqRecorderPreferences();
+  const mode = prefs.mode === "spectrum" ? "spectrum" : "stream";
+  setChecked("iq_mode_stream", mode === "stream");
+  setChecked("iq_mode_spectrum", mode === "spectrum");
+  const streamSelect = document.getElementById("iq_stream_select");
+  if (streamSelect && prefs.stream_id && Array.from(streamSelect.options).some(option => option.value === prefs.stream_id)) {
+    setValue("iq_stream_select", prefs.stream_id);
+  }
+  setValue("iq_sample_rate", String(prefs.sample_rate));
+  setValue("iq_duration_minutes", String(prefs.duration_minutes));
+  renderIqModeFields();
 }
 
 function activeIqStreamOptions() {
@@ -14209,7 +14270,9 @@ async function startIqRecording() {
   }
   const mode = currentIqMode();
   const rawMinutes = Number(document.getElementById("iq_duration_minutes").value || 0);
-  const minutes = Math.max(0, Math.min(1440, Number.isFinite(rawMinutes) ? rawMinutes : 5));
+  const minutes = Math.max(0, Math.min(1440, Number.isFinite(rawMinutes) ? rawMinutes : IQ_RECORDER_DEFAULT_DURATION_MINUTES));
+  setValue("iq_duration_minutes", String(minutes));
+  rememberIqRecorderPreferences();
   const payload = {
     mode,
     duration_seconds: Math.round(minutes * 60)
@@ -14759,9 +14822,17 @@ document.getElementById("receiver_play_pause").addEventListener("click", async (
 });
 
 for (const radio of document.querySelectorAll("input[name='iq_recording_mode']")) {
-  radio.addEventListener("change", renderIqModeFields);
+  radio.addEventListener("change", () => {
+    renderIqModeFields();
+    rememberIqRecorderPreferences();
+  });
 }
-document.getElementById("iq_stream_select").addEventListener("change", renderIqModeFields);
+document.getElementById("iq_stream_select").addEventListener("change", () => {
+  renderIqModeFields();
+  rememberIqRecorderPreferences();
+});
+document.getElementById("iq_sample_rate").addEventListener("change", rememberIqRecorderPreferences);
+document.getElementById("iq_duration_minutes").addEventListener("change", rememberIqRecorderPreferences);
 document.getElementById("iq_start_recording").addEventListener("click", async () => {
   try {
     await startIqRecording();
