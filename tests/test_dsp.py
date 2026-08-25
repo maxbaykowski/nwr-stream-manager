@@ -63,6 +63,20 @@ class DspTests(unittest.TestCase):
 
         self.assertGreater(float(np.mean(np.abs(output[-1000:]))), 0.99)
 
+    def test_iq_dc_blocker_updates_smoothly_within_large_chunks(self) -> None:
+        sample_rate = 1_536_000
+        blocker = self.dsp.IqDcBlocker(sample_rate=sample_rate, time_constant_seconds=1.0)
+        samples = np.ones(round(sample_rate * 0.02), dtype=np.complex64)
+
+        output = blocker.process(samples)
+        block_samples = round(sample_rate * blocker.max_block_seconds)
+        differences = np.abs(np.diff(output.real))
+        boundary_difference = float(differences[block_samples - 1])
+        later_mean = float(np.mean(output.real[-block_samples:]))
+
+        self.assertLess(boundary_difference, 0.002)
+        self.assertLess(later_mean, 0.99)
+
     def test_integer_decimator_matches_filter_then_downsample_reference(self) -> None:
         rng = np.random.default_rng(123)
         decimator = self.dsp.IntegerDecimator.create(
@@ -149,6 +163,15 @@ class DspTests(unittest.TestCase):
                 output = decimator.process(samples)
                 self.assertGreater(output.size, 0)
 
+    def test_wide_spectrum_transition_bandwidth_matches_intermediate_path(self) -> None:
+        for output_rate in (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_000, 1_536_000):
+            with self.subTest(output_rate=output_rate):
+                self.assertEqual(
+                    self.dsp._wide_decimator_transition_hz(output_rate, self.dsp.DEFAULT_ALIAS_TRANSITION_HZ),
+                    self.dsp.WIDE_DECIMATOR_MIN_TRANSITION_HZ,
+                )
+                self.assertEqual(self.dsp.WIDE_DECIMATOR_MIN_TRANSITION_HZ, 8_000.0)
+
     def test_high_ratio_fractional_wide_decimator_uses_staged_path(self) -> None:
         decimator = self.dsp.create_decimator(2_980_000, 192_000)
 
@@ -225,6 +248,26 @@ class DspTests(unittest.TestCase):
         self.assertIs(channelizer.decimator, decimator)
         self.assertIs(decimator.fir, fir)
         self.assertFalse(np.array_equal(fir.taps, original_taps))
+
+    def test_staged_decimator_alias_filter_update_retunes_first_and_final_stage(self) -> None:
+        decimator = self.dsp.create_decimator(
+            1_536_000,
+            24_000,
+            transition_hz=1_000,
+        )
+        self.assertIsInstance(decimator, self.dsp.StagedDecimator)
+        first_taps = decimator.first_stage.fir.taps.copy()
+        final_taps = decimator.final_stage.fir.taps.copy()
+
+        decimator.update_alias_filter(
+            1_536_000,
+            24_000,
+            transition_hz=4_000,
+            attenuation_db=40,
+        )
+
+        self.assertFalse(np.array_equal(decimator.first_stage.fir.taps, first_taps))
+        self.assertFalse(np.array_equal(decimator.final_stage.fir.taps, final_taps))
 
     def test_channelizer_target_frequency_update_keeps_existing_dsp_stages(self) -> None:
         channelizer = self.dsp.IqChannelizer(

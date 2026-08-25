@@ -479,6 +479,8 @@ class RtlCaptureSource:
 
     def __init__(self, config: RtlConfig) -> None:
         self.config = config
+        self.rtl_devices_provider: Callable[[], list[RtlDeviceInfo]] = list_rtl_devices
+        self.usb_rtl_devices_provider: Callable[[], list[UsbDeviceInfo]] = list_usb_rtl_devices
         self.sdr: BaseRtlSdr | None = None
         self.sdr_lock = threading.Lock()
         self.output_queue: queue.Queue[RtlSampleBatch | Exception | None] = queue.Queue(
@@ -496,6 +498,17 @@ class RtlCaptureSource:
         self.dropped_bytes = 0
         self.last_offer_at = 0.0
         self.last_drop_log_at = 0.0
+
+    def set_device_providers(
+        self,
+        *,
+        rtl_devices_provider: Callable[[], list[RtlDeviceInfo]] | None = None,
+        usb_rtl_devices_provider: Callable[[], list[UsbDeviceInfo]] | None = None,
+    ) -> None:
+        if rtl_devices_provider is not None:
+            self.rtl_devices_provider = rtl_devices_provider
+        if usb_rtl_devices_provider is not None:
+            self.usb_rtl_devices_provider = usb_rtl_devices_provider
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -878,15 +891,14 @@ class RtlCaptureSource:
         target_size -= target_size % 512
         return max(512, target_size)
 
-    @staticmethod
-    def _resolve_serial_to_device_index(serial: str) -> int:
+    def _resolve_serial_to_device_index(self, serial: str) -> int:
         if not serial:
             raise RtlDeviceResolutionFatalError(
                 "RTL-SDR serial is required. Device indexes are intentionally unsupported "
                 "because librtlsdr indexes can change after reconnects."
             )
-        usb_confirmed = RtlCaptureSource._wait_for_unique_usb_serial(serial)
-        devices = list_rtl_devices()
+        usb_confirmed = self._wait_for_unique_usb_serial(serial)
+        devices = self.rtl_devices_provider()
         matches = [device for device in devices if device.serial == serial]
         if not matches:
             if not usb_confirmed:
@@ -910,10 +922,9 @@ class RtlCaptureSource:
         )
         return matches[0].index
 
-    @staticmethod
-    def _wait_for_unique_usb_serial(serial: str) -> bool:
+    def _wait_for_unique_usb_serial(self, serial: str) -> bool:
         try:
-            usb_devices = list_usb_rtl_devices()
+            usb_devices = self.usb_rtl_devices_provider()
         except OSError as exc:
             LOG.warning(
                 "USB probe failed (%s); falling back to librtlsdr-only serial detection",
@@ -1143,7 +1154,7 @@ def _reset_usb_node_with_child_python(usb_node: Path, timeout_seconds: float) ->
         raise RtlUsbResetError(f"USB reset helper failed for {usb_node}{suffix}")
 
 
-def _reset_usb_node(usb_node: Path, timeout_seconds: float) -> str:
+def reset_usb_device_node(usb_node: Path, *, timeout_seconds: float = 5.0) -> str:
     usbreset = shutil.which("usbreset") if os.environ.get("NWR_STREAM_MANAGER_USE_USBRESET") == "1" else None
     if usbreset is not None:
         process = subprocess.Popen(
@@ -1185,7 +1196,7 @@ def reset_usb_rtl_device(serial: str, *, timeout_seconds: float = 5.0) -> tuple[
         raise RtlUsbResetError(f"USB bus/device numbers were not available for RTL-SDR serial {serial}")
     usb_node = Path("/dev/bus/usb") / f"{busnum:03d}" / f"{devnum:03d}"
     try:
-        method = _reset_usb_node(usb_node, timeout_seconds)
+        method = reset_usb_device_node(usb_node, timeout_seconds=timeout_seconds)
     except PermissionError as exc:
         raise RtlDeviceAccessFatalError(
             f"Access denied while resetting RTL-SDR serial {serial}. "

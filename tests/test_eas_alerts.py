@@ -486,6 +486,337 @@ class EasAlertTests(unittest.TestCase):
             saved = json.loads((streams_dir / "WXN99" / "config.json").read_text(encoding="utf-8"))
             self.assertEqual([output["icecast"]["mount"] for output in saved["outputs"]], ["/one", "/two"])
 
+    def test_add_stream_can_create_initial_soundcard_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            station = {"key": "WXN99|MI|162.475", "callsign": "WXN99", "frequency": "162.475"}
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = []
+            service.stations = [station]
+            service._sync_stream_workers_locked = lambda: None
+
+            response = service.add_stream(
+                {
+                    "station_key": station["key"],
+                    "type": "soundcard",
+                    "soundcard": {
+                        "stable_id": "alsa:usb:yeti",
+                        "channel_mode": "both",
+                        "volume": 0.75,
+                        "sample_rate": 48000,
+                    },
+                }
+            )
+
+            self.assertTrue(response["success"])
+            self.assertEqual(len(service.streams), 1)
+            output = service.streams[0]["outputs"][0]
+            self.assertEqual(output["type"], "soundcard")
+            self.assertEqual(output["soundcard"]["stable_id"], "alsa:usb:yeti")
+            self.assertEqual(output["soundcard"]["volume"], 0.75)
+            saved = json.loads((streams_dir / "WXN99" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["outputs"][0]["type"], "soundcard")
+
+    def test_soundcard_preview_stream_is_not_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            station = {"key": "WXN99|MI|162.475", "callsign": "WXN99", "frequency": "162.475"}
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = Path(temp_dir) / "streams"
+            service.streams = []
+            service.preview_streams = {}
+            service.stream_workers = {}
+            service.stations = [station]
+            service._sync_stream_workers_locked = lambda: None
+
+            response = service.upsert_soundcard_preview_stream(
+                {
+                    "station_key": station["key"],
+                    "soundcard": {
+                        "stable_id": "alsa:usb:yeti",
+                        "channel_mode": "both",
+                        "volume": 1.0,
+                        "sample_rate": 48000,
+                    },
+                }
+            )
+
+            self.assertTrue(response["success"])
+            self.assertEqual(len(service.preview_streams), 1)
+            self.assertEqual(service.streams, [])
+            self.assertFalse((Path(temp_dir) / "streams" / "WXN99" / "config.json").exists())
+
+            service.discard_soundcard_preview_stream(response["preview_id"])
+
+            self.assertEqual(service.preview_streams, {})
+
+    def test_finishing_soundcard_stream_discards_matching_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            station = {"key": "WXN99|MI|162.475", "callsign": "WXN99", "frequency": "162.475"}
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = []
+            service.preview_streams = {}
+            service.stream_workers = {}
+            service.stations = [station]
+            service._sync_stream_workers_locked = lambda: None
+
+            preview = service.upsert_soundcard_preview_stream(
+                {
+                    "station_key": station["key"],
+                    "soundcard": {
+                        "stable_id": "alsa:usb:yeti",
+                        "channel_mode": "both",
+                        "volume": 0.8,
+                        "sample_rate": 48000,
+                    },
+                }
+            )
+            response = service.add_stream(
+                {
+                    "station_key": station["key"],
+                    "type": "soundcard",
+                    "preview_id": preview["preview_id"],
+                    "soundcard": {
+                        "stable_id": "alsa:usb:yeti",
+                        "channel_mode": "both",
+                        "volume": 0.8,
+                        "sample_rate": 48000,
+                    },
+                }
+            )
+
+            self.assertTrue(response["success"])
+            self.assertEqual(service.preview_streams, {})
+            self.assertEqual(len(service.streams), 1)
+            self.assertEqual(service.streams[0]["outputs"][0]["type"], "soundcard")
+
+    def test_expired_soundcard_preview_is_stopped(self) -> None:
+        class Worker:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        service = object.__new__(self.web_control.RtlControlService)
+        service.lock = self.web_control.threading.RLock()
+        worker = Worker()
+        preview = {
+            "id": "preview-old",
+            "preview_id": "old",
+            "heartbeat_at": self.web_control.time.time() - self.web_control.SOUNDCARD_PREVIEW_TIMEOUT_SECONDS - 1,
+        }
+        service.preview_streams = {"old": preview}
+        service.stream_workers = {"preview-old": worker}
+
+        service._cleanup_expired_soundcard_previews()
+
+        self.assertEqual(service.preview_streams, {})
+        self.assertEqual(service.stream_workers, {})
+        self.assertTrue(worker.stopped)
+
+    def test_soundcard_preview_heartbeat_prevents_expiration(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.lock = self.web_control.threading.RLock()
+        preview = {
+            "id": "preview-live",
+            "preview_id": "live",
+            "heartbeat_at": self.web_control.time.time() - self.web_control.SOUNDCARD_PREVIEW_TIMEOUT_SECONDS - 1,
+        }
+        service.preview_streams = {"live": preview}
+        service.stream_workers = {}
+
+        service.heartbeat_soundcard_preview_stream("live")
+        service._cleanup_expired_soundcard_previews()
+
+        self.assertIn("live", service.preview_streams)
+
+    def test_update_soundcard_output_persists_live_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            stream = {
+                "id": "stream-1",
+                "enabled": True,
+                "station": {"callsign": "WXN99", "frequency": "162.475"},
+                "outputs": [
+                    {
+                        "id": "soundcard-1",
+                        "enabled": True,
+                        "type": "soundcard",
+                        "soundcard": {
+                            "stable_id": "alsa:usb:old",
+                            "channel_mode": "both",
+                            "volume": 1.0,
+                            "sample_rate": 48000,
+                        },
+                    }
+                ],
+            }
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+            service._sync_stream_workers_locked = lambda: None
+
+            response = service.update_stream_output(
+                {
+                    "stream_id": "stream-1",
+                    "output_id": "soundcard-1",
+                    "type": "soundcard",
+                    "enabled": True,
+                    "soundcard": {
+                        "stable_id": "alsa:usb:new",
+                        "channel_mode": "left",
+                        "volume": 0.65,
+                        "sample_rate": 48000,
+                    },
+                }
+            )
+
+            self.assertTrue(response["success"])
+            self.assertEqual(stream["outputs"][0]["soundcard"]["stable_id"], "alsa:usb:new")
+            self.assertEqual(stream["outputs"][0]["soundcard"]["channel_mode"], "left")
+            self.assertEqual(stream["outputs"][0]["soundcard"]["volume"], 0.65)
+            saved = json.loads((streams_dir / "WXN99" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["outputs"][0]["soundcard"]["stable_id"], "alsa:usb:new")
+
+    def test_reset_soundcard_closes_shared_session_and_resets_usb_node(self) -> None:
+        web_control = self.web_control
+        device = types.SimpleNamespace(
+            stable_id="alsa:usb:yeti",
+            bus="usb",
+            display_name="Yeti X",
+            card_id="Yeti",
+            card_index=3,
+            hw_device="hw:3,0",
+            pcm_device=0,
+            card_name="Yeti",
+            card_long_name="Yeti X",
+            pcm_id="USB Audio",
+            pcm_name="USB Audio",
+            vendor_id="b58e",
+            product_id="9e84",
+            serial="abc",
+            usb_port_path="1-2",
+            device_path="pci/usb1/1-2",
+            subdevices_count=1,
+            subdevices_available=1,
+        )
+        prepared = []
+        reset_nodes = []
+
+        class Manager:
+            def prepare_stable_id_for_reset(self, stable_id):
+                prepared.append(stable_id)
+                return True
+
+        service = object.__new__(web_control.RtlControlService)
+        service.reset_lock = web_control.threading.Lock()
+        service.soundcard_manager = Manager()
+        service._cached_soundcards = lambda: [device]
+        service._refresh_soundcards = lambda: [device]
+        service.status = lambda: {"status": "ok"}
+        original_node = web_control.playback_device_usb_node
+        original_reset = web_control.reset_usb_device_node
+        web_control.playback_device_usb_node = lambda selected: Path("/dev/bus/usb/003/017")
+        web_control.reset_usb_device_node = lambda node, timeout_seconds=5.0: reset_nodes.append(node) or "python-helper"
+        try:
+            response = service.reset_soundcard_device("alsa:usb:yeti")
+        finally:
+            web_control.playback_device_usb_node = original_node
+            web_control.reset_usb_device_node = original_reset
+
+        self.assertTrue(response["success"])
+        self.assertTrue(response["reappeared"])
+        self.assertEqual(prepared, ["alsa:usb:yeti"])
+        self.assertEqual(reset_nodes, [Path("/dev/bus/usb/003/017")])
+
+    def test_soundcard_output_switches_to_available_channel_when_target_channel_is_occupied(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            streams = [
+                {
+                    "id": "stream-1",
+                    "enabled": True,
+                    "station": {"callsign": "WXN99", "frequency": "162.475"},
+                    "outputs": [
+                        {
+                            "id": "left-output",
+                            "enabled": True,
+                            "type": "soundcard",
+                            "soundcard": {"stable_id": "alsa:usb:shared", "channel_mode": "left", "volume": 1.0, "sample_rate": 48000},
+                        }
+                    ],
+                },
+                {
+                    "id": "stream-2",
+                    "enabled": True,
+                    "station": {"callsign": "WZ2560", "frequency": "162.55"},
+                    "outputs": [
+                        {
+                            "id": "switch-output",
+                            "enabled": True,
+                            "type": "soundcard",
+                            "soundcard": {"stable_id": "alsa:usb:old", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000},
+                        }
+                    ],
+                },
+            ]
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = streams
+            service._sync_stream_workers_locked = lambda: None
+
+            service.update_stream_output(
+                {
+                    "stream_id": "stream-2",
+                    "output_id": "switch-output",
+                    "type": "soundcard",
+                    "enabled": True,
+                    "soundcard": {"stable_id": "alsa:usb:shared", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000},
+                }
+            )
+
+            self.assertEqual(streams[1]["outputs"][0]["soundcard"]["stable_id"], "alsa:usb:shared")
+            self.assertEqual(streams[1]["outputs"][0]["soundcard"]["channel_mode"], "right")
+
+    def test_soundcard_output_rejects_fully_occupied_device(self) -> None:
+        streams = [
+            {
+                "id": "stream-1",
+                "enabled": True,
+                "station": {"callsign": "WXN99"},
+                "outputs": [
+                    {
+                        "id": "both-output",
+                        "enabled": True,
+                        "type": "soundcard",
+                        "soundcard": {"stable_id": "alsa:usb:shared", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000},
+                    }
+                ],
+            },
+            {"id": "stream-2", "enabled": True, "station": {"callsign": "WZ2560"}, "outputs": []},
+        ]
+        service = object.__new__(self.web_control.RtlControlService)
+        service.lock = self.web_control.threading.RLock()
+        service.streams = streams
+        service.streams_directory = Path(tempfile.mkdtemp()) / "streams"
+
+        with self.assertRaisesRegex(ValueError, "no available output channels"):
+            service.add_stream_output(
+                {
+                    "stream_id": "stream-2",
+                    "type": "soundcard",
+                    "soundcard": {"stable_id": "alsa:usb:shared", "channel_mode": "left", "volume": 1.0, "sample_rate": 48000},
+                }
+            )
+
     def test_stream_status_reports_runtime_monitoring_without_persisting_it(self) -> None:
         service = object.__new__(self.web_control.RtlControlService)
         service.lock = self.web_control.threading.RLock()
@@ -528,10 +859,180 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertEqual(recorder.frames, [b"processed"])
 
+    def test_stream_worker_soundcard_tap_receives_processed_pcm_frame(self) -> None:
+        class Tap:
+            def __init__(self) -> None:
+                self.frames = []
+                self.started = False
+                self.closed = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def push_pcm(self, pcm) -> None:
+                self.frames.append(pcm)
+
+            def close(self) -> None:
+                self.closed = True
+
+        worker = object.__new__(self.web_control.IcecastStreamWorker)
+        worker.encoder_groups = {}
+        worker.monitor_sources = {}
+        worker.soundcard_taps = {}
+        worker.eas_recorder = None
+        worker.lock = self.web_control.threading.Lock()
+        worker.stream = {"station": {"callsign": "WXN99"}}
+        tap = Tap()
+
+        worker.add_soundcard_tap("tap-1", tap)
+        worker._write_pcm(b"processed")
+        self.assertTrue(worker._has_connected_outputs())
+        worker.remove_soundcard_tap("tap-1")
+
+        self.assertTrue(tap.started)
+        self.assertEqual(tap.frames, [b"processed"])
+        self.assertTrue(tap.closed)
+
+    def test_stream_sync_updates_soundcard_volume_and_channels_without_replacing_tap(self) -> None:
+        web_control = self.web_control
+
+        class Tap:
+            instances = []
+
+            def __init__(self, config, devices_provider=None):
+                self.config = config
+                self.started = False
+                self.stopped = False
+                self.channel_updates = []
+                self.volume_updates = []
+                Tap.instances.append(self)
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                self.stopped = True
+
+            def snapshot(self):
+                return {"status": "enabled", "stable_id": self.config.stable_id, "device": "hw:1,0"}
+
+            def set_channel_mode(self, channel_mode):
+                self.channel_updates.append(channel_mode)
+                self.config = web_control.AlsaStreamTapConfig(
+                    stable_id=self.config.stable_id,
+                    output_sample_rate=self.config.output_sample_rate,
+                    channel_mode=channel_mode,
+                    software_volume=self.config.software_volume,
+                )
+
+            def set_software_volume(self, volume):
+                self.volume_updates.append(volume)
+                self.config = web_control.AlsaStreamTapConfig(
+                    stable_id=self.config.stable_id,
+                    output_sample_rate=self.config.output_sample_rate,
+                    channel_mode=self.config.channel_mode,
+                    software_volume=volume,
+                )
+
+        def soundcard_output(channel_mode="both", volume=1.0, stable_id="alsa:usb:one"):
+            return {
+                "id": "soundcard-1",
+                "enabled": True,
+                "type": "soundcard",
+                "soundcard": {
+                    "stable_id": stable_id,
+                    "channel_mode": channel_mode,
+                    "volume": volume,
+                    "sample_rate": 48000,
+                },
+            }
+
+        worker = object.__new__(web_control.IcecastStreamWorker)
+        worker.outputs = {}
+        worker.soundcard_taps = {}
+        worker.stream = {"id": "stream-1", "station": {"callsign": "WXN99"}}
+        worker.lock = web_control.threading.Lock()
+        worker._soundcard_devices_provider = lambda: []
+        worker._sync_eas_recorder = lambda stream: None
+        original_tap = web_control.AlsaStreamPlaybackTap
+        web_control.AlsaStreamPlaybackTap = Tap
+        try:
+            worker.sync_stream({"outputs": [soundcard_output()]})
+            worker.sync_stream({"outputs": [soundcard_output(channel_mode="right", volume=0.5)]})
+
+            self.assertEqual(len(Tap.instances), 1)
+            self.assertEqual(Tap.instances[0].channel_updates[-1], "right")
+            self.assertEqual(Tap.instances[0].volume_updates[-1], 0.5)
+            self.assertFalse(Tap.instances[0].stopped)
+        finally:
+            web_control.AlsaStreamPlaybackTap = original_tap
+
+    def test_stream_sync_replaces_soundcard_tap_when_device_changes(self) -> None:
+        web_control = self.web_control
+
+        class Tap:
+            instances = []
+
+            def __init__(self, config, devices_provider=None):
+                self.config = config
+                self.started = False
+                self.stopped = False
+                Tap.instances.append(self)
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                self.stopped = True
+
+            def snapshot(self):
+                return {"status": "enabled", "stable_id": self.config.stable_id, "device": "hw:1,0"}
+
+            def set_channel_mode(self, channel_mode):
+                pass
+
+            def set_software_volume(self, volume):
+                pass
+
+        def soundcard_output(stable_id):
+            return {
+                "id": "soundcard-1",
+                "enabled": True,
+                "type": "soundcard",
+                "soundcard": {
+                    "stable_id": stable_id,
+                    "channel_mode": "both",
+                    "volume": 1.0,
+                    "sample_rate": 48000,
+                },
+            }
+
+        worker = object.__new__(web_control.IcecastStreamWorker)
+        worker.outputs = {}
+        worker.soundcard_taps = {}
+        worker.stream = {"id": "stream-1", "station": {"callsign": "WXN99"}}
+        worker.lock = web_control.threading.Lock()
+        worker._soundcard_devices_provider = lambda: []
+        worker._sync_eas_recorder = lambda stream: None
+        original_tap = web_control.AlsaStreamPlaybackTap
+        web_control.AlsaStreamPlaybackTap = Tap
+        try:
+            worker.sync_stream({"outputs": [soundcard_output("alsa:usb:one")]})
+            first = Tap.instances[0]
+            worker.sync_stream({"outputs": [soundcard_output("alsa:usb:two")]})
+
+            self.assertEqual(len(Tap.instances), 2)
+            self.assertTrue(first.stopped)
+            self.assertEqual(Tap.instances[1].config.stable_id, "alsa:usb:two")
+            self.assertTrue(Tap.instances[1].started)
+        finally:
+            web_control.AlsaStreamPlaybackTap = original_tap
+
     def test_stream_worker_treats_eas_as_shared_processed_output(self) -> None:
         worker = object.__new__(self.web_control.IcecastStreamWorker)
         worker.encoder_groups = {}
         worker.monitor_sources = {}
+        worker.soundcard_taps = {}
         worker.eas_recorder = object()
         worker.lock = self.web_control.threading.Lock()
 
@@ -1091,6 +1592,43 @@ class EasAlertTests(unittest.TestCase):
         self.assertLess(boundary_difference, 0.01)
         self.assertLess(boundary_difference, float(np.max(differences[: frame_samples - 1])) * 2.0)
 
+    def test_audio_dc_blocker_matches_sample_by_sample_processing_across_chunks(self) -> None:
+        sample_rate = 24_000
+        rng = np.random.default_rng(1234)
+        samples = (
+            0.35
+            + 0.05 * np.sin(2.0 * np.pi * 37.0 * np.arange(4096, dtype=np.float32) / sample_rate)
+            + rng.normal(0.0, 0.01, 4096).astype(np.float32)
+        ).astype(np.float32)
+        chunked = self.audio_effects.DcBlocker(sample_rate=sample_rate)
+        single = self.audio_effects.DcBlocker(sample_rate=sample_rate)
+
+        chunked_output = np.concatenate([
+            chunked.process(samples[index : index + 257])
+            for index in range(0, len(samples), 257)
+        ])
+        single_output = np.concatenate([
+            single.process(samples[index : index + 1])
+            for index in range(len(samples))
+        ])
+
+        self.assertLess(float(np.max(np.abs(chunked_output - single_output))), 1e-5)
+
+    def test_notch_filter_near_nyquist_does_not_raise_or_emit_nan(self) -> None:
+        config = self.config
+        processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
+            deemphasis=config.DeemphasisConfig(enabled=False, tau=0),
+            volume=config.VolumeConfig(enabled=False, multiplier=1.0),
+            lowpass=config.FilterConfig(enabled=False, frequency=3400, sharpness=0),
+            notch=config.FilterConfig(enabled=True, frequency=12000, sharpness=10),
+        ))
+        samples = np.zeros(480, dtype=np.float32)
+
+        output = processor.process(samples)
+
+        self.assertEqual(output.shape, samples.shape)
+        self.assertFalse(np.any(np.isnan(output)))
+
     def test_deemphasis_makeup_gain_increases_with_time_constant(self) -> None:
         self.assertLess(
             self.web_control.deemphasis_makeup_gain(0),
@@ -1124,6 +1662,28 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(len(first), 0)
         self.assertEqual(len(empty), 0)
         self.assertEqual(len(resumed), 1)
+
+    def test_complex_nfm_demodulator_reset_drops_cross_channel_phase_step(self) -> None:
+        demodulator = self.web_control.ComplexNfmDemodulator()
+
+        demodulator.process(np.array([1 + 0j], dtype=np.complex64))
+        with_step = demodulator.process(np.array([0 + 1j], dtype=np.complex64))
+        demodulator.reset()
+        after_reset = demodulator.process(np.array([0 + 1j], dtype=np.complex64))
+
+        self.assertEqual(len(with_step), 1)
+        self.assertGreater(abs(float(with_step[0])), 0.1)
+        self.assertEqual(len(after_reset), 0)
+
+    def test_float_frame_buffer_clear_discards_partial_old_channel_frame(self) -> None:
+        buffer = self.web_control.FloatFrameBuffer(4)
+
+        self.assertEqual(list(buffer.push(np.array([1.0, 2.0], dtype=np.float32))), [])
+        buffer.clear()
+        frames = list(buffer.push(np.array([3.0, 4.0, 5.0, 6.0], dtype=np.float32)))
+
+        self.assertEqual(len(frames), 1)
+        np.testing.assert_array_equal(frames[0], np.array([3.0, 4.0, 5.0, 6.0], dtype=np.float32))
 
     def test_fallback_frame_uses_audio_sample_rate(self) -> None:
         audio = types.SimpleNamespace(
@@ -1335,6 +1895,115 @@ class EasAlertTests(unittest.TestCase):
             entries = web_control.load_iq_recording_entries(Path(tempdir) / "index.json")
             self.assertEqual(entries[0]["id"], "recording-1")
             self.assertEqual(entries[0]["sample_rate"], sample_rate)
+
+    def test_iq_recorder_writes_192ksps_spectrum_from_intermediate_iq_without_decimating(self) -> None:
+        web_control = self.web_control
+
+        class Fanout:
+            def __init__(self):
+                self.queue = web_control.queue.Queue(maxsize=8)
+
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return self.queue
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        class Storage:
+            def add_path(self, path):
+                pass
+
+            def recording_started(self):
+                pass
+
+            def recording_stopped(self):
+                pass
+
+            def is_critical(self, path):
+                return False
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            output_path = Path(tempdir) / "intermediate-spectrum.cf32"
+            fanout = Fanout()
+            sample_rate = web_control.INTERMEDIATE_IQ_SAMPLE_RATE
+            iq = np.exp(1j * 2 * np.pi * 1000 * np.arange(2048, dtype=np.float32) / sample_rate).astype(np.complex64)
+            worker = web_control.IqRecorderWorker(
+                fanout=fanout,
+                config=web_control.IqRecorderConfig(
+                    recording_id="recording-intermediate",
+                    mode=web_control.IQ_RECORDER_MODE_SPECTRUM,
+                    sample_rate=sample_rate,
+                    duration_seconds=1.0,
+                    output_path=output_path,
+                    index_path=Path(tempdir) / "index.json",
+                    frequency_hz=162_475_000,
+                ),
+                storage_monitor=Storage(),
+                alias_filter_strength_provider=lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
+            )
+            worker.start()
+            fanout.queue.put(web_control.IqSampleBatch(data=iq, sample_rate=sample_rate, center_frequency_hz=162_475_000))
+            self._wait_for(lambda: output_path.exists() and output_path.stat().st_size >= iq.size * 8)
+            worker.stop()
+
+            interleaved = np.frombuffer(output_path.read_bytes(), dtype="<f4")
+            actual = interleaved[0::2] + 1j * interleaved[1::2]
+            np.testing.assert_array_equal(actual.astype(np.complex64), iq)
+
+    def test_192ksps_spectrum_recording_uses_intermediate_fanout(self) -> None:
+        web_control = self.web_control
+
+        class Storage:
+            def is_critical(self, path):
+                return False
+
+            def snapshot(self):
+                return {"filesystems": []}
+
+        class Worker:
+            instances = []
+
+            def __init__(self, *, fanout, config, storage_monitor, alias_filter_strength_provider):
+                self.fanout = fanout
+                self.config = config
+                self.storage_monitor = storage_monitor
+                self.alias_filter_strength_provider = alias_filter_strength_provider
+                Worker.instances.append(self)
+
+            def start(self):
+                pass
+
+            def snapshot(self):
+                return {"active": True, "status": "recording"}
+
+            def storage_time_remaining(self, storage, recordings_directory):
+                return None
+
+        original_worker = web_control.IqRecorderWorker
+        service = object.__new__(web_control.RtlControlService)
+        service.lock = web_control.threading.RLock()
+        service.iq_recorder = None
+        service.iq_recorder_account_id = None
+        service.raw_fanout = object()
+        service.intermediate_fanout = object()
+        service.storage_monitor = Storage()
+        service.iq_recordings_directory = Path(tempfile.gettempdir()) / "nwr-stream-manager-test-iq"
+        service.iq_recordings_index_path = service.iq_recordings_directory / "index.json"
+        service.settings = web_control.RtlControlSettings(alias_filter_strength=web_control.ALIAS_FILTER_STRENGTH_DEFAULT)
+        web_control.IqRecorderWorker = Worker
+        try:
+            service.start_iq_recording(
+                {
+                    "mode": web_control.IQ_RECORDER_MODE_SPECTRUM,
+                    "sample_rate": web_control.INTERMEDIATE_IQ_SAMPLE_RATE,
+                    "duration_seconds": 1,
+                }
+            )
+        finally:
+            web_control.IqRecorderWorker = original_worker
+
+        self.assertEqual(len(Worker.instances), 1)
+        self.assertIs(Worker.instances[0].fanout, service.intermediate_fanout)
 
     def test_iq_recorder_spectrum_decimators_support_all_recording_rates(self) -> None:
         web_control = self.web_control

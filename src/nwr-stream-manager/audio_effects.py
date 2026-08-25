@@ -70,7 +70,8 @@ class FirFilter:
 class DcBlocker:
     sample_rate: int = IQ_SAMPLE_RATE
     cutoff_hz: float = DC_BLOCK_CUTOFF_HZ
-    _mean: float = 0.0
+    _previous_input: float = 0.0
+    _previous_output: float = 0.0
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -92,13 +93,24 @@ class DcBlocker:
         return output
 
     def _process_vector_chunk(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        indices = np.arange(len(samples), dtype=np.float64)
-        powers = self.coefficient**indices
-        weighted = np.cumsum(samples.astype(np.float64, copy=False) / powers)
-        means = (self.coefficient ** (indices + 1.0)) * self._mean
-        means += (1.0 - self.coefficient) * powers * weighted
-        self._mean = float(means[-1])
-        return (samples - means).astype(np.float32, copy=False)
+        # Streaming one-pole DC blocker:
+        # y[n] = x[n] - x[n-1] + r*y[n-1].
+        # Compute the recursive tail in float64 chunks to avoid the large
+        # exponent/division terms used by the old running-mean form.
+        x = samples.astype(np.float64, copy=False)
+        r = self.coefficient
+        highpass_input = np.empty_like(x)
+        highpass_input[0] = x[0] - self._previous_input
+        if len(x) > 1:
+            highpass_input[1:] = np.diff(x)
+        indices = np.arange(len(x), dtype=np.float64)
+        powers = r**indices
+        weighted = np.cumsum(highpass_input / powers)
+        output = (r ** (indices + 1.0)) * self._previous_output
+        output += powers * weighted
+        self._previous_input = float(x[-1])
+        self._previous_output = float(output[-1])
+        return output.astype(np.float32, copy=False)
 
 
 @dataclass
@@ -279,6 +291,8 @@ def _filter_kernel(
         width = _notch_width(config.sharpness)
         low = max(1.0, config.frequency - width / 2)
         high = min(sample_rate / 2 - 1.0, config.frequency + width / 2)
+        if high <= low:
+            return None
         return _notch_kernel(low, high, sample_rate, taps)
     raise ValueError(f"unsupported filter kind: {kind}")
 

@@ -97,6 +97,43 @@ class RtlCaptureTests(unittest.TestCase):
         self.assertEqual(batch.sample_rate, initial.sample_rate)
         self.assertEqual(batch.center_frequency_hz, initial.center_frequency_hz)
 
+    def test_serial_resolution_uses_injected_device_providers(self) -> None:
+        source = self.rtl.RtlCaptureSource(self.rtl.RtlConfig(serial="abc"))
+        direct_calls = {"rtl": 0, "usb": 0}
+
+        def direct_rtl():
+            direct_calls["rtl"] += 1
+            return []
+
+        def direct_usb():
+            direct_calls["usb"] += 1
+            return []
+
+        source.set_device_providers(
+            rtl_devices_provider=lambda: [self.rtl.RtlDeviceInfo(index=7, description="RTL", serial="abc")],
+            usb_rtl_devices_provider=lambda: [
+                self.rtl.UsbDeviceInfo(
+                    path=Path("/sys/bus/usb/devices/1-1"),
+                    vendor_id="0bda",
+                    product_id="2838",
+                    serial="abc",
+                    description="RTL",
+                )
+            ],
+        )
+        original_rtl = self.rtl.list_rtl_devices
+        original_usb = self.rtl.list_usb_rtl_devices
+        try:
+            self.rtl.list_rtl_devices = direct_rtl
+            self.rtl.list_usb_rtl_devices = direct_usb
+            index = source._resolve_serial_to_device_index("abc")
+        finally:
+            self.rtl.list_rtl_devices = original_rtl
+            self.rtl.list_usb_rtl_devices = original_usb
+
+        self.assertEqual(index, 7)
+        self.assertEqual(direct_calls, {"rtl": 0, "usb": 0})
+
     def test_open_rtlsdr_device_uses_compat_wrapper_when_dithering_symbol_is_missing(self) -> None:
         class PyBase:
             called = False

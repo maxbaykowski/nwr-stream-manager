@@ -162,6 +162,21 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(second, b"a" * len(second))
         self.assertEqual(stats["underrun_frames"], 1)
 
+    def test_audio_source_does_not_miss_push_between_buffer_check_and_wait(self) -> None:
+        async def run_test():
+            source = self.webrtc.WebRtcAudioSource(prebuffer_frames=0, low_water_frames=0)
+            source._bind_loop(asyncio.get_running_loop())
+            with source.lock:
+                notify_sequence = source._notify_sequence
+            source.push_pcm(b"a" * source.frame_bytes)
+            started = asyncio.get_running_loop().time()
+            await source._wait_for_push(0.05, notify_sequence)
+            elapsed = asyncio.get_running_loop().time() - started
+            return elapsed
+
+        elapsed = asyncio.run(run_test())
+        self.assertLess(elapsed, 0.02)
+
     def test_audio_source_preserves_bursty_pcm_above_target_latency(self) -> None:
         async def run_test():
             source = self.webrtc.WebRtcAudioSource(
@@ -476,6 +491,38 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(feedback["available_bitrate_bps"], 96_000)
         self.assertEqual(feedback["packet_loss_fraction"], 0.02)
         self.assertEqual(feedback["rtt_ms"], 250.0)
+
+    def test_sender_bitrate_configuration_awaits_async_set_parameters(self) -> None:
+        class Encoding:
+            maxBitrate = None
+
+        class Parameters:
+            def __init__(self) -> None:
+                self.encodings = [Encoding()]
+
+        class Sender:
+            def __init__(self) -> None:
+                self.parameters = Parameters()
+                self.awaited = False
+
+            def getParameters(self):
+                return self.parameters
+
+            async def setParameters(self, parameters):
+                self.awaited = True
+                self.parameters = parameters
+
+        async def run_test():
+            sender = Sender()
+            result = self_webrtc._configure_sender_bitrate(sender, 96)
+            if hasattr(result, "__await__"):
+                await result
+            return sender.awaited, sender.parameters.encodings[0].maxBitrate
+
+        self_webrtc = self.webrtc
+        awaited, max_bitrate = asyncio.run(run_test())
+        self.assertTrue(awaited)
+        self.assertEqual(max_bitrate, 96_000)
 
     def test_opus_encoder_encodes_20_ms_packet_when_available(self) -> None:
         try:

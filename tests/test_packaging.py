@@ -106,6 +106,14 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("startBackgroundDownload", download_function)
         self.assertNotIn("window.location.href", download_function)
 
+    def test_browser_routes_preserve_deep_link_ids(self) -> None:
+        script = self.web_control.INDEX_HTML
+
+        self.assertIn("outputId: initialRoute.outputId", script)
+        self.assertIn("outputId: link.dataset.outputId || \"\"", script)
+        self.assertIn("recordingId: link.dataset.recordingId || \"\"", script)
+        self.assertIn("function replaceCurrentRoute", script)
+
 
 if __name__ == "__main__":
     unittest.main()

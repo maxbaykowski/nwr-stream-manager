@@ -339,6 +339,7 @@ class WebRtcAudioSource:
         self.last_underrun_log_at = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._event: asyncio.Event | None = None
+        self._notify_sequence = 0
         self._prebuffered = False
 
     def push_pcm(self, pcm_s16le: bytes) -> None:
@@ -357,6 +358,7 @@ class WebRtcAudioSource:
                 self.pushed_frames += 1
                 self.max_buffered_frames = max(self.max_buffered_frames, len(self.buffer))
                 self.last_frame_at = now
+            self._notify_sequence += 1
             if len(self.buffer) > self.latency_high_water_frames:
                 while len(self.buffer) > self.latency_trim_to_frames:
                     self.buffer.popleft()
@@ -454,10 +456,11 @@ class WebRtcAudioSource:
             with self.lock:
                 if len(self.buffer) >= frame_count:
                     return
+                notify_sequence = self._notify_sequence
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
-            await self._wait_for_push(min(remaining, WEBRTC_FRAME_SECONDS))
+            await self._wait_for_push(min(remaining, WEBRTC_FRAME_SECONDS), notify_sequence)
 
     async def _pop_frame(self, timeout: float) -> bytes | None:
         deadline = time.monotonic() + max(0.0, timeout)
@@ -465,18 +468,27 @@ class WebRtcAudioSource:
             with self.lock:
                 if self.buffer:
                     return self.buffer.popleft()
+                notify_sequence = self._notify_sequence
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
-            await self._wait_for_push(min(remaining, WEBRTC_FRAME_SECONDS))
+            await self._wait_for_push(min(remaining, WEBRTC_FRAME_SECONDS), notify_sequence)
         return None
 
-    async def _wait_for_push(self, timeout: float) -> None:
+    async def _wait_for_push(self, timeout: float, notify_sequence: int | None = None) -> None:
         event = self._event
         if event is None:
             await asyncio.sleep(timeout)
             return
+        if notify_sequence is not None:
+            with self.lock:
+                if self._notify_sequence != notify_sequence:
+                    return
         event.clear()
+        if notify_sequence is not None:
+            with self.lock:
+                if self._notify_sequence != notify_sequence:
+                    return
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
         except TimeoutError:
@@ -719,7 +731,12 @@ class AiortcSessionManager:
         answer = await peer.createAnswer()
         await peer.setLocalDescription(answer)
         for sender in senders:
-            _configure_sender_bitrate(sender, WEBRTC_TARGET_BITRATE_KBPS)
+            try:
+                result = _configure_sender_bitrate(sender, WEBRTC_TARGET_BITRATE_KBPS)
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception as exc:
+                LOG.debug("could not set WebRTC sender bitrate to %s Kbps: %s", WEBRTC_TARGET_BITRATE_KBPS, exc)
         with self.lock:
             old_peer = self.sessions.pop(session_id, None)
             self.sessions[session_id] = peer
@@ -865,14 +882,13 @@ def _prefer_opus(peer: Any) -> None:
         LOG.debug("could not force WebRTC Opus codec preference: %s", exc)
 
 
-def _configure_sender_bitrate(sender: Any, bitrate_kbps: int) -> None:
+def _configure_sender_bitrate(sender: Any, bitrate_kbps: int):
     try:
         parameters = sender.getParameters()
         if not parameters.encodings:
             return
         parameters.encodings[0].maxBitrate = int(bitrate_kbps) * 1000
-        result = sender.setParameters(parameters)
-        if hasattr(result, "__await__"):
-            LOG.debug("WebRTC sender bitrate parameter update is async and will be skipped")
+        return sender.setParameters(parameters)
     except Exception as exc:
         LOG.debug("could not set WebRTC sender bitrate to %s Kbps: %s", bitrate_kbps, exc)
+    return None

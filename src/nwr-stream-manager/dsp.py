@@ -16,9 +16,9 @@ DEFAULT_OUTPUT_SAMPLE_RATE = 24_000
 DEFAULT_ALIAS_TRANSITION_HZ = 1_000.0
 DEFAULT_ALIAS_ATTENUATION_DB = 80.0
 WIDE_DECIMATOR_MIN_TRANSITION_HZ = 8_000.0
-WIDE_DECIMATOR_TRANSITION_FRACTION = 1.0 / 24.0
 WIDE_DECIMATOR_ALIAS_ATTENUATION_DB = 70.0
 DEFAULT_DC_BLOCK_TIME_CONSTANT_SECONDS = 1.0
+DEFAULT_DC_BLOCK_MAX_BLOCK_SECONDS = 0.001
 STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE = 96_000.0
 STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE = 192_000.0
 RATIONAL_INTERPOLATOR_TAPS = 16
@@ -48,6 +48,7 @@ def complex64_to_interleaved_f32(samples: ComplexArray) -> bytes:
 class IqDcBlocker:
     sample_rate: int
     time_constant_seconds: float = DEFAULT_DC_BLOCK_TIME_CONSTANT_SECONDS
+    max_block_seconds: float = DEFAULT_DC_BLOCK_MAX_BLOCK_SECONDS
     _mean: np.complex64 = np.complex64(0.0)
 
     def __post_init__(self) -> None:
@@ -55,15 +56,22 @@ class IqDcBlocker:
             raise ValueError("sample_rate must be greater than 0")
         if self.time_constant_seconds <= 0.0:
             raise ValueError("time_constant_seconds must be greater than 0")
+        if self.max_block_seconds <= 0.0:
+            raise ValueError("max_block_seconds must be greater than 0")
 
     def process(self, samples: ComplexArray) -> ComplexArray:
         if samples.size == 0:
             return np.array([], dtype=np.complex64)
         samples = samples.astype(np.complex64, copy=False)
-        block_average = np.complex128(np.mean(samples, dtype=np.complex128))
-        decay = math.exp(-samples.size / (float(self.sample_rate) * self.time_constant_seconds))
-        output = (samples - self._mean).astype(np.complex64, copy=False)
-        self._mean = np.complex64(block_average + (np.complex128(self._mean) - block_average) * decay)
+        output = np.empty_like(samples, dtype=np.complex64)
+        block_size = max(1, int(round(float(self.sample_rate) * self.max_block_seconds)))
+        for start in range(0, samples.size, block_size):
+            stop = min(samples.size, start + block_size)
+            block = samples[start:stop]
+            block_average = np.complex128(np.mean(block, dtype=np.complex128))
+            decay = math.exp(-block.size / (float(self.sample_rate) * self.time_constant_seconds))
+            output[start:stop] = (block - self._mean).astype(np.complex64, copy=False)
+            self._mean = np.complex64(block_average + (np.complex128(self._mean) - block_average) * decay)
         return output
 
 
@@ -423,6 +431,7 @@ class StagedDecimator:
                     self.intermediate_rate,
                     self.output_rate,
                     self.transition_hz,
+                    self.attenuation_db,
                 )
             ),
         )
@@ -468,6 +477,15 @@ class StagedDecimator:
             raise ValueError("staged decimator rates cannot change during alias filter update")
         self.transition_hz = float(transition_hz)
         self.attenuation_db = float(attenuation_db)
+        self.first_stage.fir.update_taps(
+            self._design_first_stage_taps(
+                self.input_rate,
+                self.intermediate_rate,
+                self.output_rate,
+                self.transition_hz,
+                self.attenuation_db,
+            )
+        )
         update_decimator_alias_filter(
             self.final_stage,
             int(round(self.intermediate_rate)),
@@ -512,6 +530,7 @@ class StagedDecimator:
         intermediate_rate: float,
         output_rate: int,
         requested_transition_hz: float,
+        attenuation_db: float = 60.0,
     ) -> FloatArray:
         if intermediate_rate >= input_rate:
             return np.array([1.0], dtype=np.float32)
@@ -531,7 +550,7 @@ class StagedDecimator:
             input_rate,
             cutoff,
             transition,
-            attenuation_db=60.0,
+            attenuation_db=min(60.0, float(attenuation_db)),
         )
 
 
@@ -621,11 +640,7 @@ def update_decimator_alias_filter(
 
 def _wide_decimator_transition_hz(output_rate: int, requested_transition_hz: float) -> float:
     nyquist = float(output_rate) / 2.0
-    transition = max(
-        float(requested_transition_hz),
-        WIDE_DECIMATOR_MIN_TRANSITION_HZ,
-        float(output_rate) * WIDE_DECIMATOR_TRANSITION_FRACTION,
-    )
+    transition = max(float(requested_transition_hz), WIDE_DECIMATOR_MIN_TRANSITION_HZ)
     return min(transition, nyquist * 0.45)
 
 

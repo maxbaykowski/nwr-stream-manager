@@ -35,6 +35,19 @@ from urllib.parse import parse_qs, urlparse
 
 if __package__:
     from .audio_effects import AudioEffectsProcessor, deemphasis_makeup_gain
+    from .alsa import (
+        ALSA_CHANNEL_BOTH,
+        ALSA_CHANNEL_LEFT,
+        ALSA_CHANNEL_MODES,
+        ALSA_CHANNEL_RIGHT,
+        ALSA_STREAM_DEFAULT_SAMPLE_RATE,
+        AlsaSharedInputConfig,
+        AlsaSharedPlaybackTap,
+        AlsaStreamPlaybackTap,
+        AlsaStreamTapConfig,
+        discover_playback_devices,
+        playback_device_usb_node,
+    )
     from .config import (
         AUDIO_NYQUIST_HZ,
         AudioConfig,
@@ -43,6 +56,7 @@ if __package__:
         IQ_SAMPLE_RATE,
         parse_audio_config,
     )
+    from .device_probe import SharedDeviceProbe
     from .dsp import (
         ComplexArray,
         DEFAULT_ALIAS_ATTENUATION_DB,
@@ -66,6 +80,7 @@ if __package__:
         RtlSampleBatch,
         list_rtl_devices,
         list_usb_rtl_devices,
+        reset_usb_device_node,
         reset_usb_rtl_device,
         rtl_u8_to_complex64,
         validate_ppm_correction,
@@ -90,7 +105,9 @@ else:
     package.__version__ = "0.0.0"  # type: ignore[attr-defined]
     sys.modules.setdefault(package_name, package)
     audio_effects = importlib.import_module(f"{package_name}.audio_effects")
+    alsa_module = importlib.import_module(f"{package_name}.alsa")
     config_module = importlib.import_module(f"{package_name}.config")
+    device_probe_module = importlib.import_module(f"{package_name}.device_probe")
     dsp = importlib.import_module(f"{package_name}.dsp")
     eas_recording = importlib.import_module(f"{package_name}.eas_recording")
     encoder = importlib.import_module(f"{package_name}.encoder")
@@ -103,6 +120,18 @@ else:
     webrtc = importlib.import_module(f"{package_name}.webrtc")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
     deemphasis_makeup_gain = audio_effects.deemphasis_makeup_gain
+    ALSA_CHANNEL_BOTH = alsa_module.ALSA_CHANNEL_BOTH
+    ALSA_CHANNEL_LEFT = alsa_module.ALSA_CHANNEL_LEFT
+    ALSA_CHANNEL_MODES = alsa_module.ALSA_CHANNEL_MODES
+    ALSA_CHANNEL_RIGHT = alsa_module.ALSA_CHANNEL_RIGHT
+    ALSA_STREAM_DEFAULT_SAMPLE_RATE = alsa_module.ALSA_STREAM_DEFAULT_SAMPLE_RATE
+    AlsaSharedInputConfig = alsa_module.AlsaSharedInputConfig
+    AlsaSharedPlaybackTap = alsa_module.AlsaSharedPlaybackTap
+    AlsaStreamPlaybackTap = alsa_module.AlsaStreamPlaybackTap
+    AlsaStreamTapConfig = alsa_module.AlsaStreamTapConfig
+    discover_playback_devices = alsa_module.discover_playback_devices
+    playback_device_usb_node = alsa_module.playback_device_usb_node
+    SharedDeviceProbe = device_probe_module.SharedDeviceProbe
     AUDIO_NYQUIST_HZ = config_module.AUDIO_NYQUIST_HZ
     AudioConfig = config_module.AudioConfig
     EasRecordingConfig = config_module.EasRecordingConfig
@@ -130,6 +159,7 @@ else:
     RtlSampleBatch = rtl.RtlSampleBatch
     list_rtl_devices = rtl.list_rtl_devices
     list_usb_rtl_devices = rtl.list_usb_rtl_devices
+    reset_usb_device_node = rtl.reset_usb_device_node
     reset_usb_rtl_device = rtl.reset_usb_rtl_device
     rtl_u8_to_complex64 = rtl.rtl_u8_to_complex64
     validate_ppm_correction = rtl.validate_ppm_correction
@@ -216,6 +246,7 @@ STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
 STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
+STREAM_SILENCE_FLOAT_FRAME = np.zeros(STREAM_FRAME_SAMPLES, dtype=np.float32)
 RTL_RESET_COMMAND_TIMEOUT_SECONDS = 5.0
 RTL_RESET_REAPPEAR_TIMEOUT_SECONDS = 10.0
 STREAM_WORKER_RAW_QUEUE_SECONDS = 1.50
@@ -251,6 +282,8 @@ IQ_STORAGE_ESTIMATE_CORRECTION_FRACTION = 0.002
 STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
+SOUNDCARD_PREVIEW_TIMEOUT_SECONDS = 8.0
+SOUNDCARD_PREVIEW_CLEANUP_SECONDS = 2.0
 MAX_JSON_REQUEST_BYTES = 1_048_576
 RECENT_EAS_ALERT_SECONDS = 24 * 60 * 60
 RECENT_EAS_ALERT_LIMIT = 10
@@ -1438,6 +1471,9 @@ class ComplexNfmDemodulator:
     def __init__(self) -> None:
         self.previous_sample: np.complex64 | None = None
 
+    def reset(self) -> None:
+        self.previous_sample = None
+
     def process(self, iq: np.ndarray) -> np.ndarray:
         if len(iq) == 0:
             return np.array([], dtype=np.float32)
@@ -1639,6 +1675,12 @@ def next_web_fallback_frame(audio, state: WebFallbackPlaybackState, loop_delay_s
         output.extend(audio.pcm[state.position : state.position + chunk_size])
         state.position += chunk_size
     return bytes(output)
+
+
+def pcm_s16le_to_float32(pcm: bytes) -> np.ndarray:
+    if not pcm:
+        return np.empty(0, dtype=np.float32)
+    return (np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0).astype(np.float32, copy=False)
 
 
 def validate_account_username(username: str) -> str:
@@ -2142,6 +2184,93 @@ class SameAwareWebRtcAudioSource:
         self.audio_source.close()
 
 
+class SharedSoundcardOutputManager:
+    def __init__(self, *, devices_provider=None) -> None:
+        self.devices_provider = devices_provider or discover_playback_devices
+        self.lock = threading.RLock()
+        self.sessions: dict[str, Any] = {}
+        self.outputs: dict[str, dict[str, Any]] = {}
+
+    def sync_output(self, output_id: str, soundcard: dict[str, Any]) -> None:
+        output_id = str(output_id)
+        config = soundcard_tap_config_from_soundcard(soundcard)
+        input_config = AlsaSharedInputConfig(
+            channel_mode=config.channel_mode,
+            software_volume=config.software_volume,
+        )
+        with self.lock:
+            old = self.outputs.get(output_id)
+            if old is not None and old["stable_id"] != config.stable_id:
+                old_session = self.sessions.get(old["stable_id"])
+                if old_session is not None:
+                    old_session.unregister_input(output_id)
+                    if not old_session.has_inputs():
+                        self.sessions.pop(old["stable_id"], None)
+                        old_session.stop()
+            session = self.sessions.get(config.stable_id)
+            if session is None:
+                session = AlsaSharedPlaybackTap(
+                    config.stable_id,
+                    output_sample_rate=config.output_sample_rate,
+                    devices_provider=self.devices_provider,
+                )
+                self.sessions[config.stable_id] = session
+                session.start()
+            session.register_input(output_id, input_config)
+            self.outputs[output_id] = {
+                "stable_id": config.stable_id,
+                "channel_mode": config.channel_mode,
+                "software_volume": config.software_volume,
+            }
+
+    def remove_output(self, output_id: str) -> None:
+        output_id = str(output_id)
+        with self.lock:
+            old = self.outputs.pop(output_id, None)
+            if old is None:
+                return
+            session = self.sessions.get(old["stable_id"])
+            if session is None:
+                return
+            session.unregister_input(output_id)
+            if not session.has_inputs():
+                self.sessions.pop(old["stable_id"], None)
+                session.stop()
+
+    def push_float(self, output_id: str, samples: np.ndarray) -> None:
+        with self.lock:
+            old = self.outputs.get(str(output_id))
+            session = self.sessions.get(old["stable_id"]) if old is not None else None
+        if session is not None:
+            session.push_float(str(output_id), samples)
+
+    def snapshot(self, output_id: str) -> dict[str, Any]:
+        with self.lock:
+            old = self.outputs.get(str(output_id))
+            session = self.sessions.get(old["stable_id"]) if old is not None else None
+        return session.snapshot() if session is not None else {"status": "disabled", "error": "", "stable_id": "", "device": ""}
+
+    def prepare_stable_id_for_reset(self, stable_id: str) -> bool:
+        with self.lock:
+            session = self.sessions.get(str(stable_id))
+        if session is None:
+            return False
+        prepare = getattr(session, "prepare_for_usb_reset", None)
+        if callable(prepare):
+            prepare()
+        else:
+            session.stop()
+        return True
+
+    def stop(self) -> None:
+        with self.lock:
+            sessions = list(self.sessions.values())
+            self.sessions = {}
+            self.outputs = {}
+        for session in sessions:
+            session.stop()
+
+
 class IcecastStreamWorker:
     def __init__(
         self,
@@ -2151,12 +2280,16 @@ class IcecastStreamWorker:
         fallback_settings_provider,
         alias_filter_strength_provider,
         state_directory: Path,
+        soundcard_devices_provider=None,
+        soundcard_manager: SharedSoundcardOutputManager | None = None,
         storage_monitor: StorageMonitor | None = None,
     ) -> None:
         self.stream = stream
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
         self.alias_filter_strength_provider = alias_filter_strength_provider
+        self._soundcard_devices_provider = soundcard_devices_provider or discover_playback_devices
+        self.soundcard_manager = soundcard_manager
         self.state_directory = state_directory
         self.storage_monitor = storage_monitor or StorageMonitor([state_directory])
         station = stream.get("station", {})
@@ -2183,6 +2316,7 @@ class IcecastStreamWorker:
         self.outputs: dict[str, IcecastOutputWriter] = {}
         self.encoder_groups: dict[tuple[str, int, int], IcecastEncoderGroup] = {}
         self.monitor_sources: dict[str, SameAwareWebRtcAudioSource] = {}
+        self.soundcard_outputs: set[str] = set()
         self.eas_config: EasRecordingConfig | None = None
         self.eas_recorder: EasRecorderOutput | None = None
         self.eas_status = "disabled"
@@ -2210,6 +2344,10 @@ class IcecastStreamWorker:
         for source in list(self.monitor_sources.values()):
             source.close()
         self.monitor_sources = {}
+        for output_id in list(self.soundcard_outputs):
+            if self.soundcard_manager is not None:
+                self.soundcard_manager.remove_output(output_id)
+        self.soundcard_outputs = set()
         self._stop_eas_recorder()
         if self.thread.ident is not None:
             self.thread.join(timeout=2.0)
@@ -2220,7 +2358,7 @@ class IcecastStreamWorker:
         desired = {
             str(output.get("id", "")): output
             for output in stream_outputs(stream)
-            if output.get("enabled", True)
+            if output.get("enabled", True) and output.get("type", "icecast") == "icecast"
         }
         for output_id in list(self.outputs):
             writer = self.outputs[output_id]
@@ -2233,6 +2371,7 @@ class IcecastStreamWorker:
             writer = IcecastOutputWriter(self, output)
             self.outputs[output_id] = writer
             writer.start()
+        self._sync_soundcard_taps(stream)
         self._sync_eas_recorder(stream)
 
     def audio_config(self) -> AudioConfig:
@@ -2241,7 +2380,33 @@ class IcecastStreamWorker:
         return audio_config_from_stream(stream)
 
     def snapshots(self) -> list[dict[str, Any]]:
-        return [output.snapshot() for output in list(self.outputs.values())]
+        snapshots = [output.snapshot() for output in list(self.outputs.values())]
+        with self.lock:
+            output_ids = list(self.soundcard_outputs)
+        for output_id in output_ids:
+            snapshot = self.soundcard_manager.snapshot(output_id) if self.soundcard_manager is not None else {"status": "disabled"}
+            snapshot.update(
+                {
+                    "id": self.id,
+                    "output_id": output_id,
+                    "type": "soundcard",
+                    "status": "enabled" if snapshot.get("status") == "enabled" else "needs-attention",
+                    "outputs": [
+                        {
+                            "id": output_id,
+                            "type": "soundcard",
+                            "status": snapshot.get("status"),
+                            "soundcard": {
+                                "stable_id": snapshot.get("stable_id", ""),
+                                "device": snapshot.get("device", ""),
+                            },
+                            "error": snapshot.get("error", ""),
+                        }
+                    ],
+                }
+            )
+            snapshots.append(snapshot)
+        return snapshots
 
     def raw_queue_stats(self) -> dict[str, Any]:
         subscriber_stats = getattr(self.fanout, "subscriber_stats", None)
@@ -2287,10 +2452,85 @@ class IcecastStreamWorker:
         with self.lock:
             return bool(self.monitor_sources)
 
+    def add_soundcard_tap(self, tap_id: str, tap: Any) -> None:
+        # Compatibility hook for older focused tests. Runtime soundcards use
+        # SharedSoundcardOutputManager so one ALSA device is opened once.
+        if not hasattr(self, "soundcard_taps"):
+            self.soundcard_taps = {}
+        tap_id = str(tap_id)
+        self.soundcard_taps[tap_id] = tap
+        start = getattr(tap, "start", None)
+        if start is not None:
+            start()
+
+    def remove_soundcard_tap(self, tap_id: str) -> None:
+        tap = getattr(self, "soundcard_taps", {}).pop(str(tap_id), None)
+        if tap is not None:
+            close = getattr(tap, "close", None) or getattr(tap, "stop", None)
+            if close is not None:
+                close()
+
+    def has_soundcard_taps(self) -> bool:
+        with self.lock:
+            return bool(getattr(self, "soundcard_outputs", set())) or bool(getattr(self, "soundcard_taps", {}))
+
+    def _sync_soundcard_taps(self, stream: dict[str, Any]) -> None:
+        desired = {
+            str(output.get("id", "")): output
+            for output in stream_outputs(stream)
+            if output.get("enabled", True) and output.get("type") == "soundcard"
+        }
+        if not hasattr(self, "soundcard_outputs"):
+            self.soundcard_outputs = set()
+        if getattr(self, "soundcard_manager", None) is None:
+            self._sync_legacy_soundcard_taps(desired)
+            return
+        for output_id in list(self.soundcard_outputs):
+            if output_id not in desired:
+                if self.soundcard_manager is not None:
+                    self.soundcard_manager.remove_output(output_id)
+                self.soundcard_outputs.discard(output_id)
+        for output_id, output in desired.items():
+            if self.soundcard_manager is None:
+                continue
+            self.soundcard_manager.sync_output(output_id, output.get("soundcard", {}))
+            self.soundcard_outputs.add(output_id)
+
+    def _sync_legacy_soundcard_taps(self, desired: dict[str, dict[str, Any]]) -> None:
+        if not hasattr(self, "soundcard_taps"):
+            self.soundcard_taps = {}
+        for output_id in list(self.soundcard_taps):
+            output = desired.get(output_id)
+            tap = self.soundcard_taps[output_id]
+            if output is None:
+                self.remove_soundcard_tap(output_id)
+                continue
+            config = soundcard_tap_config_from_output(output)
+            current_config = getattr(tap, "config", None)
+            if current_config is None or current_config.stable_id != config.stable_id or current_config.output_sample_rate != config.output_sample_rate:
+                self.remove_soundcard_tap(output_id)
+                continue
+            try:
+                tap.set_channel_mode(config.channel_mode)
+                tap.set_software_volume(config.software_volume)
+            except Exception as exc:
+                LOG.warning("failed to update soundcard tap %s live: %s", output_id, exc)
+        for output_id, output in desired.items():
+            if output_id in self.soundcard_taps:
+                continue
+            tap = AlsaStreamPlaybackTap(
+                soundcard_tap_config_from_output(output),
+                devices_provider=self._soundcard_devices_provider,
+            )
+            self.add_soundcard_tap(output_id, tap)
+
     def _run_pcm_producer(self) -> None:
         channelizer: IqChannelizer | None = self._initial_channelizer
         channelizer_key: tuple[int, int] | None = self._initial_channelizer_key
         channelizer_alias_filter_strength: int | None = self._initial_channelizer_alias_filter_strength
+        channelizer_target_frequency_hz: int | None = (
+            int(getattr(channelizer, "target_frequency_hz", 0)) if channelizer is not None else None
+        )
         startup_backlog_drained = False
         last_slow_batch_log_at = 0.0
         demodulator = ComplexNfmDemodulator()
@@ -2301,6 +2541,7 @@ class IcecastStreamWorker:
         fallback_state = WebFallbackPlaybackState()
         last_real_audio = time.monotonic()
         idle_output_active = False
+        idle_next_frame_at: float | None = None
         source_generation = getattr(self.fanout, "generation", 0)
         while not self.stop_event.is_set():
             if not self._has_connected_outputs():
@@ -2310,32 +2551,51 @@ class IcecastStreamWorker:
                     pass
                 fallback_state.reset()
                 frame_buffer.clear()
+                idle_next_frame_at = None
                 continue
             try:
+                if idle_output_active:
+                    now = time.monotonic()
+                    if idle_next_frame_at is None:
+                        idle_next_frame_at = now
+                    queue_timeout = max(0.0, idle_next_frame_at - now)
+                else:
+                    queue_timeout = STREAM_IDLE_DETECTION_SECONDS
                 batch: RtlSampleBatch = self.queue.get(
-                    timeout=STREAM_FRAME_SECONDS if idle_output_active else STREAM_IDLE_DETECTION_SECONDS
+                    timeout=queue_timeout
                 )
             except queue.Empty:
                 idle_output_active = True
+                now = time.monotonic()
+                if idle_next_frame_at is None:
+                    idle_next_frame_at = now
+                frames_due = max(1, int((now - idle_next_frame_at) / STREAM_FRAME_SECONDS) + 1)
+                frames_due = min(frames_due, 8)
                 fallback_settings = self.fallback_settings_provider()
                 idle_seconds = time.monotonic() - last_real_audio
                 if not fallback_settings.enabled:
                     fallback_state.reset()
+                    idle_next_frame_at = None
                     continue
-                if not fallback_state.active and idle_seconds < fallback_settings.silence_timeout_seconds:
-                    fallback_state.reset()
-                    self._write_pcm(STREAM_SILENCE_FRAME)
-                    continue
-                if not fallback_state.active:
-                    fallback_state.active = True
-                    with self.lock:
-                        fallback_station = self.stream.get("station", {})
-                    LOG.info(
-                        "starting fallback audio for %s after %.1f seconds without IQ",
-                        fallback_station.get("callsign"),
-                        idle_seconds,
-                    )
-                self._write_pcm(next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds))
+                for _ in range(frames_due):
+                    if not fallback_state.active and idle_seconds < fallback_settings.silence_timeout_seconds:
+                        fallback_state.reset()
+                        self._write_pcm(STREAM_SILENCE_FRAME, STREAM_SILENCE_FLOAT_FRAME)
+                    else:
+                        if not fallback_state.active:
+                            fallback_state.active = True
+                            with self.lock:
+                                fallback_station = self.stream.get("station", {})
+                            LOG.info(
+                                "starting fallback audio for %s after %.1f seconds without IQ",
+                                fallback_station.get("callsign"),
+                                idle_seconds,
+                            )
+                        fallback_pcm = next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds)
+                        self._write_pcm(fallback_pcm, pcm_s16le_to_float32(fallback_pcm))
+                    idle_next_frame_at += STREAM_FRAME_SECONDS
+                if idle_next_frame_at < now - 0.25:
+                    idle_next_frame_at = now + STREAM_FRAME_SECONDS
                 continue
             if not startup_backlog_drained:
                 batch = drain_queue_to_latest(self.queue, batch)
@@ -2349,14 +2609,17 @@ class IcecastStreamWorker:
                 channelizer = None
                 channelizer_key = None
                 channelizer_alias_filter_strength = None
+                channelizer_target_frequency_hz = None
                 demodulator = ComplexNfmDemodulator()
                 frame_buffer.clear()
                 fallback_state.reset()
+                idle_next_frame_at = None
                 LOG.info(
                     "stream DSP source generation changed for %s; reset channel state",
                     self.stream.get("station", {}).get("callsign"),
                 )
             idle_output_active = False
+            idle_next_frame_at = None
             with self.lock:
                 station = self.stream["station"]
             target_frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
@@ -2384,6 +2647,7 @@ class IcecastStreamWorker:
                 )
                 channelizer_key = next_channelizer_key
                 channelizer_alias_filter_strength = alias_filter_strength
+                channelizer_target_frequency_hz = target_frequency_hz
                 demodulator = ComplexNfmDemodulator()
                 frame_buffer.clear()
             elif channelizer_alias_filter_strength != alias_filter_strength:
@@ -2393,7 +2657,11 @@ class IcecastStreamWorker:
                 )
                 channelizer_alias_filter_strength = alias_filter_strength
             if channelizer is not None:
-                channelizer.set_target_frequency(target_frequency_hz)
+                if channelizer_target_frequency_hz != target_frequency_hz:
+                    channelizer.set_target_frequency(target_frequency_hz)
+                    channelizer_target_frequency_hz = target_frequency_hz
+                    demodulator.reset()
+                    frame_buffer.clear()
             iq = iq_batch_complex(batch)
             process_started_at = time.monotonic()
             audio = demodulator.process(channelizer.process_complex(iq))
@@ -2425,7 +2693,8 @@ class IcecastStreamWorker:
                         station.get("callsign"),
                         ", ".join(changed_effects) or "none",
                     )
-                self._write_pcm(float_to_s16(effects.process(frame)))
+                processed_frame = effects.process(frame)
+                self._write_pcm(float_to_s16(processed_frame), processed_frame)
 
     def encoder_group_for(self, config: IcecastConfig) -> "IcecastEncoderGroup":
         key = icecast_encoder_key(config)
@@ -2447,15 +2716,43 @@ class IcecastStreamWorker:
             )
             return encoder_group
 
-    def _write_pcm(self, pcm: bytes) -> None:
+    def _write_pcm(self, pcm: bytes, float_samples: np.ndarray | None = None) -> None:
         for encoder_group in list(self.encoder_groups.values()):
             if encoder_group.has_outputs():
                 queue_latest(encoder_group.pcm_queue, pcm)
         with self.lock:
             monitor_sources = list(self.monitor_sources.values())
+            soundcard_output_ids = list(getattr(self, "soundcard_outputs", set()))
+            soundcard_taps = list(getattr(self, "soundcard_taps", {}).values())
             eas_recorder = self.eas_recorder
         for source in monitor_sources:
             source.push_pcm(pcm)
+        if float_samples is not None and self.soundcard_manager is not None:
+            for output_id in soundcard_output_ids:
+                try:
+                    self.soundcard_manager.push_float(output_id, float_samples)
+                except Exception as exc:
+                    LOG.warning(
+                        "soundcard output failed for %s: %s",
+                        self.stream.get("station", {}).get("callsign"),
+                        exc,
+                    )
+        for tap in soundcard_taps:
+            try:
+                if float_samples is not None:
+                    push_float = getattr(tap, "push_float", None)
+                    if push_float is not None:
+                        push_float(float_samples)
+                        continue
+                push = getattr(tap, "push_pcm", None)
+                if push is not None:
+                    push(pcm)
+            except Exception as exc:
+                LOG.warning(
+                    "soundcard tap failed for %s: %s",
+                    self.stream.get("station", {}).get("callsign"),
+                    exc,
+                )
         if eas_recorder is not None:
             recorder_config = getattr(eas_recorder, "config", None)
             if recorder_config is not None and self.storage_monitor.is_critical(Path(recorder_config.directory)):
@@ -2476,6 +2773,7 @@ class IcecastStreamWorker:
         return (
             any(encoder_group.has_outputs() for encoder_group in list(self.encoder_groups.values()))
             or self.has_monitor_sources()
+            or self.has_soundcard_taps()
             or self.has_eas_recorder()
         )
 
@@ -3105,6 +3403,9 @@ class WeatherReceiverWorker:
         channelizer: IqChannelizer | None = self._initial_channelizer
         channelizer_key: tuple[int, int] | None = self._initial_channelizer_key
         channelizer_alias_filter_strength: int | None = self._initial_channelizer_alias_filter_strength
+        channelizer_target_frequency_hz: int | None = (
+            int(getattr(channelizer, "target_frequency_hz", 0)) if channelizer is not None else None
+        )
         startup_backlog_drained = False
         last_slow_batch_log_at = 0.0
         demodulator = ComplexNfmDemodulator()
@@ -3131,6 +3432,7 @@ class WeatherReceiverWorker:
                 channelizer = None
                 channelizer_key = None
                 channelizer_alias_filter_strength = None
+                channelizer_target_frequency_hz = None
                 demodulator = ComplexNfmDemodulator()
                 frame_buffer.clear()
                 LOG.info("weather receiver source generation changed for client %s; reset channel state", self.client_id)
@@ -3156,6 +3458,7 @@ class WeatherReceiverWorker:
                 )
                 channelizer_key = next_channelizer_key
                 channelizer_alias_filter_strength = alias_filter_strength
+                channelizer_target_frequency_hz = target_frequency_hz
                 demodulator = ComplexNfmDemodulator()
                 frame_buffer.clear()
             elif channelizer_alias_filter_strength != alias_filter_strength:
@@ -3165,7 +3468,11 @@ class WeatherReceiverWorker:
                 )
                 channelizer_alias_filter_strength = alias_filter_strength
             if channelizer is not None:
-                channelizer.set_target_frequency(target_frequency_hz)
+                if channelizer_target_frequency_hz != target_frequency_hz:
+                    channelizer.set_target_frequency(target_frequency_hz)
+                    channelizer_target_frequency_hz = target_frequency_hz
+                    demodulator.reset()
+                    frame_buffer.clear()
             iq = iq_batch_complex(batch)
             process_started_at = time.monotonic()
             audio = demodulator.process(channelizer.process_complex(iq))
@@ -3203,6 +3510,14 @@ class RtlControlService:
             [state_path.parent],
             critical_callback=self._handle_critical_storage,
         )
+        self.device_probe = SharedDeviceProbe(
+            {
+                "rtl": list_rtl_devices,
+                "rtl_usb": list_usb_rtl_devices,
+                "alsa_playback": discover_playback_devices,
+            },
+            poll_interval_seconds=0.5,
+        )
         self.lock = threading.RLock()
         self.settings = load_settings(state_path)
         self.streams = load_streams(self.streams_directory, self.streams_state_path)
@@ -3216,6 +3531,13 @@ class RtlControlService:
         self.drain_thread: threading.Thread | None = None
         self.drain_stop = threading.Event()
         self.stream_workers: dict[str, IcecastStreamWorker] = {}
+        self.preview_streams: dict[str, dict[str, Any]] = {}
+        self.preview_cleanup_stop = threading.Event()
+        self.preview_cleanup_thread = threading.Thread(
+            target=self._preview_cleanup_loop,
+            name="soundcard-preview-cleanup",
+            daemon=True,
+        )
         self.monitor_streams_by_client: dict[str, str] = {}
         self.monitor_accounts_by_client: dict[str, int] = {}
         self.receiver_workers: dict[str, WeatherReceiverWorker] = {}
@@ -3228,6 +3550,7 @@ class RtlControlService:
         self.aborted_iq_recording_downloads: set[str] = set()
         self.webrtc_runner = WebRtcAsyncRunner()
         self.webrtc_sessions = AiortcSessionManager()
+        self.soundcard_manager = SharedSoundcardOutputManager(devices_provider=self._cached_soundcards)
         self.icecast_auth_cache: dict[str, float] = {}
         self.reset_lock = threading.Lock()
         self.capture_error: str | None = None
@@ -3236,6 +3559,7 @@ class RtlControlService:
         self.received_bytes = 0
         self.storage_monitor.add_path(self.iq_recordings_directory)
         self.storage_monitor.start()
+        self.preview_cleanup_thread.start()
         if self.settings.serial:
             self._start_or_update_capture_locked()
         else:
@@ -3247,12 +3571,15 @@ class RtlControlService:
         except Exception as exc:
             LOG.debug("WebRTC monitor cleanup failed: %s", exc)
         self.webrtc_runner.stop()
+        self.preview_cleanup_stop.set()
+        self.preview_cleanup_thread.join(timeout=2.0)
         with self.lock:
             recorder = self.iq_recorder
             self.iq_recorder = None
         if recorder is not None:
             recorder.stop()
         self.stop_capture()
+        self.soundcard_manager.stop()
         self.storage_monitor.stop()
 
     def revoke_account_long_lived_resources(
@@ -3317,7 +3644,36 @@ class RtlControlService:
             LOG.warning("stopping I/Q recorder because storage is critically low")
             recorder.stop()
 
+    def _preview_cleanup_loop(self) -> None:
+        while not self.preview_cleanup_stop.wait(SOUNDCARD_PREVIEW_CLEANUP_SECONDS):
+            self._cleanup_expired_soundcard_previews()
+
+    def _cleanup_expired_soundcard_previews(self) -> None:
+        now = time.time()
+        expired: list[tuple[str, IcecastStreamWorker | None]] = []
+        with self.lock:
+            for preview_id, preview in list(getattr(self, "preview_streams", {}).items()):
+                heartbeat_at = float(preview.get("heartbeat_at", preview.get("updated_at", now)))
+                if now - heartbeat_at <= SOUNDCARD_PREVIEW_TIMEOUT_SECONDS:
+                    continue
+                self.preview_streams.pop(preview_id, None)
+                expired.append((preview_id, self.stream_workers.pop(stream_worker_key(preview), None)))
+        for preview_id, worker in expired:
+            if worker is not None:
+                worker.stop()
+            LOG.info("expired temporary soundcard preview %s", preview_id)
+
+    def heartbeat_soundcard_preview_stream(self, preview_id: str) -> None:
+        preview_id = str(preview_id).strip()
+        if not preview_id:
+            return
+        with self.lock:
+            preview = getattr(self, "preview_streams", {}).get(preview_id)
+            if preview is not None:
+                preview["heartbeat_at"] = time.time()
+
     def status(self) -> dict[str, Any]:
+        self._cleanup_expired_soundcard_previews()
         with self.lock:
             capture = self.capture
             settings = self._effective_settings_locked()
@@ -3365,16 +3721,16 @@ class RtlControlService:
 
     def devices(self) -> dict[str, Any]:
         errors: list[str] = []
-        rtl_devices = []
-        usb_devices = []
-        try:
-            rtl_devices = list_rtl_devices()
-        except Exception as exc:
-            errors.append(f"librtlsdr probe failed: {exc}")
-        try:
-            usb_devices = list_usb_rtl_devices()
-        except Exception as exc:
-            errors.append(f"USB probe failed: {exc}")
+        snapshot = self.device_probe.snapshot()
+        rtl_devices = list(snapshot.devices("rtl"))
+        usb_devices = list(snapshot.devices("rtl_usb"))
+        soundcards = list(snapshot.devices("alsa_playback"))
+        if snapshot.error("rtl"):
+            errors.append(f"librtlsdr probe failed: {snapshot.error('rtl')}")
+        if snapshot.error("rtl_usb"):
+            errors.append(f"USB probe failed: {snapshot.error('rtl_usb')}")
+        if snapshot.error("alsa_playback"):
+            errors.append(f"ALSA probe failed: {snapshot.error('alsa_playback')}")
 
         by_serial: dict[str, dict[str, Any]] = {}
         for device in usb_devices:
@@ -3405,11 +3761,134 @@ class RtlControlService:
             entry["name"] = device.description or entry["name"]
             entry["librtlsdr_index"] = device.index
         devices = sorted(by_serial.values(), key=lambda item: (item["name"], item["serial"]))
-        return {"devices": devices, "errors": errors}
+        return {
+            "devices": devices,
+            "soundcards": [self._soundcard_device_payload(device) for device in soundcards],
+            "errors": errors,
+            "probed_at": snapshot.probed_at,
+        }
+
+    def _cached_rtl_devices(self) -> list[Any]:
+        return list(self.device_probe.devices("rtl"))
+
+    def _cached_usb_rtl_devices(self) -> list[Any]:
+        return list(self.device_probe.devices("rtl_usb"))
+
+    def _cached_soundcards(self) -> list[Any]:
+        return list(self.device_probe.devices("alsa_playback"))
+
+    def _refresh_soundcards(self) -> list[Any]:
+        return list(self.device_probe.snapshot(force=True).devices("alsa_playback"))
+
+    @staticmethod
+    def _soundcard_device_payload(device) -> dict[str, Any]:
+        return {
+            "stable_id": device.stable_id,
+            "hw_device": device.hw_device,
+            "card_index": device.card_index,
+            "pcm_device": device.pcm_device,
+            "card_id": device.card_id,
+            "card_name": device.card_name,
+            "card_long_name": device.card_long_name,
+            "pcm_id": device.pcm_id,
+            "pcm_name": device.pcm_name,
+            "display_name": device.display_name,
+            "bus": device.bus,
+            "vendor_id": device.vendor_id,
+            "product_id": device.product_id,
+            "serial": device.serial,
+            "usb_port_path": device.usb_port_path,
+            "device_path": device.device_path,
+            "subdevices_count": device.subdevices_count,
+            "subdevices_available": device.subdevices_available,
+        }
+
+    def _soundcard_by_stable_id(self, stable_id: str):
+        stable_id = str(stable_id or "").strip()
+        if not stable_id:
+            raise ValueError("Select a sound card to reset.")
+        matches = [device for device in self._cached_soundcards() if device.stable_id == stable_id]
+        if not matches:
+            matches = [device for device in self._refresh_soundcards() if device.stable_id == stable_id]
+        if not matches:
+            raise ValueError("Sound card is not currently connected.")
+        if len(matches) > 1:
+            raise ValueError("Sound card stable ID is ambiguous.")
+        return matches[0]
+
+    def reset_soundcard_device(self, stable_id: str) -> dict[str, Any]:
+        if not self.reset_lock.acquire(blocking=False):
+            raise ValueError("A USB device reset is already in progress.")
+        try:
+            return self._reset_soundcard_device(stable_id)
+        finally:
+            self.reset_lock.release()
+
+    def _reset_soundcard_device(self, stable_id: str) -> dict[str, Any]:
+        stable_id = str(stable_id or "").strip()
+        device = self._soundcard_by_stable_id(stable_id)
+        if device.bus != "usb":
+            raise ValueError("Only USB sound cards can be reset.")
+        usb_node = playback_device_usb_node(device)
+        LOG.info("pausing soundcard outputs before USB reset for %s", stable_id)
+        self.soundcard_manager.prepare_stable_id_for_reset(stable_id)
+        LOG.info("resetting USB soundcard %s at %s", stable_id, usb_node)
+        reset_queue: queue.Queue = queue.Queue(maxsize=1)
+
+        def run_reset() -> None:
+            try:
+                reset_queue.put((reset_usb_device_node(usb_node, timeout_seconds=RTL_RESET_COMMAND_TIMEOUT_SECONDS), None))
+            except BaseException as exc:
+                reset_queue.put((None, exc))
+
+        reset_thread = threading.Thread(
+            target=run_reset,
+            name=f"soundcard-usb-reset-{device.card_id or device.card_index}",
+            daemon=True,
+        )
+        reset_thread.start()
+        try:
+            reset_method, reset_error = reset_queue.get(timeout=RTL_RESET_COMMAND_TIMEOUT_SECONDS + 1.0)
+        except queue.Empty:
+            message = (
+                f"Sound card {device.display_name} did not finish its USB reset command. "
+                "Physically unplug and replug it if it does not recover."
+            )
+            LOG.warning("%s", message)
+            return {"success": False, "reappeared": False, "message": message, "status": self.status()}
+        if reset_error is not None:
+            raise reset_error
+        reappeared = False
+        deadline = time.monotonic() + RTL_RESET_REAPPEAR_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if any(candidate.stable_id == stable_id for candidate in self._refresh_soundcards()):
+                    reappeared = True
+                    break
+            except Exception as exc:
+                LOG.debug("ALSA probe after soundcard USB reset failed: %s", exc)
+            time.sleep(0.25)
+        if reappeared:
+            message = f"Sound card {device.display_name} was reset using {reset_method} and reappeared."
+            LOG.info("%s", message)
+        else:
+            message = (
+                f"Sound card {device.display_name} was reset using {reset_method}, but it did not reappear. "
+                "Physically unplug and replug it if it remains unavailable."
+            )
+            LOG.warning("%s", message)
+        return {
+            "success": True,
+            "stable_id": stable_id,
+            "reappeared": reappeared,
+            "device": self._soundcard_device_payload(device),
+            "message": message,
+            "status": self.status(),
+        }
 
     def reset_rtl_device(self, serial: str) -> dict[str, Any]:
         if not self.reset_lock.acquire(blocking=False):
-            raise ValueError("An RTL-SDR reset is already in progress.")
+            raise ValueError("A USB device reset is already in progress.")
         try:
             return self._reset_rtl_device(serial)
         finally:
@@ -3651,7 +4130,12 @@ class RtlControlService:
             raw_fanout = self.raw_fanout
             intermediate_fanout = self.intermediate_fanout
             config = self._iq_recorder_config_from_payload_locked(payload)
-            fanout = intermediate_fanout if config.mode == IQ_RECORDER_MODE_STREAM else raw_fanout
+            if config.mode == IQ_RECORDER_MODE_STREAM:
+                fanout = intermediate_fanout
+            elif config.sample_rate == INTERMEDIATE_IQ_SAMPLE_RATE:
+                fanout = intermediate_fanout
+            else:
+                fanout = raw_fanout
             if fanout is None:
                 raise ValueError("RTL-SDR capture is not active")
             if self.storage_monitor.is_critical(config.output_path.parent):
@@ -3992,43 +4476,73 @@ class RtlControlService:
     def add_stream(self, payload: dict[str, Any]) -> dict[str, Any]:
         station_key = str(payload.get("station_key", "")).strip()
         station = self._station_by_key(station_key)
-        icecast = validate_icecast_payload(payload.get("icecast"))
-        with self.lock:
-            self._reject_duplicate_icecast_locked(icecast)
-        auth_cache_key = icecast_auth_cache_key(icecast)
-        with self.lock:
-            auth_is_cached = self._icecast_auth_cached_locked(auth_cache_key)
-        if auth_is_cached:
-            LOG.info(
-                "using cached Icecast authentication for %s:%s%s",
-                icecast["host"],
-                icecast["port"],
-                icecast["mount"],
-            )
-        else:
-            result = self.test_icecast_auth(icecast)
-            if not result["success"]:
-                return {
-                    "success": False,
-                    "message": result["message"],
-                    "streams": list(self.streams),
-                }
+        output_type = str(payload.get("type", "") or payload.get("output_type", "")).strip().lower()
+        if not output_type:
+            output_type = "soundcard" if payload.get("soundcard") is not None else "icecast"
+        preview_worker = None
+        preview_id = str(payload.get("preview_id", "")).strip()
+        if preview_id:
             with self.lock:
-                self.icecast_auth_cache[auth_cache_key] = time.time()
+                preview = getattr(self, "preview_streams", {}).pop(preview_id, None)
+                if preview is not None:
+                    preview_worker = self.stream_workers.pop(stream_worker_key(preview), None)
+            if preview_worker is not None:
+                preview_worker.stop()
+        output_id = uuid.uuid4().hex
+        if output_type == "icecast":
+            icecast = validate_icecast_payload(payload.get("icecast"))
+            with self.lock:
+                self._reject_duplicate_icecast_locked(icecast)
+            auth_cache_key = icecast_auth_cache_key(icecast)
+            with self.lock:
+                auth_is_cached = self._icecast_auth_cached_locked(auth_cache_key)
+            if auth_is_cached:
+                LOG.info(
+                    "using cached Icecast authentication for %s:%s%s",
+                    icecast["host"],
+                    icecast["port"],
+                    icecast["mount"],
+                )
+            else:
+                result = self.test_icecast_auth(icecast)
+                if not result["success"]:
+                    return {
+                        "success": False,
+                        "message": result["message"],
+                        "streams": list(self.streams),
+                    }
+                with self.lock:
+                    self.icecast_auth_cache[auth_cache_key] = time.time()
+            output = {
+                "id": output_id,
+                "enabled": True,
+                "type": "icecast",
+                "icecast": icecast,
+                "auth_validated_at": time.time(),
+                "auth_signature": icecast_auth_signature(icecast),
+            }
+        elif output_type == "soundcard":
+            soundcard = validate_soundcard_output_payload(payload.get("soundcard"))
+            with self.lock:
+                soundcard = self._normalize_soundcard_output_locked(
+                    "",
+                    output_id,
+                    soundcard,
+                    enabled=True,
+                )
+            output = {
+                "id": output_id,
+                "enabled": True,
+                "type": "soundcard",
+                "soundcard": soundcard,
+            }
+        else:
+            raise ValueError("stream output type is not supported")
         stream = {
             "id": uuid.uuid4().hex,
             "enabled": True,
             "station": station,
-            "outputs": [
-                {
-                    "id": uuid.uuid4().hex,
-                    "enabled": True,
-                    "type": "icecast",
-                    "icecast": icecast,
-                    "auth_validated_at": time.time(),
-                    "auth_signature": icecast_auth_signature(icecast),
-                }
-            ],
+            "outputs": [output],
             "audio": asdict(AudioConfig()),
             "created_at": time.time(),
             "updated_at": time.time(),
@@ -4042,6 +4556,73 @@ class RtlControlService:
             "message": "Stream created.",
             "streams": list(self.streams),
         }
+
+    def upsert_soundcard_preview_stream(self, payload: dict[str, Any]) -> dict[str, Any]:
+        preview_id = str(payload.get("preview_id", "")).strip()
+        station_key = str(payload.get("station_key", "")).strip()
+        station = self._station_by_key(station_key)
+        soundcard = validate_soundcard_output_payload(payload.get("soundcard"))
+        with self.lock:
+            if not hasattr(self, "preview_streams"):
+                self.preview_streams = {}
+            preview = self.preview_streams.get(preview_id) if preview_id else None
+            if preview is None:
+                preview_id = uuid.uuid4().hex
+                output_id = uuid.uuid4().hex
+                preview = {
+                    "id": f"preview-{preview_id}",
+                    "preview_id": preview_id,
+                    "enabled": True,
+                    "station": station,
+                    "outputs": [
+                        {
+                            "id": output_id,
+                            "enabled": True,
+                            "type": "soundcard",
+                            "soundcard": soundcard,
+                        }
+                    ],
+                    "audio": asdict(AudioConfig()),
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                    "heartbeat_at": time.time(),
+                }
+                self.preview_streams[preview_id] = preview
+            else:
+                preview["station"] = station
+                outputs = mutable_stream_outputs(preview)
+                if not outputs:
+                    outputs.append({"id": uuid.uuid4().hex, "enabled": True, "type": "soundcard"})
+                outputs[0]["enabled"] = True
+                outputs[0]["type"] = "soundcard"
+                outputs[0]["soundcard"] = soundcard
+                preview["updated_at"] = time.time()
+                preview["heartbeat_at"] = time.time()
+            output = mutable_stream_outputs(preview)[0]
+            output["soundcard"] = self._normalize_soundcard_output_locked(
+                str(preview.get("id", "")),
+                str(output.get("id", "")),
+                output["soundcard"],
+                enabled=True,
+            )
+            self._sync_stream_workers_locked()
+        LOG.info("updated temporary soundcard preview for %s", station.get("callsign", "unknown"))
+        return {
+            "success": True,
+            "message": "Soundcard preview started.",
+            "preview_id": preview_id,
+            "soundcard": output["soundcard"],
+        }
+
+    def discard_soundcard_preview_stream(self, preview_id: str) -> dict[str, Any]:
+        preview_id = str(preview_id).strip()
+        with self.lock:
+            preview = getattr(self, "preview_streams", {}).pop(preview_id, None)
+            worker = self.stream_workers.pop(stream_worker_key(preview), None) if preview is not None else None
+        if worker is not None:
+            worker.stop()
+            LOG.info("discarded temporary soundcard preview %s", preview_id)
+        return {"success": True}
 
     def test_icecast_auth(self, icecast: dict[str, Any]) -> dict[str, Any]:
         settings = IcecastSettings(
@@ -4368,32 +4949,46 @@ class RtlControlService:
         stream_id = str(payload.get("stream_id", "")).strip()
         output_id = str(payload.get("output_id", "")).strip()
         enabled = bool(payload.get("enabled", True))
-        icecast = validate_icecast_payload(payload.get("icecast"))
+        output_type = str(payload.get("type", "")).strip().lower()
         with self.lock:
             stream, output = self._stream_output_locked(stream_id, output_id)
+            output_type = output_type or str(output.get("type", "icecast")).strip().lower()
             if output.get("enabled", True) and not enabled:
                 self._ensure_can_disable_icecast_output_locked(stream, output_id)
-            self._reject_duplicate_icecast_locked(icecast, ignore_output_id=output_id)
-            must_test_auth = icecast_auth_changed(output, icecast)
-            if must_test_auth:
-                settings = IcecastSettings(
-                    server=normalize_server(icecast["host"]),
-                    port=str(icecast["port"]),
-                    username=icecast["username"],
-                    password=icecast["password"],
-                    mountpoint=icecast["mount"],
+            if output_type == "icecast":
+                icecast = validate_icecast_payload(payload.get("icecast"))
+                self._reject_duplicate_icecast_locked(icecast, ignore_output_id=output_id)
+                must_test_auth = icecast_auth_changed(output, icecast)
+                if must_test_auth:
+                    settings = IcecastSettings(
+                        server=normalize_server(icecast["host"]),
+                        port=str(icecast["port"]),
+                        username=icecast["username"],
+                        password=icecast["password"],
+                        mountpoint=icecast["mount"],
+                    )
+                    result = test_mountpoint_authentication(settings)
+                    if not result.success:
+                        return {
+                            "success": False,
+                            "message": result.message,
+                            "streams": list(self.streams),
+                        }
+                    output["auth_validated_at"] = time.time()
+                    output["auth_signature"] = icecast_auth_signature(icecast)
+                output["icecast"] = icecast
+            elif output_type == "soundcard":
+                soundcard = validate_soundcard_output_payload(payload.get("soundcard"))
+                output["soundcard"] = self._normalize_soundcard_output_locked(
+                    stream_id,
+                    output_id,
+                    soundcard,
+                    enabled=enabled,
                 )
-                result = test_mountpoint_authentication(settings)
-                if not result.success:
-                    return {
-                        "success": False,
-                        "message": result.message,
-                        "streams": list(self.streams),
-                    }
-                output["auth_validated_at"] = time.time()
-                output["auth_signature"] = icecast_auth_signature(icecast)
+            else:
+                raise ValueError("stream output type is not supported")
             output["enabled"] = enabled
-            output["icecast"] = icecast
+            output["type"] = output_type
             stream["updated_at"] = time.time()
             save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
@@ -4405,38 +5000,102 @@ class RtlControlService:
 
     def add_stream_output(self, payload: dict[str, Any]) -> dict[str, Any]:
         stream_id = str(payload.get("stream_id", "")).strip()
-        icecast = validate_icecast_payload(payload.get("icecast"))
+        output_type = str(payload.get("type", "icecast")).strip().lower()
         with self.lock:
             stream = self._stream_locked(stream_id)
-            self._reject_duplicate_icecast_locked(icecast)
-        result = self.test_icecast_auth(icecast)
-        if not result["success"]:
-            return {
-                "success": False,
-                "message": result["message"],
-                "streams": list(self.streams),
-            }
+            if output_type == "icecast":
+                icecast = validate_icecast_payload(payload.get("icecast"))
+                self._reject_duplicate_icecast_locked(icecast)
+            elif output_type == "soundcard":
+                soundcard = validate_soundcard_output_payload(payload.get("soundcard"))
+            else:
+                raise ValueError("stream output type is not supported")
+        if output_type == "icecast":
+            result = self.test_icecast_auth(icecast)
+            if not result["success"]:
+                return {
+                    "success": False,
+                    "message": result["message"],
+                    "streams": list(self.streams),
+                }
         with self.lock:
             stream = self._stream_locked(stream_id)
-            self._reject_duplicate_icecast_locked(icecast)
-            mutable_stream_outputs(stream).append(
-                {
-                    "id": uuid.uuid4().hex,
+            output_id = uuid.uuid4().hex
+            if output_type == "icecast":
+                self._reject_duplicate_icecast_locked(icecast)
+                output = {
+                    "id": output_id,
                     "enabled": True,
                     "type": "icecast",
                     "icecast": icecast,
                     "auth_validated_at": time.time(),
                     "auth_signature": icecast_auth_signature(icecast),
                 }
-            )
+                message = "Icecast output added."
+            else:
+                soundcard = self._normalize_soundcard_output_locked(
+                    stream_id,
+                    output_id,
+                    soundcard,
+                    enabled=True,
+                )
+                output = {
+                    "id": output_id,
+                    "enabled": True,
+                    "type": "soundcard",
+                    "soundcard": soundcard,
+                }
+                message = "Soundcard output added."
+            mutable_stream_outputs(stream).append(output)
             stream["updated_at"] = time.time()
             save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         return {
             "success": True,
-            "message": "Icecast output added.",
+            "message": message,
+            "output_id": output_id,
             "streams": list(self.streams),
         }
+
+    def _normalize_soundcard_output_locked(
+        self,
+        stream_id: str,
+        output_id: str,
+        soundcard: dict[str, Any],
+        *,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        if not enabled:
+            return soundcard
+        stable_id = str(soundcard.get("stable_id", ""))
+        occupied = self._occupied_soundcard_channels_locked(ignore_output_id=output_id).get(stable_id, set())
+        requested = soundcard_channels(soundcard.get("channel_mode", ALSA_CHANNEL_BOTH))
+        if requested and requested.isdisjoint(occupied):
+            return soundcard
+        available = [channel for channel in (ALSA_CHANNEL_LEFT, ALSA_CHANNEL_RIGHT) if channel not in occupied]
+        if not available:
+            raise ValueError("That sound card has no available output channels.")
+        normalized = dict(soundcard)
+        if len(available) == 2 and soundcard.get("channel_mode") == ALSA_CHANNEL_BOTH:
+            normalized["channel_mode"] = ALSA_CHANNEL_BOTH
+        else:
+            normalized["channel_mode"] = available[0]
+        return normalized
+
+    def _occupied_soundcard_channels_locked(self, *, ignore_output_id: str = "") -> dict[str, set[str]]:
+        occupied: dict[str, set[str]] = {}
+        for stream in list(self.streams) + list(getattr(self, "preview_streams", {}).values()):
+            for output in stream_outputs(stream):
+                if str(output.get("id", "")) == ignore_output_id:
+                    continue
+                if not output.get("enabled", True) or output.get("type") != "soundcard":
+                    continue
+                soundcard = output.get("soundcard", {})
+                stable_id = str(soundcard.get("stable_id", "")).strip()
+                if not stable_id:
+                    continue
+                occupied.setdefault(stable_id, set()).update(soundcard_channels(soundcard.get("channel_mode", ALSA_CHANNEL_BOTH)))
+        return occupied
 
     def remove_stream_output(self, stream_id: str, output_id: str) -> dict[str, Any]:
         stream_id = stream_id.strip()
@@ -4560,7 +5219,7 @@ class RtlControlService:
             self.capture is not None and not isinstance(self.capture, RtlCaptureSource)
         ):
             old_capture = self.capture
-            source = RtlCaptureSource(config)
+            source = self._new_rtl_capture_source(config)
             source.start()
             self.capture = source
             self.iq_file_source_config = None
@@ -4573,7 +5232,7 @@ class RtlControlService:
             return
         if self.capture is None:
             self.capture_error = None
-            self.capture = RtlCaptureSource(config)
+            self.capture = self._new_rtl_capture_source(config)
             self.capture.start()
             self._ensure_capture_pipeline_locked()
             self._sync_stream_workers_locked()
@@ -4687,7 +5346,7 @@ class RtlControlService:
             if self.settings.serial:
                 config = self.settings.to_rtl_config()
                 old_capture = self.capture
-                source = RtlCaptureSource(config)
+                source = self._new_rtl_capture_source(config)
                 source.start()
                 self.capture = source
                 self.capture_error = None
@@ -4696,6 +5355,14 @@ class RtlControlService:
                 if old_capture is not None:
                     self._stop_capture_async(old_capture, None)
             return self.status()
+
+    def _new_rtl_capture_source(self, config: RtlConfig) -> RtlCaptureSource:
+        source = RtlCaptureSource(config)
+        source.set_device_providers(
+            rtl_devices_provider=self._cached_rtl_devices,
+            usb_rtl_devices_provider=self._cached_usb_rtl_devices,
+        )
+        return source
 
     def _iq_test_source_path(self, file_name: str) -> Path:
         directory = self.iq_test_sources_directory.resolve()
@@ -4790,6 +5457,7 @@ class RtlControlService:
             self.iq_recorder = None
             self._stop_receiver_workers_locked()
             self._stop_stream_workers_locked()
+            self.preview_streams = {}
             intermediate = self.intermediate_fanout
             self.intermediate_fanout = None
             fanout = self.raw_fanout
@@ -4847,7 +5515,7 @@ class RtlControlService:
         desired: dict[str, dict[str, Any]] = {}
         monitored_stream_ids = set(self.monitor_streams_by_client.values())
         if fanout is not None:
-            for stream in self.streams:
+            for stream in list(self.streams) + list(getattr(self, "preview_streams", {}).values()):
                 if not stream.get("enabled", True):
                     continue
                 stream_id = str(stream.get("id", ""))
@@ -4876,6 +5544,8 @@ class RtlControlService:
                 fanout=fanout,
                 fallback_settings_provider=self.fallback_settings_snapshot,
                 alias_filter_strength_provider=self._alias_filter_strength,
+                soundcard_devices_provider=self._cached_soundcards,
+                soundcard_manager=self.soundcard_manager,
                 state_directory=self.state_path.parent,
                 storage_monitor=self.storage_monitor,
             )
@@ -5142,6 +5812,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_html(INDEX_HTML)
         elif path == "/api/status":
+            query = parse_qs(parsed.query)
+            self.service.heartbeat_soundcard_preview_stream(query.get("soundcard_preview_id", [""])[0])
             response = self.service.status()
             account = getattr(self, "current_account", None)
             if isinstance(account, AccountRecord):
@@ -5499,6 +6171,16 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(response)
             return
+        if path == "/api/soundcard-reset":
+            try:
+                payload = self._read_json()
+                response = self.service.reset_soundcard_device(str(payload.get("stable_id", "")))
+            except Exception as exc:
+                LOG.warning("API soundcard reset failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path == "/api/iq-test-source":
             try:
                 payload = self._read_json()
@@ -5541,6 +6223,24 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json()
                 response = self.service.add_stream_output(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/stream-soundcard-preview":
+            try:
+                payload = self._read_json()
+                response = self.service.upsert_soundcard_preview_stream(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/stream-soundcard-preview/discard":
+            try:
+                payload = self._read_json()
+                response = self.service.discard_soundcard_preview_stream(str(payload.get("preview_id", "")))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -5599,6 +6299,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 stream_id = query.get("stream_id", [""])[0]
                 output_id = query.get("output_id", [""])[0]
                 response = self.service.remove_stream_output(stream_id, output_id)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if parsed.path == "/api/stream-soundcard-preview":
+            try:
+                query = parse_qs(parsed.query)
+                response = self.service.discard_soundcard_preview_stream(query.get("preview_id", [""])[0])
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -5697,6 +6406,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         self._send_json(response)
+
+    def do_PUT(self) -> None:
+        self.do_PATCH()
 
     def _read_json(self) -> dict[str, Any]:
         try:
@@ -6827,6 +7539,58 @@ def icecast_config_from_output(output: dict[str, Any]) -> IcecastConfig:
     )
 
 
+def validate_soundcard_output_payload(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("soundcard settings are required")
+    stable_id = str(raw.get("stable_id", "")).strip()
+    if not stable_id:
+        raise ValueError("select a sound card")
+    channel_mode = str(raw.get("channel_mode", ALSA_CHANNEL_BOTH)).strip().lower()
+    if channel_mode not in ALSA_CHANNEL_MODES:
+        raise ValueError("select left, right, or both channels")
+    try:
+        volume = float(raw.get("volume", 1.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("soundcard volume must be a number") from exc
+    if volume < 0.0 or volume > 2.0:
+        raise ValueError("soundcard volume must be from 0 through 2")
+    try:
+        sample_rate = int(raw.get("sample_rate", ALSA_STREAM_DEFAULT_SAMPLE_RATE))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("soundcard sample rate must be a number") from exc
+    if sample_rate < 8000 or sample_rate > 192000:
+        raise ValueError("soundcard sample rate is not supported")
+    return {
+        "stable_id": stable_id,
+        "channel_mode": channel_mode,
+        "volume": volume,
+        "sample_rate": sample_rate,
+    }
+
+
+def soundcard_channels(channel_mode: object) -> set[str]:
+    mode = str(channel_mode or ALSA_CHANNEL_BOTH).strip().lower()
+    if mode == ALSA_CHANNEL_LEFT:
+        return {ALSA_CHANNEL_LEFT}
+    if mode == ALSA_CHANNEL_RIGHT:
+        return {ALSA_CHANNEL_RIGHT}
+    return {ALSA_CHANNEL_LEFT, ALSA_CHANNEL_RIGHT}
+
+
+def soundcard_tap_config_from_output(output: dict[str, Any]) -> AlsaStreamTapConfig:
+    soundcard = validate_soundcard_output_payload(output.get("soundcard", {}))
+    return soundcard_tap_config_from_soundcard(soundcard)
+
+
+def soundcard_tap_config_from_soundcard(soundcard: dict[str, Any]) -> AlsaStreamTapConfig:
+    return AlsaStreamTapConfig(
+        stable_id=soundcard["stable_id"],
+        output_sample_rate=soundcard["sample_rate"],
+        channel_mode=soundcard["channel_mode"],
+        software_volume=soundcard["volume"],
+    )
+
+
 def friendly_stream_error(exc: Exception) -> str:
     message = str(exc)
     if "401" in message:
@@ -7843,6 +8607,37 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </select>
         </label>
       </div>
+      <div id="wizard_step_output_type" class="wizard-step" hidden>
+        <p>Select the output type.</p>
+        <fieldset>
+          <legend>Output type</legend>
+          <label><input id="wizard_output_type_icecast" name="wizard_output_type" type="radio" value="icecast" checked aria-describedby="wizard_output_type_icecast_hint"> Icecast mountpoint</label>
+          <span id="wizard_output_type_icecast_hint" class="hint">Send station audio to an Icecast mountpoint, including private servers or services like GWES Weather Radio, NOAA Weather Radio Org, and WeatherUSA.</span>
+          <label><input id="wizard_output_type_soundcard" name="wizard_output_type" type="radio" value="soundcard" aria-describedby="wizard_output_type_soundcard_hint"> Sound card</label>
+          <span id="wizard_output_type_soundcard_hint" class="hint">Send station audio to a local sound card, useful for feeding an Emergency Alert System ENDEC.</span>
+        </fieldset>
+      </div>
+      <div id="wizard_step_soundcard_device" class="wizard-step" hidden>
+        <p>Select the sound card that should play this stream.</p>
+        <p>The sound card must be connected to the machine running NWR Stream Manager, not the phone, tablet, or computer used to access this web interface.</p>
+        <label>Sound card
+          <select id="wizard_soundcard_device"></select>
+        </label>
+        <div id="wizard_soundcard_device_hint" class="hint"></div>
+      </div>
+      <div id="wizard_step_soundcard_controls" class="wizard-step" hidden>
+        <p>Choose which output channels to use and adjust the playback volume.</p>
+        <fieldset>
+          <legend>Output channels</legend>
+          <label><input id="wizard_soundcard_channel_both" name="wizard_soundcard_channel" type="radio" value="both" checked> Both left and right</label>
+          <label><input id="wizard_soundcard_channel_left" name="wizard_soundcard_channel" type="radio" value="left"> Left</label>
+          <label><input id="wizard_soundcard_channel_right" name="wizard_soundcard_channel" type="radio" value="right"> Right</label>
+        </fieldset>
+        <label>Volume
+          <input id="wizard_soundcard_volume" type="range" min="0" max="2" step="0.01" value="1">
+        </label>
+        <div id="wizard_soundcard_status" class="hint"></div>
+      </div>
       <div id="wizard_step_codec" class="wizard-step" hidden>
         <p>What audio codec would you like to use for the stream format? MP3 is generally more compatible, while OGG may give better audio quality at lower internet usage.</p>
         <fieldset id="icecast_format_fieldset">
@@ -7916,6 +8711,13 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <div class="actions">
           <button id="open_add_output" type="button">Add output</button>
         </div>
+        <label>Show outputs
+          <select id="output_type_filter">
+            <option value="icecast">Icecast outputs</option>
+            <option value="soundcard">Sound card outputs</option>
+          </select>
+        </label>
+        <div id="icecast_outputs_panel">
         <h3>Icecast outputs</h3>
         <table aria-label="Icecast outputs">
           <thead>
@@ -7930,10 +8732,29 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </thead>
           <tbody id="icecast-outputs-body" aria-live="off">
             <tr>
-              <td colspan="6" class="hint">No Icecast outputs configured.</td>
+              <td colspan="6" class="hint">No outputs configured.</td>
             </tr>
           </tbody>
         </table>
+        </div>
+        <div id="soundcard_outputs_panel" hidden>
+        <h3>Sound card outputs</h3>
+        <table aria-label="Sound card outputs">
+          <thead>
+            <tr>
+              <th>Sound card name</th>
+              <th>Channels</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="soundcard-outputs-body" aria-live="off">
+            <tr>
+              <td colspan="4" class="hint">No sound card outputs configured.</td>
+            </tr>
+          </tbody>
+        </table>
+        </div>
         <div id="output-list-result" class="message"></div>
       </div>
       <div id="panel_audio" class="tabpanel" role="tabpanel" aria-labelledby="tab_audio" hidden>
@@ -8094,6 +8915,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <section>
       <div id="output_form_panel">
           <h2 id="output_form_title">Add output</h2>
+          <div id="icecast_output_edit_panel">
           <label>Streaming service
             <select id="settings_icecast_service">
               <option value="custom">Custom Icecast server</option>
@@ -8166,6 +8988,32 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             <button id="cancel_output_form" type="button">Cancel</button>
             <button id="add_output" type="button">Add output</button>
             <button id="save_output_settings" type="button" hidden>Save changes</button>
+          </div>
+          </div>
+          <div id="soundcard_output_edit_panel" hidden>
+            <fieldset>
+              <legend>Sound card output</legend>
+              <div class="grid">
+                <label>Sound card
+                  <select id="settings_soundcard_device"></select>
+                </label>
+                <span id="settings_soundcard_device_hint" class="hint"></span>
+                <label>Volume
+                  <input id="settings_soundcard_volume" type="range" min="0" max="2" step="0.01" value="1">
+                </label>
+                <span class="hint">This volume applies only to this sound card output.</span>
+                <fieldset>
+                  <legend>Channels</legend>
+                  <label><input id="settings_soundcard_channel_left" name="settings_soundcard_channel" type="radio" value="left"> Left</label>
+                  <label><input id="settings_soundcard_channel_both" name="settings_soundcard_channel" type="radio" value="both" checked> Both left and right</label>
+                  <label><input id="settings_soundcard_channel_right" name="settings_soundcard_channel" type="radio" value="right"> Right</label>
+                </fieldset>
+              </div>
+            </fieldset>
+            <div class="actions">
+              <button id="reset_soundcard_device" type="button" hidden>Reset USB sound card</button>
+              <button id="cancel_soundcard_output_form" type="button">Cancel</button>
+            </div>
           </div>
         </div>
         <div id="output-result" class="message"></div>
@@ -8273,6 +9121,13 @@ const STREAM_SERVICE_HELP = {
   weatherusa: `If you do not yet have icecast credentials for streaming this station to this service, you must <a href="https://www.weatherusa.net/members/new" target="_blank" rel="noopener noreferrer">create an account on WeatherUSA</a> and <a href="https://www.weatherusa.net/members/services/radio" target="_blank" rel="noopener noreferrer">create a stream</a>. Once your stream is created, you must enter the icecast credentials into this page.`,
   nwrorg: `Use the <a href="https://noaaweatherradio.org/N2radio-finder.php" target="_blank" rel="noopener noreferrer">Weather Radio Station Lookup Utility</a> from NOAA Weather Radio Org to determine what the mountpoint should be.`
 };
+const ADD_OUTPUT_TYPE_STEP = 10;
+const ADD_OUTPUT_ICECAST_SERVICE_STEP = 11;
+const ADD_OUTPUT_ICECAST_CODEC_STEP = 12;
+const ADD_OUTPUT_ICECAST_CREDENTIALS_STEP = 13;
+const ADD_OUTPUT_ICECAST_QUALITY_STEP = 14;
+const ADD_OUTPUT_SOUNDCARD_DEVICE_STEP = 15;
+const ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP = 16;
 let applying = false;
 let timer = null;
 let gainValues = [];
@@ -8280,6 +9135,8 @@ let lastManualGain = null;
 let lastControlSignature = "";
 let stationResults = [];
 let selectedStationKey = "";
+let wizardStationOverride = null;
+let soundcardDevices = [];
 let configuredStreams = [];
 let editingStreamId = "";
 let editingOutputId = "";
@@ -8287,7 +9144,8 @@ let settingsStreamId = "";
 let outputFormMode = "add";
 let outputFormDirty = false;
 let outputFormOriginalSignature = "";
-let outputTableSignature = "";
+let icecastOutputTableSignature = "";
+let soundcardOutputTableSignature = "";
 let activeStreamSnapshots = [];
 let fallbackSignature = "";
 let fallbackUpdateTimer = null;
@@ -8301,6 +9159,9 @@ let wizardMode = "add";
 let wizardDirty = false;
 let icecastAuthPassed = false;
 let icecastAuthSignature = "";
+let wizardSoundcardOutputId = "";
+let wizardSoundcardPreviewId = "";
+let wizardSoundcardUpdateTimer = null;
 let activeStreamsSignature = "";
 let dashboardAttentionSignature = "";
 let dashboardRecentAlertsSignature = "";
@@ -8576,6 +9437,11 @@ async function request(path, options = {}) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || response.statusText);
   return data;
+}
+
+function statusRequestPath() {
+  if (!wizardSoundcardPreviewId) return "/api/status";
+  return `/api/status?soundcard_preview_id=${encodeURIComponent(wizardSoundcardPreviewId)}`;
 }
 
 async function requestWithTimeout(path, options = {}, timeoutMs = 15000) {
@@ -8897,23 +9763,49 @@ async function startStreamMonitor(streamId) {
       scheduleMonitorUnstableStop(`iceConnectionState=${peer.iceConnectionState}`);
     }
   });
-  const offer = await peer.createOffer();
-  await peer.setLocalDescription(offer);
-  const data = await request("/api/monitor/start", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      client_id: pageMonitorClientId(),
-      stream_id: streamId,
-      sdp: peer.localDescription.sdp,
-      type: peer.localDescription.type
-    })
-  });
-  await peer.setRemoteDescription(data.answer);
-  logClientEvent("info", "monitor", "monitor WebRTC answer accepted", {stream_id: streamId});
-  startMonitorPacketStats();
-  renderStreams(configuredStreams);
-  if (settingsStreamId) renderStreamSettings();
+  try {
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    const data = await request("/api/monitor/start", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        client_id: pageMonitorClientId(),
+        stream_id: streamId,
+        sdp: peer.localDescription.sdp,
+        type: peer.localDescription.type
+      })
+    });
+    await peer.setRemoteDescription(data.answer);
+    logClientEvent("info", "monitor", "monitor WebRTC answer accepted", {stream_id: streamId});
+    startMonitorPacketStats();
+    renderStreams(configuredStreams);
+    if (settingsStreamId) renderStreamSettings();
+  } catch (error) {
+    if (monitorPeerConnection === peer) {
+      monitorPeerConnection = null;
+      monitorStreamId = "";
+      clearMonitorWatchdogs();
+      resetLiveAudioElement();
+    }
+    try {
+      peer.close();
+    } catch (closeError) {
+      console.debug("failed to close failed monitor peer", closeError);
+    }
+    try {
+      await request("/api/monitor/stop", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({client_id: pageMonitorClientId()})
+      });
+    } catch (stopError) {
+      console.debug("monitor cleanup after failed start failed", stopError);
+    }
+    renderStreams(configuredStreams);
+    if (settingsStreamId) renderStreamSettings();
+    throw error;
+  }
 }
 
 async function stopStreamMonitor(options = {}) {
@@ -9272,7 +10164,11 @@ async function stopWeatherReceiver(options = {}) {
 	  if (preserveMediaSession && peer) {
 	    stopGeneratedSameAudio();
 	    clearSameLiveAudioMute();
-	    if (audio) audio.pause();
+	    setReceiverAudioTracksEnabled(false);
+	    if (audio) {
+	      audio.muted = true;
+	      audio.pause();
+	    }
 	    scheduleReceiverMediaSessionRefresh();
     renderReceiverControls();
     return;
@@ -9340,8 +10236,157 @@ function configuredDeviceLabel(serial) {
   return `Configured SDR, serial ${serial} (disconnected)`;
 }
 
+function friendlySoundcardLabel(device) {
+  const card = String(device.card_long_name || device.card_name || device.card_id || "").trim();
+  const pcm = String(device.pcm_name || device.pcm_id || "").trim();
+  const bus = device.bus === "usb" ? "USB" : device.bus === "pci" ? "PCI" : "";
+  const parts = [];
+  if (card) parts.push(card);
+  if (pcm && !card.toLowerCase().includes(pcm.toLowerCase())) parts.push(pcm);
+  if (bus) parts.push(bus);
+  const label = parts.join(", ").replace(/\\b(Generic USB|SOF[- ]DSP|sof[- ]hdadsp)\\b/gi, "").replace(/\\s+,/g, ",").replace(/\\s{2,}/g, " ").trim();
+  return label || device.display_name || device.hw_device || "Sound card";
+}
+
+function soundcardChannelsForMode(mode) {
+  if (mode === "left") return ["left"];
+  if (mode === "right") return ["right"];
+  return ["left", "right"];
+}
+
+function soundcardOccupancy(ignoreOutputId = "") {
+  const occupied = new Map();
+  for (const stream of configuredStreams) {
+    for (const output of stream.outputs || []) {
+      if ((output.type || "icecast") !== "soundcard") continue;
+      if (output.enabled === false) continue;
+      if (ignoreOutputId && output.id === ignoreOutputId) continue;
+      const soundcard = output.soundcard || {};
+      const stableId = soundcard.stable_id || "";
+      if (!stableId) continue;
+      if (!occupied.has(stableId)) occupied.set(stableId, new Set());
+      for (const channel of soundcardChannelsForMode(soundcard.channel_mode || "both")) {
+        occupied.get(stableId).add(channel);
+      }
+    }
+  }
+  return occupied;
+}
+
+function availableSoundcardChannels(stableId, ignoreOutputId = "") {
+  const used = soundcardOccupancy(ignoreOutputId).get(stableId) || new Set();
+  return ["left", "right"].filter(channel => !used.has(channel));
+}
+
+function soundcardDeviceHasAvailableChannels(stableId, ignoreOutputId = "") {
+  return availableSoundcardChannels(stableId, ignoreOutputId).length > 0;
+}
+
+function chooseAvailableSoundcardChannel(preferred, stableId, ignoreOutputId = "") {
+  const available = availableSoundcardChannels(stableId, ignoreOutputId);
+  if (available.length === 0) return "";
+  const preferredChannels = soundcardChannelsForMode(preferred || "both");
+  if (preferred === "both" && available.length === 2) return "both";
+  if (preferredChannels.length === 1 && available.includes(preferredChannels[0])) return preferredChannels[0];
+  return available[0];
+}
+
+function setSoundcardChannelOptions(prefix, stableId, ignoreOutputId = "") {
+  const available = availableSoundcardChannels(stableId, ignoreOutputId);
+  const controls = {
+    left: document.getElementById(`${prefix}_soundcard_channel_left`),
+    both: document.getElementById(`${prefix}_soundcard_channel_both`),
+    right: document.getElementById(`${prefix}_soundcard_channel_right`)
+  };
+  for (const [mode, control] of Object.entries(controls)) {
+    if (!control) continue;
+    const modeChannels = soundcardChannelsForMode(mode);
+    const visible = stableId && modeChannels.every(channel => available.includes(channel));
+    const label = control.closest("label");
+    if (label) label.hidden = !visible;
+    control.disabled = !visible;
+    if (!visible) control.checked = false;
+  }
+  const current = Object.entries(controls).find(([_mode, control]) => control && control.checked && !control.disabled);
+  if (!current) {
+    const next = chooseAvailableSoundcardChannel("both", stableId, ignoreOutputId);
+    if (next && controls[next]) controls[next].checked = true;
+  }
+}
+
+function renderWizardSoundcardDevices() {
+  const select = document.getElementById("wizard_soundcard_device");
+  if (!select) return;
+  const ignoreOutputId = wizardSoundcardOutputId || "";
+  const options = soundcardDevices
+    .filter(device => soundcardDeviceHasAvailableChannels(device.stable_id, ignoreOutputId))
+    .map(device => ({
+      value: device.stable_id,
+      label: friendlySoundcardLabel(device)
+    }));
+  if (options.length === 0) {
+    options.push({value: "", label: "No sound cards found"});
+  }
+  const signature = JSON.stringify(options);
+  if (select.dataset.signature !== signature) {
+    syncSelectOptions(select, options);
+    select.dataset.signature = signature;
+  }
+  setText(
+    "wizard_soundcard_device_hint",
+    options[0] && options[0].value ? "NWR Stream Manager will open the hardware device directly." : "No sound cards have available channels."
+  );
+  const selectedStableId = select.value || "";
+  setSoundcardChannelOptions("wizard", selectedStableId, ignoreOutputId);
+}
+
+function renderSettingsSoundcardDevices(selectedStableId = "") {
+  const select = document.getElementById("settings_soundcard_device");
+  if (!select) return;
+  const options = [];
+  const ignoreOutputId = editingOutputId || "";
+  const selectedDevice = soundcardDevices.find(device => device.stable_id === selectedStableId);
+  if (selectedStableId && !selectedDevice) {
+    options.push({value: selectedStableId, label: `Configured sound card, ${selectedStableId} (disconnected)`});
+  }
+  for (const device of soundcardDevices) {
+    if (device.stable_id !== selectedStableId && !soundcardDeviceHasAvailableChannels(device.stable_id, ignoreOutputId)) continue;
+    options.push({value: device.stable_id, label: friendlySoundcardLabel(device)});
+  }
+  if (options.length === 0) {
+    options.push({value: "", label: "No sound cards found"});
+  }
+  const signature = JSON.stringify(options);
+  if (select.dataset.signature !== signature) {
+    syncSelectOptions(select, options);
+    select.dataset.signature = signature;
+  }
+  setValue("settings_soundcard_device", selectedStableId || (options[0] ? options[0].value : ""));
+  setText(
+    "settings_soundcard_device_hint",
+    selectedStableId && !selectedDevice
+      ? "The configured sound card is not currently connected."
+      : options[0] && options[0].value
+        ? "NWR Stream Manager will open the hardware device directly."
+        : "No sound cards have available channels."
+  );
+  setSoundcardChannelOptions("settings", select.value || "", ignoreOutputId);
+  updateSettingsSoundcardResetButton();
+}
+
+function updateSettingsSoundcardResetButton() {
+  const button = document.getElementById("reset_soundcard_device");
+  if (!button) return;
+  const selected = findConfiguredOutput(settingsStreamId, editingOutputId);
+  const output = selected ? selected.output : null;
+  const stableId = document.getElementById("settings_soundcard_device").value || "";
+  const device = soundcardDeviceForStableId(stableId);
+  button.hidden = accountIsReadOnly() || outputFormMode !== "edit_soundcard" || !output || !device || device.bus !== "usb";
+}
+
 async function loadDevices(selected, options = {}) {
   const data = await request("/api/devices");
+  soundcardDevices = Array.isArray(data.soundcards) ? data.soundcards : [];
   const select = document.getElementById("serial");
   const selectedDevice = data.devices.find(device => device.serial === selected);
   const optionSignature = data.devices.map(device => [device.serial, deviceLabel(device)]);
@@ -9369,6 +10414,16 @@ async function loadDevices(selected, options = {}) {
   const fallback = !selected && data.devices.length === 1 ? data.devices[0].serial : "";
   setValue("serial", selected || fallback);
   setText("device-errors", data.errors.join(" | "));
+  renderWizardSoundcardDevices();
+  if (outputFormMode === "edit_soundcard") {
+    const selectedOutput = findConfiguredOutput(settingsStreamId, editingOutputId);
+    renderSettingsSoundcardDevices(selectedOutput && selectedOutput.output.soundcard ? selectedOutput.output.soundcard.stable_id : "");
+  }
+  if (currentViewName() === "stream_settings" || currentViewName() === "stream_output") {
+    icecastOutputTableSignature = "";
+    soundcardOutputTableSignature = "";
+    renderStreamSettings();
+  }
 }
 
 async function loadIqTestSources(options = {}) {
@@ -9498,6 +10553,7 @@ async function runStationSearchFromUi() {
 }
 
 function selectedStation() {
+  if (wizardStationOverride) return wizardStationOverride;
   return stationResults.find(station => station.key === selectedStationKey);
 }
 
@@ -9517,6 +10573,15 @@ function chooseStation() {
 function streamPayload() {
   const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
   const station = selectedStation();
+  const outputType = selectedWizardOutputType();
+  if (outputType === "soundcard" && wizardMode !== "edit") {
+    return {
+      station_key: selectedStationKey,
+      type: "soundcard",
+      preview_id: wizardSoundcardPreviewId,
+      soundcard: wizardSoundcardPayload()
+    };
+  }
   const selectedFormat = selectedWizardFormat();
   const icecast = applyServicePresetToIcecast({
     host: document.getElementById("icecast_host").value,
@@ -9530,6 +10595,7 @@ function streamPayload() {
   }, service, station, "icecast");
   return {
     station_key: selectedStationKey,
+    type: "icecast",
     icecast
   };
 }
@@ -9541,6 +10607,97 @@ function outputEditPayload() {
     enabled: document.getElementById("output_enabled").checked,
     icecast: streamPayload().icecast
   };
+}
+
+function selectedSettingsSoundcardChannelMode() {
+  const selected = document.querySelector("input[name='settings_soundcard_channel']:checked");
+  return selected ? selected.value : "both";
+}
+
+function settingsSoundcardPayload() {
+  return {
+    stable_id: document.getElementById("settings_soundcard_device").value || "",
+    channel_mode: selectedSettingsSoundcardChannelMode(),
+    volume: Number(document.getElementById("settings_soundcard_volume").value),
+    sample_rate: 48000
+  };
+}
+
+function selectedWizardOutputType() {
+  const selected = document.querySelector("input[name='wizard_output_type']:checked");
+  return selected ? selected.value : "icecast";
+}
+
+function selectedWizardSoundcardChannelMode() {
+  const selected = document.querySelector("input[name='wizard_soundcard_channel']:checked");
+  return selected ? selected.value : "both";
+}
+
+function wizardSoundcardPayload() {
+  return {
+    stable_id: document.getElementById("wizard_soundcard_device").value || "",
+    channel_mode: selectedWizardSoundcardChannelMode(),
+    volume: Number(document.getElementById("wizard_soundcard_volume").value),
+    sample_rate: 48000
+  };
+}
+
+function adjustWizardSoundcardChannelForDevice() {
+  const stableId = document.getElementById("wizard_soundcard_device").value || "";
+  const current = selectedWizardSoundcardChannelMode();
+  const next = chooseAvailableSoundcardChannel(current, stableId, wizardSoundcardOutputId || "");
+  setSoundcardChannelOptions("wizard", stableId, wizardSoundcardOutputId || "");
+  if (next) setChecked(`wizard_soundcard_channel_${next}`, true);
+}
+
+function adjustSettingsSoundcardChannelForDevice() {
+  const stableId = document.getElementById("settings_soundcard_device").value || "";
+  const current = selectedSettingsSoundcardChannelMode();
+  const next = chooseAvailableSoundcardChannel(current, stableId, editingOutputId || "");
+  setSoundcardChannelOptions("settings", stableId, editingOutputId || "");
+  if (next) setChecked(`settings_soundcard_channel_${next}`, true);
+  updateSettingsSoundcardResetButton();
+}
+
+async function resetSoundcardByStableId(stableId, resultSetter = setOutputResult) {
+  if (!stableId || accountIsReadOnly()) return;
+  resultSetter("Resetting USB sound card...");
+  const data = await requestWithTimeout("/api/soundcard-reset", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({stable_id: stableId})
+  }, 15000);
+  resultSetter(data.message || "Sound card reset finished.", data.success ? "success" : "error");
+  applyStatus(data.status || await request(statusRequestPath()), {syncControls: false});
+  await loadDevices("", {force: true});
+}
+
+function addOutputIcecastStep(streamStep) {
+  if (streamStep === 1) return ADD_OUTPUT_ICECAST_SERVICE_STEP;
+  if (streamStep === 2) return ADD_OUTPUT_ICECAST_CODEC_STEP;
+  if (streamStep === 3) return ADD_OUTPUT_ICECAST_CREDENTIALS_STEP;
+  if (streamStep === 4) return ADD_OUTPUT_ICECAST_QUALITY_STEP;
+  return streamStep;
+}
+
+function streamIcecastStep(addOutputStep) {
+  if (addOutputStep === ADD_OUTPUT_ICECAST_SERVICE_STEP) return 1;
+  if (addOutputStep === ADD_OUTPUT_ICECAST_CODEC_STEP) return 2;
+  if (addOutputStep === ADD_OUTPUT_ICECAST_CREDENTIALS_STEP) return 3;
+  if (addOutputStep === ADD_OUTPUT_ICECAST_QUALITY_STEP) return 4;
+  return addOutputStep;
+}
+
+function wizardUsesOutputSteps() {
+  return wizardMode === "add_output" || wizardStep >= ADD_OUTPUT_TYPE_STEP;
+}
+
+function wizardIsSoundcardFlow() {
+  return (
+    selectedWizardOutputType() === "soundcard" &&
+    (wizardMode === "add_output" || wizardMode === "add") &&
+    wizardStep >= ADD_OUTPUT_TYPE_STEP
+  );
 }
 
 async function setStreamEnabled(streamId, enabled, resultHandler = setStreamResult) {
@@ -10343,6 +11500,12 @@ function showSettingsTab(name) {
 }
 
 function updateOutputFormButtons() {
+  if (outputFormMode === "edit_soundcard") {
+    outputFormDirty = false;
+    document.getElementById("add_output").hidden = true;
+    document.getElementById("save_output_settings").hidden = true;
+    return;
+  }
   const changed = outputFormSignature() !== outputFormOriginalSignature;
   outputFormDirty = !document.getElementById("output_form_panel").hidden && changed;
   setDisabled(document.getElementById("add_output"), !settingsCredentialsComplete());
@@ -10362,6 +11525,8 @@ function currentSettingsStream() {
 function prepareAddOutput() {
   outputFormMode = "add";
   editingOutputId = "";
+  document.getElementById("icecast_output_edit_panel").hidden = false;
+  document.getElementById("soundcard_output_edit_panel").hidden = true;
   clearSettingsIcecastForm();
   outputFormOriginalSignature = outputFormSignature();
   outputFormDirty = false;
@@ -10373,8 +11538,8 @@ function prepareAddOutput() {
 
 function beginAddOutput() {
   if (!settingsStreamId) return;
-  prepareAddOutput();
-  navigateTo("stream_output", {streamId: settingsStreamId});
+  if (!prepareAddOutputWizard(settingsStreamId)) return;
+  navigateTo("add_stream", {streamId: settingsStreamId}, false, true);
 }
 
 function prepareEditOutput(outputId) {
@@ -10383,8 +11548,13 @@ function prepareEditOutput(outputId) {
     setOutputResult("Stream output was not found.", "error");
     return false;
   }
+  if ((selected.output.type || "icecast") === "soundcard") {
+    return prepareEditSoundcardOutput(selected);
+  }
   outputFormMode = "edit";
   editingOutputId = outputId;
+  document.getElementById("icecast_output_edit_panel").hidden = false;
+  document.getElementById("soundcard_output_edit_panel").hidden = true;
   setSettingsIcecastForm(selected.output.icecast || {});
   outputFormOriginalSignature = outputFormSignature();
   outputFormDirty = false;
@@ -10395,6 +11565,27 @@ function prepareEditOutput(outputId) {
   return true;
 }
 
+function prepareEditSoundcardOutput(selected) {
+  outputFormMode = "edit_soundcard";
+  editingOutputId = selected.output.id || "";
+  outputFormOriginalSignature = "";
+  outputFormDirty = false;
+  document.getElementById("icecast_output_edit_panel").hidden = true;
+  document.getElementById("soundcard_output_edit_panel").hidden = false;
+  const soundcard = selected.output.soundcard || {};
+  renderSettingsSoundcardDevices(soundcard.stable_id || "");
+  setValue("settings_soundcard_volume", soundcard.volume ?? 1);
+  setChecked("settings_soundcard_channel_left", soundcard.channel_mode === "left");
+  setChecked("settings_soundcard_channel_both", !soundcard.channel_mode || soundcard.channel_mode === "both");
+  setChecked("settings_soundcard_channel_right", soundcard.channel_mode === "right");
+  setText("output_form_title", "Edit sound card output");
+  document.getElementById("output_form_panel").hidden = false;
+  setOutputResult("");
+  updateOutputFormButtons();
+  loadDevices("", {force: true}).catch(error => setOutputResult(error.message, "error"));
+  return true;
+}
+
 function beginEditOutput(outputId) {
   if (!settingsStreamId || !prepareEditOutput(outputId)) return;
   navigateTo("stream_output", {streamId: settingsStreamId, outputId});
@@ -10402,9 +11593,12 @@ function beginEditOutput(outputId) {
 
 function closeOutputForm() {
   document.getElementById("output_form_panel").hidden = true;
+  document.getElementById("icecast_output_edit_panel").hidden = false;
+  document.getElementById("soundcard_output_edit_panel").hidden = true;
   outputFormDirty = false;
   outputFormOriginalSignature = "";
   editingOutputId = "";
+  outputFormMode = "add";
   setOutputResult("");
 }
 
@@ -10448,7 +11642,7 @@ function credentialsComplete() {
 }
 
 function setWizardStep(step) {
-  wizardStep = Math.max(0, Math.min(4, step));
+  wizardStep = Math.max(0, Math.min(ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP, step));
   renderWizard();
 }
 
@@ -10458,6 +11652,10 @@ function setWizardPanel(id, visible) {
 
 function renderWizard() {
   const editMode = wizardMode === "edit";
+  const addOutputMode = wizardMode === "add_output";
+  const soundcardMode = wizardIsSoundcardFlow();
+  const outputStepMode = !editMode && (addOutputMode || wizardStep >= ADD_OUTPUT_TYPE_STEP);
+  const streamStep = wizardUsesOutputSteps() ? streamIcecastStep(wizardStep) : wizardStep;
   const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
   const needsCodecStep = service === STREAM_SERVICE_CUSTOM || service === STREAM_SERVICE_WEATHERUSA;
   const needsQualityStep = service === STREAM_SERVICE_CUSTOM || service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_WEATHERUSA;
@@ -10470,34 +11668,46 @@ function renderWizard() {
   else if (document.getElementById("stream-result").textContent.startsWith("Please select ")) setStreamResult("");
   setServiceHelp("icecast_service_help", service);
   applyServiceControls("icecast", service);
-  setText("stream_wizard_title", editMode ? "Edit Stream Output" : "Add Stream");
-  if (currentViewName() === "add_stream") setPageTitle(editMode ? "Edit Stream Output" : "Add Stream");
-  setWizardPanel("wizard_step_station", !editMode && wizardStep === 0);
-  setWizardPanel("wizard_step_service", !editMode && wizardStep === 1);
-  setWizardPanel("wizard_step_codec", !editMode && wizardStep === 2 && needsCodecStep);
-  setWizardPanel("wizard_step_credentials", editMode || wizardStep === 3 || (!needsCodecStep && wizardStep === 2));
-  setWizardPanel("wizard_step_quality", !editMode && wizardStep === 4 && needsQualityStep);
+  const stream = addOutputMode ? configuredStreams.find(item => item.id === settingsStreamId) : null;
+  const title = editMode ? "Edit Stream Output" : addOutputMode ? `Add output for ${streamCallsign(stream)}` : "Add Stream";
+  setText("stream_wizard_title", title);
+  if (currentViewName() === "add_stream") setPageTitle(title);
+  setWizardPanel("wizard_step_station", !editMode && !addOutputMode && wizardStep === 0);
+  setWizardPanel("wizard_step_output_type", outputStepMode && wizardStep === ADD_OUTPUT_TYPE_STEP);
+  setWizardPanel("wizard_step_soundcard_device", soundcardMode && wizardStep === ADD_OUTPUT_SOUNDCARD_DEVICE_STEP);
+  setWizardPanel("wizard_step_soundcard_controls", soundcardMode && wizardStep === ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP);
+  setWizardPanel("wizard_step_service", !editMode && !soundcardMode && streamStep === 1);
+  setWizardPanel("wizard_step_codec", !editMode && !soundcardMode && streamStep === 2 && needsCodecStep);
+  setWizardPanel("wizard_step_credentials", !soundcardMode && (editMode || streamStep === 3 || (!needsCodecStep && streamStep === 2)));
+  setWizardPanel("wizard_step_quality", !editMode && !soundcardMode && streamStep === 4 && needsQualityStep);
   document.getElementById("cancel_wizard").hidden = editMode;
-  document.getElementById("wizard_back").hidden = editMode || wizardStep === 0;
-  document.getElementById("wizard_next").hidden = editMode || (wizardStep === 4) || (!needsQualityStep && wizardStep >= 3);
-  document.getElementById("wizard_finish").hidden = editMode || !(wizardStep === 4 || (!needsQualityStep && wizardStep >= 3));
-  document.getElementById("save_output").hidden = !editMode;
-  document.getElementById("cancel_output_edit").hidden = !editMode;
+  const backButton = document.getElementById("wizard_back");
+  backButton.hidden = editMode || (!addOutputMode && wizardStep === 0);
+  setDisabled(backButton, addOutputMode && wizardStep === ADD_OUTPUT_TYPE_STEP);
   const next = document.getElementById("wizard_next");
   const finish = document.getElementById("wizard_finish");
+  next.hidden = editMode || (soundcardMode && wizardStep === ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP) || (!soundcardMode && streamStep === 4) || (!soundcardMode && !needsQualityStep && streamStep >= 3);
+  finish.hidden = editMode || !(soundcardMode && wizardStep === ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP || (!soundcardMode && (streamStep === 4 || (!needsQualityStep && streamStep >= 3))));
+  document.getElementById("save_output").hidden = !editMode;
+  document.getElementById("cancel_output_edit").hidden = !editMode;
+  renderWizardSoundcardDevices();
   if (wizardStep === 0) {
     setDisabled(next, !selectedStation());
-  } else if (wizardStep === 3 || (!needsCodecStep && wizardStep === 2)) {
+  } else if (wizardStep === ADD_OUTPUT_TYPE_STEP) {
+    setDisabled(next, false);
+  } else if (wizardStep === ADD_OUTPUT_SOUNDCARD_DEVICE_STEP) {
+    setDisabled(next, !document.getElementById("wizard_soundcard_device").value);
+  } else if (!soundcardMode && (streamStep === 3 || (!needsCodecStep && streamStep === 2))) {
     setDisabled(next, !credentialsComplete());
   } else {
     setDisabled(next, false);
   }
   if (!finish.hidden) {
-    setDisabled(finish, wizardStep === 3 && !credentialsComplete());
+    setDisabled(finish, !soundcardMode && streamStep === 3 && !credentialsComplete());
   }
 }
 
-function beginStreamWizard() {
+function resetStreamWizardState() {
   wizardMode = "add";
   wizardStep = 0;
   wizardDirty = true;
@@ -10505,22 +11715,306 @@ function beginStreamWizard() {
   icecastAuthSignature = "";
   editingStreamId = "";
   editingOutputId = "";
+  settingsStreamId = "";
+  wizardStationOverride = null;
   selectedStationKey = "";
   setValue("station_search", "");
   updateStationSearchControls();
   clearStationResults();
   clearIcecastForm();
+  setChecked("wizard_output_type_icecast", true);
+  setChecked("wizard_output_type_soundcard", false);
+  setChecked("wizard_soundcard_channel_both", true);
+  setValue("wizard_soundcard_volume", 1);
   setStreamResult("");
   renderWizard();
+}
+
+function beginStreamWizard() {
+  resetStreamWizardState();
   navigateTo("add_stream", {}, false, true);
 }
 
 function finishWizard() {
+  const returnStreamId = wizardMode === "add_output" ? settingsStreamId : "";
   wizardDirty = false;
   icecastAuthPassed = false;
   icecastAuthSignature = "";
+  wizardStationOverride = null;
+  wizardSoundcardOutputId = "";
+  wizardSoundcardPreviewId = "";
   setStreamResult("");
-  navigateTo("streams");
+  if (returnStreamId) {
+    navigateTo("stream_settings", {streamId: returnStreamId}, false, true);
+  } else {
+    navigateTo("streams");
+  }
+}
+
+function prepareAddOutputWizard(streamId) {
+  const stream = configuredStreams.find(item => item.id === streamId);
+  if (!stream) {
+    setOutputResult("Stream was not found.", "error");
+    return false;
+  }
+  settingsStreamId = streamId;
+  editingStreamId = streamId;
+  editingOutputId = "";
+  wizardMode = "add_output";
+  wizardStep = ADD_OUTPUT_TYPE_STEP;
+  wizardDirty = true;
+  icecastAuthPassed = false;
+  icecastAuthSignature = "";
+  wizardSoundcardOutputId = "";
+  wizardSoundcardPreviewId = "";
+  wizardStationOverride = stream.station || null;
+  selectedStationKey = stream.station && stream.station.key ? stream.station.key : "";
+  setChecked("wizard_output_type_icecast", true);
+  setChecked("wizard_output_type_soundcard", false);
+  setChecked("wizard_soundcard_channel_both", true);
+  setValue("wizard_soundcard_volume", 1);
+  clearIcecastForm();
+  setText("selected_station", `Adding output for ${streamCallsign(stream)} ${stream.station && stream.station.frequency ? `${stream.station.frequency} MHz` : ""}`);
+  setStreamResult("");
+  renderWizard();
+  loadDevices("", {force: true}).catch(error => setStreamResult(error.message, "error"));
+  return true;
+}
+
+async function authenticateWizardIcecastOutput() {
+  const button = document.getElementById("wizard_next");
+  setDisabled(button, true);
+  setStreamResult("Testing Icecast authentication...");
+  try {
+    const signature = icecastCredentialSignature();
+    const data = await request("/api/icecast-auth", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({icecast: streamPayload().icecast})
+    });
+    setStreamResult(data.message, data.success ? "success" : "error");
+    if (data.success) {
+      icecastAuthPassed = true;
+      icecastAuthSignature = signature;
+      const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+      const outputSteps = wizardUsesOutputSteps();
+      if (service === STREAM_SERVICE_NWRORG) {
+        setWizardStep(outputSteps ? ADD_OUTPUT_ICECAST_CREDENTIALS_STEP : 3);
+      } else {
+        setWizardStep(outputSteps ? ADD_OUTPUT_ICECAST_QUALITY_STEP : 4);
+      }
+    }
+  } catch (error) {
+    setStreamResult(error.message, "error");
+  } finally {
+    renderWizard();
+  }
+}
+
+async function createWizardSoundcardOutput() {
+  if (!settingsStreamId) return;
+  const button = document.getElementById("wizard_next");
+  setDisabled(button, true);
+  setStreamResult(wizardSoundcardOutputId ? "Updating soundcard output..." : "Adding soundcard output...");
+  try {
+    const data = await request("/api/stream-output", {
+      method: wizardSoundcardOutputId ? "PATCH" : "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        stream_id: settingsStreamId,
+        output_id: wizardSoundcardOutputId,
+        type: "soundcard",
+        enabled: true,
+        soundcard: wizardSoundcardPayload()
+      })
+    });
+    renderStreams(data.streams || []);
+    if (data.success) {
+      wizardSoundcardOutputId = data.output_id || wizardSoundcardOutputId;
+      setStreamResult(data.message, "success");
+      setWizardStep(ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP);
+    } else {
+      setStreamResult(data.message, "error");
+    }
+  } catch (error) {
+    setStreamResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
+    renderWizard();
+  }
+}
+
+async function upsertWizardSoundcardPreview() {
+  if (wizardMode !== "add" || selectedWizardOutputType() !== "soundcard") return false;
+  const button = document.getElementById("wizard_next");
+  setDisabled(button, true);
+  setStreamResult(wizardSoundcardPreviewId ? "Updating soundcard preview..." : "Starting soundcard preview...");
+  try {
+    const data = await request("/api/stream-soundcard-preview", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        preview_id: wizardSoundcardPreviewId,
+        station_key: selectedStationKey,
+        soundcard: wizardSoundcardPayload()
+      })
+    });
+    if (data.success) {
+      wizardSoundcardPreviewId = data.preview_id || wizardSoundcardPreviewId;
+      setStreamResult(data.message, "success");
+      setWizardStep(ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP);
+      return true;
+    }
+    setStreamResult(data.message || "Soundcard preview could not be started.", "error");
+  } catch (error) {
+    setStreamResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
+    renderWizard();
+  }
+  return false;
+}
+
+async function updateWizardSoundcardPreview() {
+  if (wizardMode !== "add" || !wizardSoundcardPreviewId) return;
+  try {
+    const data = await request("/api/stream-soundcard-preview", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        preview_id: wizardSoundcardPreviewId,
+        station_key: selectedStationKey,
+        soundcard: wizardSoundcardPayload()
+      })
+    });
+    setText("wizard_soundcard_status", data.success ? "Soundcard preview updated." : data.message);
+  } catch (error) {
+    setText("wizard_soundcard_status", error.message);
+  }
+}
+
+async function discardWizardSoundcardPreview() {
+  if (!wizardSoundcardPreviewId) return;
+  const previewId = wizardSoundcardPreviewId;
+  wizardSoundcardPreviewId = "";
+  try {
+    await request(`/api/stream-soundcard-preview?preview_id=${encodeURIComponent(previewId)}`, {
+      method: "DELETE"
+    });
+  } catch (error) {
+    setStreamResult(error.message, "error");
+  }
+}
+
+function sendWizardSoundcardPreviewDiscardBeacon() {
+  if (!wizardSoundcardPreviewId) return;
+  const previewId = wizardSoundcardPreviewId;
+  wizardSoundcardPreviewId = "";
+  const payload = JSON.stringify({preview_id: previewId});
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon("/api/stream-soundcard-preview/discard", new Blob([payload], {type: "application/json"}));
+    return;
+  }
+  fetch("/api/stream-soundcard-preview/discard", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: payload,
+    keepalive: true
+  }).catch(() => {});
+}
+
+async function updateWizardSoundcardOutput() {
+  if (!settingsStreamId || !wizardSoundcardOutputId) return;
+  try {
+    const data = await request("/api/stream-output", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        stream_id: settingsStreamId,
+        output_id: wizardSoundcardOutputId,
+        type: "soundcard",
+        enabled: true,
+        soundcard: wizardSoundcardPayload()
+      })
+    });
+    renderStreams(data.streams || []);
+    setText("wizard_soundcard_status", data.success ? "Soundcard output updated." : data.message);
+  } catch (error) {
+    setText("wizard_soundcard_status", error.message);
+  }
+}
+
+function scheduleWizardSoundcardUpdate() {
+  wizardDirty = true;
+  if (wizardMode === "add" && wizardSoundcardPreviewId) {
+    if (wizardSoundcardUpdateTimer) window.clearTimeout(wizardSoundcardUpdateTimer);
+    wizardSoundcardUpdateTimer = window.setTimeout(() => {
+      wizardSoundcardUpdateTimer = null;
+      updateWizardSoundcardPreview();
+    }, 120);
+    return;
+  }
+  if (!wizardSoundcardOutputId) {
+    renderWizard();
+    return;
+  }
+  if (wizardSoundcardUpdateTimer) window.clearTimeout(wizardSoundcardUpdateTimer);
+  wizardSoundcardUpdateTimer = window.setTimeout(() => {
+    wizardSoundcardUpdateTimer = null;
+    updateWizardSoundcardOutput();
+  }, 120);
+}
+
+let settingsSoundcardUpdateTimer = null;
+
+async function updateSettingsSoundcardOutput() {
+  if (!settingsStreamId || !editingOutputId || outputFormMode !== "edit_soundcard") return;
+  const selected = findConfiguredOutput(settingsStreamId, editingOutputId);
+  if (!selected) {
+    setOutputResult("Stream output was not found.", "error");
+    return;
+  }
+  try {
+    const data = await request("/api/stream-output", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        stream_id: settingsStreamId,
+        output_id: editingOutputId,
+        type: "soundcard",
+        enabled: selected.output.enabled !== false,
+        soundcard: settingsSoundcardPayload()
+      })
+    });
+    renderStreams(data.streams || []);
+    setOutputResult(data.message || "Sound card output updated.", data.success ? "success" : "error");
+  } catch (error) {
+    setOutputResult(error.message, "error");
+  }
+}
+
+function scheduleSettingsSoundcardUpdate() {
+  outputFormDirty = false;
+  if (settingsSoundcardUpdateTimer) window.clearTimeout(settingsSoundcardUpdateTimer);
+  settingsSoundcardUpdateTimer = window.setTimeout(() => {
+    settingsSoundcardUpdateTimer = null;
+    updateSettingsSoundcardOutput();
+  }, 120);
+}
+
+async function discardWizardSoundcardOutput() {
+  if (!settingsStreamId || !wizardSoundcardOutputId) return;
+  const outputId = wizardSoundcardOutputId;
+  wizardSoundcardOutputId = "";
+  try {
+    const data = await request(
+      `/api/stream-output?stream_id=${encodeURIComponent(settingsStreamId)}&output_id=${encodeURIComponent(outputId)}`,
+      {method: "DELETE"}
+    );
+    renderStreams(data.streams || []);
+  } catch (error) {
+    setStreamResult(error.message, "error");
+  }
 }
 
 function setOutputEditMode(enabled, selected = null) {
@@ -10566,7 +12060,8 @@ function showStreamSettings(streamId) {
     return;
   }
   settingsStreamId = streamId;
-  outputTableSignature = "";
+  icecastOutputTableSignature = "";
+  soundcardOutputTableSignature = "";
   easSignature = "";
   audioEffectsSignature = "";
   selectAudioEffect(selectedAudioEffect, false);
@@ -10587,7 +12082,9 @@ function renderStreamSettings() {
   setChecked("stream_monitor_enabled", Boolean(stream && monitorStreamId === stream.id));
   setAudioEffectsControls(stream);
   setEasControls(stream);
+  renderOutputPanels();
   renderIcecastOutputsTable(stream);
+  renderSoundcardOutputsTable(stream);
 }
 
 function outputStatusFor(stream, output) {
@@ -10607,9 +12104,55 @@ function outputStatusLabel(status) {
   return "Disabled";
 }
 
+function outputStatusLabelForOutput(output, status) {
+  if ((output.type || "icecast") === "soundcard" && status === "connected") return "Enabled";
+  return outputStatusLabel(status);
+}
+
 function outputDestination(icecast) {
   if (!icecast || !icecast.host) return "Unknown";
   return `${icecast.host}:${icecast.port}${icecast.mount}`;
+}
+
+function soundcardDestination(soundcard) {
+  const device = soundcardDevices.find(item => item.stable_id === soundcard.stable_id);
+  return device ? friendlySoundcardLabel(device) : soundcard.stable_id || "Sound card";
+}
+
+function soundcardDeviceForStableId(stableId) {
+  return soundcardDevices.find(item => item.stable_id === stableId) || null;
+}
+
+function soundcardOutputUsbDevice(output) {
+  if (!output || output.type !== "soundcard") return null;
+  const stableId = output.soundcard && output.soundcard.stable_id ? output.soundcard.stable_id : "";
+  const device = soundcardDeviceForStableId(stableId);
+  return device && device.bus === "usb" ? device : null;
+}
+
+function outputRowDestination(output) {
+  if (output.type === "soundcard") return soundcardDestination(output.soundcard || {});
+  return outputDestination(output.icecast || {});
+}
+
+function outputRowFormat(output) {
+  if (output.type === "soundcard") return "Soundcard";
+  return String((output.icecast || {}).format || "mp3").toUpperCase();
+}
+
+function outputRowSampleRate(output) {
+  if (output.type === "soundcard") return `${(output.soundcard || {}).sample_rate || 48000} Hz`;
+  return `${(output.icecast || {}).sample_rate || DEFAULT_STREAM_SAMPLE_RATE} Hz`;
+}
+
+function outputRowBitrate(output) {
+  if (output.type === "soundcard") {
+    const mode = (output.soundcard || {}).channel_mode || "both";
+    const volume = Number((output.soundcard || {}).volume ?? 1).toFixed(2);
+    return `${mode}, volume ${volume}`;
+  }
+  const icecast = output.icecast || {};
+  return `${icecast.bitrate || DEFAULT_STREAM_BITRATES[icecast.format || "mp3"]} Kbps`;
 }
 
 function outputRows(stream) {
@@ -10618,29 +12161,42 @@ function outputRows(stream) {
     stream,
     output,
     icecast: output.icecast || {},
+    soundcard: output.soundcard || {},
     status: outputStatusFor(stream, output)
   }));
+}
+
+function outputRowsByType(stream, type) {
+  return outputRows(stream).filter(row => (row.output.type || "icecast") === type);
 }
 
 function outputTableNextSignature(rows) {
   return JSON.stringify(rows.map(row => ({
     id: row.output.id || "",
     enabled: row.output.enabled !== false,
-    destination: outputDestination(row.icecast),
-    format: row.icecast.format || "",
-    sample_rate: row.icecast.sample_rate || "",
-    bitrate: row.icecast.bitrate || "",
+    type: row.output.type || "icecast",
+    destination: outputRowDestination(row.output),
+    format: outputRowFormat(row.output),
+    sample_rate: outputRowSampleRate(row.output),
+    bitrate: outputRowBitrate(row.output),
+    bus: row.output.type === "soundcard" ? (soundcardDeviceForStableId((row.output.soundcard || {}).stable_id || "") || {}).bus || "" : "",
     status: row.status
   })));
 }
 
+function renderOutputPanels() {
+  const selected = document.getElementById("output_type_filter").value || "icecast";
+  document.getElementById("icecast_outputs_panel").hidden = selected !== "icecast";
+  document.getElementById("soundcard_outputs_panel").hidden = selected !== "soundcard";
+}
+
 function renderIcecastOutputsTable(stream) {
   const tbody = document.getElementById("icecast-outputs-body");
-  const rows = outputRows(stream);
+  const rows = outputRowsByType(stream, "icecast");
   const nextSignature = outputTableNextSignature(rows);
-  if (nextSignature === outputTableSignature) return;
+  if (nextSignature === icecastOutputTableSignature) return;
   if (containsFocusedElement(tbody)) return;
-  outputTableSignature = nextSignature;
+  icecastOutputTableSignature = nextSignature;
   tbody.innerHTML = "";
   if (rows.length === 0) {
     const row = document.createElement("tr");
@@ -10657,14 +12213,54 @@ function renderIcecastOutputsTable(stream) {
   }
 }
 
+function renderSoundcardOutputsTable(stream) {
+  const tbody = document.getElementById("soundcard-outputs-body");
+  const rows = outputRowsByType(stream, "soundcard");
+  const nextSignature = outputTableNextSignature(rows);
+  if (nextSignature === soundcardOutputTableSignature) return;
+  if (containsFocusedElement(tbody)) return;
+  soundcardOutputTableSignature = nextSignature;
+  tbody.innerHTML = "";
+  if (rows.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 4;
+    cell.className = "hint";
+    cell.textContent = "No sound card outputs configured.";
+    row.appendChild(cell);
+    tbody.appendChild(row);
+    return;
+  }
+  for (const row of rows) {
+    tbody.appendChild(soundcardOutputRow(row));
+  }
+}
+
 function icecastOutputRow(row) {
   const tr = document.createElement("tr");
-  const icecast = row.icecast;
-  tr.appendChild(tableCell(outputDestination(icecast)));
-  tr.appendChild(tableCell(String(icecast.format || "mp3").toUpperCase()));
-  tr.appendChild(tableCell(`${icecast.sample_rate || DEFAULT_STREAM_SAMPLE_RATE} Hz`));
-  tr.appendChild(tableCell(`${icecast.bitrate || DEFAULT_STREAM_BITRATES[icecast.format || "mp3"]} Kbps`));
-  const statusCell = tableCell(outputStatusLabel(row.status));
+  tr.appendChild(tableCell(outputRowDestination(row.output)));
+  tr.appendChild(tableCell(outputRowFormat(row.output)));
+  tr.appendChild(tableCell(outputRowSampleRate(row.output)));
+  tr.appendChild(tableCell(outputRowBitrate(row.output)));
+  const statusCell = tableCell(outputStatusLabelForOutput(row.output, row.status));
+  statusCell.className = `status-text status-${row.status}`;
+  tr.appendChild(statusCell);
+  tr.appendChild(outputActionsCell(row.stream, row.output, row.status));
+  return tr;
+}
+
+function soundcardChannelLabel(mode) {
+  if (mode === "left") return "Left";
+  if (mode === "right") return "Right";
+  return "Both left and right";
+}
+
+function soundcardOutputRow(row) {
+  const tr = document.createElement("tr");
+  const soundcard = row.output.soundcard || {};
+  tr.appendChild(tableCell(soundcardDestination(soundcard)));
+  tr.appendChild(tableCell(soundcardChannelLabel(soundcard.channel_mode || "both")));
+  const statusCell = tableCell(outputStatusLabelForOutput(row.output, row.status));
   statusCell.className = `status-text status-${row.status}`;
   tr.appendChild(statusCell);
   tr.appendChild(outputActionsCell(row.stream, row.output, row.status));
@@ -10679,7 +12275,7 @@ function outputActionsCell(stream, output) {
   button.textContent = "More actions";
   button.setAttribute("aria-haspopup", "menu");
   button.setAttribute("aria-expanded", "false");
-  button.setAttribute("aria-label", `More actions for ${outputDestination(output.icecast || {})}`);
+  button.setAttribute("aria-label", `More actions for ${outputRowDestination(output)}`);
   button.dataset.outputMenu = output.id || "";
   const menu = document.createElement("div");
   menu.className = "stream-actions-menu";
@@ -10706,11 +12302,21 @@ function outputActionsCell(stream, output) {
   remove.dataset.action = "remove-output";
   remove.dataset.streamId = stream.id || "";
   remove.dataset.outputId = output.id || "";
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.textContent = "Reset USB sound card";
+  reset.setAttribute("role", "menuitem");
+  reset.dataset.action = "reset-soundcard-output";
+  reset.dataset.streamId = stream.id || "";
+  reset.dataset.outputId = output.id || "";
   if (!accountIsReadOnly()) {
     if (output.enabled === false || canDisableIcecastOutput(stream, output)) {
       menu.appendChild(toggle);
     }
     menu.appendChild(edit);
+    if (soundcardOutputUsbDevice(output)) {
+      menu.appendChild(reset);
+    }
     if (canRemoveIcecastOutput(stream, output)) {
       menu.appendChild(remove);
     }
@@ -11304,7 +12910,8 @@ function applyAccountUi(account) {
   setHidden("remove_eas_alert", readOnly);
   if (previousRole !== (currentAccount ? currentAccount.role : "") || previousReadOnly !== readOnly) {
     activeStreamsSignature = "";
-    outputTableSignature = "";
+    icecastOutputTableSignature = "";
+    soundcardOutputTableSignature = "";
     iqRecordingsSignature = "";
     accountsSignature = "";
     renderActiveStreams(activeStreamSnapshots, configuredStreams);
@@ -12058,7 +13665,7 @@ function showView(name) {
   for (const item of document.querySelectorAll("nav [data-view]")) {
     if (
       item.dataset.view === name ||
-      (item.dataset.view === "streams" && ["stream_settings", "stream_output"].includes(name)) ||
+      (item.dataset.view === "streams" && ["add_stream", "stream_settings", "stream_output"].includes(name)) ||
       (item.dataset.view === "iq_recorder" && ["iq_recorder_start", "iq_recording_download"].includes(name)) ||
       (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name)) ||
       item.dataset.view === "accounts" && ["accounts", "create_account"].includes(name) ||
@@ -12099,7 +13706,10 @@ function routeForView(name, params = {}) {
   if (name === "create_account") query.set("view", "create_account");
   if (name === "change_password") query.set("view", "change_password");
   if (name === "streams") query.set("view", "streams");
-  if (name === "add_stream") query.set("view", "add_stream");
+  if (name === "add_stream") {
+    query.set("view", "add_stream");
+    if (params.streamId) query.set("stream", params.streamId);
+  }
   if (name === "stream_settings") {
     query.set("view", "stream_settings");
     if (params.streamId) query.set("stream", params.streamId);
@@ -12161,9 +13771,30 @@ function routeState(view, params = {}) {
   };
 }
 
+function replaceCurrentRoute(view, params = {}) {
+  history.replaceState(routeState(view, params), "", routeForView(view, params));
+}
+
 function applyRoute(route) {
   if (accountIsReadOnly() && isReadOnlyRestrictedView(route.view)) {
+    replaceCurrentRoute("dashboard");
     showView("dashboard");
+    return;
+  }
+  if (route.view === "add_stream") {
+    if (route.streamId) {
+      if (wizardMode !== "add_output" || settingsStreamId !== route.streamId) {
+        if (!prepareAddOutputWizard(route.streamId)) {
+          replaceCurrentRoute("streams");
+          showView("streams");
+          return;
+        }
+      }
+    } else if (wizardMode !== "add") {
+      resetStreamWizardState();
+    }
+    showView("add_stream");
+    renderWizard();
     return;
   }
   if (route.view === "stream_settings") {
@@ -12171,7 +13802,8 @@ function applyRoute(route) {
     const stream = configuredStreams.find(item => item.id === streamId);
     if (stream) {
       settingsStreamId = streamId;
-      outputTableSignature = "";
+      icecastOutputTableSignature = "";
+      soundcardOutputTableSignature = "";
       easSignature = "";
       audioEffectsSignature = "";
       closeOutputForm();
@@ -12183,6 +13815,8 @@ function applyRoute(route) {
       setPageTitle(`Edit stream ${streamCallsign(stream)}`);
       return;
     }
+    closeOutputForm();
+    replaceCurrentRoute("streams");
     showView("streams");
     return;
   }
@@ -12191,22 +13825,37 @@ function applyRoute(route) {
     const stream = configuredStreams.find(item => item.id === streamId);
     if (!stream) {
       closeOutputForm();
+      replaceCurrentRoute("streams");
       showView("streams");
+      return;
+    }
+    if (!route.outputId) {
+      if (prepareAddOutputWizard(streamId)) {
+        showView("add_stream");
+        renderWizard();
+      } else {
+        showView("streams");
+      }
       return;
     }
     settingsStreamId = streamId;
     const station = stream.station || {};
     setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
-    if (route.outputId) {
-      if (editingOutputId !== route.outputId || outputFormMode !== "edit") {
-        prepareEditOutput(route.outputId);
+    if (editingOutputId !== route.outputId || !["edit", "edit_soundcard"].includes(outputFormMode)) {
+      if (!prepareEditOutput(route.outputId)) {
+        closeOutputForm();
+        replaceCurrentRoute("stream_settings", {streamId});
+        renderStreamSettings();
+        showView("stream_settings");
+        setPageTitle(`Edit stream ${streamCallsign(stream)}`);
+        return;
       }
-    } else if (outputFormMode !== "add" || !outputFormIsOpen()) {
-      prepareAddOutput();
     }
-    setText("output_form_title", `${route.outputId ? "Edit output" : "Add output"} for ${streamCallsign(stream)}`);
+    const selected = findConfiguredOutput(streamId, route.outputId);
+    const isSoundcard = selected && (selected.output.type || "icecast") === "soundcard";
+    setText("output_form_title", `${isSoundcard ? "Edit sound card output" : "Edit output"} for ${streamCallsign(stream)}`);
     showView("stream_output");
-    setPageTitle(`${route.outputId ? "Edit output" : "Add output"} for ${streamCallsign(stream)}`);
+    setPageTitle(`${isSoundcard ? "Edit sound card output" : "Edit output"} for ${streamCallsign(stream)}`);
     return;
   }
   if (route.view === "eas_alerts") {
@@ -12256,6 +13905,7 @@ function applyRoute(route) {
   }
   if (route.view === "create_account") {
     if (!accountIsOwner()) {
+      replaceCurrentRoute("change_password");
       showView("change_password");
       return;
     }
@@ -12267,7 +13917,7 @@ function applyRoute(route) {
 }
 
 function outputFormHasUnsavedChanges() {
-  return currentViewName() === "stream_output" && outputFormDirty;
+  return currentViewName() === "stream_output" && outputFormMode !== "edit_soundcard" && outputFormDirty;
 }
 
 function wizardHasUnsavedChanges() {
@@ -12336,6 +13986,7 @@ function navigateTo(view, params = {}, replace = false, force = false) {
 
 function currentRouteParams() {
   const view = currentViewName();
+  if (view === "add_stream" && wizardMode === "add_output") return {streamId: settingsStreamId};
   if (view === "stream_settings") return {streamId: settingsStreamId};
   if (view === "stream_output") return {streamId: settingsStreamId, outputId: editingOutputId};
   if (view === "eas_alerts") return {streamId: easAlertStreamId, page: easAlertPage};
@@ -12967,7 +14618,9 @@ document.addEventListener("click", event => {
   event.preventDefault();
   navigateTo(link.dataset.view, {
     streamId: link.dataset.streamId || "",
+    outputId: link.dataset.outputId || "",
     alertId: link.dataset.alertId || "",
+    recordingId: link.dataset.recordingId || "",
     page: Number(link.dataset.page || 1)
   });
 });
@@ -13407,7 +15060,7 @@ document.getElementById("rescan_devices").addEventListener("click", async () => 
   const button = document.getElementById("rescan_devices");
   setDisabled(button, true);
   try {
-    const status = await request("/api/status");
+    const status = await request(statusRequestPath());
     await loadDevices(status.settings.serial);
   } catch (error) {
     setText("device-errors", error.message);
@@ -13432,7 +15085,7 @@ document.getElementById("reset_rtl_device").addEventListener("click", async () =
       body: JSON.stringify({serial})
     }, 15000);
     setText("device-errors", data.message || "RTL-SDR reset finished.");
-    applyStatus(data.status || await request("/api/status"), {syncControls: true});
+    applyStatus(data.status || await request(statusRequestPath()), {syncControls: true});
     await loadDevices(serial);
   } catch (error) {
     setText("device-errors", error.message);
@@ -13606,6 +15259,30 @@ for (const id of ["icecast_sample_rate", "icecast_bitrate", "output_enabled", "i
   });
 }
 
+for (const control of document.querySelectorAll("input[name='wizard_output_type']")) {
+  control.addEventListener("change", () => {
+    wizardDirty = true;
+    wizardSoundcardOutputId = "";
+    if (selectedWizardOutputType() !== "soundcard") {
+      discardWizardSoundcardPreview();
+    }
+    renderWizard();
+  });
+}
+
+document.getElementById("wizard_soundcard_device").addEventListener("change", () => {
+  wizardDirty = true;
+  adjustWizardSoundcardChannelForDevice();
+  if (wizardSoundcardPreviewId) scheduleWizardSoundcardUpdate();
+  renderWizard();
+});
+
+for (const control of document.querySelectorAll("input[name='wizard_soundcard_channel']")) {
+  control.addEventListener("change", scheduleWizardSoundcardUpdate);
+}
+
+document.getElementById("wizard_soundcard_volume").addEventListener("input", scheduleWizardSoundcardUpdate);
+
 document.getElementById("show_icecast_password").addEventListener("change", event => {
   document.getElementById("icecast_password").type = event.target.checked ? "text" : "password";
 });
@@ -13652,9 +15329,43 @@ for (const formatControl of document.querySelectorAll("input[name='settings_icec
   });
 }
 
+document.getElementById("settings_soundcard_device").addEventListener("change", () => {
+  adjustSettingsSoundcardChannelForDevice();
+  scheduleSettingsSoundcardUpdate();
+});
+
+for (const control of document.querySelectorAll("input[name='settings_soundcard_channel']")) {
+  control.addEventListener("change", scheduleSettingsSoundcardUpdate);
+}
+
+document.getElementById("settings_soundcard_volume").addEventListener("input", scheduleSettingsSoundcardUpdate);
+
+document.getElementById("reset_soundcard_device").addEventListener("click", async event => {
+  const button = event.currentTarget;
+  const stableId = document.getElementById("settings_soundcard_device").value || "";
+  if (!stableId) {
+    setOutputResult("Select a sound card to reset.", "error");
+    return;
+  }
+  setDisabled(button, true);
+  try {
+    await resetSoundcardByStableId(stableId);
+  } catch (error) {
+    setOutputResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
+    updateSettingsSoundcardResetButton();
+  }
+});
+
 document.getElementById("open_add_output").addEventListener("click", beginAddOutput);
 
+document.getElementById("output_type_filter").addEventListener("change", () => {
+  renderOutputPanels();
+});
+
 document.getElementById("cancel_output_form").addEventListener("click", cancelOutputForm);
+document.getElementById("cancel_soundcard_output_form").addEventListener("click", cancelOutputForm);
 
 document.getElementById("stream_enabled").addEventListener("change", async event => {
   if (!settingsStreamId || applying) return;
@@ -13712,7 +15423,8 @@ document.getElementById("add_output").addEventListener("click", async () => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({stream_id: settingsStreamId, icecast})
     });
-    outputTableSignature = "";
+    icecastOutputTableSignature = "";
+    soundcardOutputTableSignature = "";
     renderStreams(data.streams || []);
     if (data.success) {
       cancelOutputForm();
@@ -13767,7 +15479,7 @@ document.getElementById("save_output_settings").addEventListener("click", async 
   }
 });
 
-document.getElementById("icecast-outputs-body").addEventListener("click", async event => {
+async function handleOutputTableClick(event) {
   const target = event.target;
   if (!target || !target.dataset) return;
   if (target.dataset.outputMenu !== undefined) {
@@ -13805,13 +15517,37 @@ document.getElementById("icecast-outputs-body").addEventListener("click", async 
           stream_id: target.dataset.streamId,
           output_id: target.dataset.outputId,
           enabled: nextEnabled,
-          icecast: selected.output.icecast
+          type: selected.output.type || "icecast",
+          icecast: selected.output.icecast,
+          soundcard: selected.output.soundcard
         })
       });
       renderStreams(data.streams || []);
       setOutputResult(data.message, data.success ? "success" : "error");
     } catch (error) {
       setOutputResult(error.message, "error");
+    }
+    return;
+  }
+  if (target.dataset.action === "reset-soundcard-output") {
+    closeStreamActionMenus();
+    const selected = findConfiguredOutput(target.dataset.streamId, target.dataset.outputId);
+    if (!selected || selected.output.type !== "soundcard") {
+      setOutputResult("Sound card output was not found.", "error");
+      return;
+    }
+    const device = soundcardOutputUsbDevice(selected.output);
+    if (!device) {
+      setOutputResult("Only USB sound cards can be reset.", "error");
+      return;
+    }
+    target.disabled = true;
+    try {
+      await resetSoundcardByStableId(device.stable_id);
+    } catch (error) {
+      setOutputResult(error.message, "error");
+    } finally {
+      target.disabled = false;
     }
     return;
   }
@@ -13838,9 +15574,9 @@ document.getElementById("icecast-outputs-body").addEventListener("click", async 
       setOutputResult(error.message, "error");
     }
   }
-});
+}
 
-document.getElementById("icecast-outputs-body").addEventListener("keydown", event => {
+function handleOutputTableKeydown(event) {
   const target = event.target;
   if (!target || !target.dataset) return;
   if (target.dataset.outputMenu !== undefined) {
@@ -13885,13 +15621,49 @@ document.getElementById("icecast-outputs-body").addEventListener("keydown", even
       closeStreamActionMenu(menu, true);
     }
   }
-});
+}
 
-document.getElementById("cancel_wizard").addEventListener("click", () => {
+document.getElementById("icecast-outputs-body").addEventListener("click", handleOutputTableClick);
+document.getElementById("soundcard-outputs-body").addEventListener("click", handleOutputTableClick);
+document.getElementById("icecast-outputs-body").addEventListener("keydown", handleOutputTableKeydown);
+document.getElementById("soundcard-outputs-body").addEventListener("keydown", handleOutputTableKeydown);
+
+document.getElementById("cancel_wizard").addEventListener("click", async () => {
+  if (wizardMode === "add_output" && selectedWizardOutputType() === "soundcard") {
+    await discardWizardSoundcardOutput();
+  }
+  if (wizardMode === "add" && selectedWizardOutputType() === "soundcard") {
+    await discardWizardSoundcardPreview();
+  }
   finishWizard();
 });
 
-document.getElementById("wizard_back").addEventListener("click", () => {
+document.getElementById("wizard_back").addEventListener("click", async () => {
+  if (wizardUsesOutputSteps()) {
+    if (wizardStep === ADD_OUTPUT_TYPE_STEP) {
+      if (wizardMode === "add") setWizardStep(0);
+      return;
+    }
+    if (wizardStep === ADD_OUTPUT_ICECAST_SERVICE_STEP || wizardStep === ADD_OUTPUT_SOUNDCARD_DEVICE_STEP) {
+      if (wizardMode === "add" && wizardStep === ADD_OUTPUT_SOUNDCARD_DEVICE_STEP) {
+        await discardWizardSoundcardPreview();
+      }
+      setWizardStep(ADD_OUTPUT_TYPE_STEP);
+      return;
+    }
+    if (wizardStep === ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP) {
+      setWizardStep(ADD_OUTPUT_SOUNDCARD_DEVICE_STEP);
+      return;
+    }
+    const streamStep = streamIcecastStep(wizardStep);
+    const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+    if (streamStep === 3 && (service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_NWRORG)) {
+      setWizardStep(ADD_OUTPUT_ICECAST_SERVICE_STEP);
+    } else {
+      setWizardStep(addOutputIcecastStep(streamStep - 1));
+    }
+    return;
+  }
   const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
   if (wizardStep === 3 && (service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_NWRORG)) {
     setWizardStep(1);
@@ -13901,8 +15673,52 @@ document.getElementById("wizard_back").addEventListener("click", () => {
 });
 
 document.getElementById("wizard_next").addEventListener("click", async () => {
+  if (wizardUsesOutputSteps()) {
+    if (wizardStep === ADD_OUTPUT_TYPE_STEP) {
+      if (selectedWizardOutputType() === "soundcard") {
+        setWizardStep(ADD_OUTPUT_SOUNDCARD_DEVICE_STEP);
+        loadDevices("", {force: true}).catch(error => {
+          setStreamResult(error.message, "error");
+          renderWizard();
+        });
+      } else {
+        setWizardStep(ADD_OUTPUT_ICECAST_SERVICE_STEP);
+      }
+      return;
+    }
+    if (wizardStep === ADD_OUTPUT_SOUNDCARD_DEVICE_STEP) {
+      if (wizardMode === "add_output") {
+        await createWizardSoundcardOutput();
+      } else {
+        await upsertWizardSoundcardPreview();
+      }
+      return;
+    }
+    const streamStep = streamIcecastStep(wizardStep);
+    if (streamStep === 1) {
+      const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+      if (service === STREAM_SERVICE_GWES || service === STREAM_SERVICE_NWRORG) {
+        setWizardStep(ADD_OUTPUT_ICECAST_CREDENTIALS_STEP);
+      } else {
+        setWizardStep(ADD_OUTPUT_ICECAST_CODEC_STEP);
+      }
+      return;
+    }
+    if (streamStep === 2) {
+      const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
+      if (service === STREAM_SERVICE_WEATHERUSA && !document.getElementById("icecast_mount").value.trim()) {
+        setValue("icecast_mount", weatherUsaMount(selectedStation(), selectedWizardFormat()));
+      }
+      setWizardStep(ADD_OUTPUT_ICECAST_CREDENTIALS_STEP);
+      return;
+    }
+    if (streamStep === 3) {
+      await authenticateWizardIcecastOutput();
+      return;
+    }
+  }
   if (wizardStep === 0) {
-    setWizardStep(1);
+    setWizardStep(ADD_OUTPUT_TYPE_STEP);
     return;
   }
   if (wizardStep === 1) {
@@ -13923,48 +15739,60 @@ document.getElementById("wizard_next").addEventListener("click", async () => {
     return;
   }
   if (wizardStep === 3) {
-    const button = document.getElementById("wizard_next");
-    setDisabled(button, true);
-    setStreamResult("Testing Icecast authentication...");
-    try {
-      const signature = icecastCredentialSignature();
-      const data = await request("/api/icecast-auth", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({icecast: streamPayload().icecast})
-      });
-      setStreamResult(data.message, data.success ? "success" : "error");
-      if (data.success) {
-        icecastAuthPassed = true;
-        icecastAuthSignature = signature;
-        const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
-        if (service === STREAM_SERVICE_NWRORG) {
-          setWizardStep(3);
-        } else {
-          setWizardStep(4);
-        }
-      }
-    } catch (error) {
-      setStreamResult(error.message, "error");
-    } finally {
-      renderWizard();
-    }
+    await authenticateWizardIcecastOutput();
     return;
   }
 });
 
 document.getElementById("wizard_finish").addEventListener("click", async () => {
+  if (wizardMode === "add_output" && selectedWizardOutputType() === "soundcard") {
+    wizardDirty = false;
+    await updateWizardSoundcardOutput();
+    finishWizard();
+    return;
+  }
+  if (wizardMode === "add" && selectedWizardOutputType() === "soundcard") {
+    const button = document.getElementById("wizard_finish");
+    setDisabled(button, true);
+    setStreamResult("Creating stream...");
+    try {
+      const data = await request("/api/streams", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(streamPayload())
+      });
+      renderStreams(data.streams || []);
+      setStreamResult(data.message, data.success ? "success" : "error");
+      if (data.success) {
+        wizardSoundcardPreviewId = "";
+        finishWizard();
+      }
+    } catch (error) {
+      setStreamResult(error.message, "error");
+    } finally {
+      setDisabled(button, false);
+      renderWizard();
+    }
+    return;
+  }
   const button = document.getElementById("wizard_finish");
   setDisabled(button, true);
   const service = document.getElementById("icecast_service").value || STREAM_SERVICE_CUSTOM;
-  setStreamResult(service === STREAM_SERVICE_NWRORG && !icecastAuthPassed ? "Testing Icecast authentication..." : "Creating stream...");
+  const addOutputMode = wizardMode === "add_output";
+  setStreamResult(service === STREAM_SERVICE_NWRORG && !icecastAuthPassed ? "Testing Icecast authentication..." : addOutputMode ? "Adding output..." : "Creating stream...");
   try {
+    const payload = streamPayload();
+    const createdIcecast = payload.icecast;
+    if (addOutputMode && duplicateOutputExists(createdIcecast)) {
+      setStreamResult("An output with these credentials already exists.", "error");
+      return;
+    }
     if (!icecastAuthPassed || icecastAuthSignature !== icecastCredentialSignature()) {
       const signature = icecastCredentialSignature();
       const auth = await request("/api/icecast-auth", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({icecast: streamPayload().icecast})
+        body: JSON.stringify({icecast: createdIcecast})
       });
       if (!auth.success) {
         setStreamResult(auth.message, "error");
@@ -13973,14 +15801,18 @@ document.getElementById("wizard_finish").addEventListener("click", async () => {
       icecastAuthPassed = true;
       icecastAuthSignature = signature;
     }
-    setStreamResult("Creating stream...");
-    const payload = streamPayload();
-    const createdIcecast = payload.icecast;
-    const data = await request("/api/streams", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload)
-    });
+    setStreamResult(addOutputMode ? "Adding output..." : "Creating stream...");
+    const data = addOutputMode
+      ? await request("/api/stream-output", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({stream_id: settingsStreamId, icecast: createdIcecast})
+        })
+      : await request("/api/streams", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
     renderStreams(data.streams || []);
     setStreamResult(data.message, data.success ? "success" : "error");
     if (data.success) {
@@ -14013,6 +15845,7 @@ window.addEventListener("pagehide", event => {
   markLiveAudioHidden();
   scheduleReceiverMediaSessionRefresh();
   if (event.persisted) return;
+  sendWizardSoundcardPreviewDiscardBeacon();
   if (document.visibilityState === "hidden") return;
   sendLiveAudioStopBeacon();
 });
@@ -14039,6 +15872,7 @@ if (liveAudioElement) {
 }
 
 window.addEventListener("beforeunload", event => {
+  sendWizardSoundcardPreviewDiscardBeacon();
   sendLiveAudioStopBeacon({forceReceiverStop: true});
   if (!hasUnsavedNavigationState()) return;
   event.preventDefault();
@@ -14171,7 +16005,7 @@ document.getElementById("remove_eas_alert").addEventListener("click", async () =
 });
 
 async function refresh() {
-  const data = await request("/api/status");
+  const data = await request(statusRequestPath());
   applyStatus(data, {syncControls: false});
 }
 
@@ -14193,6 +16027,7 @@ async function refresh() {
   const initialRoute = routeFromLocation();
   navigateTo(initialRoute.view, {
     streamId: initialRoute.streamId,
+    outputId: initialRoute.outputId,
     alertId: initialRoute.alertId,
     recordingId: initialRoute.recordingId,
     page: initialRoute.page
@@ -14200,7 +16035,7 @@ async function refresh() {
   setInterval(refresh, 1000);
   setInterval(async () => {
     try {
-      const status = await request("/api/status");
+      const status = await request(statusRequestPath());
       if (status.account && status.account.read_only) {
         setText("device-errors", "");
         return;
