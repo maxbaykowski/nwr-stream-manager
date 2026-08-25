@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import importlib
 import json
@@ -252,6 +253,127 @@ class EasAlertTests(unittest.TestCase):
             web_control.alias_filter_attenuation_db(web_control.INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB, 0),
             web_control.ALIAS_FILTER_MIN_ATTENUATION_DB,
         )
+
+    def test_single_soundcard_output_cannot_be_disabled_or_removed(self) -> None:
+        web_control = self.web_control
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            stream = {
+                "id": "stream-1",
+                "station": {"callsign": "WZ2560"},
+                "outputs": [
+                    {
+                        "id": "soundcard-1",
+                        "enabled": True,
+                        "type": "soundcard",
+                        "soundcard": {
+                            "stable_id": "alsa:usb:yeti-x",
+                            "channel_mode": "both",
+                            "volume": 1.0,
+                            "sample_rate": 48000,
+                        },
+                    }
+                ],
+                "eas_recording": {"enabled": False},
+            }
+            service = object.__new__(web_control.RtlControlService)
+            service.lock = web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+            service._sync_stream_workers_locked = lambda: None
+
+            with self.assertRaisesRegex(ValueError, "At least one output must remain enabled"):
+                service.update_stream_output({
+                    "stream_id": "stream-1",
+                    "output_id": "soundcard-1",
+                    "enabled": False,
+                    "type": "soundcard",
+                    "soundcard": stream["outputs"][0]["soundcard"],
+                })
+            with self.assertRaisesRegex(ValueError, "At least one output must remain enabled"):
+                service.remove_stream_output("stream-1", "soundcard-1")
+
+    def test_soundcard_output_can_be_disabled_when_another_output_remains(self) -> None:
+        web_control = self.web_control
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            stream = {
+                "id": "stream-1",
+                "station": {"callsign": "WXN99"},
+                "outputs": [
+                    {
+                        "id": "soundcard-1",
+                        "enabled": True,
+                        "type": "soundcard",
+                        "soundcard": {
+                            "stable_id": "alsa:usb:yeti-x",
+                            "channel_mode": "left",
+                            "volume": 1.0,
+                            "sample_rate": 48000,
+                        },
+                    },
+                    {
+                        "id": "soundcard-2",
+                        "enabled": True,
+                        "type": "soundcard",
+                        "soundcard": {
+                            "stable_id": "alsa:usb:yeti-x",
+                            "channel_mode": "right",
+                            "volume": 1.0,
+                            "sample_rate": 48000,
+                        },
+                    },
+                ],
+                "eas_recording": {"enabled": False},
+            }
+            service = object.__new__(web_control.RtlControlService)
+            service.lock = web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+            service._sync_stream_workers_locked = lambda: None
+
+            response = service.update_stream_output({
+                "stream_id": "stream-1",
+                "output_id": "soundcard-1",
+                "enabled": False,
+                "type": "soundcard",
+                "soundcard": stream["outputs"][0]["soundcard"],
+            })
+
+            self.assertTrue(response["success"])
+            self.assertFalse(stream["outputs"][0]["enabled"])
+
+    def test_soundcard_output_can_be_removed_when_eas_output_remains(self) -> None:
+        web_control = self.web_control
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            stream = {
+                "id": "stream-1",
+                "station": {"callsign": "WXN99"},
+                "outputs": [
+                    {
+                        "id": "soundcard-1",
+                        "enabled": True,
+                        "type": "soundcard",
+                        "soundcard": {
+                            "stable_id": "alsa:usb:yeti-x",
+                            "channel_mode": "both",
+                            "volume": 1.0,
+                            "sample_rate": 48000,
+                        },
+                    }
+                ],
+                "eas_recording": {"enabled": True},
+            }
+            service = object.__new__(web_control.RtlControlService)
+            service.lock = web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+            service._sync_stream_workers_locked = lambda: None
+
+            response = service.remove_stream_output("stream-1", "soundcard-1")
+
+            self.assertEqual(response["streams"][0]["outputs"], [])
 
     def test_storage_monitor_reports_decimal_used_and_total_storage(self) -> None:
         web_control = self.web_control
@@ -828,6 +950,88 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(status["monitoring"], {"client-1": "stream-1"})
         self.assertNotIn("monitoring", service.streams[0])
 
+    def test_disabling_stream_stops_active_monitors(self) -> None:
+        web_control = self.web_control
+
+        class Worker:
+            id = "stream-1"
+
+            def __init__(self):
+                self.removed = []
+
+            def remove_monitor_source(self, client_id):
+                self.removed.append(client_id)
+
+        class Sessions:
+            def __init__(self):
+                self.closed = []
+
+            async def close(self, client_id):
+                self.closed.append(client_id)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stream = {"id": "stream-1", "enabled": True, "station": {"callsign": "WXN99"}}
+            worker = Worker()
+            sessions = Sessions()
+            service = object.__new__(web_control.RtlControlService)
+            service.lock = web_control.threading.RLock()
+            service.streams_directory = Path(temp_dir) / "streams"
+            service.streams = [stream]
+            service.monitor_streams_by_client = {"client-1": "stream-1", "client-2": "other-stream"}
+            service.monitor_accounts_by_client = {"client-1": 1, "client-2": 1}
+            service.stream_workers = {"stream-1": worker}
+            service._sync_stream_workers_locked = lambda: None
+            service.webrtc_runner = types.SimpleNamespace(run=lambda coro, timeout=None: asyncio.run(coro))
+            service.webrtc_sessions = sessions
+
+            response = service.update_stream({"stream_id": "stream-1", "enabled": False})
+
+            self.assertFalse(stream["enabled"])
+            self.assertEqual(response["monitoring"], {"client-2": "other-stream"})
+            self.assertEqual(worker.removed, ["client-1"])
+            self.assertEqual(sessions.closed, ["client-1"])
+
+    def test_removing_stream_stops_active_monitors(self) -> None:
+        web_control = self.web_control
+
+        class Worker:
+            id = "stream-1"
+
+            def __init__(self):
+                self.removed = []
+
+            def remove_monitor_source(self, client_id):
+                self.removed.append(client_id)
+
+        class Sessions:
+            def __init__(self):
+                self.closed = []
+
+            async def close(self, client_id):
+                self.closed.append(client_id)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stream = {"id": "stream-1", "enabled": True, "station": {"callsign": "WXN99"}}
+            worker = Worker()
+            sessions = Sessions()
+            service = object.__new__(web_control.RtlControlService)
+            service.lock = web_control.threading.RLock()
+            service.streams_directory = Path(temp_dir) / "streams"
+            service.streams = [stream]
+            service.monitor_streams_by_client = {"client-1": "stream-1"}
+            service.monitor_accounts_by_client = {"client-1": 1}
+            service.stream_workers = {"stream-1": worker}
+            service._sync_stream_workers_locked = lambda: None
+            service.webrtc_runner = types.SimpleNamespace(run=lambda coro, timeout=None: asyncio.run(coro))
+            service.webrtc_sessions = sessions
+
+            response = service.remove_stream("stream-1")
+
+            self.assertEqual(response["streams"], [])
+            self.assertEqual(response["monitoring"], {})
+            self.assertEqual(worker.removed, ["client-1"])
+            self.assertEqual(sessions.closed, ["client-1"])
+
     def test_stream_worker_monitor_source_receives_processed_pcm_frame(self) -> None:
         worker = object.__new__(self.web_control.IcecastStreamWorker)
         worker.encoder_groups = {}
@@ -1027,6 +1231,161 @@ class EasAlertTests(unittest.TestCase):
             self.assertTrue(Tap.instances[1].started)
         finally:
             web_control.AlsaStreamPlaybackTap = original_tap
+
+    def test_shared_soundcard_manager_serializes_disable_reenable_reopen(self) -> None:
+        web_control = self.web_control
+
+        class Tap:
+            instances = []
+
+            def __init__(self, stable_id, output_sample_rate=48000, devices_provider=None):
+                self.stable_id = stable_id
+                self.output_sample_rate = output_sample_rate
+                self.devices_provider = devices_provider
+                self.inputs = set()
+                self.started = False
+                self.stopped = False
+                self.thread = type("Thread", (), {"is_alive": lambda _self: self.started and not self.stopped})()
+                Tap.instances.append(self)
+
+            def start(self):
+                if self.started:
+                    raise RuntimeError("thread can only be started once")
+                self.started = True
+
+            def stop(self):
+                self.stopped = True
+
+            def register_input(self, output_id, _config):
+                self.inputs.add(output_id)
+
+            def unregister_input(self, output_id):
+                self.inputs.discard(output_id)
+
+            def has_inputs(self):
+                return bool(self.inputs)
+
+            def snapshot(self):
+                return {"status": "enabled", "stable_id": self.stable_id, "device": "hw:1,0"}
+
+        original_tap = web_control.AlsaSharedPlaybackTap
+        web_control.AlsaSharedPlaybackTap = Tap
+        try:
+            manager = web_control.SharedSoundcardOutputManager(devices_provider=lambda: [])
+            soundcard = {"stable_id": "alsa:usb:yeti", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000}
+
+            manager.sync_output("output-1", soundcard)
+            first = Tap.instances[0]
+            manager.remove_output("output-1")
+            manager.sync_output("output-1", soundcard)
+
+            self.assertTrue(first.stopped)
+            self.assertEqual(len(Tap.instances), 2)
+            self.assertTrue(Tap.instances[1].started)
+            self.assertIn("output-1", Tap.instances[1].inputs)
+        finally:
+            web_control.AlsaSharedPlaybackTap = original_tap
+
+    def test_shared_soundcard_manager_recreates_dead_session_with_existing_inputs(self) -> None:
+        web_control = self.web_control
+
+        class Tap:
+            instances = []
+
+            def __init__(self, stable_id, output_sample_rate=48000, devices_provider=None):
+                self.stable_id = stable_id
+                self.inputs = set()
+                self.started = False
+                self.stopped = False
+                self.alive = True
+                self.thread = type("Thread", (), {"is_alive": lambda _self: self.alive})()
+                Tap.instances.append(self)
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                self.stopped = True
+                self.alive = False
+
+            def register_input(self, output_id, _config):
+                self.inputs.add(output_id)
+
+            def unregister_input(self, output_id):
+                self.inputs.discard(output_id)
+
+            def has_inputs(self):
+                return bool(self.inputs)
+
+            def snapshot(self):
+                return {"status": "enabled", "stable_id": self.stable_id, "device": "hw:1,0"}
+
+        original_tap = web_control.AlsaSharedPlaybackTap
+        web_control.AlsaSharedPlaybackTap = Tap
+        try:
+            manager = web_control.SharedSoundcardOutputManager(devices_provider=lambda: [])
+            soundcard = {"stable_id": "alsa:usb:yeti", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000}
+            manager.sync_output("stream-a", soundcard)
+            manager.sync_output("stream-b", {**soundcard, "channel_mode": "right"})
+            first = Tap.instances[0]
+            first.alive = False
+
+            manager.sync_output("stream-a", soundcard)
+
+            self.assertTrue(first.stopped)
+            self.assertEqual(len(Tap.instances), 2)
+            self.assertEqual(Tap.instances[1].inputs, {"stream-a", "stream-b"})
+        finally:
+            web_control.AlsaSharedPlaybackTap = original_tap
+
+    def test_shared_soundcard_manager_owner_prevents_stale_worker_removal(self) -> None:
+        web_control = self.web_control
+
+        class Tap:
+            def __init__(self, stable_id, output_sample_rate=48000, devices_provider=None):
+                self.stable_id = stable_id
+                self.inputs = set()
+                self.pushed = []
+                self.started = False
+                self.stopped = False
+                self.thread = type("Thread", (), {"is_alive": lambda _self: self.started and not self.stopped})()
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                self.stopped = True
+
+            def register_input(self, output_id, _config):
+                self.inputs.add(output_id)
+
+            def unregister_input(self, output_id):
+                self.inputs.discard(output_id)
+
+            def has_inputs(self):
+                return bool(self.inputs)
+
+            def push_float(self, output_id, samples):
+                self.pushed.append((output_id, samples.copy()))
+
+        original_tap = web_control.AlsaSharedPlaybackTap
+        web_control.AlsaSharedPlaybackTap = Tap
+        try:
+            manager = web_control.SharedSoundcardOutputManager(devices_provider=lambda: [])
+            soundcard = {"stable_id": "alsa:usb:yeti", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000}
+            old_owner = object()
+            new_owner = object()
+
+            manager.sync_output("output-1", soundcard, owner=old_owner)
+            manager.sync_output("output-1", soundcard, owner=new_owner)
+            manager.remove_output("output-1", owner=old_owner)
+            manager.push_float("output-1", np.array([0.25], dtype=np.float32), owner=new_owner)
+
+            session = manager.sessions["alsa:usb:yeti"]
+            self.assertIn("output-1", session.inputs)
+            self.assertEqual(len(session.pushed), 1)
+        finally:
+            web_control.AlsaSharedPlaybackTap = original_tap
 
     def test_stream_worker_treats_eas_as_shared_processed_output(self) -> None:
         worker = object.__new__(self.web_control.IcecastStreamWorker)

@@ -68,6 +68,29 @@ class AuthTests(unittest.TestCase):
         self.assertIn("usernamePattern", html)
         self.assertIn("passwordPattern", html)
         self.assertIn("setup_next", html)
+        self.assertIn("/api/setup-state", html)
+        self.assertIn("pageshow", html)
+        self.assertIn("window.location.replace", html)
+
+    def test_setup_state_reports_setup_required_before_account_exists(self) -> None:
+        handler = object.__new__(self.web_control.RtlControlHandler)
+        handler.current_account = None
+        handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(has_account=lambda: False))
+        sent = {}
+        handler._send_json = lambda payload, status=self.web_control.HTTPStatus.OK: sent.update(payload=payload, status=status)
+
+        self.assertFalse(handler._auth_ok_or_setup_response("/api/setup-state", "GET"))
+        self.assertEqual(sent["payload"], {"setup_required": True})
+
+    def test_setup_state_reports_setup_complete_after_owner_exists(self) -> None:
+        handler = object.__new__(self.web_control.RtlControlHandler)
+        handler.current_account = None
+        handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(has_account=lambda: True))
+        sent = {}
+        handler._send_json = lambda payload, status=self.web_control.HTTPStatus.OK: sent.update(payload=payload, status=status)
+
+        self.assertFalse(handler._auth_ok_or_setup_response("/api/setup-state", "GET"))
+        self.assertEqual(sent["payload"], {"setup_required": False})
 
     def test_password_hash_does_not_store_plaintext(self) -> None:
         encoded = self.web_control.hash_account_password("StrongPass!1")

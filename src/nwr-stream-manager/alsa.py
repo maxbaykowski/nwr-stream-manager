@@ -50,10 +50,10 @@ ALSA_PLAYBACK_FORMATS = (
     (SND_PCM_FORMAT_U32_LE, "U32_LE", 4),
     (SND_PCM_FORMAT_S24_LE, "S24_LE", 4),
     (SND_PCM_FORMAT_U24_LE, "U24_LE", 4),
-    (SND_PCM_FORMAT_S24_3LE, "S24_3LE", 3),
-    (SND_PCM_FORMAT_U24_3LE, "U24_3LE", 3),
     (SND_PCM_FORMAT_S16_LE, "S16_LE", 2),
     (SND_PCM_FORMAT_U16_LE, "U16_LE", 2),
+    (SND_PCM_FORMAT_S24_3LE, "S24_3LE", 3),
+    (SND_PCM_FORMAT_U24_3LE, "U24_3LE", 3),
     (SND_PCM_FORMAT_S8, "S8", 1),
     (SND_PCM_FORMAT_U8, "U8", 1),
 )
@@ -667,6 +667,7 @@ class AlsaSharedPlaybackTap:
         self.error = ""
         self.device: AlsaPlaybackDevice | None = None
         self.playback: AlsaPcmPlayback | None = None
+        self.reopen_block_until = 0.0
 
     def start(self) -> None:
         if self.thread.is_alive():
@@ -846,6 +847,8 @@ class AlsaPcmPlayback:
         self.frames_written = 0
         self.recoveries = 0
         self.last_write_at = 0.0
+        self.start_threshold_frames = 0
+        self.avail_min_frames = 0
         if normalize_mixer and self.card_index is not None:
             self.mixer_adjustments = tuple(normalize_playback_mixer_to_unity(self.card_index, library=self.lib))
         self._open()
@@ -864,6 +867,8 @@ class AlsaPcmPlayback:
                 "frames_written": self.frames_written,
                 "recoveries": self.recoveries,
                 "last_write_at": self.last_write_at,
+                "start_threshold_frames": self.start_threshold_frames,
+                "avail_min_frames": self.avail_min_frames,
                 "mixer_adjustments": [
                     {
                         "name": adjustment.control_name,
@@ -1015,9 +1020,11 @@ class AlsaPcmPlayback:
                 ctypes.byref(direction),
             )
             _check_alsa(self.lib.snd_pcm_hw_params(self.handle, params), self.lib, "snd_pcm_hw_params")
+            period_frames = max(1, round(self.sample_rate * int(period_time_us.value) / 1_000_000.0))
+            self._set_software_params(period_frames)
             _check_alsa(self.lib.snd_pcm_prepare(self.handle), self.lib, "snd_pcm_prepare")
             LOG.info(
-                "opened ALSA playback %s requested_rate=%s actual_rate=%s channels=%s format=%s buffer_time_us=%s period_time_us=%s mixer=%s",
+                "opened ALSA playback %s requested_rate=%s actual_rate=%s channels=%s format=%s buffer_time_us=%s period_time_us=%s start_threshold_frames=%s avail_min_frames=%s mixer=%s",
                 self.device,
                 self.requested_sample_rate,
                 self.sample_rate,
@@ -1025,6 +1032,8 @@ class AlsaPcmPlayback:
                 self.pcm_format_name,
                 int(buffer_time_us.value),
                 int(period_time_us.value),
+                self.start_threshold_frames,
+                self.avail_min_frames,
                 [
                     {
                         "name": adjustment.control_name,
@@ -1049,6 +1058,31 @@ class AlsaPcmPlayback:
                 return
             errors.append(f"{name}: {_decode(self.lib.snd_strerror(int(result)))}")
         raise AlsaError("ALSA playback device does not support a usable PCM format: " + "; ".join(errors))
+
+    def _set_software_params(self, period_frames: int) -> None:
+        frames = max(1, int(period_frames))
+        params = ctypes.c_void_p()
+        try:
+            _check_alsa(self.lib.snd_pcm_sw_params_malloc(ctypes.byref(params)), self.lib, "snd_pcm_sw_params_malloc")
+            _check_alsa(self.lib.snd_pcm_sw_params_current(self.handle, params), self.lib, "snd_pcm_sw_params_current")
+            threshold = ctypes.c_ulong(frames)
+            _check_alsa(
+                self.lib.snd_pcm_sw_params_set_start_threshold(self.handle, params, threshold),
+                self.lib,
+                "snd_pcm_sw_params_set_start_threshold",
+            )
+            avail_min = ctypes.c_ulong(frames)
+            _check_alsa(
+                self.lib.snd_pcm_sw_params_set_avail_min(self.handle, params, avail_min),
+                self.lib,
+                "snd_pcm_sw_params_set_avail_min",
+            )
+            _check_alsa(self.lib.snd_pcm_sw_params(self.handle, params), self.lib, "snd_pcm_sw_params")
+            self.start_threshold_frames = frames
+            self.avail_min_frames = frames
+        finally:
+            if params:
+                self.lib.snd_pcm_sw_params_free(params)
 
 
 def apply_software_volume_s16le(pcm_s16le: bytes, volume: float) -> bytes:
@@ -1609,6 +1643,26 @@ def _configure_playback_signatures(lib: ctypes.CDLL) -> None:
     lib.snd_pcm_hw_params_set_period_time_near.restype = ctypes.c_int
     lib.snd_pcm_hw_params.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     lib.snd_pcm_hw_params.restype = ctypes.c_int
+    lib.snd_pcm_sw_params_malloc.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    lib.snd_pcm_sw_params_malloc.restype = ctypes.c_int
+    lib.snd_pcm_sw_params_free.argtypes = [ctypes.c_void_p]
+    lib.snd_pcm_sw_params_free.restype = None
+    lib.snd_pcm_sw_params_current.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.snd_pcm_sw_params_current.restype = ctypes.c_int
+    lib.snd_pcm_sw_params_set_start_threshold.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    ]
+    lib.snd_pcm_sw_params_set_start_threshold.restype = ctypes.c_int
+    lib.snd_pcm_sw_params_set_avail_min.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    ]
+    lib.snd_pcm_sw_params_set_avail_min.restype = ctypes.c_int
+    lib.snd_pcm_sw_params.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.snd_pcm_sw_params.restype = ctypes.c_int
 
 
 def _configure_mixer_signatures(lib: ctypes.CDLL) -> None:

@@ -125,6 +125,19 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("function restoreIqRecorderPreferences", script)
         self.assertIn("rememberIqRecorderPreferences();", script)
 
+    def test_add_stream_wizard_does_not_include_legacy_mountpoint_editing(self) -> None:
+        script = self.web_control.INDEX_HTML
+        add_stream_start = script.index('<div id="view_add_stream"')
+        add_stream_end = script.index('<div id="view_stream_settings"', add_stream_start)
+        add_stream_view = script[add_stream_start:add_stream_end]
+
+        self.assertNotIn('id="streams-list"', add_stream_view)
+        self.assertNotIn('id="output_enabled"', add_stream_view)
+        self.assertNotIn('id="save_output"', add_stream_view)
+        self.assertNotIn('id="cancel_output_edit"', add_stream_view)
+        self.assertNotIn("function editOutput(", script)
+        self.assertNotIn("function outputEditPayload(", script)
+
 
 if __name__ == "__main__":
     unittest.main()

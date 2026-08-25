@@ -2191,7 +2191,7 @@ class SharedSoundcardOutputManager:
         self.sessions: dict[str, Any] = {}
         self.outputs: dict[str, dict[str, Any]] = {}
 
-    def sync_output(self, output_id: str, soundcard: dict[str, Any]) -> None:
+    def sync_output(self, output_id: str, soundcard: dict[str, Any], owner: Any = None) -> None:
         output_id = str(output_id)
         config = soundcard_tap_config_from_soundcard(soundcard)
         input_config = AlsaSharedInputConfig(
@@ -2205,9 +2205,13 @@ class SharedSoundcardOutputManager:
                 if old_session is not None:
                     old_session.unregister_input(output_id)
                     if not old_session.has_inputs():
-                        self.sessions.pop(old["stable_id"], None)
                         old_session.stop()
+                        self.sessions.pop(old["stable_id"], None)
             session = self.sessions.get(config.stable_id)
+            if session is not None and not self._session_alive(session):
+                session.stop()
+                self.sessions.pop(config.stable_id, None)
+                session = None
             if session is None:
                 session = AlsaSharedPlaybackTap(
                     config.stable_id,
@@ -2216,30 +2220,46 @@ class SharedSoundcardOutputManager:
                 )
                 self.sessions[config.stable_id] = session
                 session.start()
+                for existing_output_id, existing in self.outputs.items():
+                    if existing_output_id == output_id or existing.get("stable_id") != config.stable_id:
+                        continue
+                    session.register_input(
+                        existing_output_id,
+                        AlsaSharedInputConfig(
+                            channel_mode=existing["channel_mode"],
+                            software_volume=existing["software_volume"],
+                        ),
+                    )
             session.register_input(output_id, input_config)
             self.outputs[output_id] = {
                 "stable_id": config.stable_id,
                 "channel_mode": config.channel_mode,
                 "software_volume": config.software_volume,
+                "owner": owner,
             }
 
-    def remove_output(self, output_id: str) -> None:
+    def remove_output(self, output_id: str, owner: Any = None) -> None:
         output_id = str(output_id)
         with self.lock:
-            old = self.outputs.pop(output_id, None)
+            old = self.outputs.get(output_id)
             if old is None:
                 return
+            if owner is not None and old.get("owner") is not owner:
+                return
+            self.outputs.pop(output_id, None)
             session = self.sessions.get(old["stable_id"])
             if session is None:
                 return
             session.unregister_input(output_id)
             if not session.has_inputs():
-                self.sessions.pop(old["stable_id"], None)
                 session.stop()
+                self.sessions.pop(old["stable_id"], None)
 
-    def push_float(self, output_id: str, samples: np.ndarray) -> None:
+    def push_float(self, output_id: str, samples: np.ndarray, owner: Any = None) -> None:
         with self.lock:
             old = self.outputs.get(str(output_id))
+            if old is not None and owner is not None and old.get("owner") is not owner:
+                old = None
             session = self.sessions.get(old["stable_id"]) if old is not None else None
         if session is not None:
             session.push_float(str(output_id), samples)
@@ -2269,6 +2289,14 @@ class SharedSoundcardOutputManager:
             self.outputs = {}
         for session in sessions:
             session.stop()
+
+    @staticmethod
+    def _session_alive(session: Any) -> bool:
+        thread = getattr(session, "thread", None)
+        if thread is None:
+            return True
+        is_alive = getattr(thread, "is_alive", None)
+        return bool(is_alive()) if callable(is_alive) else True
 
 
 class IcecastStreamWorker:
@@ -2322,6 +2350,7 @@ class IcecastStreamWorker:
         self.eas_status = "disabled"
         self.eas_error: str | None = None
         self.last_audio_at: float | None = None
+        self._soundcard_owner = object()
         self.lock = threading.Lock()
 
     @property
@@ -2346,7 +2375,7 @@ class IcecastStreamWorker:
         self.monitor_sources = {}
         for output_id in list(self.soundcard_outputs):
             if self.soundcard_manager is not None:
-                self.soundcard_manager.remove_output(output_id)
+                self.soundcard_manager.remove_output(output_id, owner=self._soundcard_owner)
         self.soundcard_outputs = set()
         self._stop_eas_recorder()
         if self.thread.ident is not None:
@@ -2488,12 +2517,12 @@ class IcecastStreamWorker:
         for output_id in list(self.soundcard_outputs):
             if output_id not in desired:
                 if self.soundcard_manager is not None:
-                    self.soundcard_manager.remove_output(output_id)
+                    self.soundcard_manager.remove_output(output_id, owner=self._soundcard_owner)
                 self.soundcard_outputs.discard(output_id)
         for output_id, output in desired.items():
             if self.soundcard_manager is None:
                 continue
-            self.soundcard_manager.sync_output(output_id, output.get("soundcard", {}))
+            self.soundcard_manager.sync_output(output_id, output.get("soundcard", {}), owner=self._soundcard_owner)
             self.soundcard_outputs.add(output_id)
 
     def _sync_legacy_soundcard_taps(self, desired: dict[str, dict[str, Any]]) -> None:
@@ -2730,7 +2759,7 @@ class IcecastStreamWorker:
         if float_samples is not None and self.soundcard_manager is not None:
             for output_id in soundcard_output_ids:
                 try:
-                    self.soundcard_manager.push_float(output_id, float_samples)
+                    self.soundcard_manager.push_float(output_id, float_samples, owner=self._soundcard_owner)
                 except Exception as exc:
                     LOG.warning(
                         "soundcard output failed for %s: %s",
@@ -4781,16 +4810,16 @@ class RtlControlService:
 
     def remove_stream(self, stream_id: str) -> dict[str, Any]:
         stream_id = stream_id.strip()
+        monitor_client_ids: list[str] = []
         with self.lock:
             removed = [stream for stream in self.streams if stream.get("id") == stream_id]
             self.streams = [stream for stream in self.streams if stream.get("id") != stream_id]
             if not removed:
                 raise ValueError("stream was not found")
-            for client_id, monitored_stream_id in list(self.monitor_streams_by_client.items()):
-                if monitored_stream_id == stream_id:
-                    self._remove_monitor_source_locked(client_id)
+            monitor_client_ids = self._remove_monitor_sources_for_stream_locked(stream_id)
             remove_stream_configs(self.streams_directory, removed)
             self._sync_stream_workers_locked()
+        self._close_monitor_sessions(monitor_client_ids)
         LOG.info("removed stream %s", stream_id)
         return self.stream_status()
 
@@ -4903,16 +4932,16 @@ class RtlControlService:
         if "enabled" not in payload:
             raise ValueError("stream enabled state is required")
         enabled = bool(payload.get("enabled"))
+        monitor_client_ids: list[str] = []
         with self.lock:
             stream = self._stream_locked(stream_id)
             stream["enabled"] = enabled
             stream["updated_at"] = time.time()
             if not enabled:
-                for client_id, monitored_stream_id in list(self.monitor_streams_by_client.items()):
-                    if monitored_stream_id == stream_id:
-                        self._remove_monitor_source_locked(client_id)
+                monitor_client_ids = self._remove_monitor_sources_for_stream_locked(stream_id)
             save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
+        self._close_monitor_sessions(monitor_client_ids)
         LOG.info("%s stream %s", "started" if enabled else "stopped", stream_id)
         return self.stream_status()
 
@@ -4954,7 +4983,7 @@ class RtlControlService:
             stream, output = self._stream_output_locked(stream_id, output_id)
             output_type = output_type or str(output.get("type", "icecast")).strip().lower()
             if output.get("enabled", True) and not enabled:
-                self._ensure_can_disable_icecast_output_locked(stream, output_id)
+                self._ensure_can_disable_output_locked(stream, output_id)
             if output_type == "icecast":
                 icecast = validate_icecast_payload(payload.get("icecast"))
                 self._reject_duplicate_icecast_locked(icecast, ignore_output_id=output_id)
@@ -5103,7 +5132,7 @@ class RtlControlService:
         with self.lock:
             stream = self._stream_locked(stream_id)
             outputs = stream_outputs(stream)
-            self._ensure_can_disable_icecast_output_locked(stream, output_id)
+            self._ensure_can_disable_output_locked(stream, output_id)
             before = len(outputs)
             stream["outputs"] = [output for output in outputs if output.get("id") != output_id]
             if len(stream["outputs"]) == before:
@@ -5127,8 +5156,8 @@ class RtlControlService:
                 return stream, output
         raise ValueError("stream output was not found")
 
-    def _ensure_can_disable_icecast_output_locked(self, stream: dict[str, Any], output_id: str) -> None:
-        if enabled_output_count(stream, disabled_icecast_output_id=output_id) <= 0:
+    def _ensure_can_disable_output_locked(self, stream: dict[str, Any], output_id: str) -> None:
+        if enabled_output_count(stream, disabled_output_id=output_id) <= 0:
             raise ValueError("At least one output must remain enabled for each stream.")
 
     def _ensure_can_disable_eas_recording_locked(self, stream: dict[str, Any]) -> None:
@@ -5529,7 +5558,7 @@ class RtlControlService:
         for key in list(self.stream_workers):
             if key not in desired:
                 worker = self.stream_workers.pop(key)
-                worker.stop()
+                self._stop_stream_worker_async(worker, reason="retired")
 
         if fanout is None:
             return
@@ -5556,6 +5585,24 @@ class RtlControlService:
                 stream.get("station", {}).get("callsign", "unknown"),
             )
 
+    def _stop_stream_worker_async(self, worker: IcecastStreamWorker, *, reason: str) -> None:
+        def cleanup() -> None:
+            try:
+                worker.stop()
+            except Exception as exc:
+                LOG.warning(
+                    "stream worker cleanup failed for %s after %s: %s",
+                    getattr(worker, "id", "unknown"),
+                    reason,
+                    exc,
+                )
+
+        threading.Thread(
+            target=cleanup,
+            name=f"stream-worker-stop-{getattr(worker, 'id', 'unknown')}",
+            daemon=True,
+        ).start()
+
     def _remove_monitor_source_locked(self, client_id: str) -> None:
         stream_id = self.monitor_streams_by_client.pop(client_id, "")
         self.monitor_accounts_by_client.pop(client_id, None)
@@ -5566,6 +5613,23 @@ class RtlControlService:
                 worker.remove_monitor_source(client_id)
                 break
         self._sync_stream_workers_locked()
+
+    def _remove_monitor_sources_for_stream_locked(self, stream_id: str) -> list[str]:
+        client_ids = [
+            client_id
+            for client_id, monitored_stream_id in list(self.monitor_streams_by_client.items())
+            if monitored_stream_id == stream_id
+        ]
+        for client_id in client_ids:
+            self._remove_monitor_source_locked(client_id)
+        return client_ids
+
+    def _close_monitor_sessions(self, client_ids: list[str]) -> None:
+        for client_id in client_ids:
+            try:
+                self.webrtc_runner.run(self.webrtc_sessions.close(client_id), timeout=3.0)
+            except Exception as exc:
+                LOG.debug("WebRTC monitor close failed for client %s: %s", client_id, exc)
 
     def _remove_receiver_locked(self, client_id: str) -> bool:
         worker = self.receiver_workers.pop(client_id, None)
@@ -5678,6 +5742,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
     def _auth_ok_or_setup_response(self, path: str, method: str) -> bool:
         self.current_account = None
         has_account = self.service.accounts.has_account()
+        if path == "/api/setup-state":
+            self._send_json({"setup_required": not has_account})
+            return False
         if not has_account:
             if method == "GET":
                 self._send_html(SETUP_HTML)
@@ -6440,6 +6507,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         data = content.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self._send_pending_auth_session_cookie()
         self.end_headers()
@@ -7434,12 +7502,12 @@ def mutable_stream_outputs(stream: dict[str, Any]) -> list[dict[str, Any]]:
 def enabled_output_count(
     stream: dict[str, Any],
     *,
-    disabled_icecast_output_id: str | None = None,
+    disabled_output_id: str | None = None,
     eas_enabled: bool | None = None,
 ) -> int:
     count = 0
     for output in stream_outputs(stream):
-        if disabled_icecast_output_id and output.get("id") == disabled_icecast_output_id:
+        if disabled_output_id and output.get("id") == disabled_output_id:
             continue
         if output.get("enabled", True):
             count += 1
@@ -7901,6 +7969,16 @@ const username = document.getElementById("setup_username");
 const password = document.getElementById("setup_password");
 const confirmPassword = document.getElementById("setup_confirm_password");
 
+async function redirectIfSetupComplete() {
+  try {
+    const response = await fetch("/api/setup-state", {cache: "no-store"});
+    if (!response.ok) return;
+    const data = await response.json();
+    if (!data.setup_required) window.location.replace("/");
+  } catch (error) {
+  }
+}
+
 function validateSetupForm() {
   const valid = usernamePattern.test(username.value) &&
     passwordPattern.test(password.value) &&
@@ -7961,6 +8039,8 @@ form.addEventListener("submit", async event => {
 document.getElementById("setup_finish").addEventListener("click", () => {
   window.location.replace("/");
 });
+window.addEventListener("pageshow", redirectIfSetupComplete);
+redirectIfSetupComplete();
 </script>
 </body>
 </html>
@@ -8669,8 +8749,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             <select id="icecast_bitrate" aria-describedby="icecast_bitrate_hint"></select>
           </label>
           <span id="icecast_bitrate_hint" class="hint">Encoder bitrate in Kbps for this Icecast mountpoint.</span>
-          <label id="output_enabled_label"><input id="output_enabled" type="checkbox" checked aria-describedby="output_enabled_hint"> Output enabled</label>
-          <span id="output_enabled_hint" class="hint">Enable or disable this Icecast output.</span>
         </div>
       </fieldset>
       </div>
@@ -8679,11 +8757,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <button id="wizard_back" type="button" hidden>Back</button>
         <button id="wizard_next" type="button">Next</button>
         <button id="wizard_finish" type="button" hidden>Finish</button>
-        <button id="save_output" type="button" hidden>Save Changes</button>
-        <button id="cancel_output_edit" type="button" hidden>Cancel</button>
       </div>
       <div id="stream-result" class="message"></div>
-      <div id="streams-list" class="stream-list" aria-live="off"></div>
     </section>
   </div>
 
@@ -8695,7 +8770,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <input id="stream_enabled" type="checkbox">
         Enable this stream
       </label>
-      <label class="checkbox-row">
+      <label id="stream_monitor_label" class="checkbox-row">
         <input id="stream_monitor_enabled" type="checkbox" aria-describedby="stream_monitor_hint">
         Monitor
       </label>
@@ -9557,6 +9632,21 @@ function resetLiveAudioElement() {
   }
 }
 
+function clearLocalStreamMonitor() {
+  const peer = monitorPeerConnection;
+  monitorPeerConnection = null;
+  monitorStreamId = "";
+  clearMonitorWatchdogs();
+  resetLiveAudioElement();
+  if (peer) {
+    try {
+      peer.close();
+    } catch (error) {
+      console.debug("failed to close monitor peer", error);
+    }
+  }
+}
+
 function markLiveAudioHidden() {
   if (!monitorPeerConnection && !receiverPeerConnection) return;
   liveAudioHiddenAt = Date.now();
@@ -9815,12 +9905,7 @@ async function stopStreamMonitor(options = {}) {
   const notifyServer = options.notifyServer !== false;
   const unstable = options.unstable === true;
   const clientId = pageMonitorClientId();
-  const peer = monitorPeerConnection;
-  monitorPeerConnection = null;
-  monitorStreamId = "";
-  clearMonitorWatchdogs();
-  resetLiveAudioElement();
-  if (peer) peer.close();
+  clearLocalStreamMonitor();
   if (notifyServer) {
     try {
       await request("/api/monitor/stop", {
@@ -10603,15 +10688,6 @@ function streamPayload() {
   };
 }
 
-function outputEditPayload() {
-  return {
-    stream_id: editingStreamId,
-    output_id: editingOutputId,
-    enabled: document.getElementById("output_enabled").checked,
-    icecast: streamPayload().icecast
-  };
-}
-
 function selectedSettingsSoundcardChannelMode() {
   const selected = document.querySelector("input[name='settings_soundcard_channel']:checked");
   return selected ? selected.value : "both";
@@ -10708,14 +10784,30 @@ async function setStreamEnabled(streamId, enabled, resultHandler = setStreamResu
     resultHandler("This account is read-only.", "error");
     return null;
   }
-  const data = await request("/api/streams", {
-    method: "PATCH",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({stream_id: streamId, enabled})
-  });
-  renderStreams(data.streams || []);
-  resultHandler(enabled ? "Stream started." : "Stream stopped.", "success");
-  return data;
+  const stream = configuredStreams.find(item => item.id === streamId);
+  const previousEnabled = stream ? streamIsEnabled(stream) : null;
+  if (stream) {
+    stream.enabled = enabled;
+    if (!enabled && monitorStreamId === streamId) clearLocalStreamMonitor();
+    renderStreams(configuredStreams, {force: true});
+  }
+  try {
+    const data = await request("/api/streams", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({stream_id: streamId, enabled})
+    });
+    if (!enabled && monitorStreamId === streamId) clearLocalStreamMonitor();
+    renderStreams(data.streams || [], {force: true});
+    resultHandler(enabled ? "Stream started." : "Stream stopped.", "success");
+    return data;
+  } catch (error) {
+    if (stream && previousEnabled !== null) {
+      stream.enabled = previousEnabled;
+      renderStreams(configuredStreams, {force: true});
+    }
+    throw error;
+  }
 }
 
 function streamLabel(stream) {
@@ -10741,11 +10833,15 @@ function streamStatusLabel(status) {
   return "Disabled";
 }
 
+function streamIsEnabled(stream) {
+  return Boolean(stream && stream.enabled !== false && stream.enabled !== "false" && stream.enabled !== 0);
+}
+
 function streamOutputCount(stream) {
   return enabledStreamOutputCount(stream);
 }
 
-function enabledIcecastOutputCount(stream) {
+function enabledConfiguredOutputCount(stream) {
   return streamOutputs(stream).filter(output => output.enabled !== false).length;
 }
 
@@ -10754,15 +10850,15 @@ function easRecordingEnabled(stream) {
 }
 
 function enabledStreamOutputCount(stream) {
-  return enabledIcecastOutputCount(stream) + (easRecordingEnabled(stream) ? 1 : 0);
+  return enabledConfiguredOutputCount(stream) + (easRecordingEnabled(stream) ? 1 : 0);
 }
 
-function canDisableIcecastOutput(stream, output) {
+function canDisableOutput(stream, output) {
   if (!output || output.enabled === false) return true;
   return enabledStreamOutputCount(stream) > 1;
 }
 
-function canRemoveIcecastOutput(stream, output) {
+function canRemoveOutput(stream, output) {
   if (!output || output.enabled === false) return true;
   return enabledStreamOutputCount(stream) > 1;
 }
@@ -10787,7 +10883,7 @@ function populateBitrates() {
 
 function streamOutputs(stream) {
   if (Array.isArray(stream.outputs)) return stream.outputs;
-  if (stream.icecast) return [{id: stream.id, enabled: stream.enabled !== false, icecast: stream.icecast}];
+  if (stream.icecast) return [{id: stream.id, enabled: streamIsEnabled(stream), icecast: stream.icecast}];
   return [];
 }
 
@@ -10976,7 +11072,7 @@ function findConfiguredOutput(streamId, outputId) {
   return {stream, output, outputs};
 }
 
-function setIcecastForm(icecast, enabled = true) {
+function setIcecastForm(icecast) {
   const service = serviceFromIcecast(icecast);
   const station = selectedStation();
   const preset = applyServicePresetToIcecast(icecast || {}, service, station, "icecast");
@@ -10991,7 +11087,6 @@ function setIcecastForm(icecast, enabled = true) {
   setChecked("icecast_format_ogg", preset.format === "ogg");
   setValue("icecast_sample_rate", preset.sample_rate || 24000);
   setValue("icecast_bitrate", preset.bitrate || (format === "mp3" ? 64 : 48));
-  setChecked("output_enabled", enabled);
   setServiceHelp("icecast_service_help", service);
   applyServiceControls("icecast", service);
 }
@@ -11130,7 +11225,7 @@ function resetWizardForService(service) {
   } else if (service === STREAM_SERVICE_WEATHERUSA) {
     next.password = current.password || "";
   }
-  setIcecastForm(next, true);
+  setIcecastForm(next);
   icecastAuthPassed = false;
   icecastAuthSignature = "";
   renderWizard();
@@ -11609,12 +11704,12 @@ function cancelOutputForm() {
   const streamId = settingsStreamId;
   closeOutputForm();
   if (currentViewName() === "stream_output" && streamId) {
-    navigateTo("stream_settings", {streamId}, false, true);
+    navigateTo("stream_settings", {streamId}, true, true);
   }
 }
 
 function clearIcecastForm() {
-  setIcecastForm({service: STREAM_SERVICE_CUSTOM, format: "mp3", sample_rate: 24000, bitrate: 64}, true);
+  setIcecastForm({service: STREAM_SERVICE_CUSTOM, format: "mp3", sample_rate: 24000, bitrate: 64});
   setChecked("show_icecast_password", false);
   document.getElementById("icecast_password").type = "password";
 }
@@ -11691,8 +11786,6 @@ function renderWizard() {
   const finish = document.getElementById("wizard_finish");
   next.hidden = editMode || (soundcardMode && wizardStep === ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP) || (!soundcardMode && streamStep === 4) || (!soundcardMode && !needsQualityStep && streamStep >= 3);
   finish.hidden = editMode || !(soundcardMode && wizardStep === ADD_OUTPUT_SOUNDCARD_CONTROLS_STEP || (!soundcardMode && (streamStep === 4 || (!needsQualityStep && streamStep >= 3))));
-  document.getElementById("save_output").hidden = !editMode;
-  document.getElementById("cancel_output_edit").hidden = !editMode;
   renderWizardSoundcardDevices();
   if (wizardStep === 0) {
     setDisabled(next, !selectedStation());
@@ -11738,7 +11831,8 @@ function beginStreamWizard() {
   navigateTo("add_stream", {}, false, true);
 }
 
-function finishWizard() {
+function finishWizard(options = {}) {
+  const replace = options.replace !== false;
   const returnStreamId = wizardMode === "add_output" ? settingsStreamId : "";
   wizardDirty = false;
   icecastAuthPassed = false;
@@ -11748,9 +11842,9 @@ function finishWizard() {
   wizardSoundcardPreviewId = "";
   setStreamResult("");
   if (returnStreamId) {
-    navigateTo("stream_settings", {streamId: returnStreamId}, false, true);
+    navigateTo("stream_settings", {streamId: returnStreamId}, replace, true);
   } else {
-    navigateTo("streams");
+    navigateTo("streams", {}, replace, true);
   }
 }
 
@@ -12020,33 +12114,6 @@ async function discardWizardSoundcardOutput() {
   }
 }
 
-function setOutputEditMode(enabled, selected = null) {
-  wizardMode = enabled ? "edit" : "add";
-  editingStreamId = enabled && selected ? selected.stream.id : "";
-  editingOutputId = enabled && selected ? selected.output.id : "";
-  const enabledLabel = document.getElementById("output_enabled_label");
-  enabledLabel.hidden = !enabled || !selected || selected.outputs.length <= 1;
-  if (!enabled) {
-    setChecked("output_enabled", true);
-  }
-  renderWizard();
-}
-
-function editOutput(streamId, outputId) {
-  const selected = findConfiguredOutput(streamId, outputId);
-  if (!selected) {
-    setStreamResult("Stream output was not found.", "error");
-    return;
-  }
-  selectedStationKey = selected.stream.station.key || "";
-  setIcecastForm(selected.output.icecast || {}, selected.output.enabled !== false);
-  setOutputEditMode(true, selected);
-  setText("selected_station", `Editing ${selected.stream.station.callsign} ${selected.stream.station.frequency} MHz`);
-  wizardDirty = true;
-  setStreamResult("");
-  navigateTo("add_stream", {}, false, true);
-}
-
 function editStreamSettings(streamId, outputId = "") {
   if (outputId) {
     settingsStreamId = streamId;
@@ -12078,11 +12145,17 @@ function showStreamSettings(streamId) {
 function renderStreamSettings() {
   const stream = currentSettingsStream();
   const addButton = document.getElementById("open_add_output");
+  const monitorLabel = document.getElementById("stream_monitor_label");
+  const monitorHint = document.getElementById("stream_monitor_hint");
+  const enabled = streamIsEnabled(stream);
+  const monitorHidden = !enabled;
   setDisabled(addButton, !stream);
   setDisabled(document.getElementById("stream_enabled"), !stream);
-  setDisabled(document.getElementById("stream_monitor_enabled"), !stream || stream.enabled === false);
-  if (stream) setChecked("stream_enabled", stream.enabled !== false);
-  setChecked("stream_monitor_enabled", Boolean(stream && monitorStreamId === stream.id));
+  monitorLabel.hidden = monitorHidden;
+  monitorHint.hidden = monitorHidden;
+  setDisabled(document.getElementById("stream_monitor_enabled"), monitorHidden);
+  if (stream) setChecked("stream_enabled", enabled);
+  setChecked("stream_monitor_enabled", Boolean(enabled && monitorStreamId === stream.id));
   setAudioEffectsControls(stream);
   setEasControls(stream);
   renderOutputPanels();
@@ -12091,7 +12164,7 @@ function renderStreamSettings() {
 }
 
 function outputStatusFor(stream, output) {
-  if (!stream || stream.enabled === false) return "disabled";
+  if (!streamIsEnabled(stream)) return "disabled";
   if (!output || output.enabled === false) return "disabled";
   const active = activeStreamSnapshots.find(snapshot =>
     snapshot.id === stream.id && streamOutputs(snapshot).some(activeOutput => activeOutput.id === output.id)
@@ -12313,14 +12386,14 @@ function outputActionsCell(stream, output) {
   reset.dataset.streamId = stream.id || "";
   reset.dataset.outputId = output.id || "";
   if (!accountIsReadOnly()) {
-    if (output.enabled === false || canDisableIcecastOutput(stream, output)) {
+    if (output.enabled === false || canDisableOutput(stream, output)) {
       menu.appendChild(toggle);
     }
     menu.appendChild(edit);
     if (soundcardOutputUsbDevice(output)) {
       menu.appendChild(reset);
     }
-    if (canRemoveIcecastOutput(stream, output)) {
+    if (canRemoveOutput(stream, output)) {
       menu.appendChild(remove);
     }
   }
@@ -12344,7 +12417,7 @@ function activeStreamRows(activeStreams, configured = configuredStreams) {
       const status = statuses.includes("needs-attention") ? "needs-attention" : statuses.includes("enabled") ? "enabled" : "disabled";
       rows.push({
         id: stream.id,
-        enabled: stream.enabled !== false,
+        enabled: streamIsEnabled(stream),
         station: stream.station,
         outputs: streamOutputs(stream),
         status
@@ -12353,10 +12426,10 @@ function activeStreamRows(activeStreams, configured = configuredStreams) {
     } else {
       rows.push({
         id: stream.id,
-        enabled: stream.enabled !== false,
+        enabled: streamIsEnabled(stream),
         station: stream.station,
         outputs: streamOutputs(stream),
-        status: stream.enabled === false ? "disabled" : "disabled"
+        status: "disabled"
       });
     }
   }
@@ -12371,7 +12444,7 @@ function activeStreamSignature(rows) {
     const station = stream.station || {};
     return {
       id: stream.id || "",
-      enabled: stream.enabled !== false,
+      enabled: streamIsEnabled(stream),
       callsign: station.callsign || "",
       frequency: station.frequency || "",
       outputs: streamOutputs(stream).map(output => ({
@@ -12386,14 +12459,14 @@ function activeStreamSignature(rows) {
   }));
 }
 
-function renderActiveStreams(activeStreams, configured = configuredStreams) {
+function renderActiveStreams(activeStreams, configured = configuredStreams, options = {}) {
   const tbody = document.getElementById("active-streams-body");
   const rows = activeStreamRows(activeStreams, configured);
   const nextSignature = activeStreamSignature(rows);
   if (nextSignature === activeStreamsSignature) {
     return;
   }
-  if (containsFocusedElement(tbody)) return;
+  if (!options.force && containsFocusedElement(tbody)) return;
   activeStreamsSignature = nextSignature;
   tbody.innerHTML = "";
 
@@ -12578,7 +12651,8 @@ function streamActionsCell(stream) {
   menu.setAttribute("role", "menu");
   const toggle = document.createElement("button");
   toggle.type = "button";
-  toggle.textContent = stream.enabled === false ? "Start stream" : "Stop stream";
+  const enabled = streamIsEnabled(stream);
+  toggle.textContent = enabled ? "Stop stream" : "Start stream";
   toggle.setAttribute("role", "menuitem");
   toggle.dataset.action = "toggle-active-stream";
   toggle.dataset.streamId = stream.id || "";
@@ -12603,7 +12677,9 @@ function streamActionsCell(stream) {
   if (!accountIsReadOnly()) {
     menu.appendChild(toggle);
   }
-  menu.appendChild(monitor);
+  if (enabled) {
+    menu.appendChild(monitor);
+  }
   if (!accountIsReadOnly()) {
     menu.appendChild(edit);
     menu.appendChild(remove);
@@ -12651,55 +12727,14 @@ function closeStreamActionMenus() {
   }
 }
 
-function renderStreams(streams) {
+function renderStreams(streams, options = {}) {
   configuredStreams = streams || [];
-  renderActiveStreams(activeStreamSnapshots, configuredStreams);
+  if (monitorStreamId) {
+    const monitored = configuredStreams.find(stream => stream.id === monitorStreamId);
+    if (!monitored || !streamIsEnabled(monitored)) clearLocalStreamMonitor();
+  }
+  renderActiveStreams(activeStreamSnapshots, configuredStreams, options);
   if (settingsStreamId) renderStreamSettings();
-  const list = document.getElementById("streams-list");
-  if (containsFocusedElement(list)) return;
-  list.innerHTML = "";
-  if (configuredStreams.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "hint";
-    empty.textContent = "No streams configured.";
-    list.appendChild(empty);
-    return;
-  }
-  for (const stream of configuredStreams) {
-    const item = document.createElement("div");
-    item.className = "stream-item";
-    const title = document.createElement("b");
-    title.textContent = streamLabel(stream);
-    const details = document.createElement("div");
-    details.className = "hint";
-    details.textContent = `${streamOutputCount(stream)} output${streamOutputCount(stream) === 1 ? "" : "s"}.`;
-    const outputs = document.createElement("div");
-    outputs.className = "actions";
-    if (!accountIsReadOnly()) {
-      for (const output of streamOutputs(stream)) {
-        const icecast = output.icecast || {};
-        const edit = document.createElement("button");
-        edit.type = "button";
-        edit.textContent = `Edit ${icecast.mount || "Icecast output"}`;
-        edit.dataset.action = "edit-output";
-        edit.dataset.streamId = stream.id;
-        edit.dataset.outputId = output.id;
-        outputs.appendChild(edit);
-      }
-    }
-    item.appendChild(title);
-    item.appendChild(details);
-    if (!accountIsReadOnly()) {
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.textContent = "Remove";
-      remove.dataset.action = "remove-stream";
-      remove.dataset.streamId = stream.id;
-      item.appendChild(outputs);
-      item.appendChild(remove);
-    }
-    list.appendChild(item);
-  }
 }
 
 async function loadStreams() {
@@ -14095,7 +14130,7 @@ function restoreIqRecorderPreferences() {
 
 function activeIqStreamOptions() {
   return configuredStreams
-    .filter(stream => stream.enabled !== false)
+    .filter(stream => streamIsEnabled(stream))
     .map(stream => {
       const station = stream.station || {};
       const callsign = station.callsign || "Unknown";
@@ -14729,7 +14764,7 @@ document.getElementById("open_create_account").addEventListener("click", () => {
   navigateTo("create_account");
 });
 document.getElementById("cancel_create_account").addEventListener("click", () => {
-  navigateTo("accounts");
+  navigateTo("accounts", {}, true, true);
 });
 document.getElementById("create_account").addEventListener("click", async () => {
   try {
@@ -14746,7 +14781,7 @@ document.getElementById("change_account_password").addEventListener("click", asy
   }
 });
 document.getElementById("cancel_change_password").addEventListener("click", () => {
-  navigateTo("dashboard");
+  navigateTo("dashboard", {}, true, true);
 });
 document.getElementById("accounts-body").addEventListener("click", async event => {
   const target = event.target;
@@ -14852,10 +14887,10 @@ document.getElementById("open_iq_start").addEventListener("click", () => {
   navigateTo("iq_recorder_start");
 });
 document.getElementById("cancel_iq_start").addEventListener("click", () => {
-  navigateTo("iq_recorder");
+  navigateTo("iq_recorder", {}, true, true);
 });
 document.getElementById("cancel_iq_download").addEventListener("click", () => {
-  navigateTo("iq_recorder");
+  navigateTo("iq_recorder", {}, true, true);
 });
 document.getElementById("iq_download_recording").addEventListener("click", async () => {
   try {
@@ -15031,7 +15066,7 @@ document.getElementById("active-streams-body").addEventListener("click", async e
       return;
     }
     try {
-      await setStreamEnabled(target.dataset.streamId, stream.enabled === false, setStreamsResult);
+      await setStreamEnabled(target.dataset.streamId, !streamIsEnabled(stream), setStreamsResult);
     } catch (error) {
       setStreamsResult(error.message, "error");
     }
@@ -15320,7 +15355,7 @@ for (const id of ["icecast_host", "icecast_port", "icecast_username", "icecast_p
   });
 }
 
-for (const id of ["icecast_sample_rate", "icecast_bitrate", "output_enabled", "icecast_alt_enabled", "icecast_alt_number"]) {
+for (const id of ["icecast_sample_rate", "icecast_bitrate", "icecast_alt_enabled", "icecast_alt_number"]) {
   document.getElementById(id).addEventListener("change", () => {
     wizardDirty = true;
     icecastAuthPassed = false;
@@ -15451,7 +15486,7 @@ document.getElementById("stream_enabled").addEventListener("change", async event
   } catch (error) {
     setOutputResult(error.message, "error");
     const stream = currentSettingsStream();
-    if (stream) setChecked("stream_enabled", stream.enabled !== false);
+    if (stream) setChecked("stream_enabled", streamIsEnabled(stream));
   } finally {
     setControlBusy(event.target, false);
   }
@@ -15576,7 +15611,7 @@ async function handleOutputTableClick(event) {
       return;
     }
     const nextEnabled = selected.output.enabled === false;
-    if (!nextEnabled && !canDisableIcecastOutput(selected.stream, selected.output)) {
+    if (!nextEnabled && !canDisableOutput(selected.stream, selected.output)) {
       setOutputResult("At least one output must remain enabled for each stream.", "error");
       return;
     }
@@ -15629,7 +15664,7 @@ async function handleOutputTableClick(event) {
       setOutputResult("Stream output was not found.", "error");
       return;
     }
-    if (!canRemoveIcecastOutput(selected.stream, selected.output)) {
+    if (!canRemoveOutput(selected.stream, selected.output)) {
       setOutputResult("At least one output must remain enabled for each stream.", "error");
       return;
     }
@@ -15950,56 +15985,6 @@ window.addEventListener("beforeunload", event => {
   event.returnValue = "";
 });
 
-document.getElementById("cancel_output_edit").addEventListener("click", () => {
-  setOutputEditMode(false);
-  wizardDirty = false;
-  setStreamResult("");
-  navigateTo("streams");
-});
-
-document.getElementById("save_output").addEventListener("click", async () => {
-  const button = document.getElementById("save_output");
-  setDisabled(button, true);
-  setStreamResult("Saving stream output settings...");
-  try {
-    const data = await request("/api/stream-output", {
-      method: "PATCH",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(outputEditPayload())
-    });
-    renderStreams(data.streams || []);
-    setStreamResult(data.message, data.success ? "success" : "error");
-    if (data.success) {
-      wizardDirty = false;
-      setOutputEditMode(false);
-      navigateTo("streams");
-    }
-  } catch (error) {
-    setStreamResult(error.message, "error");
-  } finally {
-    setDisabled(button, false);
-  }
-});
-
-document.getElementById("streams-list").addEventListener("click", async event => {
-  const button = event.target;
-  if (!button || !button.dataset || !button.dataset.streamId) return;
-  if (button.dataset.action === "edit-output") {
-    editOutput(button.dataset.streamId, button.dataset.outputId);
-    return;
-  }
-  if (button.dataset.action !== "remove-stream") return;
-  try {
-    const data = await request(`/api/streams?id=${encodeURIComponent(button.dataset.streamId)}`, {
-      method: "DELETE"
-    });
-    renderStreams(data.streams || []);
-    setStreamResult("");
-  } catch (error) {
-    setStreamResult(error.message, "error");
-  }
-});
-
 document.getElementById("eas_alert_stream").addEventListener("change", event => {
   easAlertStreamId = event.target.value;
   easAlertPage = 1;
@@ -16033,10 +16018,10 @@ document.getElementById("eas_delete_manual").addEventListener("click", event => 
 document.getElementById("eas_export_alerts").addEventListener("click", exportEasAlerts);
 document.getElementById("eas_delete_alerts").addEventListener("click", deleteEasAlerts);
 document.getElementById("cancel_eas_export").addEventListener("click", () => {
-  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
 });
 document.getElementById("cancel_eas_delete").addEventListener("click", () => {
-  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
 });
 
 document.getElementById("eas_alert_prev").addEventListener("click", () => {

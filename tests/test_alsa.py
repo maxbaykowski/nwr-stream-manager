@@ -383,6 +383,11 @@ class AlsaDiscoveryTests(unittest.TestCase):
         np.testing.assert_allclose(output[:, 0], 0.25)
         np.testing.assert_allclose(output[:, 1], 0.25)
 
+    def test_shared_playback_tap_initializes_reopen_block_state(self) -> None:
+        tap = self.alsa.AlsaSharedPlaybackTap("alsa:usb:test", output_sample_rate=24_000)
+
+        self.assertEqual(tap.reopen_block_until, 0.0)
+
     def test_stream_tap_clears_stale_audio_when_playback_reopens(self) -> None:
         device = self.alsa.playback_device_from_info(self.card(2), self.pcm())
 
@@ -532,6 +537,76 @@ class AlsaDiscoveryTests(unittest.TestCase):
             np.frombuffer(self.alsa.convert_float32_sample_format(samples, self.alsa.SND_PCM_FORMAT_FLOAT_LE), dtype="<f4").tolist(),
             [-1.0, 0.0, 1.0],
         )
+
+    def test_playback_format_preference_uses_s16_before_packed_24_bit(self) -> None:
+        class Lib:
+            def __init__(self, supported) -> None:
+                self.supported = set(supported)
+                self.attempts = []
+
+            def snd_pcm_hw_params_set_format(self, _handle, _params, pcm_format):
+                self.attempts.append(pcm_format)
+                return 0 if pcm_format in self.supported else -1
+
+            def snd_strerror(self, _code):
+                return b"unsupported"
+
+        playback = object.__new__(self.alsa.AlsaPcmPlayback)
+        playback.handle = ctypes.c_void_p(1234)
+        playback.lib = Lib({self.alsa.SND_PCM_FORMAT_S16_LE, self.alsa.SND_PCM_FORMAT_S24_3LE})
+
+        playback._set_supported_format(ctypes.c_void_p(5678))
+
+        self.assertEqual(playback.pcm_format, self.alsa.SND_PCM_FORMAT_S16_LE)
+        self.assertEqual(playback.pcm_format_name, "S16_LE")
+
+    def test_playback_sets_software_start_threshold_to_one_period(self) -> None:
+        class Lib:
+            def __init__(self) -> None:
+                self.start_threshold = None
+                self.avail_min = None
+                self.applied = False
+                self.freed = False
+
+            def snd_pcm_sw_params_malloc(self, out):
+                out._obj.value = 5678
+                return 0
+
+            def snd_pcm_sw_params_current(self, _handle, _params):
+                return 0
+
+            def snd_pcm_sw_params_set_start_threshold(self, _handle, _params, frames):
+                self.start_threshold = int(frames.value)
+                return 0
+
+            def snd_pcm_sw_params_set_avail_min(self, _handle, _params, frames):
+                self.avail_min = int(frames.value)
+                return 0
+
+            def snd_pcm_sw_params(self, _handle, _params):
+                self.applied = True
+                return 0
+
+            def snd_pcm_sw_params_free(self, _params):
+                self.freed = True
+
+            def snd_strerror(self, _code):
+                return b"error"
+
+        playback = object.__new__(self.alsa.AlsaPcmPlayback)
+        playback.handle = ctypes.c_void_p(1234)
+        playback.lib = Lib()
+        playback.start_threshold_frames = 0
+        playback.avail_min_frames = 0
+
+        playback._set_software_params(960)
+
+        self.assertEqual(playback.start_threshold_frames, 960)
+        self.assertEqual(playback.avail_min_frames, 960)
+        self.assertEqual(playback.lib.start_threshold, 960)
+        self.assertEqual(playback.lib.avail_min, 960)
+        self.assertTrue(playback.lib.applied)
+        self.assertTrue(playback.lib.freed)
 
     def test_mixer_unity_target_prefers_zero_db_without_boost(self) -> None:
         self.assertEqual(self.alsa.mixer_unity_target_mb(-6000, 1200), 0)
