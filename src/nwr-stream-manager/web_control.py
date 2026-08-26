@@ -9178,6 +9178,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 <label>Sound card
                   <select id="settings_soundcard_device"></select>
                 </label>
+                <button id="reset_soundcard_device" type="button" hidden>Reset USB sound card</button>
                 <span id="settings_soundcard_device_hint" class="hint"></span>
                 <label>Volume
                   <input id="settings_soundcard_volume" type="range" min="0" max="2" step="0.01" value="1">
@@ -9192,7 +9193,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               </div>
             </fieldset>
             <div class="actions">
-              <button id="reset_soundcard_device" type="button" hidden>Reset USB sound card</button>
               <button id="cancel_soundcard_output_form" type="button">Cancel</button>
             </div>
           </div>
