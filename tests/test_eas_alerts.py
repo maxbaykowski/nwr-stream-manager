@@ -458,6 +458,64 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "critical")
         self.assertIn("Please free up disk space", snapshot["message"])
 
+    def test_storage_monitor_requires_stable_readings_before_recovering_from_critical(self) -> None:
+        web_control = self.web_control
+        available_blocks = 100_000
+
+        def fake_stat(_path):
+            return types.SimpleNamespace(st_dev=10)
+
+        def fake_statvfs(_path):
+            return types.SimpleNamespace(
+                f_frsize=1000,
+                f_bsize=1000,
+                f_blocks=10_000_000,
+                f_bfree=available_blocks,
+                f_bavail=available_blocks,
+                f_favail=50_000,
+            )
+
+        monitor = web_control.StorageMonitor(
+            [Path("/")],
+            stat_provider=fake_stat,
+            statvfs_provider=fake_statvfs,
+        )
+
+        self.assertEqual(monitor.refresh()["status"], "critical")
+        available_blocks = 2_000_000
+        self.assertEqual(monitor.refresh()["status"], "critical")
+        self.assertEqual(monitor.refresh()["status"], "critical")
+        snapshot = monitor.refresh()
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["filesystems"][0]["raw_status"], "ok")
+
+    def test_storage_monitor_applies_worsening_storage_status_immediately(self) -> None:
+        web_control = self.web_control
+        available_blocks = 2_000_000
+
+        def fake_stat(_path):
+            return types.SimpleNamespace(st_dev=11)
+
+        def fake_statvfs(_path):
+            return types.SimpleNamespace(
+                f_frsize=1000,
+                f_bsize=1000,
+                f_blocks=10_000_000,
+                f_bfree=available_blocks,
+                f_bavail=available_blocks,
+                f_favail=50_000,
+            )
+
+        monitor = web_control.StorageMonitor(
+            [Path("/")],
+            stat_provider=fake_stat,
+            statvfs_provider=fake_statvfs,
+        )
+
+        self.assertEqual(monitor.refresh()["status"], "ok")
+        available_blocks = 100_000
+        self.assertEqual(monitor.refresh()["status"], "critical")
+
     def test_recent_eas_alerts_filters_last_24_hours_and_sorts_by_callsign_tie(self) -> None:
         web_control = self.web_control
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1603,6 +1661,41 @@ class EasAlertTests(unittest.TestCase):
             response = service.eas_alerts("stream-1", page=1, per_page=10)
 
             self.assertEqual([alert["event_name"] for alert in response["alerts"]], ["Practice/Demo Warning", "Severe Thunderstorm Warning"])
+
+    def test_eas_alert_streams_include_existing_alert_index_when_recording_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            streams_dir = state_dir / "streams"
+            alert_dir = streams_dir / "WXN99" / "alerts"
+            alert_dir.mkdir(parents=True)
+            (alert_dir / "index.json").write_text(
+                json.dumps({"version": 1, "alerts": [{"event_type": "RWT"}]}),
+                encoding="utf-8",
+            )
+            stream = {"id": "stream-1", "station": {"callsign": "WXN99"}, "eas_recording": {"enabled": False}}
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+
+            response = service.eas_alert_streams()
+
+            self.assertEqual([item["id"] for item in response["streams"]], ["stream-1"])
+            self.assertEqual(response["streams"][0]["alert_count"], 1)
+
+    def test_eas_alert_streams_include_enabled_recording_without_alert_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            streams_dir = Path(temp_dir) / "streams"
+            stream = {"id": "stream-1", "station": {"callsign": "WXN99"}, "eas_recording": {"enabled": True}}
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.streams_directory = streams_dir
+            service.streams = [stream]
+
+            response = service.eas_alert_streams()
+
+            self.assertEqual([item["id"] for item in response["streams"]], ["stream-1"])
+            self.assertEqual(response["streams"][0]["alert_count"], 0)
 
     def test_export_zip_contains_audio_and_sanitized_index_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

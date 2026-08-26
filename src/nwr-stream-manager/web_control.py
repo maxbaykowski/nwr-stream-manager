@@ -217,6 +217,7 @@ STORAGE_LOW_FREE_PERCENT = 5.0
 STORAGE_CRITICAL_FREE_PERCENT = 1.0
 STORAGE_LOW_INODES = 1024
 STORAGE_CRITICAL_INODES = 128
+STORAGE_STATUS_RECOVERY_SAMPLES = 3
 STATIONS_ASSET_PATH = Path(__file__).resolve().parent / "assets" / "nwr_stations.json"
 USB_VENDOR_NAMES = {
     "0bda": "Realtek",
@@ -405,6 +406,7 @@ class StorageMonitor:
         statvfs_provider=None,
         stat_provider=None,
         critical_callback=None,
+        recovery_callback=None,
         idle_poll_seconds: float = STORAGE_IDLE_POLL_SECONDS,
         recording_poll_seconds: float = STORAGE_RECORDING_POLL_SECONDS,
     ) -> None:
@@ -412,6 +414,7 @@ class StorageMonitor:
         self.statvfs_provider = statvfs_provider or os.statvfs
         self.stat_provider = stat_provider or os.stat
         self.critical_callback = critical_callback
+        self.recovery_callback = recovery_callback
         self.idle_poll_seconds = float(idle_poll_seconds)
         self.recording_poll_seconds = float(recording_poll_seconds)
         self.lock = threading.RLock()
@@ -420,6 +423,8 @@ class StorageMonitor:
         self.active_recordings = 0
         self.snapshot_data: dict[str, Any] = self._empty_snapshot()
         self.last_callback_status = ""
+        self.filesystem_status_by_device: dict[int | str, str] = {}
+        self.filesystem_recovery_candidates: dict[int | str, tuple[str, int]] = {}
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -481,6 +486,8 @@ class StorageMonitor:
                 continue
             filesystem = self._filesystem_snapshot(path, existing_path, stat_result, stats)
             device_id = filesystem["device_id"]
+            filesystem["raw_status"] = filesystem["status"]
+            filesystem["status"] = self._stable_filesystem_status(device_id, filesystem["status"])
             current = filesystems_by_device.get(device_id)
             if current is None or len(str(filesystem["path"])) < len(str(current["path"])):
                 filesystems_by_device[device_id] = filesystem
@@ -511,6 +518,11 @@ class StorageMonitor:
                     except Exception as exc:
                         LOG.warning("storage critical callback failed: %s", exc)
             else:
+                if self.last_callback_status == "critical" and self.recovery_callback is not None:
+                    try:
+                        self.recovery_callback(snapshot)
+                    except Exception as exc:
+                        LOG.warning("storage recovery callback failed: %s", exc)
                 self.last_callback_status = str(snapshot.get("status", ""))
             poll_seconds = float(snapshot.get("poll_seconds", self.idle_poll_seconds))
             self.stop_event.wait(max(0.5, poll_seconds))
@@ -562,6 +574,27 @@ class StorageMonitor:
             return "unknown"
         return "ok"
 
+    def _stable_filesystem_status(self, device_id: int | str, raw_status: str) -> str:
+        severity = {"ok": 0, "low": 1, "critical": 2}
+        raw = raw_status if raw_status in severity else "ok"
+        current = self.filesystem_status_by_device.get(device_id)
+        if current not in severity:
+            self.filesystem_status_by_device[device_id] = raw
+            self.filesystem_recovery_candidates.pop(device_id, None)
+            return raw
+        if severity[raw] >= severity[current]:
+            self.filesystem_status_by_device[device_id] = raw
+            self.filesystem_recovery_candidates.pop(device_id, None)
+            return raw
+        candidate, count = self.filesystem_recovery_candidates.get(device_id, ("", 0))
+        count = count + 1 if candidate == raw else 1
+        if count >= STORAGE_STATUS_RECOVERY_SAMPLES:
+            self.filesystem_status_by_device[device_id] = raw
+            self.filesystem_recovery_candidates.pop(device_id, None)
+            return raw
+        self.filesystem_recovery_candidates[device_id] = (raw, count)
+        return current
+
     @staticmethod
     def _empty_snapshot() -> dict[str, Any]:
         return {
@@ -597,7 +630,10 @@ def storage_filesystem_status(
 
 def storage_status_message(status: str) -> str:
     if status == "critical":
-        return "Storage is critically low. Recording has been stopped. Please free up disk space."
+        return (
+            "Storage is critically low. I/Q recording will be unavailable and EAS recording has been disabled "
+            "for all streams. Please free up disk space."
+        )
     if status == "low":
         return "Storage is running low. Please free up disk space."
     if status == "unknown":
@@ -619,6 +655,29 @@ def format_storage_bytes(value: int | float) -> str:
     if unit_index == 0:
         return f"{int(value)} {units[unit_index]}"
     return f"{value:.1f} {units[unit_index]}"
+
+
+def directory_size_bytes(path: Path) -> int:
+    total = 0
+    try:
+        stack = [Path(path)]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                total += int(entry.stat(follow_symlinks=False).st_size)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
 
 
 def validate_alias_filter_strength(value: Any) -> int:
@@ -2841,8 +2900,17 @@ class IcecastStreamWorker:
         )
         with self.lock:
             current_config = self.eas_config
+            current_recorder = self.eas_recorder
         if next_config == current_config:
-            return
+            if next_config is None:
+                return
+            if current_recorder is not None:
+                return
+            if self.storage_monitor.is_critical(Path(next_config.directory)):
+                with self.lock:
+                    self.eas_status = "needs-attention"
+                    self.eas_error = storage_status_message("critical")
+                return
         self._stop_eas_recorder()
         if next_config is None:
             with self.lock:
@@ -3538,6 +3606,7 @@ class RtlControlService:
         self.storage_monitor = StorageMonitor(
             [state_path.parent],
             critical_callback=self._handle_critical_storage,
+            recovery_callback=self._handle_storage_recovered,
         )
         self.device_probe = SharedDeviceProbe(
             {
@@ -3667,11 +3736,19 @@ class RtlControlService:
         with self.lock:
             workers = list(self.stream_workers.values())
             recorder = self.iq_recorder
+            if recorder is not None:
+                self.iq_recorder = None
+                self.iq_recorder_account_id = None
         for worker in workers:
             worker.stop_eas_recording_due_to_storage(message)
         if recorder is not None:
             LOG.warning("stopping I/Q recorder because storage is critically low")
             recorder.stop()
+
+    def _handle_storage_recovered(self, snapshot: dict[str, Any]) -> None:
+        LOG.info("storage is no longer critically low; resyncing stream recorders")
+        with self.lock:
+            self._sync_stream_workers_locked()
 
     def _preview_cleanup_loop(self) -> None:
         while not self.preview_cleanup_stop.wait(SOUNDCARD_PREVIEW_CLEANUP_SECONDS):
@@ -3743,10 +3820,24 @@ class RtlControlService:
                 "active_streams": self._active_streams_locked(),
                 "active_eas_recorders": self._active_eas_recorders_locked(),
                 "recent_eas_alerts": self._recent_eas_alerts_locked(),
-                "storage": self.storage_monitor.snapshot(),
+                "storage": self._storage_status_snapshot_locked(),
                 "iq_recorder": self._iq_recorder_status_locked(),
                 "logs": self.log_handler.snapshot()[-80:],
             }
+
+    def _storage_status_snapshot_locked(self) -> dict[str, Any]:
+        snapshot = self.storage_monitor.snapshot()
+        iq_bytes = directory_size_bytes(self.iq_recordings_directory)
+        eas_bytes = 0
+        for stream in self.streams:
+            eas_bytes += directory_size_bytes(stream_alerts_directory(self.streams_directory.parent, stream))
+        snapshot["usage"] = {
+            "iq_recordings_bytes": iq_bytes,
+            "iq_recordings": format_storage_bytes(iq_bytes),
+            "eas_recordings_bytes": eas_bytes,
+            "eas_recordings": format_storage_bytes(eas_bytes),
+        }
+        return snapshot
 
     def devices(self) -> dict[str, Any]:
         errors: list[str] = []
@@ -4480,7 +4571,7 @@ class RtlControlService:
     def _stream_has_eas_alert_index(self, stream: dict[str, Any]) -> bool:
         return (
             eas_recording_settings_from_stream(stream).enabled
-            and eas_alert_index_path(self.streams_directory, stream).exists()
+            or eas_alert_index_path(self.streams_directory, stream).exists()
         )
 
     def _eas_alert_stream_summary(self, stream: dict[str, Any]) -> dict[str, Any]:
@@ -8322,24 +8413,38 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 </div>
 <main>
   <div id="view_dashboard" class="view">
-    <section>
-      <h2>Dashboard</h2>
-      <div class="status" aria-live="off">
-        <div class="metric"><b>Configured SDR</b><span id="summary_sdr">none</span></div>
-        <div class="metric"><b>Gain</b><span id="summary_gain">automatic</span></div>
-        <div class="metric"><b>Capture</b><span id="summary_capture">inactive</span></div>
-        <div class="metric"><b>Configured Streams</b><span id="summary_stream_count">0</span></div>
-        <div class="metric"><b>Storage</b><span id="summary_storage">unknown</span></div>
-      </div>
-      <div id="storage-warning" class="storage-warning" hidden></div>
+    <section id="dashboard_sdr_section">
+      <h2>Configured SDR</h2>
+      <p id="dashboard_sdr_attention" class="status-text status-needs-attention" hidden>RTL-SDR requires attention. Check the SDR immediately.</p>
+      <dl id="dashboard_sdr_details" class="details-list">
+        <dt>Source</dt><dd id="summary_source">RTL-SDR</dd>
+        <dt>Device</dt><dd id="summary_sdr">none</dd>
+        <dt>PPM correction</dt><dd id="summary_ppm">0</dd>
+        <dt>Gain level</dt><dd id="summary_gain">automatic</dd>
+        <dt>Bias tee</dt><dd id="summary_bias_tee">disabled</dd>
+        <dt>Alias filter</dt><dd id="summary_alias_filter">100%</dd>
+        <dt>Capture</dt><dd id="summary_capture">inactive</dd>
+      </dl>
+      <p><a id="dashboard_configure_sdr" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a></p>
     </section>
-    <section>
-      <h2>Streams needing attention</h2>
+    <section id="dashboard_streams_section">
+      <h2>Configured streams</h2>
+      <p id="dashboard-stream-summary">No streams configured.</p>
       <div id="dashboard-stream-attention" class="stream-list"></div>
+      <p><a href="/?view=streams" data-view="streams">Manage streams</a></p>
     </section>
-    <section>
+    <section id="dashboard_recent_alerts_section">
       <h2>Recently issued EAS alerts</h2>
       <div id="dashboard-recent-alerts" class="stream-list"></div>
+    </section>
+    <section id="dashboard_storage_section">
+      <h2>Storage</h2>
+      <dl class="details-list">
+        <dt>Storage</dt><dd id="summary_storage">unknown</dd>
+        <dt>I/Q files</dt><dd id="summary_iq_storage">0 B</dd>
+        <dt>EAS recordings</dt><dd id="summary_eas_storage">0 B</dd>
+      </dl>
+      <div id="storage-warning" class="storage-warning" hidden></div>
     </section>
   </div>
 
@@ -8941,6 +9046,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             Enable EAS recording
           </label>
           <span id="eas_enabled_hint" class="hint">Record EAS alerts received from this station.</span>
+          <span id="eas_storage_blocked_hint" class="error" hidden>Disabled due to insufficient disk space.</span>
           <label>Pre-recording time in seconds
             <input id="eas_pre_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_pre_seconds_hint">
           </label>
@@ -9238,8 +9344,11 @@ let wizardSoundcardOutputId = "";
 let wizardSoundcardPreviewId = "";
 let wizardSoundcardUpdateTimer = null;
 let activeStreamsSignature = "";
+let configuredStreamsSignature = "";
+let lastDashboardStreamRefreshAt = 0;
 let dashboardAttentionSignature = "";
 let dashboardRecentAlertsSignature = "";
+let storageIsCritical = false;
 let easAlertStreams = [];
 let easAlertStreamsSignature = "";
 let easAlertListSignature = "";
@@ -11553,10 +11662,12 @@ function setEasControls(stream) {
   const station = stream && stream.station ? stream.station : {};
   const directory = station.callsign ? `~/.local/state/nwr-stream-manager/streams/${station.callsign}/alerts` : "";
   const showEnabledControl = !settings.enabled || canDisableEasRecording(stream);
-  const nextSignature = JSON.stringify({settings, directory, showEnabledControl});
+  const storageBlocked = storageIsCritical && settings.enabled;
+  const nextSignature = JSON.stringify({settings, directory, showEnabledControl, storageBlocked});
   if (nextSignature === easSignature) return;
   setChecked("eas_enabled", settings.enabled);
   document.getElementById("eas_enabled_label").hidden = !showEnabledControl;
+  setHidden("eas_storage_blocked_hint", !storageBlocked);
   setValue("eas_pre_seconds", settings.pre_seconds);
   setValue("eas_post_seconds", settings.post_seconds);
   setValue("eas_max_seconds", settings.max_seconds);
@@ -12486,35 +12597,88 @@ function renderActiveStreams(activeStreams, configured = configuredStreams, opti
   }
 }
 
-function dashboardAttentionSignatureFor(items) {
-  return JSON.stringify(items.map(item => ({
-    id: item.id || "",
-    callsign: item.callsign || "",
-    status: item.status || "",
-    error: item.error || ""
-  })));
+function dashboardAttentionSignatureFor(items, configured = configuredStreams) {
+  return JSON.stringify({
+    summary: configuredStreamSummary(configured),
+    items: items.map(item => ({
+      id: item.id || "",
+      callsign: item.callsign || "",
+      status: item.status || "",
+      detail: item.detail || "",
+      error: item.error || ""
+    }))
+  });
+}
+
+function pluralize(count, singular, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function configuredStreamSummary(configured = configuredStreams) {
+  const streams = configured || [];
+  const total = streams.length;
+  const enabled = streams.filter(stream => streamIsEnabled(stream)).length;
+  const disabled = Math.max(0, total - enabled);
+  if (!total) return "No streams configured.";
+  return `${pluralize(total, "stream")} configured, ${enabled} enabled, ${disabled} disabled.`;
+}
+
+function sentenceList(items) {
+  const values = (items || []).map(item => String(item || "").trim()).filter(Boolean);
+  if (values.length <= 1) return values[0] || "";
+  if (values.length === 2) return `${values[0]} and ${values[1]}`;
+  return `${values.slice(0, -1).join(", ")} and ${values[values.length - 1]}`;
 }
 
 function streamAttentionItems(activeStreams, configured = configuredStreams) {
   const configuredById = new Map((configured || []).map(stream => [stream.id, stream]));
-  const items = [];
+  const byStream = new Map();
   for (const active of activeStreams || []) {
     if (normalizeStreamStatus(active.status) !== "needs-attention") continue;
     const configuredStream = configuredById.get(active.id) || {};
     const station = active.station || configuredStream.station || {};
     const outputs = active.outputs || [];
-    const output = outputs.length ? outputs[0] : {};
-    const icecast = output.icecast || {};
-    const destination = icecast.host ? outputDestination(icecast) : "";
-    items.push({
-      id: active.id || configuredStream.id || "",
-      callsign: station.callsign || "Unknown",
-      frequency: station.frequency || "",
-      status: active.status || "",
-      destination,
-      error: active.error || ""
-    });
+    const streamId = active.id || configuredStream.id || "";
+    if (!streamId) continue;
+    let item = byStream.get(streamId);
+    if (!item) {
+      item = {
+        id: streamId,
+        callsign: station.callsign || "Unknown",
+        frequency: station.frequency || "",
+        status: "needs-attention",
+        icecastFailed: false,
+        soundcardFailed: false,
+        errors: []
+      };
+      byStream.set(streamId, item);
+    }
+    if (active.error) item.errors.push(active.error);
+    if (!outputs.length) continue;
+    for (const output of outputs) {
+      const type = output.type || "icecast";
+      const outputStatus = normalizeStreamStatus(output.status || active.status);
+      if (outputStatus !== "needs-attention") continue;
+      if (type === "soundcard") {
+        item.soundcardFailed = true;
+      } else {
+        item.icecastFailed = true;
+      }
+    }
   }
+  const items = Array.from(byStream.values()).map(item => {
+    let detail = "";
+    if (item.icecastFailed && item.soundcardFailed) {
+      detail = "One or more Icecast destinations failed to connect and one or more sound cards are not currently connected.";
+    } else if (item.icecastFailed) {
+      detail = "One or more Icecast destinations failed to connect.";
+    } else if (item.soundcardFailed) {
+      detail = "One or more sound cards are not currently connected.";
+    } else {
+      detail = item.errors[0] || "This stream needs attention.";
+    }
+    return Object.assign(item, {detail});
+  });
   items.sort((a, b) => String(a.callsign).localeCompare(String(b.callsign)) || String(a.destination).localeCompare(String(b.destination)));
   return items;
 }
@@ -12522,9 +12686,10 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
 function renderDashboardStreamAttention(activeStreams, configured = configuredStreams) {
   const container = document.getElementById("dashboard-stream-attention");
   const items = streamAttentionItems(activeStreams, configured);
-  const nextSignature = dashboardAttentionSignatureFor(items);
+  const nextSignature = dashboardAttentionSignatureFor(items, configured);
   if (nextSignature === dashboardAttentionSignature) return;
   dashboardAttentionSignature = nextSignature;
+  setText("dashboard-stream-summary", configuredStreamSummary(configured));
   container.innerHTML = "";
   if (!items.length) {
     const healthy = document.createElement("div");
@@ -12533,6 +12698,13 @@ function renderDashboardStreamAttention(activeStreams, configured = configuredSt
     container.appendChild(healthy);
     return;
   }
+  const alert = document.createElement("p");
+  alert.className = "status-text status-needs-attention";
+  const names = Array.from(new Set(items.map(item => item.callsign)));
+  alert.textContent = names.length === 1
+    ? `Stream ${names[0]} requires attention!`
+    : `Streams ${sentenceList(names)} require attention.`;
+  container.appendChild(alert);
   for (const item of items) {
     const row = document.createElement("div");
     row.className = "stream-item";
@@ -12540,10 +12712,9 @@ function renderDashboardStreamAttention(activeStreams, configured = configuredSt
     link.href = routeForView("stream_settings", {streamId: item.id});
     link.dataset.view = "stream_settings";
     link.dataset.streamId = item.id;
-    link.textContent = item.callsign;
-    const detail = item.error || (item.destination ? `${item.destination} needs attention.` : "This stream needs attention.");
+    link.textContent = `View stream details for ${item.callsign}`;
     row.appendChild(link);
-    row.append(`: ${detail}`);
+    row.append(`: ${item.detail}`);
     container.appendChild(row);
   }
 }
@@ -12729,6 +12900,7 @@ function closeStreamActionMenus() {
 
 function renderStreams(streams, options = {}) {
   configuredStreams = streams || [];
+  configuredStreamsSignature = configuredStreamsRefreshSignature(configuredStreams);
   if (monitorStreamId) {
     const monitored = configuredStreams.find(stream => stream.id === monitorStreamId);
     if (!monitored || !streamIsEnabled(monitored)) clearLocalStreamMonitor();
@@ -12737,10 +12909,36 @@ function renderStreams(streams, options = {}) {
   if (settingsStreamId) renderStreamSettings();
 }
 
-async function loadStreams() {
+function configuredStreamsRefreshSignature(streams) {
+  return JSON.stringify((streams || []).map(stream => ({
+    id: stream.id || "",
+    enabled: stream.enabled !== false,
+    station: stream.station || {},
+    output_count: streamOutputs(stream).length,
+    outputs: streamOutputs(stream).map(output => ({
+      id: output.id || "",
+      type: output.type || "icecast",
+      enabled: output.enabled !== false,
+      icecast: output.icecast || null,
+      soundcard: output.soundcard || null
+    })),
+    eas_recording: stream.eas_recording || {},
+    fallback: stream.fallback || {},
+    audio_effects: stream.audio_effects || {}
+  })));
+}
+
+async function loadStreams(options = {}) {
   const data = await request("/api/streams");
-  renderStreams(data.streams || []);
-  await loadEasAlertStreams({preserve: true, quiet: true});
+  const streams = data.streams || [];
+  const signature = configuredStreamsRefreshSignature(streams);
+  if (options.force || signature !== configuredStreamsSignature) {
+    configuredStreamsSignature = signature;
+    renderStreams(streams);
+  }
+  if (options.refreshEas !== false) {
+    await loadEasAlertStreams({preserve: true, quiet: true});
+  }
 }
 
 function gainIndexFor(value) {
@@ -12940,6 +13138,7 @@ function applyAccountUi(account) {
   setHidden("nav_accounts", !owner);
   setHidden("nav_change_password", owner);
   setHidden("nav_rtl", readOnly);
+  setHidden("dashboard_configure_sdr", readOnly);
   setHidden("open_add_stream", readOnly);
   setHidden("open_iq_start", readOnly);
   setHidden("iq_stop_recording", readOnly);
@@ -14039,15 +14238,98 @@ function activeSdrLabel(settings) {
   return option ? option.textContent : `serial ${settings.serial}`;
 }
 
+function sourceIsIqFile(data) {
+  return data && data.source && data.source.kind === "iq_file";
+}
+
+function rtlRequiresAttention(data) {
+  if (!data || sourceIsIqFile(data)) return false;
+  const settings = data.settings || {};
+  if (data.capture_error) return true;
+  if (settings.serial && !data.active) return true;
+  return false;
+}
+
+function formatSdrSampleRate(rate) {
+  const value = Number(rate || 0);
+  if (!value) return "unknown";
+  return `${value.toLocaleString()} S/s`;
+}
+
+function renderDashboardSdr(data) {
+  const settings = data.settings || {};
+  const source = data.source || {};
+  const attention = rtlRequiresAttention(data);
+  const attentionElement = document.getElementById("dashboard_sdr_attention");
+  const detailsElement = document.getElementById("dashboard_sdr_details");
+  if (attentionElement) attentionElement.hidden = !attention;
+  if (detailsElement) detailsElement.hidden = attention;
+  if (attention) return;
+
+  if (sourceIsIqFile(data)) {
+    setText("summary_source", "I/Q file");
+    setText("summary_sdr", source.name || "unknown file");
+    setText("summary_ppm", "not applicable");
+    setText("summary_gain", "not applicable");
+    setText("summary_bias_tee", "not applicable");
+    setText("summary_alias_filter", `${settings.alias_filter_strength ?? 100}%`);
+    setText("summary_capture", data.active ? `active, ${formatSdrSampleRate(source.sample_rate)}` : "inactive");
+    return;
+  }
+
+  setText("summary_source", "RTL-SDR");
+  setText("summary_sdr", activeSdrLabel(settings));
+  setText("summary_ppm", `${settings.ppm_correction || 0} PPM`);
+  setText("summary_gain", settings.gain === null ? "automatic" : `${settings.gain} dB`);
+  setText("summary_bias_tee", settings.bias_tee ? "enabled" : "disabled");
+  setText("summary_alias_filter", `${settings.alias_filter_strength ?? 100}%`);
+  setText("summary_capture", data.active ? `active, ${formatSdrSampleRate(source.sample_rate || settings.sample_rate)}` : "inactive");
+}
+
 function renderStorageSummary(storage) {
   const filesystems = storage && Array.isArray(storage.filesystems) ? storage.filesystems : [];
   const primary = filesystems.length ? filesystems[0] : null;
-  setText("summary_storage", primary && primary.summary ? primary.summary.replace(/^Storage: /, "") : "unknown");
+  const status = storage && storage.status ? String(storage.status) : "unknown";
+  storageIsCritical = status === "critical";
+  reorderDashboardStorage(status);
+  const storageText = primary
+    ? `${formatStorageBytes(primary.used_bytes || 0)} of ${formatStorageBytes(primary.total_bytes || 0)} used (${Math.round(Number(primary.used_percent || 0))}%)`
+    : "unknown";
+  setText("summary_storage", storageText);
+  const usage = storage && storage.usage ? storage.usage : {};
+  setText("summary_iq_storage", usage.iq_recordings || "0 B");
+  setText("summary_eas_storage", usage.eas_recordings || "0 B");
   const warning = document.getElementById("storage-warning");
   const message = storage && storage.status && storage.status !== "ok" ? storage.message || "Please free up disk space." : "";
   if (warning.textContent !== message) warning.textContent = message;
   const hidden = !message;
   if (warning.hidden !== hidden) warning.hidden = hidden;
+}
+
+function reorderDashboardStorage(status) {
+  const dashboard = document.getElementById("view_dashboard");
+  const storage = document.getElementById("dashboard_storage_section");
+  const sdr = document.getElementById("dashboard_sdr_section");
+  const recent = document.getElementById("dashboard_recent_alerts_section");
+  if (!dashboard || !storage || !sdr || !recent) return;
+  const elevated = status === "low" || status === "critical";
+  if (elevated && dashboard.firstElementChild !== storage) {
+    dashboard.insertBefore(storage, dashboard.firstElementChild);
+  } else if (!elevated && storage.previousElementSibling !== recent) {
+    dashboard.insertBefore(storage, recent.nextElementSibling);
+  }
+}
+
+function formatStorageBytes(value) {
+  let amount = Math.max(0, Number(value || 0));
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let index = 0;
+  while (amount >= 1000 && index < units.length - 1) {
+    amount /= 1000;
+    index += 1;
+  }
+  if (index === 0) return `${Math.round(amount)} ${units[index]}`;
+  return `${amount.toFixed(1)} ${units[index]}`;
 }
 
 function primaryStorageSummary(storage) {
@@ -14399,11 +14681,7 @@ async function downloadSelectedIqRecording() {
 }
 
 function updateDashboard(data) {
-  const settings = data.settings;
-  setText("summary_sdr", activeSdrLabel(settings));
-  setText("summary_gain", settings.gain === null ? "automatic" : `${settings.gain} dB`);
-  setText("summary_capture", data.active ? "active" : "inactive");
-  setText("summary_stream_count", configuredStreams.length);
+  renderDashboardSdr(data);
   renderStorageSummary(data.storage || {});
   activeStreamSnapshots = data.active_streams || [];
   renderActiveStreams(data.active_streams || [], configuredStreams);
@@ -14535,7 +14813,11 @@ function scheduleEasUpdate() {
         })
       });
       renderStreams(data.streams || []);
-      setEasResult("EAS recording settings saved.", "success");
+      if (payload.enabled && storageIsCritical) {
+        setEasResult("Disabled due to insufficient disk space.", "error");
+      } else {
+        setEasResult("EAS recording settings saved.", "success");
+      }
       loadEasAlertStreams({preserve: true, quiet: true});
     } catch (error) {
       setEasResult(error.message, "error");
@@ -16061,6 +16343,17 @@ document.getElementById("remove_eas_alert").addEventListener("click", async () =
 });
 
 async function refresh() {
+  if (currentViewName() === "dashboard") {
+    const now = Date.now();
+    if (now - lastDashboardStreamRefreshAt >= 2000) {
+      lastDashboardStreamRefreshAt = now;
+      try {
+        await loadStreams({refreshEas: false});
+      } catch (error) {
+        console.debug("dashboard stream refresh failed", error);
+      }
+    }
+  }
   const data = await request(statusRequestPath());
   applyStatus(data, {syncControls: false});
 }
