@@ -57,6 +57,11 @@ if __package__:
         parse_audio_config,
     )
     from .device_probe import SharedDeviceProbe
+    from .dependency_check import (
+        DependencyCheckError,
+        check_startup_dependencies,
+        format_dependency_summary,
+    )
     from .dsp import (
         ComplexArray,
         DEFAULT_ALIAS_ATTENUATION_DB,
@@ -108,6 +113,7 @@ else:
     alsa_module = importlib.import_module(f"{package_name}.alsa")
     config_module = importlib.import_module(f"{package_name}.config")
     device_probe_module = importlib.import_module(f"{package_name}.device_probe")
+    dependency_check_module = importlib.import_module(f"{package_name}.dependency_check")
     dsp = importlib.import_module(f"{package_name}.dsp")
     eas_recording = importlib.import_module(f"{package_name}.eas_recording")
     encoder = importlib.import_module(f"{package_name}.encoder")
@@ -132,6 +138,9 @@ else:
     discover_playback_devices = alsa_module.discover_playback_devices
     playback_device_usb_node = alsa_module.playback_device_usb_node
     SharedDeviceProbe = device_probe_module.SharedDeviceProbe
+    DependencyCheckError = dependency_check_module.DependencyCheckError
+    check_startup_dependencies = dependency_check_module.check_startup_dependencies
+    format_dependency_summary = dependency_check_module.format_dependency_summary
     AUDIO_NYQUIST_HZ = config_module.AUDIO_NYQUIST_HZ
     AudioConfig = config_module.AudioConfig
     EasRecordingConfig = config_module.EasRecordingConfig
@@ -7956,6 +7965,12 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
     configure_dependency_logging()
     log_path = log_file or default_log_path(state_path)
     configure_file_logging(log_path)
+    try:
+        dependency_results = check_startup_dependencies()
+    except DependencyCheckError:
+        LOG.exception("NWR Stream Manager cannot start because a dependency check failed")
+        raise
+    LOG.info("startup dependency check passed: %s", format_dependency_summary(dependency_results))
     ring_handler = RingLogHandler()
     logging.getLogger().addHandler(ring_handler)
     service = RtlControlService(state_path, ring_handler)
@@ -7979,6 +7994,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         run_server(args.host, args.port, args.state, args.verbose, args.log_file)
+    except DependencyCheckError:
+        return 1
     except KeyboardInterrupt:
         return 130
     return 0
