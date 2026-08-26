@@ -42,6 +42,7 @@ class EasAlertTests(unittest.TestCase):
         cls.web_control = load_web_control_module()
         cls.config = importlib.import_module("nwr_stream_manager.config")
         cls.audio_effects = importlib.import_module("nwr_stream_manager.audio_effects")
+        cls.dsp = importlib.import_module("nwr_stream_manager.dsp")
 
     def test_alert_summary_uses_same_event_lookup(self) -> None:
         alert = {
@@ -2536,7 +2537,10 @@ class EasAlertTests(unittest.TestCase):
             transition_hz=web_control.INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
             attenuation_db=web_control.INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
         )
-        self.assertLess(decimator.fir.taps.size, 900)
+        self.assertIsInstance(decimator, self.dsp.FixedFactor8IntermediateDecimator)
+        self.assertLess(decimator.first_stage.taps.size, 900)
+        self.assertLess(decimator.second_stage.taps.size, 900)
+        self.assertLess(decimator.final_stage.fir.taps.size, 900)
         iq = np.exp(1j * 2 * np.pi * 1000 * np.arange(65_536, dtype=np.float32) / input_rate).astype(np.complex64)
         raw = self._complex_to_rtl_u8(iq)
         intermediate.start()

@@ -23,6 +23,9 @@ STAGED_DECIMATOR_MIN_INTERMEDIATE_RATE = 96_000.0
 STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE = 192_000.0
 RATIONAL_INTERPOLATOR_TAPS = 16
 RATIONAL_INTERPOLATOR_ATTENUATION_DB = 60.0
+FAST_INTERMEDIATE_INPUT_RATE = 1_536_000
+FAST_INTERMEDIATE_OUTPUT_RATE = 192_000
+FAST_INTERMEDIATE_HALFBAND_TAPS = 15
 
 
 def rtl_u8_to_complex64(chunk: bytes | bytearray | memoryview) -> ComplexArray:
@@ -292,6 +295,157 @@ class IntegerDecimator:
                 transition_hz=transition_hz,
                 attenuation_db=attenuation_db,
             )
+        )
+
+
+def design_halfband_taps(
+    taps_count: int = FAST_INTERMEDIATE_HALFBAND_TAPS,
+    *,
+    attenuation_db: float = 60.0,
+) -> FloatArray:
+    if taps_count < 7 or taps_count % 4 != 3:
+        raise ValueError("half-band FIR tap count must be 4m+3 and at least 7")
+    n = np.arange(taps_count, dtype=np.float64) - (taps_count - 1) / 2.0
+    response = 0.5 * np.sinc(0.5 * n)
+    response *= np.kaiser(taps_count, _kaiser_beta(attenuation_db))
+    center = taps_count // 2
+    response[center] = 0.5
+    for index in range(taps_count):
+        if index != center and (index - center) % 2 == 0:
+            response[index] = 0.0
+    response /= np.sum(response)
+    return response.astype(np.float32)
+
+
+@dataclass
+class HalfBandDecimator2x:
+    taps: FloatArray
+    _history: ComplexArray = field(init=False)
+    _samples_seen: int = 0
+    _center_index: int = field(init=False)
+    _nonzero_indices: NDArray[np.int64] = field(init=False)
+    _nonzero_taps: FloatArray = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.update_taps(self.taps)
+
+    @property
+    def is_integer_decimation(self) -> bool:
+        return True
+
+    def update_taps(self, taps: FloatArray) -> None:
+        taps = np.asarray(taps, dtype=np.float32)
+        if taps.ndim != 1 or taps.size < 7 or taps.size % 4 != 3:
+            raise ValueError("half-band FIR taps must be one-dimensional with 4m+3 taps")
+        center = int(taps.size // 2)
+        keep = int(taps.size - 1)
+        if hasattr(self, "_history"):
+            if self._history.size >= keep:
+                history = self._history[-keep:].copy()
+            else:
+                history = np.zeros(keep, dtype=np.complex64)
+                if self._history.size:
+                    history[-self._history.size :] = self._history
+        else:
+            history = np.zeros(keep, dtype=np.complex64)
+        nonzero_indices = np.array(
+            [
+                index
+                for index, value in enumerate(taps)
+                if index != center and abs(float(value)) > 1e-12
+            ],
+            dtype=np.int64,
+        )
+        self.taps = taps
+        self._history = history
+        self._center_index = center
+        self._nonzero_indices = nonzero_indices
+        self._nonzero_taps = taps[nonzero_indices]
+
+    def process(self, samples: ComplexArray) -> ComplexArray:
+        samples = samples.astype(np.complex64, copy=False)
+        if samples.size == 0:
+            return np.array([], dtype=np.complex64)
+        work = np.concatenate((self._history, samples))
+        offset = (-self._samples_seen) % 2
+        valid_count = int(samples.size)
+        if offset >= valid_count:
+            self._history = work[-(self.taps.size - 1) :].copy()
+            self._samples_seen += valid_count
+            return np.array([], dtype=np.complex64)
+        output_count = 1 + ((valid_count - 1 - offset) // 2)
+        starts = offset + (np.arange(output_count, dtype=np.int64) * 2)
+        output = work[starts + self._center_index] * self.taps[self._center_index]
+        for index, tap in zip(self._nonzero_indices, self._nonzero_taps):
+            output = output + work[starts + index] * tap
+        self._history = work[-(self.taps.size - 1) :].copy()
+        self._samples_seen += valid_count
+        return output.astype(np.complex64, copy=False)
+
+
+@dataclass
+class FixedFactor8IntermediateDecimator:
+    input_rate: int = FAST_INTERMEDIATE_INPUT_RATE
+    output_rate: int = FAST_INTERMEDIATE_OUTPUT_RATE
+    transition_hz: float = WIDE_DECIMATOR_MIN_TRANSITION_HZ
+    attenuation_db: float = WIDE_DECIMATOR_ALIAS_ATTENUATION_DB
+    first_stage: HalfBandDecimator2x = field(init=False)
+    second_stage: HalfBandDecimator2x = field(init=False)
+    final_stage: IntegerDecimator = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.input_rate != FAST_INTERMEDIATE_INPUT_RATE or self.output_rate != FAST_INTERMEDIATE_OUTPUT_RATE:
+            raise ValueError("fixed intermediate decimator only supports 1536000 to 192000 S/s")
+        halfband = design_halfband_taps(
+            FAST_INTERMEDIATE_HALFBAND_TAPS,
+            attenuation_db=min(60.0, float(self.attenuation_db)),
+        )
+        self.first_stage = HalfBandDecimator2x(halfband)
+        self.second_stage = HalfBandDecimator2x(halfband)
+        self.final_stage = IntegerDecimator(
+            factor=2,
+            fir=FirFilter(
+                design_alias_filter_taps(
+                    self.input_rate // 4,
+                    self.output_rate,
+                    transition_hz=self.transition_hz,
+                    attenuation_db=self.attenuation_db,
+                )
+            ),
+        )
+
+    @property
+    def is_integer_decimation(self) -> bool:
+        return True
+
+    def process(self, samples: ComplexArray) -> ComplexArray:
+        if samples.size == 0:
+            return np.array([], dtype=np.complex64)
+        return self.final_stage.process(self.second_stage.process(self.first_stage.process(samples)))
+
+    def update_alias_filter(
+        self,
+        input_rate: int,
+        output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
+        *,
+        transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ,
+        attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
+    ) -> None:
+        if int(input_rate) != self.input_rate or int(output_rate) != self.output_rate:
+            raise ValueError("fixed intermediate decimator rates cannot change during alias filter update")
+        self.transition_hz = float(transition_hz)
+        self.attenuation_db = float(attenuation_db)
+        halfband = design_halfband_taps(
+            FAST_INTERMEDIATE_HALFBAND_TAPS,
+            attenuation_db=min(60.0, float(attenuation_db)),
+        )
+        self.first_stage.update_taps(halfband)
+        self.second_stage.update_taps(halfband)
+        self.final_stage.update_alias_filter(
+            self.input_rate // 4,
+            self.output_rate,
+            transition_hz=self.transition_hz,
+            attenuation_db=self.attenuation_db,
         )
 
 
@@ -565,13 +719,22 @@ def create_decimator(
     *,
     transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ,
     attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
-) -> IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator:
+) -> IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator | FixedFactor8IntermediateDecimator:
     if input_rate <= 0 or output_rate <= 0:
         raise ValueError("input_rate and output_rate must be greater than 0")
     if input_rate < output_rate:
         raise ValueError("input_rate must be greater than or equal to output_rate")
     if input_rate == output_rate:
         return IdentityDecimator()
+    if input_rate == FAST_INTERMEDIATE_INPUT_RATE and output_rate == FAST_INTERMEDIATE_OUTPUT_RATE:
+        transition_hz = _wide_decimator_transition_hz(output_rate, transition_hz)
+        attenuation_db = min(float(attenuation_db), WIDE_DECIMATOR_ALIAS_ATTENUATION_DB)
+        return FixedFactor8IntermediateDecimator(
+            input_rate=input_rate,
+            output_rate=output_rate,
+            transition_hz=transition_hz,
+            attenuation_db=attenuation_db,
+        )
     if output_rate >= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
         transition_hz = _wide_decimator_transition_hz(output_rate, transition_hz)
         attenuation_db = min(float(attenuation_db), WIDE_DECIMATOR_ALIAS_ATTENUATION_DB)
@@ -618,7 +781,7 @@ def create_decimator(
 
 
 def update_decimator_alias_filter(
-    decimator: IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator,
+    decimator: IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator | FixedFactor8IntermediateDecimator,
     input_rate: int,
     output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
     *,

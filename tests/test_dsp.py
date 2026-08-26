@@ -156,12 +156,28 @@ class DspTests(unittest.TestCase):
             with self.subTest(output_rate=output_rate):
                 decimator = self.dsp.create_decimator(1_536_000, output_rate)
                 self.assertNotIsInstance(decimator, self.dsp.StagedDecimator)
-                taps = getattr(getattr(decimator, "fir", None), "taps", None)
-                self.assertIsNotNone(taps)
-                self.assertLess(taps.size, 1_200)
+                if isinstance(decimator, self.dsp.FixedFactor8IntermediateDecimator):
+                    self.assertLess(decimator.first_stage.taps.size, 1_200)
+                    self.assertLess(decimator.second_stage.taps.size, 1_200)
+                    self.assertLess(decimator.final_stage.fir.taps.size, 1_200)
+                else:
+                    taps = getattr(getattr(decimator, "fir", None), "taps", None)
+                    self.assertIsNotNone(taps)
+                    self.assertLess(taps.size, 1_200)
                 samples = np.ones(4096, dtype=np.complex64)
                 output = decimator.process(samples)
                 self.assertGreater(output.size, 0)
+
+    def test_fixed_rtl_intermediate_rate_uses_fast_factor8_decimator(self) -> None:
+        decimator = self.dsp.create_decimator(1_536_000, 192_000)
+
+        self.assertIsInstance(decimator, self.dsp.FixedFactor8IntermediateDecimator)
+        self.assertIsInstance(decimator.first_stage, self.dsp.HalfBandDecimator2x)
+        self.assertIsInstance(decimator.second_stage, self.dsp.HalfBandDecimator2x)
+        self.assertIsInstance(decimator.final_stage, self.dsp.IntegerDecimator)
+        self.assertEqual(decimator.first_stage.taps.size, 15)
+        self.assertEqual(decimator.second_stage.taps.size, 15)
+        self.assertTrue(decimator.is_integer_decimation)
 
     def test_wide_spectrum_transition_bandwidth_matches_intermediate_path(self) -> None:
         for output_rate in (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_000, 1_536_000):
@@ -208,6 +224,56 @@ class DspTests(unittest.TestCase):
 
         self.assertGreater(float(np.mean(np.abs(edge_output[-4096:]))), 0.65)
         self.assertLess(float(np.mean(np.abs(rejected_output[-4096:]))), 0.05)
+
+    def test_fast_intermediate_decimator_matches_existing_alias_profile(self) -> None:
+        sample_rate = 1_536_000
+        output_rate = 192_000
+        count = round(sample_rate * 0.12)
+        discard = round(output_rate * 0.02)
+        time_axis = np.arange(count, dtype=np.float64) / sample_rate
+        old_decimator_factory = lambda: self.dsp.IntegerDecimator.create(
+            sample_rate,
+            output_rate,
+            transition_hz=self.dsp.WIDE_DECIMATOR_MIN_TRANSITION_HZ,
+            attenuation_db=self.dsp.WIDE_DECIMATOR_ALIAS_ATTENUATION_DB,
+        )
+        new_decimator_factory = lambda: self.dsp.create_decimator(sample_rate, output_rate)
+
+        def settled_rms(decimator, frequency_hz: float) -> float:
+            samples = np.exp(1j * 2.0 * np.pi * frequency_hz * time_axis).astype(np.complex64)
+            output = decimator.process(samples)
+            if output.size > discard * 2:
+                output = output[discard:-discard]
+            return float(np.sqrt(np.mean(np.abs(output) ** 2)))
+
+        for frequency_hz in (20_000, 88_000, 90_000, 92_000, 94_000, 96_000, 98_000, 104_000, 120_000):
+            with self.subTest(frequency_hz=frequency_hz):
+                old_base = settled_rms(old_decimator_factory(), 20_000)
+                new_base = settled_rms(new_decimator_factory(), 20_000)
+                old_relative = settled_rms(old_decimator_factory(), frequency_hz) / old_base
+                new_relative = settled_rms(new_decimator_factory(), frequency_hz) / new_base
+
+                self.assertLess(abs(20.0 * np.log10(max(new_relative, 1e-12)) - 20.0 * np.log10(max(old_relative, 1e-12))), 3.0)
+
+    def test_fast_intermediate_alias_filter_update_retunes_existing_stages(self) -> None:
+        decimator = self.dsp.create_decimator(1_536_000, 192_000)
+        self.assertIsInstance(decimator, self.dsp.FixedFactor8IntermediateDecimator)
+        first_stage = decimator.first_stage
+        second_stage = decimator.second_stage
+        final_stage = decimator.final_stage
+        final_taps = final_stage.fir.taps.copy()
+
+        decimator.update_alias_filter(
+            1_536_000,
+            192_000,
+            transition_hz=16_000,
+            attenuation_db=40,
+        )
+
+        self.assertIs(decimator.first_stage, first_stage)
+        self.assertIs(decimator.second_stage, second_stage)
+        self.assertIs(decimator.final_stage, final_stage)
+        self.assertFalse(np.array_equal(decimator.final_stage.fir.taps, final_taps))
 
     def test_channel_decimator_preserves_wide_nwr_fm_sideband(self) -> None:
         sample_rate = 192_000
