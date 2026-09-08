@@ -8407,6 +8407,7 @@ INDEX_HTML = """<!doctype html>
 <title>NWR Stream Manager</title>
 <style>
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+*, *::before, *::after { box-sizing: border-box; }
 body { margin: 0; background: #f6f7f9; color: #14181f; }
 header { background: #fff; border-bottom: 1px solid #d8dde6; }
 .topbar { max-width: 980px; margin: 0 auto; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
@@ -8416,10 +8417,13 @@ main { max-width: 980px; margin: 0 auto; padding: 24px; }
 h1 { font-size: 22px; margin: 0; }
 h2 { font-size: 20px; margin: 0 0 16px; }
 h3 { font-size: 16px; margin: 18px 0 10px; }
-section { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+section { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 18px; margin-bottom: 16px; overflow-x: auto; }
 [hidden] { display: none !important; }
-label { display: grid; gap: 6px; font-weight: 600; margin-bottom: 14px; }
-select, input, button { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; }
+label { display: grid; gap: 6px; font-weight: 600; margin-bottom: 14px; min-width: 0; }
+select, input, button { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; max-width: 100%; }
+select, input:not([type="checkbox"]):not([type="radio"]), textarea { width: 100%; min-width: 0; }
+input[type="checkbox"], input[type="radio"] { width: auto; min-width: 13px; }
+input[type="range"] { min-height: 40px; }
 fieldset { border: 1px solid #d8dde6; border-radius: 6px; margin: 16px 0 0; padding: 14px; }
 legend { font-weight: 700; padding: 0 6px; }
 button { cursor: pointer; }
@@ -8432,10 +8436,13 @@ nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #255
 .nav-more-menu[hidden] { display: none; }
 .nav-more-menu a { border: 0; border-radius: 4px; }
 .view[hidden] { display: none; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
-.row { display: flex; align-items: center; gap: 10px; }
-.row label { margin: 0; display: flex; align-items: center; gap: 8px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; min-width: 0; }
+.row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.row label { margin: 0; display: flex; align-items: center; gap: 8px; min-width: 44px; min-height: 44px; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.receiver-controls { display: flex; flex-wrap: nowrap; gap: 10px; align-items: center; }
+.receiver-control-button { width: 46px; height: 42px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 20px; line-height: 1; flex: 0 0 auto; }
+.receiver-control-button svg { width: 22px; height: 22px; display: block; fill: currentColor; }
 .status { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
 .metric { border: 1px solid #d8dde6; border-radius: 6px; padding: 10px; }
 .metric b { display: block; font-size: 12px; color: #526070; text-transform: uppercase; }
@@ -8496,10 +8503,25 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .notice-dialog { background: #181d24; border-color: #333b48; }
 }
 @media (max-width: 680px) {
+  .topbar { display: grid; grid-template-columns: 1fr; align-items: start; gap: 12px; padding: 14px 16px; }
+  .topbar h1 { font-size: 24px; }
+  nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; width: 100%; align-items: stretch; }
+  nav a, nav button { width: 100%; min-height: 44px; text-align: center; }
+  .nav-more { display: block; min-width: 0; }
+  .nav-more-menu { left: 0; right: auto; width: min(260px, calc(100vw - 32px)); }
+  main { padding: 16px; }
   .effects-layout { display: block; }
   .effects-layout.effect-detail-active .effects-list { display: none; }
   .effects-layout:not(.effect-detail-active) .effects-detail { display: none; }
   .audio-effects-back { display: inline-block; margin-bottom: 12px; }
+}
+@media (max-width: 900px) and (orientation: landscape) {
+  .topbar { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 14px; padding: 10px 16px; }
+  .topbar h1 { font-size: 20px; max-width: 9rem; }
+  nav { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; width: 100%; }
+  nav a, nav button { min-height: 40px; padding: 6px 8px; text-align: center; }
+  .nav-more-menu { right: 0; left: auto; }
+  main { padding: 16px; }
 }
 </style>
 </head>
@@ -8678,10 +8700,17 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div class="status" aria-live="off">
         <div class="metric"><b>Frequency</b><span id="receiver_frequency">162.475 MHz</span></div>
       </div>
-      <div class="actions" aria-label="Weather radio receiver controls">
-        <button id="receiver_previous" type="button">Previous channel</button>
-        <button id="receiver_play_pause" type="button">Play</button>
-        <button id="receiver_next" type="button">Next channel</button>
+      <div class="receiver-controls" aria-label="Weather radio receiver controls">
+        <button id="receiver_previous" class="receiver-control-button" type="button" aria-label="Previous channel" title="Previous channel">
+          <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M19 5v14L8 12l11-7zM6 5h2v14H6V5z"></path></svg>
+        </button>
+        <button id="receiver_play_pause" class="receiver-control-button" type="button" aria-label="Play" title="Play">
+          <svg id="receiver_play_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M8 5v14l11-7L8 5z"></path></svg>
+          <svg id="receiver_pause_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false" hidden><path d="M7 5h4v14H7V5zm6 0h4v14h-4V5z"></path></svg>
+        </button>
+        <button id="receiver_next" class="receiver-control-button" type="button" aria-label="Next channel" title="Next channel">
+          <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M5 19V5l11 7-11 7zm11-14h2v14h-2V5z"></path></svg>
+        </button>
       </div>
       <div id="receiver-result" class="message"></div>
     </section>
@@ -10479,7 +10508,15 @@ function renderReceiverControls() {
   const channel = currentReceiverChannel();
   setText("receiver_frequency", channel.label);
   const playPause = document.getElementById("receiver_play_pause");
-  if (playPause) playPause.textContent = receiverPlaying ? "Pause" : "Play";
+  const playIcon = document.getElementById("receiver_play_icon");
+  const pauseIcon = document.getElementById("receiver_pause_icon");
+  const label = receiverPlaying ? "Pause" : "Play";
+  if (playPause) {
+    playPause.setAttribute("aria-label", label);
+    playPause.title = label;
+  }
+  if (playIcon) playIcon.hidden = receiverPlaying;
+  if (pauseIcon) pauseIcon.hidden = !receiverPlaying;
 }
 
 function setReceiverResult(message, kind = "") {

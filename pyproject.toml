@@ -37,6 +37,12 @@ dependencies = [
   "easrecorder @ git+https://github.com/maxbaykowski/easrecorder.git@main",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "playwright",
+  "pytest",
+]
+
 [project.urls]
 Homepage = "https://github.com/maxbaykowski/nwr-stream-manager"
 Repository = "https://github.com/maxbaykowski/nwr-stream-manager"

@@ -45,6 +45,40 @@ system Media Session after pausing WebRTC audio from VoiceOver's two-finger
 double-tap gesture or from external media controls. If that happens, reopen the
 browser page and press Play in NWR Stream Manager to resume audio.
 
+## Development UI layout checks
+
+The repository includes a Playwright-based layout smoke test for checking common
+phone, tablet, and desktop viewport sizes. It is intended for development only
+and is not part of the runtime dependency set.
+
+Install the development tools and Chromium browser support:
+
+```bash
+python3 -m pip install -e '.[dev]'
+python3 -m playwright install chromium
+```
+
+Start NWR Stream Manager, then run:
+
+```bash
+NWRSM_LAYOUT_USER=owner NWRSM_LAYOUT_PASSWORD=password \
+  python3 tools/check_ui_layout.py --url http://127.0.0.1:8080
+```
+
+The checker visits the dashboard, RTL-SDR configuration, streams, add-stream
+wizard, receiver, I/Q recorder, new I/Q recording, EAS alerts, EAS export/delete,
+and logs pages across several viewport sizes. When credentials are supplied, it
+also discovers configured streams, stream settings tabs, editable outputs, EAS
+alert detail pages, and I/Q recording download pages through the web API. It
+fails if pages overflow horizontally, controls overlap, controls are too small,
+or the receiver previous/play/next buttons wrap or become different sizes.
+
+To save screenshots for review:
+
+```bash
+python3 tools/check_ui_layout.py --url http://127.0.0.1:8080 --screenshots /tmp/nwr-layout
+```
+
 ## First-run setup and accounts
 
 When no account database exists, the web interface starts in setup mode and asks
