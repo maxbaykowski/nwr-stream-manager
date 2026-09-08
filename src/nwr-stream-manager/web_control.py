@@ -2560,6 +2560,14 @@ class IcecastStreamWorker:
         if source is not None:
             source.close()
 
+    def set_monitor_source_paused(self, client_id: str, paused: bool) -> bool:
+        with self.lock:
+            source = self.monitor_sources.get(client_id)
+        if source is None:
+            return False
+        source.set_paused(paused)
+        return True
+
     def monitor_source_stats(self, client_id: str) -> dict[str, Any]:
         with self.lock:
             source = self.monitor_sources.get(client_id)
@@ -4912,6 +4920,43 @@ class RtlControlService:
             LOG.info("stopped WebRTC monitor for stream %s on client %s", stopped_stream_id, client_id)
         return {"success": True, "monitoring": self.monitor_status(client_id)}
 
+    def pause_monitor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id", "")).strip()
+        if not client_id:
+            raise ValueError("monitor client id is required")
+        with self.lock:
+            stream_id = self.monitor_streams_by_client.get(client_id, "")
+            worker = None
+            if stream_id:
+                for candidate in self.stream_workers.values():
+                    if candidate.id == stream_id:
+                        worker = candidate
+                        break
+            if worker is None or not worker.set_monitor_source_paused(client_id, True):
+                raise ValueError("stream monitor is not active")
+        LOG.info("paused WebRTC monitor for stream %s on client %s", stream_id, client_id)
+        return {"success": True, "monitoring": self.monitor_status(client_id)}
+
+    def resume_monitor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id", "")).strip()
+        if not client_id:
+            raise ValueError("monitor client id is required")
+        with self.lock:
+            stream_id = self.monitor_streams_by_client.get(client_id, "")
+            stream = self._stream_locked(stream_id) if stream_id else None
+            if stream is not None and stream.get("enabled", True) is False:
+                raise ValueError("start the stream before monitoring it")
+            worker = None
+            if stream_id:
+                for candidate in self.stream_workers.values():
+                    if candidate.id == stream_id:
+                        worker = candidate
+                        break
+            if worker is None or not worker.set_monitor_source_paused(client_id, False):
+                raise ValueError("stream monitor is not active")
+        LOG.info("resumed WebRTC monitor for stream %s on client %s", stream_id, client_id)
+        return {"success": True, "monitoring": self.monitor_status(client_id)}
+
     def monitor_status(self, client_id: str) -> dict[str, Any]:
         with self.lock:
             stream_id = self.monitor_streams_by_client.get(client_id, "")
@@ -5997,6 +6042,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return path in {
                 "/api/client-log",
                 "/api/monitor/start",
+                "/api/monitor/pause",
+                "/api/monitor/resume",
                 "/api/monitor/stop",
                 "/api/receiver/start",
                 "/api/receiver/tune",
@@ -6317,6 +6364,26 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 response = self.service.stop_monitor(payload)
             except Exception as exc:
                 LOG.warning("API monitor stop failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/monitor/pause":
+            try:
+                payload = self._read_json()
+                response = self.service.pause_monitor(payload)
+            except Exception as exc:
+                LOG.warning("API monitor pause failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/monitor/resume":
+            try:
+                payload = self._read_json()
+                response = self.service.resume_monitor(payload)
+            except Exception as exc:
+                LOG.warning("API monitor resume failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -9463,6 +9530,7 @@ let webRtcSupport = {
 let monitorClientId = "";
 let monitorStreamId = "";
 let monitorPeerConnection = null;
+let monitorPaused = false;
 let monitorUnstableTimer = null;
 let monitorStatsTimer = null;
 let monitorLastPacketCount = 0;
@@ -9905,10 +9973,9 @@ function stopMediaSessionAnchor(reason = "") {
 
 function monitoredStreamLabel() {
   const stream = configuredStreams.find(candidate => candidate.id === monitorStreamId);
-  if (!stream) return "NWR Stream Monitor";
+  if (!stream) return "Monitor of stream";
   const station = stream.station || {};
-  if (station.callsign && station.frequency) return `${station.callsign} ${station.frequency} MHz`;
-  return station.callsign || "NWR Stream Monitor";
+  return `Monitor of ${station.callsign || "stream"}`;
 }
 
 function clearLiveMediaSession() {
@@ -10033,6 +10100,7 @@ function clearLocalStreamMonitor() {
   const peer = monitorPeerConnection;
   monitorPeerConnection = null;
   monitorStreamId = "";
+  monitorPaused = false;
   clearMonitorWatchdogs();
   resetLiveAudioElement();
   stopMediaSessionAnchor("monitor-local-clear");
@@ -10137,7 +10205,7 @@ async function stopMonitorForUnstableConnection(reason = "") {
 }
 
 function scheduleMonitorUnstableStop(reason = "") {
-  if (!monitorStreamId || monitorUnstableTimer) return;
+  if (!monitorStreamId || monitorPaused || monitorUnstableTimer) return;
   monitorUnstableTimer = setTimeout(async () => {
     monitorUnstableTimer = null;
     await stopMonitorForUnstableConnection(reason);
@@ -10146,7 +10214,7 @@ function scheduleMonitorUnstableStop(reason = "") {
 
 async function pollMonitorPacketStats() {
   const peer = monitorPeerConnection;
-  if (!peer || !monitorStreamId) return;
+  if (!peer || !monitorStreamId || monitorPaused) return;
   try {
     const stats = await peer.getStats();
     let packetCount = 0;
@@ -10177,6 +10245,10 @@ function startMonitorPacketStats() {
 async function startStreamMonitor(streamId) {
   if (monitorStreamId === streamId && monitorPeerConnection) {
     if (!liveAudioNeedsRestart && !liveAudioPeerIsUnusable(monitorPeerConnection)) {
+      if (monitorPaused) {
+        await resumeStreamMonitor();
+        return;
+      }
       resumeMonitorPlayback();
       return;
     }
@@ -10201,6 +10273,7 @@ async function startStreamMonitor(streamId) {
   createLiveEventChannel(peer);
   monitorPeerConnection = peer;
   monitorStreamId = streamId;
+  monitorPaused = false;
   await startMediaSessionAnchor("monitor-start");
   updateMonitorMediaSession();
   const audio = document.getElementById("stream_monitor_audio");
@@ -10289,6 +10362,7 @@ async function startStreamMonitor(streamId) {
     if (monitorPeerConnection === peer) {
       monitorPeerConnection = null;
       monitorStreamId = "";
+      monitorPaused = false;
       clearMonitorWatchdogs();
       resetLiveAudioElement();
       stopMediaSessionAnchor("monitor-start-failed");
@@ -10333,6 +10407,44 @@ async function stopStreamMonitor(options = {}) {
   renderStreams(configuredStreams);
   if (settingsStreamId) renderStreamSettings();
   if (unstable) showMonitorUnstableDialog();
+}
+
+async function pauseStreamMonitor() {
+  if (!monitorPeerConnection || !monitorStreamId || monitorPaused) return;
+  const streamId = monitorStreamId;
+  monitorPaused = true;
+  clearMonitorUnstableTimer();
+  await request("/api/monitor/pause", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({client_id: pageMonitorClientId()})
+  });
+  const audio = document.getElementById("stream_monitor_audio");
+  if (audio) audio.pause();
+  pauseMediaSessionAnchor("monitor-pause");
+  updateMonitorMediaSession();
+  logClientEvent("info", "monitor", "monitor paused", {stream_id: streamId});
+  renderStreams(configuredStreams);
+  if (settingsStreamId) renderStreamSettings();
+}
+
+async function resumeStreamMonitor() {
+  if (!monitorPeerConnection || !monitorStreamId) return;
+  const streamId = monitorStreamId;
+  await request("/api/monitor/resume", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({client_id: pageMonitorClientId()})
+  });
+  monitorPaused = false;
+  clearMonitorUnstableTimer();
+  await startMediaSessionAnchor("monitor-resume");
+  resumeMonitorPlayback();
+  updateMonitorMediaSession();
+  startMonitorPacketStats();
+  logClientEvent("info", "monitor", "monitor resumed", {stream_id: streamId});
+  renderStreams(configuredStreams);
+  if (settingsStreamId) renderStreamSettings();
 }
 
 async function toggleStreamMonitor(streamId, resultHandler = setStreamResult) {
@@ -10495,15 +10607,18 @@ function updateMonitorMediaSession() {
   if (!("mediaSession" in navigator) || !("MediaMetadata" in window) || !monitorPeerConnection || !monitorStreamId) return;
   navigator.mediaSession.metadata = new MediaMetadata({
     title: monitoredStreamLabel(),
-    artist: "NOAA Weather Radio"
+    artist: "NWR Stream Manager"
   });
-  navigator.mediaSession.playbackState = "playing";
+  navigator.mediaSession.playbackState = monitorPaused ? "paused" : "playing";
   try {
     navigator.mediaSession.setActionHandler("previoustrack", null);
     navigator.mediaSession.setActionHandler("nexttrack", null);
-    navigator.mediaSession.setActionHandler("play", () => startStreamMonitor(monitorStreamId));
+    navigator.mediaSession.setActionHandler("play", () => {
+      resumeStreamMonitor()
+        .catch(error => console.debug("media session monitor play failed", error));
+    });
     navigator.mediaSession.setActionHandler("pause", () => {
-      stopStreamMonitor({notifyServer: true})
+      pauseStreamMonitor()
         .catch(error => console.debug("media session monitor pause failed", error));
     });
   } catch (error) {
@@ -13245,6 +13360,7 @@ function renderStreams(streams, options = {}) {
   if (monitorStreamId) {
     const monitored = configuredStreams.find(stream => stream.id === monitorStreamId);
     if (!monitored || !streamIsEnabled(monitored)) clearLocalStreamMonitor();
+    else updateMonitorMediaSession();
   }
   renderActiveStreams(activeStreamSnapshots, configuredStreams, options);
   if (settingsStreamId) renderStreamSettings();
@@ -16600,6 +16716,12 @@ if (liveAudioElement) {
       logClientEvent("info", "receiver", "receiver native media pause observed", {frequency: currentReceiverChannel().label});
       stopWeatherReceiver({preserveMediaSession: true})
         .catch(error => console.debug("receiver native pause handling failed", error))
+      return;
+    }
+    if (monitorPeerConnection && monitorStreamId && !monitorPaused) {
+      logClientEvent("info", "monitor", "monitor native media pause observed", {stream_id: monitorStreamId});
+      pauseStreamMonitor()
+        .catch(error => console.debug("monitor native pause handling failed", error));
       return;
     }
     if (receiverPaused && receiverPeerConnection) {
