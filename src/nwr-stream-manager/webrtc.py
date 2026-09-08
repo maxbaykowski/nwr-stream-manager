@@ -31,14 +31,14 @@ WEBRTC_TARGET_BITRATE_KBPS = 128
 WEBRTC_MIN_BITRATE_KBPS = 32
 WEBRTC_BITRATE_STEP_KBPS = 8
 WEBRTC_RECOVERY_STABLE_FEEDBACKS = 12
-WEBRTC_MONITOR_PREBUFFER_FRAMES = 12
-WEBRTC_MONITOR_TARGET_LATENCY_FRAMES = 12
-WEBRTC_MONITOR_LOW_WATER_FRAMES = 8
-WEBRTC_MONITOR_LATENCY_HIGH_WATER_FRAMES = 32
-WEBRTC_MONITOR_LATENCY_TRIM_TO_FRAMES = 24
-WEBRTC_MONITOR_MAX_BUFFER_FRAMES = 64
-WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS = 0.5
-WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS = 0.12
+WEBRTC_MONITOR_PREBUFFER_FRAMES = 6
+WEBRTC_MONITOR_TARGET_LATENCY_FRAMES = 6
+WEBRTC_MONITOR_LOW_WATER_FRAMES = 3
+WEBRTC_MONITOR_LATENCY_HIGH_WATER_FRAMES = 14
+WEBRTC_MONITOR_LATENCY_TRIM_TO_FRAMES = 8
+WEBRTC_MONITOR_MAX_BUFFER_FRAMES = 32
+WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS = 0.24
+WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS = 0.06
 
 
 class WebRtcError(RuntimeError):
@@ -404,6 +404,15 @@ class WebRtcAudioSource:
         self._log_underrun()
         return b"\x00" * self.frame_bytes
 
+    def clear_buffer(self) -> None:
+        with self.lock:
+            dropped = len(self.buffer)
+            self.buffer.clear()
+            self.stale_frames += dropped
+            self._prebuffered = True
+            self._notify_sequence += 1
+        self._notify_loop()
+
     def stats(self) -> dict[str, Any]:
         with self.lock:
             buffered_frames = len(self.buffer)
@@ -544,9 +553,15 @@ def create_webrtc_pcm_audio_track(source: WebRtcAudioSource):
             self._pending = bytearray()
             self._pts = 0
             self._started_at: float | None = None
+            self._source_paused = _source_is_paused(audio_source)
 
         async def recv(self):
             needed_bytes = WEBRTC_OPUS_FRAME_SAMPLES * WEBRTC_OPUS_CHANNELS * 2
+            paused = _source_is_paused(self._source)
+            if paused != self._source_paused:
+                self._pending.clear()
+                self._started_at = None
+                self._source_paused = paused
             attempts = 0
             read_started_at = time.monotonic()
             deadline = time.monotonic() + WEBRTC_FRAME_SECONDS
@@ -556,7 +571,15 @@ def create_webrtc_pcm_audio_track(source: WebRtcAudioSource):
                 attempts += 1
                 if time.monotonic() >= deadline:
                     break
-            if len(self._pending) < needed_bytes:
+            paused = _source_is_paused(self._source)
+            if paused != self._source_paused:
+                self._pending.clear()
+                self._started_at = None
+                self._source_paused = paused
+            if paused:
+                self._pending.clear()
+                pcm = b"\x00" * needed_bytes
+            elif len(self._pending) < needed_bytes:
                 pcm = bytes(self._pending) + b"\x00" * (needed_bytes - len(self._pending))
                 self._pending.clear()
             else:
@@ -591,6 +614,16 @@ async def _read_source_pcm(source: WebRtcAudioSource, timeout: float) -> bytes:
         return await source.read_pcm(timeout=timeout)
     except TypeError:
         return await source.read_pcm()
+
+
+def _source_is_paused(source: WebRtcAudioSource) -> bool:
+    is_paused = getattr(source, "is_paused", None)
+    if not callable(is_paused):
+        return False
+    try:
+        return bool(is_paused())
+    except Exception:
+        return False
 
 
 class AiortcSessionManager:

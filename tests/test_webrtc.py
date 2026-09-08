@@ -93,15 +93,15 @@ class WebRtcTests(unittest.TestCase):
         source = self.webrtc.WebRtcAudioSource()
         stats = source.stats()
 
-        self.assertEqual(stats["prebuffer_frames"], 12)
-        self.assertEqual(stats["target_latency_frames"], 12)
-        self.assertEqual(stats["low_water_frames"], 8)
-        self.assertEqual(stats["latency_high_water_frames"], 32)
-        self.assertEqual(stats["latency_trim_to_frames"], 24)
-        self.assertEqual(stats["max_frames"], 64)
+        self.assertEqual(stats["prebuffer_frames"], 6)
+        self.assertEqual(stats["target_latency_frames"], 6)
+        self.assertEqual(stats["low_water_frames"], 3)
+        self.assertEqual(stats["latency_high_water_frames"], 14)
+        self.assertEqual(stats["latency_trim_to_frames"], 8)
+        self.assertEqual(stats["max_frames"], 32)
         self.assertAlmostEqual(
             stats["target_latency_frames"] * self.webrtc.WEBRTC_FRAME_SECONDS,
-            0.24,
+            0.12,
         )
 
     def test_audio_source_frame_size_uses_configured_sample_rate(self) -> None:
@@ -222,6 +222,18 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(after["stale_frames"], 2)
         self.assertEqual(after["buffered_frames"], 4)
         self.assertEqual(first, b"c" + b"\x00" * (frame_bytes - 1))
+
+    def test_audio_source_clear_buffer_drops_queued_audio(self) -> None:
+        source = self.webrtc.WebRtcAudioSource(max_frames=4, prebuffer_frames=0, low_water_frames=0)
+        source.push_pcm(b"a" * source.frame_bytes)
+        source.push_pcm(b"b" * source.frame_bytes)
+
+        source.clear_buffer()
+
+        stats = source.stats()
+        self.assertEqual(stats["buffered_frames"], 0)
+        self.assertEqual(stats["stale_frames"], 2)
+        self.assertEqual(source.get_latest_pcm(timeout=0), b"\x00" * source.frame_bytes)
 
     def test_webrtc_track_waits_for_complete_resampled_frame_before_padding(self) -> None:
         class Source:
@@ -379,6 +391,46 @@ class WebRtcTests(unittest.TestCase):
         self.assertGreaterEqual(second_elapsed, 0.015)
         self.assertGreaterEqual(third_elapsed, 0.055)
         self.assertGreaterEqual(fourth_elapsed, 0.015)
+
+    def test_webrtc_track_outputs_silence_when_source_is_paused(self) -> None:
+        class Source:
+            sample_rate = 48_000
+
+            def __init__(self) -> None:
+                self.paused = False
+
+            async def read_pcm(self, timeout=0.25):
+                return b"\x11\x22" * self_webrtc.WEBRTC_OPUS_FRAME_SAMPLES
+
+            def is_paused(self):
+                return self.paused
+
+        class PassthroughResampler:
+            def __init__(self, _input_rate, _output_rate) -> None:
+                pass
+
+            def process(self, pcm: bytes) -> bytes:
+                return pcm
+
+        async def run_test():
+            source = Source()
+            track = self_webrtc.create_webrtc_pcm_audio_track(source)
+            source.paused = True
+            frame = await track.recv()
+            return bytes(frame.planes[0])
+
+        self_webrtc = self.webrtc
+        original_resampler = self.webrtc.PcmResampler
+        self.webrtc.PcmResampler = PassthroughResampler
+        try:
+            try:
+                pcm = asyncio.run(run_test())
+            except self.webrtc.WebRtcError as exc:
+                self.skipTest(str(exc))
+        finally:
+            self.webrtc.PcmResampler = original_resampler
+
+        self.assertEqual(pcm, b"\x00" * (self.webrtc.WEBRTC_OPUS_FRAME_SAMPLES * 2))
 
     def test_server_capability_report_has_expected_shape(self) -> None:
         report = self.webrtc.server_webrtc_capabilities().to_dict()

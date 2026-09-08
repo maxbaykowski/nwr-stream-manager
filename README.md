@@ -37,6 +37,14 @@ nwr-stream-manager --host 0.0.0.0 --port 8080
 
 The web interface will print the local and LAN URLs it is listening on.
 
+## Browser monitoring notes
+
+NWR Stream Manager can monitor streams and the weather radio receiver directly
+in the browser using WebRTC audio. On iOS, Safari may discard or confuse the
+system Media Session after pausing WebRTC audio from VoiceOver's two-finger
+double-tap gesture or from external media controls. If that happens, reopen the
+browser page and press Play in NWR Stream Manager to resume audio.
+
 ## First-run setup and accounts
 
 When no account database exists, the web interface starts in setup mode and asks

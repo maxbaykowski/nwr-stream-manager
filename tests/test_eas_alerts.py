@@ -1478,6 +1478,52 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(channelizer.shifter.offset_hz, 50000.0)
         self.assertEqual(channelizer.shifter._phase, 1.25)
 
+    def test_webrtc_audio_source_outputs_silence_while_paused(self) -> None:
+        source = self.web_control.SameAwareWebRtcAudioSource(sample_rate=24_000, event_queue=None)
+        try:
+            frame = b"\x01\x02" * (source.frame_bytes // 2)
+            source.push_pcm(frame)
+            source.set_paused(True)
+
+            self.assertEqual(source.get_latest_pcm(), b"\x00" * source.frame_bytes)
+            self.assertEqual(
+                asyncio.run(source.read_pcm(timeout=0)),
+                b"\x00" * source.frame_bytes,
+            )
+            self.assertTrue(source.stats()["paused"])
+
+            source.set_paused(False)
+            self.assertEqual(source.get_latest_pcm(timeout=0), b"\x00" * source.frame_bytes)
+            source.push_pcm(frame)
+
+            self.assertEqual(source.get_latest_pcm(), frame)
+            self.assertFalse(source.stats()["paused"])
+        finally:
+            source.close()
+
+    def test_receiver_pause_resume_keep_existing_worker(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.lock = self.web_control.threading.RLock()
+
+        class Worker:
+            def __init__(self) -> None:
+                self.paused = None
+
+            def set_paused(self, paused):
+                self.paused = paused
+
+        worker = Worker()
+        service.receiver_workers = {"client-1": worker}
+        service.receiver_status = lambda client_id: {"client_id": client_id, "paused": worker.paused}
+
+        paused = self.web_control.RtlControlService.pause_receiver(service, {"client_id": "client-1"})
+        resumed = self.web_control.RtlControlService.resume_receiver(service, {"client_id": "client-1"})
+
+        self.assertIs(service.receiver_workers["client-1"], worker)
+        self.assertEqual(paused["receiver"], {"client_id": "client-1", "paused": True})
+        self.assertEqual(resumed["receiver"], {"client_id": "client-1", "paused": False})
+        self.assertFalse(worker.paused)
+
     def test_alert_detail_uses_same_location_lookup(self) -> None:
         alert = {
             "event_type": "TOR",

@@ -2216,6 +2216,8 @@ class SameAwareWebRtcAudioSource:
         self.sample_rate = sample_rate
         self.frame_bytes = self.audio_source.frame_bytes
         self.event_queue = event_queue
+        self.paused = False
+        self.lock = threading.Lock()
         self.suppressor = (
             SameSuppressionProcessor(
                 sample_rate=sample_rate,
@@ -2225,21 +2227,39 @@ class SameAwareWebRtcAudioSource:
             else None
         )
 
+    def set_paused(self, paused: bool) -> None:
+        paused = bool(paused)
+        with self.lock:
+            changed = self.paused != paused
+            self.paused = paused
+        if changed:
+            self.audio_source.clear_buffer()
+
+    def is_paused(self) -> bool:
+        with self.lock:
+            return self.paused
+
+    def _pause_frame(self, frame: bytes) -> bytes:
+        if not self.is_paused():
+            return frame
+        return bytes(len(frame))
+
     def push_pcm(self, pcm: bytes) -> None:
         if self.suppressor is None:
-            self.audio_source.push_pcm(pcm)
+            self.audio_source.push_pcm(self._pause_frame(pcm))
             return
         for frame in self.suppressor.process_pcm(pcm):
-            self.audio_source.push_pcm(frame)
+            self.audio_source.push_pcm(self._pause_frame(frame))
 
     async def read_pcm(self, timeout: float = 0.25) -> bytes:
-        return await self.audio_source.read_pcm(timeout=timeout)
+        return self._pause_frame(await self.audio_source.read_pcm(timeout=timeout))
 
     def get_latest_pcm(self, timeout: float = 0.02) -> bytes:
-        return self.audio_source.get_latest_pcm(timeout=timeout)
+        return self._pause_frame(self.audio_source.get_latest_pcm(timeout=timeout))
 
     def stats(self) -> dict[str, Any]:
         stats = self.audio_source.stats()
+        stats["paused"] = self.is_paused()
         suppressor = self.suppressor
         if suppressor is not None:
             stats["same_suppression_state"] = suppressor.state
@@ -3482,6 +3502,9 @@ class WeatherReceiverWorker:
             self.frequency_hz = frequency_hz
         return frequency_hz
 
+    def set_paused(self, paused: bool) -> None:
+        self.source.set_paused(paused)
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             frequency_hz = self.frequency_hz
@@ -3490,6 +3513,7 @@ class WeatherReceiverWorker:
             "client_id": self.client_id,
             "frequency_hz": frequency_hz,
             "frequency_mhz": receiver_frequency_mhz(frequency_hz),
+            "paused": self.source.is_paused(),
             "last_audio_at": last_audio_at,
             "stats": self.source.stats(),
             "raw_queue": self.raw_queue_stats(),
@@ -5004,6 +5028,30 @@ class RtlControlService:
         LOG.info("tuned weather receiver client %s to %s MHz", client_id, receiver_frequency_mhz(frequency_hz))
         return {"success": True, "receiver": self.receiver_status(client_id)}
 
+    def pause_receiver(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id", "")).strip()
+        if not client_id:
+            raise ValueError("receiver client id is required")
+        with self.lock:
+            worker = self.receiver_workers.get(client_id)
+            if worker is None:
+                raise ValueError("weather radio receiver is not playing")
+            worker.set_paused(True)
+        LOG.info("paused weather receiver client %s", client_id)
+        return {"success": True, "receiver": self.receiver_status(client_id)}
+
+    def resume_receiver(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id", "")).strip()
+        if not client_id:
+            raise ValueError("receiver client id is required")
+        with self.lock:
+            worker = self.receiver_workers.get(client_id)
+            if worker is None:
+                raise ValueError("weather radio receiver is not playing")
+            worker.set_paused(False)
+        LOG.info("resumed weather receiver client %s", client_id)
+        return {"success": True, "receiver": self.receiver_status(client_id)}
+
     def stop_receiver(self, payload: dict[str, Any]) -> dict[str, Any]:
         client_id = str(payload.get("client_id", "")).strip()
         if not client_id:
@@ -5952,6 +6000,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 "/api/monitor/stop",
                 "/api/receiver/start",
                 "/api/receiver/tune",
+                "/api/receiver/pause",
+                "/api/receiver/resume",
                 "/api/receiver/stop",
                 "/api/account/password",
             }
@@ -6291,6 +6341,26 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 response = self.service.tune_receiver(payload)
             except Exception as exc:
                 LOG.warning("API receiver tune failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/receiver/pause":
+            try:
+                payload = self._read_json()
+                response = self.service.pause_receiver(payload)
+            except Exception as exc:
+                LOG.warning("API receiver pause failed for %s: %s", self._client_address(), exc)
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/receiver/resume":
+            try:
+                payload = self._read_json()
+                response = self.service.resume_receiver(payload)
+            except Exception as exc:
+                LOG.warning("API receiver resume failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -8340,6 +8410,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 .notice-dialog { position: fixed; right: 24px; bottom: 24px; z-index: 20; max-width: min(420px, calc(100vw - 48px)); padding: 16px; border: 1px solid #b9c0cc; border-radius: 8px; background: #fff; box-shadow: 0 12px 30px rgb(20 24 31 / 22%); }
 .notice-dialog h2 { font-size: 18px; margin-bottom: 8px; }
 .notice-dialog p { margin: 0 0 14px; }
+.media-session-audio { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 @media (prefers-color-scheme: dark) {
   body { background: #101318; color: #eef2f7; }
   header, section, select, input, button { background: #181d24; color: #eef2f7; border-color: #333b48; }
@@ -9293,7 +9364,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <audio id="stream_monitor_audio" autoplay playsinline hidden></audio>
+  <audio id="stream_monitor_audio" class="media-session-audio" autoplay playsinline aria-hidden="true" tabindex="-1"></audio>
+  <audio id="media_session_anchor_audio" class="media-session-audio" loop preload="auto" playsinline aria-hidden="true" tabindex="-1"></audio>
 </main>
 <script>
 const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto", "alias_filter_strength"];
@@ -9397,6 +9469,7 @@ let monitorLastPacketCount = 0;
 let monitorLastPacketAt = 0;
 let receiverClientId = "";
 let receiverPeerConnection = null;
+let receiverRemoteStream = null;
 let receiverPlaying = false;
 let receiverPaused = false;
 let receiverChannelIndex = 3;
@@ -9407,12 +9480,16 @@ let receiverLastPacketAt = 0;
 let unloadLiveAudioStopSent = false;
 let liveAudioHiddenAt = 0;
 let liveAudioNeedsRestart = false;
+let mediaSessionAnchorUrl = "";
+let mediaSessionAnchorStarted = false;
 let currentAccount = null;
 let accountsSignature = "";
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
 const LIVE_AUDIO_BACKGROUND_RESTART_MS = 30000;
-const WEBRTC_JITTER_BUFFER_TARGET_SECONDS = 0.1;
+const WEBRTC_JITTER_BUFFER_TARGET_SECONDS = 0.06;
+const MEDIA_SESSION_ANCHOR_SECONDS = 8;
+const MEDIA_SESSION_ANCHOR_SAMPLE_RATE = 8000;
 const SAME_MARK_HZ = 2083.3;
 const SAME_SPACE_HZ = 1562.5;
 const SAME_BAUD = 520.83;
@@ -9671,6 +9748,182 @@ function logClientEvent(level, area, message, details = {}) {
   }).catch(() => {});
 }
 
+function mediaSessionDiagnostics(audio) {
+  const session = "mediaSession" in navigator ? navigator.mediaSession : null;
+  return {
+    media_session_supported: Boolean(session),
+    media_metadata_supported: "MediaMetadata" in window,
+    media_session_playback_state: session ? session.playbackState : "",
+    audio_present: Boolean(audio),
+    audio_hidden: Boolean(audio && audio.hidden),
+    audio_paused: Boolean(audio && audio.paused),
+    audio_muted: Boolean(audio && audio.muted),
+    audio_volume: audio ? audio.volume : null,
+    audio_ready_state: audio ? audio.readyState : null,
+    audio_network_state: audio ? audio.networkState : null,
+    audio_has_src_object: Boolean(audio && audio.srcObject),
+    audio_track_count: audio && audio.srcObject && typeof audio.srcObject.getAudioTracks === "function"
+      ? audio.srcObject.getAudioTracks().length
+      : 0,
+    visibility_state: document.visibilityState,
+    user_agent: navigator.userAgent
+  };
+}
+
+function mediaSessionAnchorDiagnostics() {
+  const anchor = document.getElementById("media_session_anchor_audio");
+  return {
+    media_session_anchor_supported: shouldUseMediaSessionAnchor(),
+    anchor_present: Boolean(anchor),
+    anchor_started: mediaSessionAnchorStarted,
+    anchor_paused: Boolean(anchor && anchor.paused),
+    anchor_muted: Boolean(anchor && anchor.muted),
+    anchor_volume: anchor ? anchor.volume : null,
+    anchor_ready_state: anchor ? anchor.readyState : null,
+    anchor_network_state: anchor ? anchor.networkState : null,
+    anchor_current_time: anchor ? anchor.currentTime : null,
+    anchor_has_src: Boolean(anchor && anchor.currentSrc)
+  };
+}
+
+function prepareLiveAudioElement(audio) {
+  if (!audio) return;
+  audio.hidden = false;
+  audio.classList.add("media-session-audio");
+  audio.setAttribute("aria-hidden", "true");
+  audio.setAttribute("tabindex", "-1");
+  audio.muted = false;
+  audio.volume = 1;
+}
+
+function shouldUseMediaSessionAnchor() {
+  return "mediaSession" in navigator;
+}
+
+function createMediaSessionAnchorUrl() {
+  if (mediaSessionAnchorUrl) return mediaSessionAnchorUrl;
+  const samples = MEDIA_SESSION_ANCHOR_SECONDS * MEDIA_SESSION_ANCHOR_SAMPLE_RATE;
+  const dataBytes = samples * 2;
+  const buffer = new ArrayBuffer(44 + dataBytes);
+  const view = new DataView(buffer);
+  const writeText = (offset, text) => {
+    for (let index = 0; index < text.length; index += 1) {
+      view.setUint8(offset + index, text.charCodeAt(index));
+    }
+  };
+  writeText(0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  writeText(8, "WAVE");
+  writeText(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, MEDIA_SESSION_ANCHOR_SAMPLE_RATE, true);
+  view.setUint32(28, MEDIA_SESSION_ANCHOR_SAMPLE_RATE * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeText(36, "data");
+  view.setUint32(40, dataBytes, true);
+  for (let index = 0; index < samples; index += 1) {
+    const sample = index % 2 === 0 ? 1 : -1;
+    view.setInt16(44 + index * 2, sample, true);
+  }
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  for (let index = 0; index < bytes.length; index += 1) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+  mediaSessionAnchorUrl = `data:audio/wav;base64,${btoa(binary)}`;
+  return mediaSessionAnchorUrl;
+}
+
+function prepareMediaSessionAnchor() {
+  const anchor = document.getElementById("media_session_anchor_audio");
+  if (!anchor || !shouldUseMediaSessionAnchor()) return null;
+  anchor.hidden = false;
+  anchor.classList.add("media-session-audio");
+  anchor.setAttribute("aria-hidden", "true");
+  anchor.setAttribute("tabindex", "-1");
+  anchor.loop = true;
+  anchor.muted = false;
+  anchor.volume = 1;
+  if (!anchor.src) anchor.src = createMediaSessionAnchorUrl();
+  return anchor;
+}
+
+async function startMediaSessionAnchor(reason = "") {
+  const anchor = prepareMediaSessionAnchor();
+  if (!anchor) return false;
+  try {
+    await anchor.play();
+    mediaSessionAnchorStarted = true;
+    logClientEvent("info", "media-session", "media session anchor started", {
+      reason,
+      ...mediaSessionAnchorDiagnostics()
+    });
+    return true;
+  } catch (error) {
+    mediaSessionAnchorStarted = false;
+    logClientEvent("warning", "media-session", "media session anchor playback failed", {
+      reason,
+      error: error.message,
+      ...mediaSessionAnchorDiagnostics()
+    });
+    return false;
+  }
+}
+
+function pauseMediaSessionAnchor(reason = "") {
+  const anchor = document.getElementById("media_session_anchor_audio");
+  if (!anchor || !mediaSessionAnchorStarted) return;
+  try {
+    anchor.pause();
+    logClientEvent("info", "media-session", "media session anchor paused", {
+      reason,
+      ...mediaSessionAnchorDiagnostics()
+    });
+  } catch (error) {
+    console.debug("media session anchor pause failed", error);
+  }
+}
+
+function stopMediaSessionAnchor(reason = "") {
+  const anchor = document.getElementById("media_session_anchor_audio");
+  if (!anchor) return;
+  try {
+    anchor.pause();
+    anchor.currentTime = 0;
+    mediaSessionAnchorStarted = false;
+    logClientEvent("info", "media-session", "media session anchor stopped", {
+      reason,
+      ...mediaSessionAnchorDiagnostics()
+    });
+  } catch (error) {
+    console.debug("media session anchor stop failed", error);
+  }
+}
+
+function monitoredStreamLabel() {
+  const stream = configuredStreams.find(candidate => candidate.id === monitorStreamId);
+  if (!stream) return "NWR Stream Monitor";
+  const station = stream.station || {};
+  if (station.callsign && station.frequency) return `${station.callsign} ${station.frequency} MHz`;
+  return station.callsign || "NWR Stream Monitor";
+}
+
+function clearLiveMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  try {
+    for (const action of ["previoustrack", "nexttrack", "play", "pause"]) {
+      navigator.mediaSession.setActionHandler(action, null);
+    }
+    navigator.mediaSession.metadata = null;
+    navigator.mediaSession.playbackState = "none";
+  } catch (error) {
+    console.debug("media session cleanup failed", error);
+  }
+}
+
 function formatDecimalBytes(value) {
   let bytes = Number(value || 0);
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -9749,6 +10002,9 @@ function resetLiveAudioElement() {
   clearSameLiveAudioMute();
   const audio = document.getElementById("stream_monitor_audio");
   if (!audio) return;
+  prepareLiveAudioElement(audio);
+  audio.muted = false;
+  audio.volume = 1;
   audio.pause();
   audio.srcObject = null;
   try {
@@ -9758,12 +10014,29 @@ function resetLiveAudioElement() {
   }
 }
 
+function restoreReceiverRemoteAudioElement() {
+  const audio = document.getElementById("stream_monitor_audio");
+  if (!audio || !receiverRemoteStream) return null;
+  if (audio.srcObject !== receiverRemoteStream) audio.srcObject = receiverRemoteStream;
+  prepareLiveAudioElement(audio);
+  return audio;
+}
+
+function pauseReceiverAudioElement() {
+  const audio = document.getElementById("stream_monitor_audio");
+  if (!audio) return;
+  prepareLiveAudioElement(audio);
+  audio.pause();
+}
+
 function clearLocalStreamMonitor() {
   const peer = monitorPeerConnection;
   monitorPeerConnection = null;
   monitorStreamId = "";
   clearMonitorWatchdogs();
   resetLiveAudioElement();
+  stopMediaSessionAnchor("monitor-local-clear");
+  if (!receiverPeerConnection) clearLiveMediaSession();
   if (peer) {
     try {
       peer.close();
@@ -9782,6 +10055,10 @@ function markLiveAudioVisible() {
   if (!liveAudioHiddenAt) return false;
   const hiddenForMs = Date.now() - liveAudioHiddenAt;
   liveAudioHiddenAt = 0;
+  if (receiverPaused && receiverPeerConnection && !monitorPeerConnection) {
+    scheduleReceiverMediaSessionRefresh();
+    return false;
+  }
   if (hiddenForMs >= LIVE_AUDIO_BACKGROUND_RESTART_MS) {
     liveAudioNeedsRestart = true;
     logClientEvent("info", "live-audio", "live audio marked stale after page background", {hidden_ms: hiddenForMs});
@@ -9924,6 +10201,8 @@ async function startStreamMonitor(streamId) {
   createLiveEventChannel(peer);
   monitorPeerConnection = peer;
   monitorStreamId = streamId;
+  await startMediaSessionAnchor("monitor-start");
+  updateMonitorMediaSession();
   const audio = document.getElementById("stream_monitor_audio");
   const transceiver = peer.addTransceiver("audio", {direction: "recvonly"});
   if (transceiver.receiver && "jitterBufferTarget" in transceiver.receiver) {
@@ -9942,8 +10221,13 @@ async function startStreamMonitor(streamId) {
       }
     }
     audio.srcObject = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
-    audio.hidden = true;
-    audio.play().catch(error => setStreamResult(`Monitoring audio could not start: ${error.message}`, "error"));
+    prepareLiveAudioElement(audio);
+    audio.play()
+      .then(() => logClientEvent("info", "monitor", "monitor audio element playback started", mediaSessionDiagnostics(audio)))
+      .catch(error => {
+        logClientEvent("warning", "monitor", "monitor audio element playback failed", {...mediaSessionDiagnostics(audio), error: error.message});
+        setStreamResult(`Monitoring audio could not start: ${error.message}`, "error");
+      });
     for (const eventName of ["waiting", "stalled", "suspend"]) {
       audio.addEventListener(eventName, () => {
         if (monitorPeerConnection === peer) scheduleMonitorUnstableStop(`audio ${eventName}`);
@@ -9998,6 +10282,7 @@ async function startStreamMonitor(streamId) {
     await peer.setRemoteDescription(data.answer);
     logClientEvent("info", "monitor", "monitor WebRTC answer accepted", {stream_id: streamId});
     startMonitorPacketStats();
+    updateMonitorMediaSession();
     renderStreams(configuredStreams);
     if (settingsStreamId) renderStreamSettings();
   } catch (error) {
@@ -10006,6 +10291,8 @@ async function startStreamMonitor(streamId) {
       monitorStreamId = "";
       clearMonitorWatchdogs();
       resetLiveAudioElement();
+      stopMediaSessionAnchor("monitor-start-failed");
+      clearLiveMediaSession();
     }
     try {
       peer.close();
@@ -10190,14 +10477,37 @@ function updateReceiverMediaSession() {
     title: channel.label,
     artist: "NOAA Weather Radio"
   });
-  navigator.mediaSession.playbackState = receiverPlaying ? "playing" : "paused";
+  navigator.mediaSession.playbackState = receiverPlaying && !receiverPaused ? "playing" : "paused";
   try {
     navigator.mediaSession.setActionHandler("previoustrack", () => receiverPreviousChannel());
     navigator.mediaSession.setActionHandler("nexttrack", () => receiverNextChannel());
     navigator.mediaSession.setActionHandler("play", () => startWeatherReceiver());
-    navigator.mediaSession.setActionHandler("pause", () => stopWeatherReceiver({preserveMediaSession: true}));
+    navigator.mediaSession.setActionHandler("pause", () => {
+      stopWeatherReceiver({preserveMediaSession: true})
+        .catch(error => console.debug("media session receiver pause failed", error));
+    });
   } catch (error) {
     console.debug("media session action setup failed", error);
+  }
+}
+
+function updateMonitorMediaSession() {
+  if (!("mediaSession" in navigator) || !("MediaMetadata" in window) || !monitorPeerConnection || !monitorStreamId) return;
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: monitoredStreamLabel(),
+    artist: "NOAA Weather Radio"
+  });
+  navigator.mediaSession.playbackState = "playing";
+  try {
+    navigator.mediaSession.setActionHandler("previoustrack", null);
+    navigator.mediaSession.setActionHandler("nexttrack", null);
+    navigator.mediaSession.setActionHandler("play", () => startStreamMonitor(monitorStreamId));
+    navigator.mediaSession.setActionHandler("pause", () => {
+      stopStreamMonitor({notifyServer: true})
+        .catch(error => console.debug("media session monitor pause failed", error));
+    });
+  } catch (error) {
+    console.debug("monitor media session action setup failed", error);
   }
 }
 
@@ -10215,16 +10525,7 @@ function scheduleReceiverMediaSessionRefresh() {
 }
 
 function clearReceiverMediaSession() {
-  if (!("mediaSession" in navigator)) return;
-  try {
-    for (const action of ["previoustrack", "nexttrack", "play", "pause"]) {
-      navigator.mediaSession.setActionHandler(action, null);
-    }
-    navigator.mediaSession.metadata = null;
-    navigator.mediaSession.playbackState = "none";
-  } catch (error) {
-    console.debug("media session cleanup failed", error);
-  }
+  clearLiveMediaSession();
 }
 
 function setReceiverAudioTracksEnabled(enabled) {
@@ -10237,21 +10538,28 @@ function setReceiverAudioTracksEnabled(enabled) {
 
 async function startWeatherReceiver() {
   if (receiverPeerConnection) {
-    if (liveAudioNeedsRestart || liveAudioPeerIsUnusable(receiverPeerConnection)) {
+    if (liveAudioNeedsRestart || liveAudioPeerIsUnusable(receiverPeerConnection) || !receiverRemoteStream) {
       logClientEvent("info", "receiver", "restarting stale receiver WebRTC session", {frequency: currentReceiverChannel().label});
       await stopWeatherReceiver({notifyServer: true});
       liveAudioNeedsRestart = false;
     } else {
       logClientEvent("info", "receiver", "receiver resume requested", {frequency: currentReceiverChannel().label});
+      await request("/api/receiver/resume", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({client_id: pageReceiverClientId()})
+      });
       receiverPlaying = true;
       receiverPaused = false;
       clearReceiverUnstableTimer();
-	      setReceiverAudioTracksEnabled(true);
-	      const audio = document.getElementById("stream_monitor_audio");
-	      if (audio && audio.srcObject) {
-	        audio.muted = false;
-	        await audio.play();
-	      }
+      await startMediaSessionAnchor("receiver-resume");
+      const audio = restoreReceiverRemoteAudioElement();
+      setReceiverAudioTracksEnabled(true);
+      if (audio && audio.srcObject) {
+        prepareLiveAudioElement(audio);
+        await audio.play();
+        logClientEvent("info", "receiver", "receiver audio element playback resumed", mediaSessionDiagnostics(audio));
+      }
       startReceiverPacketStats();
       updateReceiverMediaSession();
       renderReceiverControls();
@@ -10276,6 +10584,8 @@ async function startWeatherReceiver() {
   receiverPeerConnection = peer;
   receiverPlaying = true;
   receiverPaused = false;
+  await startMediaSessionAnchor("receiver-start");
+  updateReceiverMediaSession();
   renderReceiverControls();
   const audio = document.getElementById("stream_monitor_audio");
   const transceiver = peer.addTransceiver("audio", {direction: "recvonly"});
@@ -10287,7 +10597,7 @@ async function startWeatherReceiver() {
     }
   }
   peer.addEventListener("track", event => {
-    event.track.enabled = !receiverPaused;
+    event.track.enabled = true;
     if (event.receiver && "jitterBufferTarget" in event.receiver) {
       try {
         event.receiver.jitterBufferTarget = WEBRTC_JITTER_BUFFER_TARGET_SECONDS;
@@ -10295,19 +10605,28 @@ async function startWeatherReceiver() {
         console.debug("WebRTC track jitterBufferTarget is not writable", error);
       }
     }
-    audio.srcObject = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
-    audio.hidden = true;
-    setReceiverAudioTracksEnabled(!receiverPaused);
-    if (!receiverPaused) {
-      audio.play().catch(error => setReceiverResult(`Receiver audio could not start: ${error.message}`, "error"));
-    }
+    receiverRemoteStream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+    audio.srcObject = receiverRemoteStream;
+    prepareLiveAudioElement(audio);
+    setReceiverAudioTracksEnabled(true);
+    audio.play()
+      .then(() => logClientEvent("info", "receiver", "receiver audio element playback started", mediaSessionDiagnostics(audio)))
+      .catch(error => {
+        logClientEvent("warning", "receiver", "receiver audio element playback failed", {...mediaSessionDiagnostics(audio), error: error.message});
+        setReceiverResult(`Receiver audio could not start: ${error.message}`, "error");
+      });
     for (const eventName of ["waiting", "stalled", "suspend"]) {
       audio.addEventListener(eventName, () => {
         if (receiverPeerConnection === peer) scheduleReceiverUnstableStop(`audio ${eventName}`);
       });
     }
     audio.addEventListener("playing", () => {
-      if (receiverPeerConnection === peer) clearReceiverUnstableTimer();
+      if (receiverPeerConnection !== peer) return;
+      if (receiverPaused) {
+        scheduleReceiverMediaSessionRefresh();
+        return;
+      }
+      clearReceiverUnstableTimer();
     });
     event.track.addEventListener("mute", () => {
       if (receiverPeerConnection === peer) scheduleReceiverUnstableStop("audio track muted");
@@ -10373,23 +10692,28 @@ async function stopWeatherReceiver(options = {}) {
   const peer = receiverPeerConnection;
   receiverPlaying = false;
   receiverPaused = preserveMediaSession && !!peer;
-	  clearReceiverWatchdogs();
-	  const audio = document.getElementById("stream_monitor_audio");
-	  if (preserveMediaSession && peer) {
-	    stopGeneratedSameAudio();
-	    clearSameLiveAudioMute();
-	    setReceiverAudioTracksEnabled(false);
-	    if (audio) {
-	      audio.muted = true;
-	      audio.pause();
-	    }
-	    scheduleReceiverMediaSessionRefresh();
+  clearReceiverWatchdogs();
+  if (preserveMediaSession && peer) {
+    stopGeneratedSameAudio();
+    clearSameLiveAudioMute();
+    setReceiverAudioTracksEnabled(true);
+    logClientEvent("info", "receiver", "receiver pause requested", {frequency: currentReceiverChannel().label});
+    await request("/api/receiver/pause", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({client_id: clientId})
+    });
+    pauseReceiverAudioElement();
+    pauseMediaSessionAnchor("receiver-pause");
+    scheduleReceiverMediaSessionRefresh();
     renderReceiverControls();
     return;
   }
   receiverPeerConnection = null;
+  receiverRemoteStream = null;
   receiverPaused = false;
   clearReceiverMediaSession();
+  stopMediaSessionAnchor("receiver-stop");
   resetLiveAudioElement();
   if (peer) peer.close();
   if (notifyServer) {
@@ -15142,7 +15466,7 @@ document.getElementById("receiver_previous").addEventListener("click", receiverP
 document.getElementById("receiver_next").addEventListener("click", receiverNextChannel);
 document.getElementById("receiver_play_pause").addEventListener("click", async () => {
   try {
-    if (receiverPlaying) {
+    if (receiverPeerConnection && !receiverPaused) {
       await stopWeatherReceiver({preserveMediaSession: true});
       setReceiverResult("Receiver paused.", "success");
     } else {
@@ -16272,7 +16596,15 @@ document.addEventListener("visibilitychange", () => {
 const liveAudioElement = document.getElementById("stream_monitor_audio");
 if (liveAudioElement) {
   liveAudioElement.addEventListener("pause", () => {
-    if (receiverPaused && receiverPeerConnection) scheduleReceiverMediaSessionRefresh();
+    if (receiverPeerConnection && receiverPlaying && !receiverPaused) {
+      logClientEvent("info", "receiver", "receiver native media pause observed", {frequency: currentReceiverChannel().label});
+      stopWeatherReceiver({preserveMediaSession: true})
+        .catch(error => console.debug("receiver native pause handling failed", error))
+      return;
+    }
+    if (receiverPaused && receiverPeerConnection) {
+      scheduleReceiverMediaSessionRefresh();
+    }
   });
 }
 
