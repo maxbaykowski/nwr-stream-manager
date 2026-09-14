@@ -162,6 +162,56 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(second, b"a" * len(second))
         self.assertEqual(stats["underrun_frames"], 1)
 
+    def test_audio_source_blocking_reader_uses_startup_prebuffer(self) -> None:
+        source = self.webrtc.WebRtcAudioSource(
+            max_frames=4,
+            prebuffer_frames=2,
+            target_latency_frames=4,
+            low_water_frames=0,
+            prebuffer_timeout_seconds=0.2,
+        )
+
+        def delayed_push():
+            import time
+
+            time.sleep(0.03)
+            source.push_pcm(b"a" * source.frame_bytes)
+            source.push_pcm(b"b" * source.frame_bytes)
+
+        thread = __import__("threading").Thread(target=delayed_push)
+        thread.start()
+        first = source.read_pcm_blocking(timeout=self.webrtc.WEBRTC_FRAME_SECONDS)
+        thread.join(timeout=1.0)
+
+        self.assertEqual(first, b"a" * len(first))
+        self.assertEqual(source.stats()["underrun_frames"], 0)
+
+    def test_audio_source_blocking_reader_rebuffers_after_underrun(self) -> None:
+        source = self.webrtc.WebRtcAudioSource(
+            max_frames=4,
+            prebuffer_frames=2,
+            target_latency_frames=4,
+            low_water_frames=0,
+            prebuffer_timeout_seconds=0.2,
+        )
+        first = source.read_pcm_blocking(timeout=0.01)
+
+        def delayed_push():
+            import time
+
+            time.sleep(0.03)
+            source.push_pcm(b"a" * source.frame_bytes)
+            source.push_pcm(b"b" * source.frame_bytes)
+
+        thread = __import__("threading").Thread(target=delayed_push)
+        thread.start()
+        second = source.read_pcm_blocking(timeout=self.webrtc.WEBRTC_FRAME_SECONDS)
+        thread.join(timeout=1.0)
+
+        self.assertEqual(first, b"\x00" * len(first))
+        self.assertEqual(second, b"a" * len(second))
+        self.assertEqual(source.stats()["underrun_frames"], 1)
+
     def test_audio_source_does_not_miss_push_between_buffer_check_and_wait(self) -> None:
         async def run_test():
             source = self.webrtc.WebRtcAudioSource(prebuffer_frames=0, low_water_frames=0)

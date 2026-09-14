@@ -72,6 +72,27 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('route.view === "rtl" && developmentIqSourcesEnabled', script)
         self.assertIn('if (!developmentIqSourcesEnabled) return {files: [], active: null};', script)
 
+    def test_dashboard_stream_attention_links_are_permission_sensitive(self) -> None:
+        script = self.web_control.INDEX_HTML
+
+        self.assertIn("read_only: accountIsReadOnly()", script)
+        self.assertIn("const readOnly = accountIsReadOnly();", script)
+        self.assertIn("if (readOnly) {", script)
+        self.assertIn("dashboardAttentionSignature = \"\";", script)
+        self.assertIn("renderDashboardStreamAttention(activeStreamSnapshots, configuredStreams);", script)
+        self.assertIn("function stationHasIdentity(station)", script)
+        self.assertIn("stationHasIdentity(active.station) ? active.station : configuredStream.station || {}", script)
+
+    def test_public_active_stream_snapshot_omits_empty_station(self) -> None:
+        snapshot = self.web_control.public_active_stream_snapshot({
+            "id": "stream-1",
+            "station": {},
+            "status": "needs-attention",
+            "outputs": [],
+        })
+
+        self.assertNotIn("station", snapshot)
+
     def test_state_directory_environment_sets_default_state_path(self) -> None:
         with patch.dict("os.environ", {"STATE_DIRECTORY": "/var/lib/nwr-stream-manager"}, clear=True):
             self.assertEqual(

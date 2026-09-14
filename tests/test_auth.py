@@ -356,6 +356,8 @@ class AuthTests(unittest.TestCase):
             ("PATCH", "/api/stream-output"),
             ("PUT", "/api/stream-output"),
             ("DELETE", "/api/stream-output"),
+            ("POST", "/api/stream-soundcard-preview"),
+            ("DELETE", "/api/stream-soundcard-preview"),
             ("POST", "/api/icecast-auth"),
             ("PATCH", "/api/fallback-settings"),
             ("PUT", "/api/fallback-settings"),
@@ -365,6 +367,9 @@ class AuthTests(unittest.TestCase):
             ("PUT", "/api/settings"),
             ("POST", "/api/rtl-reset"),
             ("POST", "/api/soundcard-reset"),
+            ("POST", "/api/iq-test-source"),
+            ("POST", "/api/iq-test-source/stop"),
+            ("POST", "/api/iq-test-source/seek"),
             ("POST", "/api/iq-recorder/start"),
             ("POST", "/api/iq-recorder/stop"),
             ("DELETE", "/api/iq-recording"),
@@ -384,6 +389,60 @@ class AuthTests(unittest.TestCase):
         for method, path in allowed:
             with self.subTest(method=method, path=path):
                 self.assertTrue(handler._read_only_request_allowed(path, method))
+
+    def test_read_only_stream_status_redacts_secrets_and_filters_monitoring(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.lock = self.web_control.threading.RLock()
+        service.streams = [
+            {
+                "id": "stream-1",
+                "enabled": True,
+                "station": {"callsign": "WXN99", "frequency": "162.475"},
+                "outputs": [
+                    {
+                        "id": "out-1",
+                        "enabled": True,
+                        "type": "icecast",
+                        "icecast": {
+                            "host": "icecast.example",
+                            "port": 8000,
+                            "username": "source",
+                            "password": "secret",
+                            "mount": "/WXN99.mp3",
+                            "format": "mp3",
+                            "sample_rate": 22050,
+                            "bitrate": 64,
+                        },
+                        "auth_signature": "secret-signature",
+                    }
+                ],
+                "audio": {"volume": {"multiplier": 2}},
+            }
+        ]
+        service.monitor_streams_by_client = {"client-owned": "stream-1", "client-other": "stream-2"}
+        service.monitor_accounts_by_client = {"client-owned": 7, "client-other": 8}
+
+        status = service.stream_status(read_only=True, account_id=7)
+        stream = status["streams"][0]
+        output = stream["outputs"][0]
+
+        self.assertEqual(status["monitoring"], {"client-owned": "stream-1"})
+        self.assertNotIn("audio", stream)
+        self.assertNotIn("password", output["icecast"])
+        self.assertNotIn("username", output["icecast"])
+        self.assertNotIn("auth_signature", output)
+        self.assertEqual(output["icecast"]["mount"], "/WXN99.mp3")
+
+    def test_webrtc_client_controls_require_matching_account(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.monitor_streams_by_client = {"client-1": "stream-1"}
+        service.monitor_accounts_by_client = {"client-1": 10}
+        service.receiver_workers = {}
+        service.receiver_accounts_by_client = {}
+
+        service._ensure_webrtc_client_owner_locked("client-1", 10, require_existing=True)
+        with self.assertRaisesRegex(ValueError, "different account"):
+            service._ensure_webrtc_client_owner_locked("client-1", 11, require_existing=True)
 
     def test_read_only_iq_recorder_status_is_redacted(self) -> None:
         service = object.__new__(self.web_control.RtlControlService)

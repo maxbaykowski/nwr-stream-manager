@@ -404,6 +404,30 @@ class WebRtcAudioSource:
         self._log_underrun()
         return b"\x00" * self.frame_bytes
 
+    def read_pcm_blocking(self, timeout: float = 0.25) -> bytes:
+        if not self._prebuffered and self.prebuffer_frames:
+            self._wait_for_buffer_blocking(
+                self.prebuffer_frames,
+                max(timeout, self.prebuffer_timeout_seconds),
+            )
+            self._prebuffered = True
+        elif self.low_water_frames:
+            with self.lock:
+                buffered = len(self.buffer)
+            if 0 < buffered < self.low_water_frames:
+                self._wait_for_buffer_blocking(
+                    self.low_water_frames,
+                    max(WEBRTC_FRAME_SECONDS, self.refill_timeout_seconds),
+                )
+        frame = self._pop_frame_blocking(timeout)
+        if frame is None:
+            self.underrun_frames += 1
+            self._log_underrun()
+            self._prebuffered = False
+            return b"\x00" * self.frame_bytes
+        self.read_frames += 1
+        return frame
+
     def clear_buffer(self) -> None:
         with self.lock:
             dropped = len(self.buffer)
@@ -482,6 +506,29 @@ class WebRtcAudioSource:
             if remaining <= 0:
                 return None
             await self._wait_for_push(min(remaining, WEBRTC_FRAME_SECONDS), notify_sequence)
+        return None
+
+    def _wait_for_buffer_blocking(self, frame_count: int, timeout: float) -> None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while not self.closed.is_set():
+            with self.lock:
+                if len(self.buffer) >= frame_count:
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.005, remaining))
+
+    def _pop_frame_blocking(self, timeout: float) -> bytes | None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while not self.closed.is_set():
+            with self.lock:
+                if self.buffer:
+                    return self.buffer.popleft()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(0.005, remaining))
         return None
 
     async def _wait_for_push(self, timeout: float, notify_sequence: int | None = None) -> None:

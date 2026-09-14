@@ -40,10 +40,16 @@ The web interface will print the local and LAN URLs it is listening on.
 ## Browser monitoring notes
 
 NWR Stream Manager can monitor streams and the weather radio receiver directly
-in the browser using WebRTC audio. On iOS, Safari may discard or confuse the
-system Media Session after pausing WebRTC audio from VoiceOver's two-finger
-double-tap gesture or from external media controls. If that happens, reopen the
-browser page and press Play in NWR Stream Manager to resume audio.
+in the browser using low-latency Opus audio over a WebSocket transport. This
+path provides more predictable latency than WebRTC and supports Media Session
+controls on supported browsers.
+
+Background playback for stream monitoring and the weather radio receiver is
+supported on Android browsers that keep web media sessions active in the
+background. Background playback for those realtime features is not supported on
+iPhone or iPad: iOS may stop the WebSocket/Web Audio playback path when Safari
+is backgrounded. Reopen Safari and press Play in NWR Stream Manager to resume
+listening.
 
 ## Development UI layout checks
 
