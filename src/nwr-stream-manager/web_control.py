@@ -9669,6 +9669,7 @@ const SAME_BAUD = 520.83;
 const SAME_PREAMBLE_BYTE = 0xAB;
 const SAME_PREAMBLE_BYTES = 16;
 const SAME_TRAILING_NUL_BYTES = 3;
+const SAME_GENERATED_AMPLITUDE = 0.5;
 const SAME_CLIENT_PLAYOUT_DELAY_SECONDS = 0.45;
 const SAME_LIVE_AUDIO_MUTE_TAIL_SECONDS = 1.0;
 const IQ_RECORDER_SAMPLE_RATES = [192000, 256000, 384000, 512000, 768000, 1024000, 1536000];
@@ -9762,7 +9763,7 @@ function generateSameBurst(payload, sampleRate) {
       const frequency = ((byte >> bitIndex) & 1) ? SAME_MARK_HZ : SAME_SPACE_HZ;
       const step = 2 * Math.PI * frequency / sampleRate;
       for (let index = 0; index < bitSamples; index += 1) {
-        output[offset] = 0.73 * Math.sin(phase);
+        output[offset] = SAME_GENERATED_AMPLITUDE * Math.sin(phase);
         offset += 1;
         phase += step;
         if (phase >= 2 * Math.PI) phase -= 2 * Math.PI;
