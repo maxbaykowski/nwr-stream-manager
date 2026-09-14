@@ -3891,6 +3891,7 @@ class RtlControlService:
                 "received_bytes": self.received_bytes,
                 "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
                 "fallback": asdict(self.fallback_settings),
+                "streams": list(self.streams),
                 "active_streams": self._active_streams_locked(),
                 "active_eas_recorders": self._active_eas_recorders_locked(),
                 "recent_eas_alerts": self._recent_eas_alerts_locked(),
@@ -13644,6 +13645,13 @@ function renderStreams(streams, options = {}) {
   if (settingsStreamId) renderStreamSettings();
 }
 
+function syncConfiguredStreamsFromStatus(data) {
+  if (!data || !Array.isArray(data.streams)) return;
+  const signature = configuredStreamsRefreshSignature(data.streams);
+  if (signature === configuredStreamsSignature) return;
+  renderStreams(data.streams);
+}
+
 function configuredStreamsRefreshSignature(streams) {
   return JSON.stringify((streams || []).map(stream => ({
     id: stream.id || "",
@@ -15723,6 +15731,7 @@ function applyStatus(data, options = {}) {
   setText("logs", data.logs.join("\\n"));
   renderIqTestSourceStatus(data);
   setFallbackControls(data.fallback);
+  syncConfiguredStreamsFromStatus(data);
   updateDashboard(data);
   const now = Date.now();
   if (now - lastEasAlertRefreshAt > 10000) {
@@ -17421,17 +17430,6 @@ document.getElementById("eas_alert_audio").addEventListener("ended", async () =>
 });
 
 async function refresh() {
-  if (currentViewName() === "dashboard") {
-    const now = Date.now();
-    if (now - lastDashboardStreamRefreshAt >= 2000) {
-      lastDashboardStreamRefreshAt = now;
-      try {
-        await loadStreams({refreshEas: false});
-      } catch (error) {
-        console.debug("dashboard stream refresh failed", error);
-      }
-    }
-  }
   const data = await request(statusRequestPath());
   applyStatus(data, {syncControls: false});
 }
