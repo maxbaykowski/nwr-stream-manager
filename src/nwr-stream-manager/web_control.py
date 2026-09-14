@@ -6757,17 +6757,60 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         content_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
         disposition = "attachment" if download else "inline"
         data_length = path.stat().st_size
+        start = 0
+        end = data_length - 1
+        partial = False
+        range_header = "" if delete_after else str(self.headers.get("Range", "")).strip()
+        if range_header:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+            if not match or data_length <= 0:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{data_length}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                return
+            raw_start, raw_end = match.groups()
+            if raw_start == "" and raw_end == "":
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{data_length}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                return
+            if raw_start == "":
+                suffix_length = int(raw_end)
+                if suffix_length <= 0:
+                    start = data_length
+                else:
+                    start = max(0, data_length - suffix_length)
+                end = data_length - 1
+            else:
+                start = int(raw_start)
+                end = int(raw_end) if raw_end else data_length - 1
+            if start >= data_length or start > end:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{data_length}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                return
+            end = min(end, data_length - 1)
+            partial = True
+        response_length = max(0, end - start + 1)
         try:
-            self.send_response(HTTPStatus.OK)
+            self.send_response(HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(data_length))
+            self.send_header("Content-Length", str(response_length))
+            self.send_header("Accept-Ranges", "bytes")
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{data_length}")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Disposition", f'{disposition}; filename="{http_header_filename(download_name)}"')
             self._send_pending_auth_session_cookie()
             self.end_headers()
             with path.open("rb") as source:
-                while True:
-                    chunk = source.read(1024 * 1024)
+                source.seek(start)
+                remaining = response_length
+                while remaining > 0:
+                    chunk = source.read(min(1024 * 1024, remaining))
                     if not chunk:
                         break
                     try:
@@ -6775,6 +6818,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         LOG.debug("client disconnected before file response could be written")
                         break
+                    remaining -= len(chunk)
         finally:
             if delete_after:
                 path.unlink(missing_ok=True)
@@ -7059,6 +7103,8 @@ def eas_alert_detail(stream: dict[str, Any], alert: dict[str, Any], index: int) 
         "event_type": event.display_name,
         "areas": areas,
         "issued_at": format_local_datetime(issued_at),
+        "issued_at_media": issued_at.astimezone().strftime("%m/%d/%Y; %I:%M %p %Z"),
+        "issued_at_epoch": issued_at.timestamp(),
         "expires_at": format_local_datetime(expires_at),
         "audio_url": f"/api/eas-alert-audio?stream_id={stream.get('id', '')}&alert_id={eas_alert_id(alert, index)}",
         "download_url": f"/api/eas-alert-audio?stream_id={stream.get('id', '')}&alert_id={eas_alert_id(alert, index)}&download=1",
@@ -8439,10 +8485,13 @@ nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #255
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; min-width: 0; }
 .row { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .row label { margin: 0; display: flex; align-items: center; gap: 8px; min-width: 44px; min-height: 44px; }
+.checkbox-row { display: flex; align-items: center; gap: 8px; min-height: 44px; margin-top: 14px; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .receiver-controls { display: flex; flex-wrap: nowrap; gap: 10px; align-items: center; }
 .receiver-control-button { width: 46px; height: 42px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 20px; line-height: 1; flex: 0 0 auto; }
 .receiver-control-button svg { width: 22px; height: 22px; display: block; fill: currentColor; }
+.desktop-volume-control { max-width: 320px; margin: 14px 0; }
+.desktop-volume-control input { width: 100%; }
 .status { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
 .metric { border: 1px solid #d8dde6; border-radius: 6px; padding: 10px; }
 .metric b { display: block; font-size: 12px; color: #526070; text-transform: uppercase; }
@@ -8514,6 +8563,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .effects-layout.effect-detail-active .effects-list { display: none; }
   .effects-layout:not(.effect-detail-active) .effects-detail { display: none; }
   .audio-effects-back { display: inline-block; margin-bottom: 12px; }
+  .desktop-volume-control { display: none; }
 }
 @media (max-width: 900px) and (orientation: landscape) {
   .topbar { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 14px; padding: 10px 16px; }
@@ -8522,6 +8572,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   nav a, nav button { min-height: 40px; padding: 6px 8px; text-align: center; }
   .nav-more-menu { right: 0; left: auto; }
   main { padding: 16px; }
+  .desktop-volume-control { display: none; }
 }
 </style>
 </head>
@@ -8533,7 +8584,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <a id="nav_dashboard" href="/" data-view="dashboard" aria-current="page">Dashboard</a>
       <a id="nav_rtl" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
       <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
-      <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" hidden>EAS alerts</a>
+      <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" data-eas-entry="restore" hidden>EAS alerts</a>
       <span class="nav-more">
         <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
         <span id="nav_more_menu" class="nav-more-menu" role="menu" hidden>
@@ -8712,6 +8763,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M5 19V5l11 7-11 7zm11-14h2v14h-2V5z"></path></svg>
         </button>
       </div>
+      <label class="desktop-volume-control">Volume
+        <input id="receiver_volume" type="range" min="0" max="100" step="1" value="100">
+      </label>
       <div id="receiver-result" class="message"></div>
     </section>
   </div>
@@ -9450,11 +9504,27 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <dt>Issued</dt><dd id="eas_detail_issued">Unknown</dd>
         <dt>Expires</dt><dd id="eas_detail_expires">Unknown</dd>
       </dl>
-      <audio id="eas_alert_audio" controls preload="metadata"></audio>
+      <audio id="eas_alert_audio" preload="metadata"></audio>
+      <div class="receiver-controls" aria-label="EAS alert playback controls">
+        <button id="eas_alert_detail_previous" class="receiver-control-button" type="button" aria-label="Previous alert" title="Previous alert">
+          <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M19 5v14L8 12l11-7zM6 5h2v14H6V5z"></path></svg>
+        </button>
+        <button id="eas_alert_detail_play_pause" class="receiver-control-button" type="button" aria-label="Play" title="Play">
+          <svg id="eas_alert_detail_play_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M8 5v14l11-7L8 5z"></path></svg>
+          <svg id="eas_alert_detail_pause_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false" hidden><path d="M7 5h4v14H7V5zm6 0h4v14h-4V5z"></path></svg>
+        </button>
+        <button id="eas_alert_detail_next" class="receiver-control-button" type="button" aria-label="Next alert" title="Next alert">
+          <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M5 19V5l11 7-11 7zm11-14h2v14h-2V5z"></path></svg>
+        </button>
+      </div>
+      <label class="desktop-volume-control">Volume
+        <input id="eas_alert_volume" type="range" min="0" max="100" step="1" value="100">
+      </label>
+      <label class="checkbox-row"><input id="eas_alert_autoplay" type="checkbox"> Autoplay</label>
       <div class="actions">
         <a id="eas_alert_download" role="button" href="#">Download alert</a>
         <button id="remove_eas_alert" type="button">Remove alert</button>
-        <button id="back_to_eas_alerts" type="button">Back</button>
+        <a id="back_to_eas_alerts" href="/?view=eas_alerts">Alert list</a>
       </div>
       <div id="eas-alert-detail-result" class="message"></div>
     </section>
@@ -9543,6 +9613,14 @@ let easAlertPage = 1;
 let easAlertTotalPages = 1;
 let easAlertReturnPage = 1;
 let lastEasAlertRefreshAt = 0;
+let easAlertDetailPageAlerts = [];
+let easAlertDetailTotalPages = 1;
+let easAlertDetailIsPlaying = false;
+let easAlertAutoplay = false;
+let easAlertDetailStream = null;
+let easAlertDetailCurrent = null;
+let easAlertLastRoute = {view: "eas_alerts", streamId: "", alertId: "", page: 1};
+let easAlertPlaybackVolume = 100;
 let easBulkOptionsSignature = "";
 let easBulkServerNow = null;
 let iqRecorderSignature = "";
@@ -9574,16 +9652,14 @@ let receiverUnstableTimer = null;
 let receiverStatsTimer = null;
 let receiverLastPacketCount = 0;
 let receiverLastPacketAt = 0;
+let receiverPlaybackVolume = 100;
 let unloadLiveAudioStopSent = false;
-let liveAudioHiddenAt = 0;
-let liveAudioNeedsRestart = false;
 let mediaSessionAnchorUrl = "";
 let mediaSessionAnchorStarted = false;
 let currentAccount = null;
 let accountsSignature = "";
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
-const LIVE_AUDIO_BACKGROUND_RESTART_MS = 30000;
 const WEBRTC_JITTER_BUFFER_TARGET_SECONDS = 0.06;
 const MEDIA_SESSION_ANCHOR_SECONDS = 8;
 const MEDIA_SESSION_ANCHOR_SAMPLE_RATE = 8000;
@@ -9615,6 +9691,7 @@ const PROTECTED_AUDIO_BANDS = [
   {min: 2000, max: 2200}
 ];
 let sameAudioContext = null;
+let sameOutputGain = null;
 let sameLiveAudioMuteTimer = null;
 let sameLiveAudioMutedBySame = false;
 let sameActiveSources = new Set();
@@ -9623,6 +9700,11 @@ async function ensureSameAudioContext() {
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
   if (!AudioContextClass) return null;
   if (!sameAudioContext) sameAudioContext = new AudioContextClass();
+  if (!sameOutputGain || sameOutputGain.context !== sameAudioContext) {
+    sameOutputGain = sameAudioContext.createGain();
+    sameOutputGain.connect(sameAudioContext.destination);
+  }
+  updateSameOutputGain();
   if (sameAudioContext.state === "suspended") {
     try {
       await sameAudioContext.resume();
@@ -9632,6 +9714,16 @@ async function ensureSameAudioContext() {
     }
   }
   return sameAudioContext;
+}
+
+function updateSameOutputGain() {
+  if (!sameOutputGain || !sameAudioContext) return;
+  const target = playbackVolumeScalar(receiverPlaybackVolume);
+  try {
+    sameOutputGain.gain.setTargetAtTime(target, sameAudioContext.currentTime, 0.01);
+  } catch (error) {
+    sameOutputGain.gain.value = target;
+  }
 }
 
 function samePayloadBytes(payload) {
@@ -9730,6 +9822,11 @@ function stopGeneratedSameAudio() {
   sameActiveSources.clear();
 }
 
+function stopLiveSamePlayback() {
+  stopGeneratedSameAudio();
+  clearSameLiveAudioMute();
+}
+
 function muteLiveAudioForSame(durationSeconds) {
   const audio = document.getElementById("stream_monitor_audio");
   if (!audio) return;
@@ -9761,7 +9858,7 @@ async function playSamePayload(payload, repetitions = 3, gapSeconds = 1.0) {
   buffer.copyToChannel(samples, 0);
   const source = context.createBufferSource();
   source.buffer = buffer;
-  source.connect(context.destination);
+  source.connect(sameOutputGain || context.destination);
   sameActiveSources.add(source);
   source.addEventListener("ended", () => {
     sameActiveSources.delete(source);
@@ -9893,6 +9990,24 @@ function prepareLiveAudioElement(audio) {
   audio.volume = 1;
 }
 
+function playbackVolumeScalar(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 1;
+  return Math.min(100, Math.max(0, numeric)) / 100;
+}
+
+function applyReceiverPlaybackVolume() {
+  const audio = document.getElementById("stream_monitor_audio");
+  if (!audio || !receiverPeerConnection) return;
+  audio.volume = playbackVolumeScalar(receiverPlaybackVolume);
+}
+
+function applyEasAlertPlaybackVolume() {
+  const audio = document.getElementById("eas_alert_audio");
+  if (!audio) return;
+  audio.volume = playbackVolumeScalar(easAlertPlaybackVolume);
+}
+
 function shouldUseMediaSessionAnchor() {
   return "mediaSession" in navigator;
 }
@@ -10010,7 +10125,7 @@ function monitoredStreamLabel() {
 function clearLiveMediaSession() {
   if (!("mediaSession" in navigator)) return;
   try {
-    for (const action of ["previoustrack", "nexttrack", "play", "pause"]) {
+    for (const action of ["previoustrack", "nexttrack", "play", "pause", "seekto", "seekbackward", "seekforward"]) {
       navigator.mediaSession.setActionHandler(action, null);
     }
     navigator.mediaSession.metadata = null;
@@ -10094,8 +10209,7 @@ function liveAudioPeerIsUnusable(peer) {
 }
 
 function resetLiveAudioElement() {
-  stopGeneratedSameAudio();
-  clearSameLiveAudioMute();
+  stopLiveSamePlayback();
   const audio = document.getElementById("stream_monitor_audio");
   if (!audio) return;
   prepareLiveAudioElement(audio);
@@ -10115,6 +10229,7 @@ function restoreReceiverRemoteAudioElement() {
   if (!audio || !receiverRemoteStream) return null;
   if (audio.srcObject !== receiverRemoteStream) audio.srcObject = receiverRemoteStream;
   prepareLiveAudioElement(audio);
+  applyReceiverPlaybackVolume();
   return audio;
 }
 
@@ -10141,42 +10256,6 @@ function clearLocalStreamMonitor() {
       console.debug("failed to close monitor peer", error);
     }
   }
-}
-
-function markLiveAudioHidden() {
-  if (!monitorPeerConnection && !receiverPeerConnection) return;
-  liveAudioHiddenAt = Date.now();
-}
-
-function markLiveAudioVisible() {
-  if (!liveAudioHiddenAt) return false;
-  const hiddenForMs = Date.now() - liveAudioHiddenAt;
-  liveAudioHiddenAt = 0;
-  if (receiverPaused && receiverPeerConnection && !monitorPeerConnection) {
-    scheduleReceiverMediaSessionRefresh();
-    return false;
-  }
-  if (hiddenForMs >= LIVE_AUDIO_BACKGROUND_RESTART_MS) {
-    liveAudioNeedsRestart = true;
-    logClientEvent("info", "live-audio", "live audio marked stale after page background", {hidden_ms: hiddenForMs});
-    return true;
-  }
-  return false;
-}
-
-async function recoverLiveAudioAfterPageRestore() {
-  const stale = markLiveAudioVisible();
-  scheduleReceiverMediaSessionRefresh();
-  if (!stale) return;
-  if (monitorPeerConnection) {
-    await stopStreamMonitor({notifyServer: true});
-    setStreamResult("Monitoring was paused after the page was backgrounded. Start monitoring again to reconnect.");
-  }
-  if (receiverPeerConnection) {
-    await stopWeatherReceiver({notifyServer: true});
-    setReceiverResult("Receiver paused after the page was backgrounded. Press Play to reconnect.");
-  }
-  liveAudioNeedsRestart = false;
 }
 
 function showMonitorUnstableDialog() {
@@ -10272,8 +10351,9 @@ function startMonitorPacketStats() {
 }
 
 async function startStreamMonitor(streamId) {
+  pauseCurrentEasAlert();
   if (monitorStreamId === streamId && monitorPeerConnection) {
-    if (!liveAudioNeedsRestart && !liveAudioPeerIsUnusable(monitorPeerConnection)) {
+    if (!liveAudioPeerIsUnusable(monitorPeerConnection)) {
       if (monitorPaused) {
         await resumeStreamMonitor();
         return;
@@ -10283,7 +10363,6 @@ async function startStreamMonitor(streamId) {
     }
     logClientEvent("info", "monitor", "restarting stale monitor WebRTC session", {stream_id: streamId});
     await stopStreamMonitor({notifyServer: true});
-    liveAudioNeedsRestart = false;
   }
   logClientEvent("info", "monitor", "monitor start requested", {stream_id: streamId});
   await stopWeatherReceiver({notifyServer: true});
@@ -10443,6 +10522,7 @@ async function pauseStreamMonitor() {
   const streamId = monitorStreamId;
   monitorPaused = true;
   clearMonitorUnstableTimer();
+  stopLiveSamePlayback();
   await request("/api/monitor/pause", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
@@ -10689,11 +10769,11 @@ function setReceiverAudioTracksEnabled(enabled) {
 }
 
 async function startWeatherReceiver() {
+  pauseCurrentEasAlert();
   if (receiverPeerConnection) {
-    if (liveAudioNeedsRestart || liveAudioPeerIsUnusable(receiverPeerConnection) || !receiverRemoteStream) {
+    if (liveAudioPeerIsUnusable(receiverPeerConnection) || !receiverRemoteStream) {
       logClientEvent("info", "receiver", "restarting stale receiver WebRTC session", {frequency: currentReceiverChannel().label});
       await stopWeatherReceiver({notifyServer: true});
-      liveAudioNeedsRestart = false;
     } else {
       logClientEvent("info", "receiver", "receiver resume requested", {frequency: currentReceiverChannel().label});
       await request("/api/receiver/resume", {
@@ -10709,6 +10789,7 @@ async function startWeatherReceiver() {
       setReceiverAudioTracksEnabled(true);
       if (audio && audio.srcObject) {
         prepareLiveAudioElement(audio);
+        applyReceiverPlaybackVolume();
         await audio.play();
         logClientEvent("info", "receiver", "receiver audio element playback resumed", mediaSessionDiagnostics(audio));
       }
@@ -10760,6 +10841,7 @@ async function startWeatherReceiver() {
     receiverRemoteStream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
     audio.srcObject = receiverRemoteStream;
     prepareLiveAudioElement(audio);
+    applyReceiverPlaybackVolume();
     setReceiverAudioTracksEnabled(true);
     audio.play()
       .then(() => logClientEvent("info", "receiver", "receiver audio element playback started", mediaSessionDiagnostics(audio)))
@@ -10846,8 +10928,7 @@ async function stopWeatherReceiver(options = {}) {
   receiverPaused = preserveMediaSession && !!peer;
   clearReceiverWatchdogs();
   if (preserveMediaSession && peer) {
-    stopGeneratedSameAudio();
-    clearSameLiveAudioMute();
+    stopLiveSamePlayback();
     setReceiverAudioTracksEnabled(true);
     logClientEvent("info", "receiver", "receiver pause requested", {frequency: currentReceiverChannel().label});
     await request("/api/receiver/pause", {
@@ -13265,12 +13346,14 @@ function renderDashboardRecentAlerts(alerts) {
     alertLink.dataset.streamId = alert.stream_id || "";
     alertLink.dataset.alertId = alert.id || "";
     alertLink.dataset.page = "1";
+    alertLink.dataset.easEntry = "detail";
     alertLink.textContent = sentenceCaseAlertName(alert.event_name);
     const allLink = document.createElement("a");
     allLink.href = routeForView("eas_alerts", {streamId: alert.stream_id || "", page: 1});
     allLink.dataset.view = "eas_alerts";
     allLink.dataset.streamId = alert.stream_id || "";
     allLink.dataset.page = "1";
+    allLink.dataset.easEntry = "list";
     allLink.textContent = `View all EAS alerts for ${alert.callsign || "this stream"}`;
     item.appendChild(alertLink);
     item.append(` issued ${relativeTimeAgo(alert.issued_at_epoch)} on ${alert.callsign || "Unknown"}. `);
@@ -14198,7 +14281,7 @@ async function exportEasAlerts() {
     document.body.appendChild(link);
     link.click();
     link.remove();
-    navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+    navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
   } catch (error) {
     setEasBulkResult("export", error.message, "error");
   }
@@ -14218,7 +14301,7 @@ async function deleteEasAlerts() {
     }
     const confirmed = window.confirm(`${count.count} alert${count.count === 1 ? "" : "s"} and their audio files will be permanently deleted.`);
     if (!confirmed) {
-      navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+      navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
       return;
     }
     const response = await request("/api/eas-alert-delete", {
@@ -14291,6 +14374,222 @@ async function loadEasAlerts(options = {}) {
   }
 }
 
+async function fetchEasAlertPage(page) {
+  if (!easAlertStreamId) return {alerts: [], page: 1, total_pages: 1};
+  return request(`/api/eas-alerts?stream_id=${encodeURIComponent(easAlertStreamId)}&page=${encodeURIComponent(Math.max(1, Number(page || 1)))}&per_page=${EAS_ALERTS_PER_PAGE}`);
+}
+
+function currentEasAlertPageIndex() {
+  return easAlertDetailPageAlerts.findIndex(alert => alert.id === easAlertDetailId);
+}
+
+async function updateEasAlertDetailNavigation() {
+  if (!easAlertStreamId || !easAlertDetailId) {
+    easAlertDetailPageAlerts = [];
+    easAlertDetailTotalPages = 1;
+    setEasAlertDetailNavButtons();
+    return;
+  }
+  const pageData = await fetchEasAlertPage(easAlertReturnPage);
+  easAlertDetailPageAlerts = pageData.alerts || [];
+  easAlertDetailTotalPages = Number(pageData.total_pages || 1);
+  setEasAlertDetailNavButtons();
+}
+
+function setEasAlertDetailNavButtons() {
+  const index = currentEasAlertPageIndex();
+  const previousButton = document.getElementById("eas_alert_detail_previous");
+  const nextButton = document.getElementById("eas_alert_detail_next");
+  const hasPreviousOlder = index >= 0 && (index < easAlertDetailPageAlerts.length - 1 || easAlertReturnPage < easAlertDetailTotalPages);
+  const hasNextNewer = index >= 0 && (index > 0 || easAlertReturnPage > 1);
+  setDisabled(previousButton, !hasPreviousOlder);
+  setDisabled(nextButton, !hasNextNewer);
+}
+
+function setEasAlertPlaybackState(playing) {
+  easAlertDetailIsPlaying = Boolean(playing);
+  const button = document.getElementById("eas_alert_detail_play_pause");
+  const playIcon = document.getElementById("eas_alert_detail_play_icon");
+  const pauseIcon = document.getElementById("eas_alert_detail_pause_icon");
+  const label = easAlertDetailIsPlaying ? "Pause" : "Play";
+  if (button) {
+    button.setAttribute("aria-label", label);
+    button.title = label;
+  }
+  if (playIcon) playIcon.hidden = easAlertDetailIsPlaying;
+  if (pauseIcon) pauseIcon.hidden = !easAlertDetailIsPlaying;
+  updateEasAlertMediaSession();
+}
+
+async function playCurrentEasAlert() {
+  const audio = document.getElementById("eas_alert_audio");
+  if (!audio || !audio.src) return;
+  if (monitorPeerConnection || receiverPeerConnection) {
+    await stopStreamMonitor({notifyServer: true});
+    await stopWeatherReceiver({notifyServer: true});
+  }
+  applyEasAlertPlaybackVolume();
+  await audio.play();
+  setEasAlertPlaybackState(true);
+}
+
+function pauseCurrentEasAlert() {
+  const audio = document.getElementById("eas_alert_audio");
+  if (audio) audio.pause();
+  setEasAlertPlaybackState(false);
+}
+
+function stopCurrentEasAlertForSwitch() {
+  const audio = document.getElementById("eas_alert_audio");
+  if (!audio) {
+    setEasAlertPlaybackState(false);
+    return;
+  }
+  try {
+    audio.pause();
+    if (Number.isFinite(audio.duration) && audio.currentTime !== 0) audio.currentTime = 0;
+    audio.removeAttribute("src");
+    audio.load();
+  } catch (error) {
+    console.debug("EAS alert audio stop before switch failed", error);
+  }
+  setEasAlertPlaybackState(false);
+}
+
+function easAlertMediaTitle() {
+  const alert = easAlertDetailCurrent || {};
+  const eventType = alert.event_type || "EAS alert";
+  const issued = alert.issued_at_media || alert.issued_at || "unknown time";
+  return `${eventType} from ${issued}`;
+}
+
+function easAlertMediaAlbum() {
+  const stream = easAlertDetailStream || {};
+  return `EAS Alerts from ${stream.callsign || "Unknown"}`;
+}
+
+function updateEasAlertPositionState() {
+  if (!("mediaSession" in navigator) || typeof navigator.mediaSession.setPositionState !== "function") return;
+  const audio = document.getElementById("eas_alert_audio");
+  if (!audio || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
+  const position = Number.isFinite(audio.currentTime) ? Math.min(Math.max(0, audio.currentTime), audio.duration) : 0;
+  try {
+    navigator.mediaSession.setPositionState({
+      duration: audio.duration,
+      playbackRate: Number.isFinite(audio.playbackRate) && audio.playbackRate > 0 ? audio.playbackRate : 1,
+      position
+    });
+  } catch (error) {
+    console.debug("EAS alert media session position update failed", error);
+  }
+}
+
+function seekEasAlertAudio(target) {
+  const audio = document.getElementById("eas_alert_audio");
+  if (!audio || !Number.isFinite(target)) return;
+  const duration = Number.isFinite(audio.duration) ? audio.duration : target;
+  const clamped = Math.min(Math.max(0, target), duration);
+  if (typeof audio.fastSeek === "function") audio.fastSeek(clamped);
+  else audio.currentTime = clamped;
+  updateEasAlertPositionState();
+}
+
+function setEasAlertMediaAction(action, handler) {
+  try {
+    navigator.mediaSession.setActionHandler(action, handler);
+  } catch (error) {
+    console.debug(`EAS alert media session action ${action} is not supported`, error);
+  }
+}
+
+function updateEasAlertMediaSession() {
+  if (!("mediaSession" in navigator) || !("MediaMetadata" in window) || !easAlertDetailCurrent) return;
+  if (monitorPeerConnection || receiverPeerConnection) return;
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: easAlertMediaTitle(),
+    artist: "NWR Stream Manager",
+    album: easAlertMediaAlbum()
+  });
+  navigator.mediaSession.playbackState = easAlertDetailIsPlaying ? "playing" : "paused";
+  updateEasAlertPositionState();
+  setEasAlertMediaAction("previoustrack", () => {
+    navigateEasAlertDetail("previous", {autoplay: true}).catch(error => setEasAlertDetailResult(error.message, "error"));
+  });
+  setEasAlertMediaAction("nexttrack", () => {
+    navigateEasAlertDetail("next", {autoplay: true}).catch(error => setEasAlertDetailResult(error.message, "error"));
+  });
+  setEasAlertMediaAction("play", () => {
+    playCurrentEasAlert().catch(error => setEasAlertDetailResult(`Alert audio could not start: ${error.message}`, "error"));
+  });
+  setEasAlertMediaAction("pause", () => {
+    pauseCurrentEasAlert();
+  });
+  setEasAlertMediaAction("seekto", event => {
+    if (!event || !Number.isFinite(event.seekTime)) return;
+    seekEasAlertAudio(event.seekTime);
+  });
+}
+
+function clearEasAlertMediaSession() {
+  easAlertDetailCurrent = null;
+  easAlertDetailStream = null;
+  if (monitorPeerConnection) updateMonitorMediaSession();
+  else if (receiverPeerConnection) updateReceiverMediaSession();
+  else clearLiveMediaSession();
+}
+
+function clearEasAlertBrowserMediaSession() {
+  if (monitorPeerConnection) updateMonitorMediaSession();
+  else if (receiverPeerConnection) updateReceiverMediaSession();
+  else clearLiveMediaSession();
+}
+
+async function navigateEasAlertDetail(direction, options = {}) {
+  const replace = options.replace === true;
+  const autoplay = options.autoplay === true;
+  await updateEasAlertDetailNavigation();
+  const index = currentEasAlertPageIndex();
+  if (index < 0) return false;
+  let target = null;
+  let targetPage = easAlertReturnPage;
+  if (direction === "previous") {
+    if (index < easAlertDetailPageAlerts.length - 1) {
+      target = easAlertDetailPageAlerts[index + 1];
+    } else if (easAlertReturnPage < easAlertDetailTotalPages) {
+      targetPage = easAlertReturnPage + 1;
+      const pageData = await fetchEasAlertPage(targetPage);
+      target = (pageData.alerts || [])[0] || null;
+    }
+  } else if (direction === "next") {
+    if (index > 0) {
+      target = easAlertDetailPageAlerts[index - 1];
+    } else if (easAlertReturnPage > 1) {
+      targetPage = easAlertReturnPage - 1;
+      const pageData = await fetchEasAlertPage(targetPage);
+      const alerts = pageData.alerts || [];
+      target = alerts[alerts.length - 1] || null;
+    }
+  }
+  if (!target || !target.id) {
+    setEasAlertDetailNavButtons();
+    return false;
+  }
+  stopCurrentEasAlertForSwitch();
+  easAlertDetailId = target.id;
+  easAlertReturnPage = targetPage;
+  navigateTo("eas_alert_detail", {
+    streamId: easAlertStreamId,
+    alertId: easAlertDetailId,
+    page: easAlertReturnPage
+  }, replace, true);
+  if (autoplay) {
+    window.setTimeout(() => {
+      playCurrentEasAlert().catch(error => setEasAlertDetailResult(`Alert audio could not start: ${error.message}`, "error"));
+    }, 250);
+  }
+  return true;
+}
+
 async function loadEasAlertDetail() {
   if (!easAlertStreamId || !easAlertDetailId) {
     setEasAlertDetailResult("EAS alert was not found.", "error");
@@ -14299,13 +14598,24 @@ async function loadEasAlertDetail() {
   try {
     const data = await request(`/api/eas-alert?stream_id=${encodeURIComponent(easAlertStreamId)}&alert_id=${encodeURIComponent(easAlertDetailId)}`);
     const alert = data.alert || {};
+    easAlertDetailStream = data.stream || null;
+    easAlertDetailCurrent = alert;
     setText("eas_alert_detail_title", alert.event_type || "EAS alert");
     setText("eas_detail_event", alert.event_type || "Unknown event");
     setText("eas_detail_areas", Array.isArray(alert.areas) && alert.areas.length ? alert.areas.join(", ") : "Unknown area");
     setText("eas_detail_issued", alert.issued_at || "Unknown");
     setText("eas_detail_expires", alert.expires_at || "Unknown");
-    document.getElementById("eas_alert_audio").src = alert.audio_url || "";
+    const audio = document.getElementById("eas_alert_audio");
+    if (audio.src !== alert.audio_url) {
+      audio.src = alert.audio_url || "";
+      audio.currentTime = 0;
+      applyEasAlertPlaybackVolume();
+      audio.load();
+    }
     document.getElementById("eas_alert_download").href = alert.download_url || "#";
+    document.getElementById("back_to_eas_alerts").href = routeForView("eas_alerts", {streamId: easAlertStreamId, page: easAlertReturnPage});
+    await updateEasAlertDetailNavigation();
+    setEasAlertPlaybackState(Boolean(audio && !audio.paused && !audio.ended));
     setPageTitle(`Details for alert ${alert.event_type || "EAS alert"} issued on ${alert.issued_at || "an unknown time"}`);
     setEasAlertDetailResult("");
   } catch (error) {
@@ -14419,6 +14729,33 @@ function showView(name) {
 function currentViewName() {
   const visible = Array.from(document.querySelectorAll(".view")).find(view => !view.hidden);
   return visible ? visible.id.replace(/^view_/, "") : "dashboard";
+}
+
+function isEasAlertsView(name) {
+  return ["eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name);
+}
+
+function easRouteFromParams(view, params = {}) {
+  return {
+    view,
+    streamId: params.streamId || "",
+    alertId: params.alertId || "",
+    page: Math.max(1, Number(params.page || 1))
+  };
+}
+
+function rememberEasRoute(view, params = {}) {
+  if (view === "eas_alert_detail" && params.alertId) {
+    easAlertLastRoute = easRouteFromParams(view, params);
+    return;
+  }
+  if (view === "eas_alerts") {
+    easAlertLastRoute = easRouteFromParams(view, params);
+  }
+}
+
+function restoredEasRoute() {
+  return Object.assign({view: "eas_alerts", streamId: "", alertId: "", page: 1}, easAlertLastRoute || {});
 }
 
 function routeForView(name, params = {}) {
@@ -14592,6 +14929,7 @@ function applyRoute(route) {
   if (route.view === "eas_alerts") {
     easAlertStreamId = route.streamId || easAlertStreamId;
     easAlertPage = Math.max(1, Number(route.page || 1));
+    rememberEasRoute("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
     showView("eas_alerts");
     loadEasAlertStreams({preserve: true, forceList: true});
     return;
@@ -14608,6 +14946,7 @@ function applyRoute(route) {
     easAlertStreamId = route.streamId || easAlertStreamId;
     easAlertDetailId = route.alertId || "";
     easAlertReturnPage = Math.max(1, Number(route.page || 1));
+    rememberEasRoute("eas_alert_detail", {streamId: easAlertStreamId, alertId: easAlertDetailId, page: easAlertReturnPage});
     showView("eas_alert_detail");
     loadEasAlertDetail();
     return;
@@ -15231,6 +15570,9 @@ function applyStatus(data, options = {}) {
   if (now - lastEasAlertRefreshAt > 10000) {
     lastEasAlertRefreshAt = now;
     loadEasAlertStreams({preserve: true, quiet: true});
+    if (currentViewName() === "eas_alert_detail") {
+      updateEasAlertDetailNavigation().catch(error => console.debug("EAS alert detail navigation refresh failed", error));
+    }
   }
   if (currentViewName().startsWith("iq_") && now - lastIqRecordingsRefreshAt > 5000) {
     lastIqRecordingsRefreshAt = now;
@@ -15490,13 +15832,29 @@ document.addEventListener("click", event => {
     return;
   }
   event.preventDefault();
-  navigateTo(link.dataset.view, {
+  const currentView = currentViewName();
+  let targetView = link.dataset.view;
+  let targetParams = {
     streamId: link.dataset.streamId || "",
     outputId: link.dataset.outputId || "",
     alertId: link.dataset.alertId || "",
     recordingId: link.dataset.recordingId || "",
     page: Number(link.dataset.page || 1)
-  });
+  };
+  if (targetView === "eas_alerts" && link.dataset.easEntry === "restore") {
+    const restored = restoredEasRoute();
+    targetView = restored.view;
+    targetParams = {streamId: restored.streamId, alertId: restored.alertId, page: restored.page};
+  }
+  if (isEasAlertsView(targetView) && link.dataset.easEntry === "list") {
+    pauseCurrentEasAlert();
+    targetView = "eas_alerts";
+    targetParams.alertId = "";
+  } else if (targetView === "eas_alert_detail" && link.dataset.easEntry === "detail" && !isEasAlertsView(currentView)) {
+    pauseCurrentEasAlert();
+  }
+  const replace = isEasAlertsView(currentView) && isEasAlertsView(targetView);
+  navigateTo(targetView, targetParams, replace);
 });
 
 document.getElementById("nav_more_button").addEventListener("click", () => {
@@ -15617,6 +15975,11 @@ document.getElementById("dismiss_receiver_unstable").addEventListener("click", d
 
 document.getElementById("receiver_previous").addEventListener("click", receiverPreviousChannel);
 document.getElementById("receiver_next").addEventListener("click", receiverNextChannel);
+document.getElementById("receiver_volume").addEventListener("input", event => {
+  receiverPlaybackVolume = Number(event.target.value);
+  applyReceiverPlaybackVolume();
+  updateSameOutputGain();
+});
 document.getElementById("receiver_play_pause").addEventListener("click", async () => {
   try {
     if (receiverPeerConnection && !receiverPaused) {
@@ -16724,8 +17087,6 @@ function sendLiveAudioStopBeacon(options = {}) {
 }
 
 window.addEventListener("pagehide", event => {
-  markLiveAudioHidden();
-  scheduleReceiverMediaSessionRefresh();
   if (event.persisted) return;
   sendWizardSoundcardPreviewDiscardBeacon();
   if (document.visibilityState === "hidden") return;
@@ -16734,16 +17095,6 @@ window.addEventListener("pagehide", event => {
 
 window.addEventListener("pageshow", () => {
   unloadLiveAudioStopSent = false;
-  recoverLiveAudioAfterPageRestore().catch(error => console.debug("live audio page restore recovery failed", error));
-});
-
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    markLiveAudioHidden();
-    scheduleReceiverMediaSessionRefresh();
-    return;
-  }
-  recoverLiveAudioAfterPageRestore().catch(error => console.debug("live audio visibility recovery failed", error));
 });
 
 const liveAudioElement = document.getElementById("stream_monitor_audio");
@@ -16780,18 +17131,18 @@ document.getElementById("eas_alert_stream").addEventListener("change", event => 
   easAlertPage = 1;
   easAlertListSignature = "";
   easBulkOptionsSignature = "";
-  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
 });
 
 document.getElementById("open_eas_export").addEventListener("click", () => {
   easBulkOptionsSignature = "";
-  navigateTo("eas_alert_export", {streamId: easAlertStreamId, page: easAlertPage});
+  navigateTo("eas_alert_export", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
 });
 
 document.getElementById("open_eas_delete").addEventListener("click", () => {
   if (accountIsReadOnly()) return;
   easBulkOptionsSignature = "";
-  navigateTo("eas_alert_delete", {streamId: easAlertStreamId, page: easAlertPage});
+  navigateTo("eas_alert_delete", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
 });
 
 document.getElementById("eas_export_options").addEventListener("change", () => updateManualRangeVisibility("export"));
@@ -16817,13 +17168,13 @@ document.getElementById("cancel_eas_delete").addEventListener("click", () => {
 document.getElementById("eas_alert_prev").addEventListener("click", () => {
   if (easAlertPage <= 1) return;
   easAlertPage -= 1;
-  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
 });
 
 document.getElementById("eas_alert_next").addEventListener("click", () => {
   if (easAlertPage >= easAlertTotalPages) return;
   easAlertPage += 1;
-  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
 });
 
 document.getElementById("eas-alert-list").addEventListener("click", event => {
@@ -16837,17 +17188,78 @@ document.getElementById("eas-alert-list").addEventListener("click", event => {
     streamId: easAlertStreamId,
     alertId: easAlertDetailId,
     page: easAlertReturnPage
-  });
+  }, true, true);
 });
 
-document.getElementById("back_to_eas_alerts").addEventListener("click", () => {
-  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertReturnPage});
+document.getElementById("back_to_eas_alerts").addEventListener("click", event => {
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  pauseCurrentEasAlert();
+  easAlertDetailId = "";
+  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertReturnPage}, true, true);
 });
 
 document.getElementById("remove_eas_alert").addEventListener("click", async () => {
   if (accountIsReadOnly()) return;
   if (!window.confirm("Remove this EAS alert and its audio file?")) return;
   await removeCurrentEasAlert();
+});
+
+document.getElementById("eas_alert_detail_previous").addEventListener("click", () => {
+  const shouldResume = easAlertDetailIsPlaying;
+  navigateEasAlertDetail("previous", {replace: true, autoplay: shouldResume}).catch(error => setEasAlertDetailResult(error.message, "error"));
+});
+
+document.getElementById("eas_alert_detail_next").addEventListener("click", () => {
+  const shouldResume = easAlertDetailIsPlaying;
+  navigateEasAlertDetail("next", {replace: true, autoplay: shouldResume}).catch(error => setEasAlertDetailResult(error.message, "error"));
+});
+
+document.getElementById("eas_alert_detail_play_pause").addEventListener("click", () => {
+  if (easAlertDetailIsPlaying) {
+    pauseCurrentEasAlert();
+  } else {
+    playCurrentEasAlert().catch(error => setEasAlertDetailResult(`Alert audio could not start: ${error.message}`, "error"));
+  }
+});
+
+document.getElementById("eas_alert_autoplay").addEventListener("change", event => {
+  easAlertAutoplay = Boolean(event.target.checked);
+});
+
+document.getElementById("eas_alert_volume").addEventListener("input", event => {
+  easAlertPlaybackVolume = Number(event.target.value);
+  applyEasAlertPlaybackVolume();
+});
+
+document.getElementById("eas_alert_audio").addEventListener("play", () => {
+  setEasAlertPlaybackState(true);
+});
+
+document.getElementById("eas_alert_audio").addEventListener("pause", () => {
+  setEasAlertPlaybackState(false);
+});
+
+for (const eventName of ["loadedmetadata", "durationchange", "timeupdate", "seeked", "ratechange"]) {
+  document.getElementById("eas_alert_audio").addEventListener(eventName, () => {
+    updateEasAlertPositionState();
+  });
+}
+
+document.getElementById("eas_alert_audio").addEventListener("ended", async () => {
+  setEasAlertPlaybackState(false);
+  updateEasAlertPositionState();
+  if (!easAlertAutoplay) {
+    clearEasAlertBrowserMediaSession();
+    return;
+  }
+  try {
+    const advanced = await navigateEasAlertDetail("next", {replace: true, autoplay: true});
+    if (!advanced) clearEasAlertBrowserMediaSession();
+  } catch (error) {
+    clearEasAlertBrowserMediaSession();
+    setEasAlertDetailResult(error.message, "error");
+  }
 });
 
 async function refresh() {
