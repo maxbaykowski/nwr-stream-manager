@@ -2210,6 +2210,38 @@ class AuthSessionStore:
                 self.sessions.pop(token, None)
 
 
+def enrich_live_same_event(event: dict[str, Any]) -> dict[str, Any]:
+    if event.get("type") not in {"same_header", "same_alert_confirmed"}:
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return event
+    parsed = payload.get("parsed")
+    if not isinstance(parsed, dict):
+        return event
+    same_event = lookup_event(str(parsed.get("event_type", "")))
+    fips_codes = parsed.get("fips_codes", [])
+    if not isinstance(fips_codes, (list, tuple)):
+        fips_codes = []
+    areas = [
+        format_same_location_for_alert(str(code))
+        for code in fips_codes
+        if isinstance(code, str) and code.strip()
+    ]
+    start_time = parse_utc_datetime(str(parsed.get("start_time_utc", "")))
+    duration_seconds = int(parsed.get("duration_seconds") or 0)
+    expires_at = start_time + timedelta(seconds=max(0, duration_seconds))
+    enriched = dict(event)
+    enriched_payload = dict(payload)
+    enriched_payload["display"] = {
+        "event_name": same_event.display_name,
+        "areas": areas,
+        "expires_at": format_local_time(expires_at),
+    }
+    enriched["payload"] = enriched_payload
+    return enriched
+
+
 class SameAwareWebRtcAudioSource:
     def __init__(self, *, sample_rate: int = IQ_SAMPLE_RATE, event_queue: SameEventQueue | None = None) -> None:
         self.audio_source = WebRtcAudioSource(sample_rate=sample_rate)
@@ -2218,10 +2250,11 @@ class SameAwareWebRtcAudioSource:
         self.event_queue = event_queue
         self.paused = False
         self.lock = threading.Lock()
+        event_sink = (lambda event: event_queue.put(enrich_live_same_event(event))) if event_queue is not None else None
         self.suppressor = (
             SameSuppressionProcessor(
                 sample_rate=sample_rate,
-                event_sink=event_queue.put,
+                event_sink=event_sink,
             )
             if event_queue is not None
             else None
@@ -7277,6 +7310,12 @@ def format_local_datetime(value: datetime, *, separator: str = ",") -> str:
     return f"{date_text} {separator} {time_text}"
 
 
+def format_local_time(value: datetime) -> str:
+    local = value.astimezone()
+    time_text = local.strftime("%I:%M %p %Z")
+    return time_text[1:] if time_text.startswith("0") else time_text
+
+
 def sentence_case_event(name: str) -> str:
     if not name:
         return "Unknown event"
@@ -8533,6 +8572,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 .notice-dialog { position: fixed; right: 24px; bottom: 24px; z-index: 20; max-width: min(420px, calc(100vw - 48px)); padding: 16px; border: 1px solid #b9c0cc; border-radius: 8px; background: #fff; box-shadow: 0 12px 30px rgb(20 24 31 / 22%); }
 .notice-dialog h2 { font-size: 18px; margin-bottom: 8px; }
 .notice-dialog p { margin: 0 0 14px; }
+.same-alert-flash { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 25; width: min(720px, calc(100vw - 32px)); padding: 14px 16px; border: 2px solid #b00020; border-radius: 8px; background: #fff4f4; color: #14181f; box-shadow: 0 12px 30px rgb(20 24 31 / 22%); font-weight: 700; }
+.screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .media-session-audio { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 @media (prefers-color-scheme: dark) {
   body { background: #101318; color: #eef2f7; }
@@ -8550,6 +8591,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .tabs { border-color: #333b48; }
   .tabs button[aria-selected="true"] { border-bottom-color: #181d24; }
   .notice-dialog { background: #181d24; border-color: #333b48; }
+  .same-alert-flash { background: #2a1518; color: #eef2f7; border-color: #ff6b7a; }
 }
 @media (max-width: 680px) {
   .topbar { display: grid; grid-template-columns: 1fr; align-items: start; gap: 12px; padding: 14px 16px; }
@@ -8639,6 +8681,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <a href="/?view=iq_recorder" data-view="iq_recorder">Return to I/Q recorder</a>
   <span id="iq_recording_banner_elapsed">0:00</span>
 </div>
+<div id="same_alert_flash" class="same-alert-flash" hidden></div>
+<div id="same_alert_live" class="screen-reader-only" aria-live="assertive" aria-relevant="additions text" aria-atomic="false"></div>
 <main>
   <div id="view_dashboard" class="view">
     <section id="dashboard_sdr_section">
@@ -9696,6 +9740,9 @@ let sameOutputGain = null;
 let sameLiveAudioMuteTimer = null;
 let sameLiveAudioMutedBySame = false;
 let sameActiveSources = new Set();
+let sameAlertFlashTimer = null;
+let sameAlertLastAnnouncementId = "";
+let sameAlertLiveRegionTimer = null;
 
 async function ensureSameAudioContext() {
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -9799,6 +9846,112 @@ function shouldSuppressLiveSamePlayback() {
   return Boolean(receiverPeerConnection && receiverPaused && !monitorStreamId);
 }
 
+function shouldAnnounceReceiverSameAlert() {
+  return Boolean(receiverPeerConnection && receiverPlaying && !receiverPaused && !monitorStreamId);
+}
+
+function articleForPhrase(phrase) {
+  const text = String(phrase || "").trim();
+  if (!text) return "An";
+  return /^[aeiou]/i.test(text) ? "An" : "A";
+}
+
+function sameAlertDisplayData(event) {
+  const payload = event && event.payload && typeof event.payload === "object" ? event.payload : {};
+  const display = payload.display && typeof payload.display === "object" ? payload.display : {};
+  const parsed = payload.parsed && typeof payload.parsed === "object" ? payload.parsed : {};
+  const eventName = String(display.event_name || parsed.event_type || "EAS alert").trim();
+  const areas = Array.isArray(display.areas) ? display.areas.map(area => String(area).trim()).filter(Boolean) : [];
+  const areaText = areas.length ? areas.join(", ") : "an unknown area";
+  const expiresAt = String(display.expires_at || "").trim();
+  const expiresText = expiresAt ? `, effective until ${expiresAt}` : "";
+  return {
+    eventName,
+    fullText: `${articleForPhrase(eventName)} ${eventName} has been issued for ${areaText}${expiresText}.`
+  };
+}
+
+function shouldUseCompactSameAlertFlash() {
+  const width = Math.min(window.innerWidth || 0, document.documentElement.clientWidth || window.innerWidth || 0);
+  const height = Math.min(window.innerHeight || 0, document.documentElement.clientHeight || window.innerHeight || 0);
+  if (width >= 700) return false;
+  if (width >= 640 && width > height) return false;
+  return true;
+}
+
+function renderSameAlertFlashText(element, displayData) {
+  element.textContent = "";
+  if (!shouldUseCompactSameAlertFlash()) {
+    element.textContent = displayData.fullText;
+    return;
+  }
+  const visualText = document.createElement("span");
+  visualText.textContent = displayData.eventName;
+  element.append(visualText);
+}
+
+function hideSameAlertFlash() {
+  if (sameAlertFlashTimer) {
+    clearTimeout(sameAlertFlashTimer);
+    sameAlertFlashTimer = null;
+  }
+  const element = document.getElementById("same_alert_flash");
+  if (!element) return;
+  element.hidden = true;
+}
+
+function announceSameAlertForScreenReaders(text) {
+  const liveRegion = document.getElementById("same_alert_live");
+  if (!liveRegion) return;
+  if (sameAlertLiveRegionTimer) {
+    clearTimeout(sameAlertLiveRegionTimer);
+    sameAlertLiveRegionTimer = null;
+  }
+  liveRegion.replaceChildren();
+  window.setTimeout(() => {
+    const alert = document.createElement("div");
+    alert.setAttribute("role", "alert");
+    alert.setAttribute("aria-atomic", "true");
+    alert.textContent = text;
+    liveRegion.append(alert);
+  }, 50);
+  sameAlertLiveRegionTimer = setTimeout(() => {
+    liveRegion.replaceChildren();
+    sameAlertLiveRegionTimer = null;
+  }, 2500);
+}
+
+function flashReceiverSameAlert(event) {
+  if (!shouldAnnounceReceiverSameAlert()) {
+    logClientEvent("info", "same", "skipped receiver SAME alert announcement", {
+      receiver_peer: Boolean(receiverPeerConnection),
+      receiver_playing: Boolean(receiverPlaying),
+      receiver_paused: Boolean(receiverPaused),
+      monitor_stream_id: monitorStreamId || ""
+    });
+    return;
+  }
+  const eventId = String(event && event.id || "");
+  if (eventId && eventId === sameAlertLastAnnouncementId) return;
+  sameAlertLastAnnouncementId = eventId;
+  const element = document.getElementById("same_alert_flash");
+  if (!element) return;
+  const displayData = sameAlertDisplayData(event);
+  announceSameAlertForScreenReaders(displayData.fullText);
+  if (sameAlertFlashTimer) clearTimeout(sameAlertFlashTimer);
+  element.textContent = "";
+  element.hidden = false;
+  window.setTimeout(() => {
+    renderSameAlertFlashText(element, displayData);
+  }, 20);
+  sameAlertFlashTimer = setTimeout(hideSameAlertFlash, 5000);
+  logClientEvent("info", "same", "receiver SAME alert announcement shown", {
+    id: eventId,
+    event_name: displayData.eventName,
+    compact: shouldUseCompactSameAlertFlash()
+  });
+}
+
 function clearSameLiveAudioMute() {
   if (sameLiveAudioMuteTimer) {
     clearTimeout(sameLiveAudioMuteTimer);
@@ -9826,6 +9979,7 @@ function stopGeneratedSameAudio() {
 function stopLiveSamePlayback() {
   stopGeneratedSameAudio();
   clearSameLiveAudioMute();
+  hideSameAlertFlash();
 }
 
 function muteLiveAudioForSame(durationSeconds) {
@@ -9876,6 +10030,9 @@ function handleLiveSameEvent(event) {
     playSamePayload(rawHeader, Number(event.payload.repetitions || 3), Number(event.payload.gap_seconds || 1.0)).catch(error => {
       logClientEvent("warning", "same", "SAME header playback failed", {error: error.message});
     });
+  } else if (event.type === "same_alert_confirmed") {
+    logClientEvent("info", "same", "received confirmed live SAME alert event", {id: event.id});
+    flashReceiverSameAlert(event);
   } else if (event.type === "same_eom") {
     logClientEvent("info", "same", "received live SAME EOM event", {id: event.id});
     playSamePayload("NNNN", Number(event.payload && event.payload.repetitions || 3), Number(event.payload && event.payload.gap_seconds || 1.0)).catch(error => {

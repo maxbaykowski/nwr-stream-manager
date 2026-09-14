@@ -35,6 +35,7 @@ SAME_DETECT_MIN_SECONDS = 0.08
 SAME_DETECT_END_SECONDS = 0.18
 SAME_CANDIDATE_TIMEOUT_SECONDS = 12.0
 SAME_EVENT_DEDUP_SECONDS = 45.0
+SAME_HEADER_CONFIRM_TIMEOUT_SECONDS = 30.0
 SAME_PREAMBLE_DETECT_MIN_BITS = 28
 SAME_PREAMBLE_DETECT_SECONDS = 0.36
 MULTIMON_RESET_AFTER_PAYLOADS = 3
@@ -491,6 +492,8 @@ class SameSuppressionProcessor:
         self.lookbehind_frames = max(self.min_tone_frames, round(float(lookbehind_seconds) / 0.02))
         self.end_quiet_frames = max(1, round(SAME_DETECT_END_SECONDS / 0.02))
         self.last_events: dict[tuple[str, str], float] = {}
+        self.decoded_header_window: deque[str] = deque(maxlen=3)
+        self.last_decoded_header_at: float | None = None
 
     def close(self) -> None:
         close = getattr(self.decoder, "close", None)
@@ -522,9 +525,13 @@ class SameSuppressionProcessor:
                     "gap_seconds": SAME_INTER_BURST_GAP_SECONDS,
                 },
             )
-            return self._emit_once("header", parsed.raw_header, event)
+            events = self._emit_once("header", parsed.raw_header, event)
+            events.extend(self._confirmed_header_events(parsed))
+            return events
         if payload.startswith("NNNN"):
             self._mark_candidate_validated()
+            self.decoded_header_window.clear()
+            self.last_decoded_header_at = None
             event = SameLiveEvent(
                 type="same_eom",
                 id=same_event_id("eom", "NNNN"),
@@ -629,6 +636,33 @@ class SameSuppressionProcessor:
             return False
         self.last_preamble_check_tone_frames = self.candidate_tone_frames
         return True
+
+    def _confirmed_header_events(self, parsed: SameParsedHeader) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        if (
+            self.last_decoded_header_at is not None
+            and now - self.last_decoded_header_at > SAME_HEADER_CONFIRM_TIMEOUT_SECONDS
+        ):
+            self.decoded_header_window.clear()
+        self.decoded_header_window.append(parsed.raw_header)
+        self.last_decoded_header_at = now
+        if sum(1 for header in self.decoded_header_window if header == parsed.raw_header) < 2:
+            return []
+        event = SameLiveEvent(
+            type="same_alert_confirmed",
+            id=same_event_id("alert-confirmed", parsed.raw_header),
+            sample_offset=self.candidate_start_sample_offset,
+            sample_rate=self.sample_rate,
+            payload={
+                "raw_header": parsed.raw_header,
+                "parsed": asdict(parsed),
+            },
+        )
+        events = self._emit_once("alert-confirmed", parsed.raw_header, event)
+        if events:
+            self.decoded_header_window.clear()
+            self.last_decoded_header_at = None
+        return events
 
     def _emit_once(self, kind: str, key: str, event: SameLiveEvent) -> list[dict[str, Any]]:
         now = time.monotonic()

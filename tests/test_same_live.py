@@ -241,7 +241,7 @@ class SameLiveTests(unittest.TestCase):
         self.assertEqual(events[0]["payload"]["raw_header"], "ZCZC-WXR-TOR-026139+0030-2211907-KDTX/NWS-")
         self.assertEqual(events[0]["payload"]["parsed"]["event_type"], "TOR")
 
-    def test_partial_and_final_headers_emit_once(self) -> None:
+    def test_duplicate_headers_emit_once_and_confirm_alert(self) -> None:
         events = []
         processor = self.same_live.SameSuppressionProcessor(
             sample_rate=24_000,
@@ -254,9 +254,77 @@ class SameLiveTests(unittest.TestCase):
         second = processor.submit_decoded_payload(header)
 
         self.assertEqual(len(first), 1)
-        self.assertEqual(second, [])
-        self.assertEqual(len(events), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["type"], "same_header")
+        self.assertEqual(events[1]["type"], "same_alert_confirmed")
         self.assertEqual(events[0]["payload"]["raw_header"], header)
+        self.assertEqual(events[1]["payload"]["raw_header"], header)
+
+    def test_first_and_third_matching_headers_confirm_alert(self) -> None:
+        events = []
+        processor = self.same_live.SameSuppressionProcessor(
+            sample_rate=24_000,
+            event_sink=events.append,
+            enable_decoder=False,
+        )
+        first = "ZCZC-WXR-RWT-026121-026005-026139+0030-0911515-KGRR/NWS-"
+        second = "ZCZC-WXR-RWT-026121-026005+0030-0911515-KGRR/NWS-"
+
+        processor.submit_decoded_payload(first)
+        processor.submit_decoded_payload(second)
+        third = processor.submit_decoded_payload(first)
+
+        self.assertEqual(len(third), 1)
+        self.assertEqual(third[0]["type"], "same_alert_confirmed")
+        self.assertEqual(third[0]["payload"]["raw_header"], first)
+
+    def test_second_and_third_matching_headers_confirm_alert(self) -> None:
+        events = []
+        processor = self.same_live.SameSuppressionProcessor(
+            sample_rate=24_000,
+            event_sink=events.append,
+            enable_decoder=False,
+        )
+        first = "ZCZC-WXR-RWT-026121+0030-0911515-KGRR/NWS-"
+        second = "ZCZC-WXR-RWT-026121-026005-026139+0030-0911515-KGRR/NWS-"
+
+        processor.submit_decoded_payload(first)
+        processor.submit_decoded_payload(second)
+        third = processor.submit_decoded_payload(second)
+
+        self.assertEqual(len(third), 1)
+        self.assertEqual(third[0]["type"], "same_alert_confirmed")
+        self.assertEqual(third[0]["payload"]["raw_header"], second)
+
+    def test_header_confirmation_window_expires_after_thirty_seconds(self) -> None:
+        processor = self.same_live.SameSuppressionProcessor(
+            sample_rate=24_000,
+            enable_decoder=False,
+        )
+        header = "ZCZC-WXR-RWT-026121-026005-026139+0030-0911515-KGRR/NWS-"
+
+        processor.submit_decoded_payload(header)
+        processor.last_decoded_header_at = time.monotonic() - 31.0
+        second = processor.submit_decoded_payload(header)
+
+        self.assertEqual(second, [])
+        self.assertEqual(list(processor.decoded_header_window), [header])
+
+    def test_confirmed_header_clears_confirmation_window(self) -> None:
+        processor = self.same_live.SameSuppressionProcessor(
+            sample_rate=24_000,
+            enable_decoder=False,
+        )
+        header = "ZCZC-WXR-RWT-026121-026005-026139+0030-0911515-KGRR/NWS-"
+
+        processor.submit_decoded_payload(header)
+        confirmed = processor.submit_decoded_payload(header)
+
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]["type"], "same_alert_confirmed")
+        self.assertEqual(list(processor.decoded_header_window), [])
+        self.assertIsNone(processor.last_decoded_header_at)
 
     def test_detector_candidate_feeds_silence_before_validation(self) -> None:
         processor = self.same_live.SameSuppressionProcessor(
