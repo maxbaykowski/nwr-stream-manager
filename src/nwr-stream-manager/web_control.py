@@ -74,6 +74,7 @@ if __package__:
     from .encoder import PcmResampler, create_audio_encoder
     from .fallback_audio import load_fallback_audio
     from .icecast import IcecastSource
+    from .icecastauth import IcecastSettings, normalize_server, test_mountpoint_authentication
     from .nfm import float_to_s16
     from .rtl import (
         DEFAULT_RTL_SAMPLE_RATE,
@@ -119,6 +120,7 @@ else:
     encoder = importlib.import_module(f"{package_name}.encoder")
     fallback_audio = importlib.import_module(f"{package_name}.fallback_audio")
     icecast_module = importlib.import_module(f"{package_name}.icecast")
+    icecastauth_module = importlib.import_module(f"{package_name}.icecastauth")
     nfm = importlib.import_module(f"{package_name}.nfm")
     rtl = importlib.import_module(f"{package_name}.rtl")
     same_data = importlib.import_module(f"{package_name}.same_data")
@@ -158,6 +160,9 @@ else:
     create_audio_encoder = encoder.create_audio_encoder
     load_fallback_audio = fallback_audio.load_fallback_audio
     IcecastSource = icecast_module.IcecastSource
+    IcecastSettings = icecastauth_module.IcecastSettings
+    normalize_server = icecastauth_module.normalize_server
+    test_mountpoint_authentication = icecastauth_module.test_mountpoint_authentication
     float_to_s16 = nfm.float_to_s16
     DEFAULT_RTL_SAMPLE_RATE = rtl.DEFAULT_RTL_SAMPLE_RATE
     NWR_CENTER_FREQUENCY_HZ = rtl.NWR_CENTER_FREQUENCY_HZ
@@ -182,8 +187,6 @@ else:
     WebRtcError = webrtc.WebRtcError
     create_webrtc_pcm_audio_track = webrtc.create_webrtc_pcm_audio_track
     server_webrtc_capabilities = webrtc.server_webrtc_capabilities
-
-from .icecastauth import IcecastSettings, normalize_server, test_mountpoint_authentication
 
 import numpy as np
 
@@ -3662,13 +3665,20 @@ class WeatherReceiverWorker:
 
 
 class RtlControlService:
-    def __init__(self, state_path: Path, log_handler: RingLogHandler) -> None:
+    def __init__(
+        self,
+        state_path: Path,
+        log_handler: RingLogHandler,
+        *,
+        development_iq_sources_enabled: bool = False,
+    ) -> None:
         self.state_path = state_path
         self.streams_state_path = state_path.with_name(STREAMS_STATE_FILE_NAME)
         self.streams_directory = state_path.parent / STREAMS_DIRECTORY_NAME
         self.iq_recordings_directory = state_path.parent / IQ_RECORDINGS_DIRECTORY_NAME
         self.iq_recordings_index_path = self.iq_recordings_directory / IQ_RECORDINGS_INDEX_FILE_NAME
         self.iq_test_sources_directory = state_path.parent / IQ_TEST_SOURCES_DIRECTORY_NAME
+        self.development_iq_sources_enabled = bool(development_iq_sources_enabled)
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.accounts = AccountStore(state_path.parent / ACCOUNTS_DATABASE_FILE_NAME)
         self.auth_sessions = AuthSessionStore()
@@ -3894,6 +3904,9 @@ class RtlControlService:
                 "storage": self._storage_status_snapshot_locked(),
                 "iq_recorder": self._iq_recorder_status_locked(),
                 "logs": self.log_handler.snapshot()[-80:],
+                "capabilities": {
+                    "development_iq_sources": self.development_iq_sources_enabled,
+                },
             }
 
     def _storage_status_snapshot_locked(self) -> dict[str, Any]:
@@ -5516,6 +5529,7 @@ class RtlControlService:
         )
 
     def iq_test_sources(self) -> dict[str, Any]:
+        self._ensure_development_iq_sources_enabled()
         directory = self.iq_test_sources_directory
         directory.mkdir(parents=True, exist_ok=True)
         files: list[dict[str, Any]] = []
@@ -5550,6 +5564,7 @@ class RtlControlService:
             }
 
     def start_iq_test_source(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_development_iq_sources_enabled()
         file_name = str(payload.get("file_name", "")).strip()
         sample_rate = int(payload.get("sample_rate", 0))
         if not file_name:
@@ -5577,6 +5592,7 @@ class RtlControlService:
         return self.status()
 
     def seek_iq_test_source(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_development_iq_sources_enabled()
         seconds = float(payload.get("seconds", 0.0))
         if seconds == 0.0:
             return self.status()
@@ -5591,6 +5607,7 @@ class RtlControlService:
         return response
 
     def stop_iq_test_source(self) -> dict[str, Any]:
+        self._ensure_development_iq_sources_enabled()
         with self.lock:
             if self.iq_file_source_config is None:
                 return self.status()
@@ -5625,6 +5642,10 @@ class RtlControlService:
         if not path.is_file():
             raise FileNotFoundError("I/Q source file was not found")
         return path
+
+    def _ensure_development_iq_sources_enabled(self) -> None:
+        if not self.development_iq_sources_enabled:
+            raise ValueError("I/Q file test sources are only available when running from the source tree.")
 
     def _stop_capture_async(
         self,
@@ -6131,7 +6152,11 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         elif path == "/api/devices":
             self._send_json(self.service.devices())
         elif path == "/api/iq-test-sources":
-            self._send_json(self.service.iq_test_sources())
+            try:
+                self._send_json(self.service.iq_test_sources())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
         elif path == "/api/stations":
             query = parse_qs(parsed.query)
             search = query.get("q", [""])[0]
@@ -8146,6 +8171,27 @@ def configure_file_logging(path: Path) -> None:
     logging.getLogger().addHandler(handler)
 
 
+def development_iq_sources_available(argv0: str | None = None) -> bool:
+    """Return true only when web_control.py is executed directly from source.
+
+    Console scripts and ``python -m nwr_stream_manager`` both execute installed
+    package code through an entry point, so they intentionally do not expose the
+    development-only I/Q file source even when the package was installed from a
+    local checkout.
+    """
+    invoked = Path(argv0 if argv0 is not None else sys.argv[0])
+    try:
+        invoked = invoked.resolve()
+        current = Path(__file__).resolve()
+    except OSError:
+        return False
+    if invoked != current or current.name != "web_control.py":
+        return False
+    if current.parent.name != "nwr-stream-manager" or current.parent.parent.name != "src":
+        return False
+    return (current.parents[2] / "pyproject.toml").is_file()
+
+
 def install_shutdown_signal_handlers(server: ThreadingHTTPServer) -> dict[int, Any]:
     if threading.current_thread() is not threading.main_thread():
         return {}
@@ -8192,7 +8238,12 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
     LOG.info("startup dependency check passed: %s", format_dependency_summary(dependency_results))
     ring_handler = RingLogHandler()
     logging.getLogger().addHandler(ring_handler)
-    service = RtlControlService(state_path, ring_handler)
+    development_iq_sources = development_iq_sources_available()
+    service = RtlControlService(
+        state_path,
+        ring_handler,
+        development_iq_sources_enabled=development_iq_sources,
+    )
     RtlControlHandler.service = service
     server = ThreadingHTTPServer((host, port), RtlControlHandler)
     previous_signal_handlers = install_shutdown_signal_handlers(server)
@@ -8201,6 +8252,8 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
         LOG.info("RTL-SDR control web interface available at %s", url)
     LOG.info("RTL-SDR settings will be remembered in %s", state_path)
     LOG.info("server log file is %s", log_path)
+    if development_iq_sources:
+        LOG.info("development I/Q file source controls are enabled")
     try:
         server.serve_forever()
     finally:
@@ -8523,6 +8576,8 @@ nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #255
 .row label { margin: 0; display: flex; align-items: center; gap: 8px; min-width: 44px; min-height: 44px; }
 .checkbox-row { display: flex; align-items: center; gap: 8px; min-height: 44px; margin-top: 14px; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.iq-test-source-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.iq-test-source-actions button { min-height: 44px; white-space: normal; }
 .receiver-controls { display: flex; flex-wrap: nowrap; gap: 10px; align-items: center; }
 .receiver-control-button { width: 46px; height: 42px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 20px; line-height: 1; flex: 0 0 auto; }
 .receiver-control-button svg { width: 22px; height: 22px; display: block; fill: currentColor; }
@@ -8756,7 +8811,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.
       </div>
     </section>
-    <section>
+    <section id="iq_test_source_section" hidden>
       <h3>I/Q test source</h3>
       <p class="hint">Use an interleaved complex float32 I/Q file as the receiver source for testing. Files loop until you switch back to the RTL-SDR.</p>
       <div class="grid">
@@ -8773,7 +8828,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       </div>
       <div id="iq_test_source_position" class="hint"></div>
       <div id="iq-test-source-result" class="message"></div>
-      <div class="actions">
+      <div class="actions iq-test-source-actions">
         <button id="rescan_iq_test_sources" type="button">Rescan I/Q files</button>
         <button id="start_iq_test_source" type="button">Use I/Q file source</button>
         <button id="seek_iq_test_source_back_60" type="button">Back 1 minute</button>
@@ -9612,6 +9667,7 @@ let selectedStationKey = "";
 let wizardStationOverride = null;
 let soundcardDevices = [];
 let configuredStreams = [];
+let developmentIqSourcesEnabled = false;
 let editingStreamId = "";
 let editingOutputId = "";
 let settingsStreamId = "";
@@ -11350,6 +11406,7 @@ async function loadDevices(selected, options = {}) {
 }
 
 async function loadIqTestSources(options = {}) {
+  if (!developmentIqSourcesEnabled) return {files: [], active: null};
   const data = await request("/api/iq-test-sources");
   const select = document.getElementById("iq_test_source_file");
   const sourceOptions = data.files.map(file => ({
@@ -11378,6 +11435,14 @@ async function loadIqTestSources(options = {}) {
 }
 
 function renderIqTestSourceStatus(data) {
+  developmentIqSourcesEnabled = Boolean(data && data.capabilities && data.capabilities.development_iq_sources);
+  setHidden("iq_test_source_section", !developmentIqSourcesEnabled);
+  if (!developmentIqSourcesEnabled) {
+    setText("iq-test-source-result", "");
+    setText("iq_test_source_directory", "");
+    setText("iq_test_source_position", "");
+    return;
+  }
   const source = data.source || {};
   const active = source.kind === "iq_file";
   const stats = data.capture_stats || {};
@@ -15111,7 +15176,7 @@ function applyRoute(route) {
     return;
   }
   if (route.view !== "stream_settings") settingsStreamId = "";
-  if (route.view === "rtl") {
+  if (route.view === "rtl" && developmentIqSourcesEnabled) {
     loadIqTestSources({force: true}).catch(error => setText("iq-test-source-result", error.message));
   }
   if (route.view === "receiver") renderReceiverControls();

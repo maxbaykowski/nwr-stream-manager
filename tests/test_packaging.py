@@ -56,6 +56,22 @@ class PackagingTests(unittest.TestCase):
             {"nwr-stream-manager": "nwr_stream_manager.web_control:main"},
         )
 
+    def test_development_iq_sources_only_when_web_control_script_is_directly_run(self) -> None:
+        web_control_path = PACKAGE_PATH / "web_control.py"
+
+        self.assertTrue(self.web_control.development_iq_sources_available(str(web_control_path)))
+        self.assertFalse(self.web_control.development_iq_sources_available("/usr/local/bin/nwr-stream-manager"))
+        self.assertFalse(self.web_control.development_iq_sources_available("-m"))
+
+    def test_development_iq_source_ui_is_hidden_until_capability_is_enabled(self) -> None:
+        script = self.web_control.INDEX_HTML
+
+        self.assertIn('id="iq_test_source_section" hidden', script)
+        self.assertIn("let developmentIqSourcesEnabled = false;", script)
+        self.assertIn("capabilities.development_iq_sources", script)
+        self.assertIn('route.view === "rtl" && developmentIqSourcesEnabled', script)
+        self.assertIn('if (!developmentIqSourcesEnabled) return {files: [], active: null};', script)
+
     def test_state_directory_environment_sets_default_state_path(self) -> None:
         with patch.dict("os.environ", {"STATE_DIRECTORY": "/var/lib/nwr-stream-manager"}, clear=True):
             self.assertEqual(

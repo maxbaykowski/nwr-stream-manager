@@ -96,6 +96,30 @@ class IqFileSourceTests(unittest.TestCase):
 
         self.assertIs(output, samples)
 
+    def test_iq_test_sources_are_development_gated(self) -> None:
+        web_control = self.web_control
+        service = object.__new__(web_control.RtlControlService)
+        service.development_iq_sources_enabled = False
+
+        with self.assertRaisesRegex(ValueError, "only available"):
+            service.iq_test_sources()
+
+    def test_iq_test_sources_lists_files_when_development_enabled(self) -> None:
+        web_control = self.web_control
+        with tempfile.TemporaryDirectory() as tempdir:
+            source_dir = Path(tempdir)
+            (source_dir / "sample.cf32").write_bytes(np.zeros(2, dtype="<f4").tobytes())
+            service = object.__new__(web_control.RtlControlService)
+            service.development_iq_sources_enabled = True
+            service.iq_test_sources_directory = source_dir
+            service.lock = web_control.threading.RLock()
+            service.iq_file_source_config = None
+
+            response = service.iq_test_sources()
+
+        self.assertEqual(response["directory"], str(source_dir))
+        self.assertEqual([item["name"] for item in response["files"]], ["sample.cf32"])
+
     def test_intermediate_fanout_accepts_complex_batches(self) -> None:
         class DummyFanout:
             def __init__(self) -> None:
