@@ -14,21 +14,58 @@ MIN_HIGHPASS_FILTER_TAPS = 513
 MAX_FILTER_TAPS = 1025
 DC_BLOCK_CUTOFF_HZ = 20.0
 DC_BLOCK_VECTOR_CHUNK_SAMPLES = 4096
-BASE_DEEMPHASIS_MAKEUP_GAIN = 1.0
-MAX_DEEMPHASIS_MAKEUP_GAIN = 2.2
+NWR_DEEMPHASIS_MAKEUP_GAIN = 2.0
+NWR_DEEMPHASIS_DISABLED_GAIN = 0.75
+COMFORT_NOISE_BASS_CUTOFF_HZ = 900.0
+COMFORT_NOISE_VECTOR_CHUNK_SAMPLES = 1024
 
 
 @dataclass
 class ComfortNoiseGenerator:
     config: ComfortNoiseConfig
     rng: np.random.Generator = field(default_factory=np.random.default_rng)
+    sample_rate: int = IQ_SAMPLE_RATE
+    _brownish_previous: float = 0.0
+
+    def __post_init__(self) -> None:
+        self._brownish_coefficient = float(
+            np.exp(-2.0 * np.pi * COMFORT_NOISE_BASS_CUTOFF_HZ / self.sample_rate)
+        )
 
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         if not self.config.enabled or len(samples) == 0:
             return samples
         level = comfort_noise_linear_level(self.config.level_db)
-        noise = self.rng.normal(0.0, level, len(samples)).astype(np.float32)
+        noise = self.rng.normal(0.0, 1.0, len(samples)).astype(np.float32)
+        noise = self._brownish_noise(noise, level)
         return (samples + noise).astype(np.float32, copy=False)
+
+    def _brownish_noise(
+        self,
+        noise: NDArray[np.float32],
+        level: float,
+    ) -> NDArray[np.float32]:
+        shaped = np.empty_like(noise, dtype=np.float32)
+        for start in range(0, len(noise), COMFORT_NOISE_VECTOR_CHUNK_SAMPLES):
+            stop = min(start + COMFORT_NOISE_VECTOR_CHUNK_SAMPLES, len(noise))
+            shaped[start:stop] = self._brownish_noise_chunk(noise[start:stop])
+        rms = float(np.sqrt(np.mean(shaped.astype(np.float64) ** 2)))
+        if rms > 1e-12:
+            shaped *= level / rms
+        else:
+            shaped *= 0.0
+        return shaped
+
+    def _brownish_noise_chunk(self, noise: NDArray[np.float32]) -> NDArray[np.float32]:
+        coefficient = self._brownish_coefficient
+        samples = noise.astype(np.float64, copy=False)
+        indices = np.arange(len(samples), dtype=np.float64)
+        powers = coefficient**indices
+        weighted = np.cumsum(((1.0 - coefficient) * samples) / powers)
+        shaped = (coefficient ** (indices + 1.0)) * self._brownish_previous
+        shaped += powers * weighted
+        self._brownish_previous = float(shaped[-1])
+        return shaped.astype(np.float32, copy=False)
 
 
 @dataclass
@@ -114,27 +151,16 @@ class DcBlocker:
 
 
 @dataclass
-class DeemphasisMakeupGain:
-    tau: float
-
-    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        if len(samples) == 0:
-            return samples
-        return (samples * deemphasis_makeup_gain(self.tau)).astype(np.float32, copy=False)
-
-
-@dataclass
 class AudioEffectsProcessor:
     config: AudioConfig
     sample_rate: int = IQ_SAMPLE_RATE
 
     def __post_init__(self) -> None:
-        self.comfort_noise = ComfortNoiseGenerator(self.config.comfort_noise)
+        self.comfort_noise = ComfortNoiseGenerator(self.config.comfort_noise, sample_rate=self.sample_rate)
         self.deemphasis = DeemphasisFilter(
             self.sample_rate,
             self.config.deemphasis_tau,
         )
-        self.deemphasis_makeup = DeemphasisMakeupGain(self.config.deemphasis_tau)
         self.dc_blocker = DcBlocker(self.sample_rate)
         self.highpass = _build_filter("highpass", self.config.highpass, self.sample_rate)
         self.lowpass = _build_filter("lowpass", self.config.lowpass, self.sample_rate)
@@ -143,6 +169,7 @@ class AudioEffectsProcessor:
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         audio = self.comfort_noise.process(samples)
         audio = self.deemphasis.process_float(audio)
+        audio = audio * deemphasis_makeup_gain(self.config.deemphasis_tau)
         audio = self.dc_blocker.process(audio)
         if self.highpass is not None:
             audio = self.highpass.process(audio)
@@ -150,7 +177,6 @@ class AudioEffectsProcessor:
             audio = self.lowpass.process(audio)
         if self.notch is not None:
             audio = self.notch.process(audio)
-        audio = self.deemphasis_makeup.process(audio)
         if self.config.volume.enabled:
             audio = audio * self.config.volume.multiplier
         return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
@@ -166,7 +192,6 @@ class AudioEffectsProcessor:
 
         if config.deemphasis != self.config.deemphasis:
             self.deemphasis.update_tau(config.deemphasis_tau)
-            self.deemphasis_makeup.tau = config.deemphasis_tau
             changed.append("deemphasis")
 
         if config.highpass != self.config.highpass:
@@ -220,10 +245,7 @@ def comfort_noise_linear_level(level_db: float) -> float:
 
 
 def deemphasis_makeup_gain(tau: float) -> float:
-    normalized = max(0.0, min(1.0, tau / 530.0))
-    return BASE_DEEMPHASIS_MAKEUP_GAIN + (
-        MAX_DEEMPHASIS_MAKEUP_GAIN - BASE_DEEMPHASIS_MAKEUP_GAIN
-    ) * normalized**0.85
+    return NWR_DEEMPHASIS_MAKEUP_GAIN if tau > 0 else NWR_DEEMPHASIS_DISABLED_GAIN
 
 
 def highpass_tap_count_for_sharpness(sharpness: float) -> int:

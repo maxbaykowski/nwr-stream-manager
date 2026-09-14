@@ -318,7 +318,7 @@ RECEIVER_AUDIO_CONFIG = parse_audio_config(
         "comfort_noise": {"enabled": False, "level_db": -40},
         "volume": {"enabled": False, "multiplier": 1.0},
         "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
-        "lowpass": {"enabled": True, "frequency": 3400, "sharpness": 2},
+        "lowpass": {"enabled": False, "frequency": 3400, "sharpness": 2},
         "notch": {"enabled": False, "frequency": 3000, "sharpness": 0},
     }
 )
@@ -9226,7 +9226,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <div id="audio_effects_list" class="effects-list" aria-label="Audio effects">
             <button type="button" data-audio-effect="volume">Volume multiplier</button>
             <button type="button" data-audio-effect="comfort_noise">Comfort noise</button>
-            <button type="button" data-audio-effect="deemphasis">NFM deemphasis</button>
+            <button type="button" data-audio-effect="deemphasis">NWR deemphasis</button>
             <button type="button" data-audio-effect="highpass">Highpass</button>
             <button type="button" data-audio-effect="lowpass">Lowpass</button>
             <button type="button" data-audio-effect="notch">Notch filter</button>
@@ -9251,23 +9251,20 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 <input id="audio_comfort_noise_enabled" type="checkbox" aria-describedby="audio_comfort_noise_enabled_hint">
                 Enable comfort noise
               </label>
-              <span id="audio_comfort_noise_enabled_hint" class="hint">Mixes very quiet white noise into demodulated audio, similar to some analog receivers.</span>
+              <span id="audio_comfort_noise_enabled_hint" class="hint">Mixes very quiet bass-weighted noise into demodulated audio, similar to some analog receivers.</span>
               <label>Level
-                <input id="audio_comfort_noise_level" type="number" min="-80" max="-20" step="1" aria-describedby="audio_comfort_noise_level_hint">
+                <input id="audio_comfort_noise_level" type="number" min="-60" max="-30" step="1" aria-describedby="audio_comfort_noise_level_hint">
               </label>
-              <span id="audio_comfort_noise_level_hint" class="hint">Noise level in dB below full scale. Valid range is -80 through -20.</span>
+              <span id="audio_comfort_noise_level_hint" class="hint">Noise level in dB below full scale. Valid range is -60 through -30.</span>
             </div>
             <div id="audio_effect_deemphasis" class="audio-effect-panel" hidden>
-              <h4>NFM deemphasis</h4>
+              <h4>NWR deemphasis</h4>
               <label class="checkbox-row">
                 <input id="audio_deemphasis_enabled" type="checkbox" aria-describedby="audio_deemphasis_enabled_hint">
-                Enable NFM deemphasis
+                Enable NWR deemphasis
               </label>
-              <span id="audio_deemphasis_enabled_hint" class="hint">NFM deemphasis filter for reducing high frequency content.</span>
-              <label>Time constant
-                <input id="audio_deemphasis_tau" type="number" min="0" max="530" step="1" aria-describedby="audio_deemphasis_tau_hint">
-              </label>
-              <span id="audio_deemphasis_tau_hint" class="hint">Time constant in microseconds. Valid range is 0 through 530. Higher values deemphasize audio more aggressively.</span>
+              <span id="audio_deemphasis_enabled_hint" class="hint">Reduces high-frequency audio components like an actual NOAA Weather Radio receiver would.</span>
+              <input id="audio_deemphasis_tau" type="hidden" value="300">
             </div>
             <div id="audio_effect_highpass" class="audio-effect-panel" hidden>
               <h4>Highpass</h4>
@@ -9291,7 +9288,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 <input id="audio_lowpass_enabled" type="checkbox" aria-describedby="audio_lowpass_enabled_hint">
                 Enable lowpass
               </label>
-              <span id="audio_lowpass_enabled_hint" class="hint">Gets rid of high-frequency audio. This is different from the NFM deemphasis filter.</span>
+              <span id="audio_lowpass_enabled_hint" class="hint">Gets rid of high-frequency audio. This is separate from the standard NWR deemphasis curve.</span>
               <label>Frequency
                 <input id="audio_lowpass_frequency" type="number" min="2200" max="12000" step="1" aria-describedby="audio_lowpass_frequency_hint">
               </label>
@@ -12326,7 +12323,7 @@ function defaultAudioEffectsSettings() {
     comfort_noise: {enabled: false, level_db: -40.0},
     deemphasis: {enabled: true, tau: 300.0},
     highpass: {enabled: false, frequency: 300.0, sharpness: 0.0},
-    lowpass: {enabled: true, frequency: 3400.0, sharpness: 2.0},
+    lowpass: {enabled: false, frequency: 3400.0, sharpness: 2.0},
     notch: {enabled: false, frequency: 3000.0, sharpness: 0.0}
   };
 }

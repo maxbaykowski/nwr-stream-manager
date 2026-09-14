@@ -7,6 +7,12 @@ from numpy.typing import NDArray
 
 
 PCM_SCALE = 32768.0
+NWR_DEEMPHASIS_LOW_HZ = 300.0
+NWR_DEEMPHASIS_HIGH_HZ = 3000.0
+NWR_DEEMPHASIS_LOW_SHELF_END_HZ = 500.0
+NWR_DEEMPHASIS_LOW_SHELF_GAIN = 0.8
+NWR_DEEMPHASIS_POST_HIGH_ROLLOFF = 2.5
+NWR_DEEMPHASIS_TAPS = 257
 
 
 @dataclass
@@ -81,11 +87,75 @@ def generate_deemphasis_curve(sample_rate: int, tau: float) -> NDArray[np.float3
         raise ValueError("sample_rate must be greater than 0")
     if tau <= 0:
         return np.array([1.0], dtype=np.float32)
+    return generate_nwr_deemphasis_curve(sample_rate)
 
-    tau_seconds = tau / 1_000_000.0
-    duration = max(1 / sample_rate, tau_seconds * 8)
-    sample_count = max(1, int(np.ceil(duration * sample_rate)))
-    times = np.arange(sample_count, dtype=np.float32) / sample_rate
-    curve = np.exp(-times / tau_seconds).astype(np.float32)
-    curve /= np.sum(curve)
-    return curve
+
+def generate_nwr_deemphasis_curve(
+    sample_rate: int,
+    *,
+    taps: int = NWR_DEEMPHASIS_TAPS,
+) -> NDArray[np.float32]:
+    """Return the fixed NOAA Weather Radio receive de-emphasis FIR.
+
+    NWR transmit audio is pre-emphasized at +6 dB/octave from 300 Hz
+    through 3000 Hz. The receive side applies the inverse -6 dB/octave
+    curve over the same range, with unity gain below 300 Hz.
+
+    A practical weather-radio receiver still needs to keep demodulated
+    wideband hiss from sitting on a flat shelf above 3000 Hz. Above the
+    specified pre-emphasis range, continue with a gentle noise taper
+    instead of a sharp lowpass so upper speech detail remains audible.
+    A shallow low shelf keeps the 250-350 Hz region from sounding too
+    forward without removing the low-frequency body entirely. Overall
+    gain is normalized conservatively to avoid introducing clipping.
+    """
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be greater than 0")
+    if taps < 3:
+        raise ValueError("taps must be at least 3")
+    taps = int(taps)
+    if taps % 2 == 0:
+        taps += 1
+    nyquist = sample_rate / 2.0
+    if nyquist <= NWR_DEEMPHASIS_LOW_HZ:
+        return np.array([1.0], dtype=np.float32)
+
+    nfft = 1
+    while nfft < taps * 16:
+        nfft *= 2
+    frequencies = np.fft.rfftfreq(nfft, d=1.0 / float(sample_rate))
+    high_hz = min(NWR_DEEMPHASIS_HIGH_HZ, nyquist)
+    high_gain = NWR_DEEMPHASIS_LOW_HZ / high_hz
+    response = np.ones_like(frequencies, dtype=np.float64)
+    sloped = (frequencies > NWR_DEEMPHASIS_LOW_HZ) & (frequencies < high_hz)
+    response[sloped] = NWR_DEEMPHASIS_LOW_HZ / frequencies[sloped]
+    low_shelf = frequencies < NWR_DEEMPHASIS_LOW_SHELF_END_HZ
+    if np.any(low_shelf):
+        shelf_progress = np.clip(
+            frequencies[low_shelf] / NWR_DEEMPHASIS_LOW_SHELF_END_HZ,
+            0.0,
+            1.0,
+        )
+        smooth = shelf_progress * shelf_progress * (3.0 - 2.0 * shelf_progress)
+        response[low_shelf] *= (
+            NWR_DEEMPHASIS_LOW_SHELF_GAIN
+            + (1.0 - NWR_DEEMPHASIS_LOW_SHELF_GAIN) * smooth
+        )
+    above_high = frequencies >= high_hz
+    if np.any(above_high):
+        post_high_ratio = np.maximum(frequencies[above_high], high_hz) / high_hz
+        response[above_high] = high_gain / np.power(
+            post_high_ratio,
+            NWR_DEEMPHASIS_POST_HIGH_ROLLOFF,
+        )
+
+    impulse = np.fft.irfft(response, n=nfft)
+    centered = np.fft.fftshift(impulse)
+    start = (nfft - taps) // 2
+    kernel = centered[start : start + taps].copy()
+    kernel *= np.hamming(taps)
+    kernel_response = np.abs(np.fft.rfft(kernel, n=nfft))
+    peak = float(np.max(kernel_response)) if len(kernel_response) else 0.0
+    if peak > 1.0:
+        kernel /= peak
+    return kernel.astype(np.float32)

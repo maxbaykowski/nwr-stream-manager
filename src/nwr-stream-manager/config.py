@@ -142,7 +142,7 @@ class AudioConfig:
     volume: VolumeConfig = field(default_factory=VolumeConfig)
     highpass: FilterConfig = field(default_factory=FilterConfig)
     lowpass: FilterConfig = field(
-        default_factory=lambda: FilterConfig(enabled=True, frequency=3400.0, sharpness=2.0)
+        default_factory=lambda: FilterConfig(enabled=False, frequency=3400.0, sharpness=2.0)
     )
     notch: FilterConfig = field(default_factory=FilterConfig)
 
@@ -642,8 +642,8 @@ def validate_volume_config(config: VolumeConfig) -> None:
 
 
 def validate_comfort_noise_config(config: ComfortNoiseConfig) -> None:
-    if not _finite(config.level_db) or not -80 <= config.level_db <= -20:
-        raise ConfigError("level_db must be between -80 and -20")
+    if not _finite(config.level_db) or not -60 <= config.level_db <= -30:
+        raise ConfigError("level_db must be between -60 and -30")
 
 
 def validate_filter_config(name: str, config: FilterConfig) -> None:
