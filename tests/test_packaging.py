@@ -48,6 +48,14 @@ class PackagingTests(unittest.TestCase):
 
         self.assertIn("pyrtlsdr", project["dependencies"])
 
+    def test_only_primary_console_script_is_installed(self) -> None:
+        project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+        self.assertEqual(
+            project["scripts"],
+            {"nwr-stream-manager": "nwr_stream_manager.web_control:main"},
+        )
+
     def test_state_directory_environment_sets_default_state_path(self) -> None:
         with patch.dict("os.environ", {"STATE_DIRECTORY": "/var/lib/nwr-stream-manager"}, clear=True):
             self.assertEqual(

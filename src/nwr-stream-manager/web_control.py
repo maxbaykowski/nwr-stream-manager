@@ -183,11 +183,7 @@ else:
     create_webrtc_pcm_audio_track = webrtc.create_webrtc_pcm_audio_track
     server_webrtc_capabilities = webrtc.server_webrtc_capabilities
 
-repo_root = Path(__file__).resolve().parents[2]
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
-
-from icecastauth import IcecastSettings, normalize_server, test_mountpoint_authentication
+from .icecastauth import IcecastSettings, normalize_server, test_mountpoint_authentication
 
 import numpy as np
 

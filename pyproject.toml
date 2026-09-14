@@ -50,13 +50,9 @@ Issues = "https://github.com/maxbaykowski/nwr-stream-manager/issues"
 
 [project.scripts]
 nwr-stream-manager = "nwr_stream_manager.web_control:main"
-nwr-stream-manager-web = "nwr_stream_manager.web_control:main"
-rtl-weatherband = "nwr_stream_manager.cli:main"
-icecastauth = "icecastauth:main"
 
 [tool.setuptools]
 packages = ["nwr_stream_manager", "nwr_stream_manager.assets"]
-py-modules = ["icecastauth"]
 include-package-data = true
 
 [tool.setuptools.package-dir]
