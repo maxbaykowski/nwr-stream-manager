@@ -2118,13 +2118,14 @@ class EasAlertTests(unittest.TestCase):
         gain_3000 = float(response[np.argmin(np.abs(freqs - 3000.0))])
         gain_6000 = float(response[np.argmin(np.abs(freqs - 6000.0))])
 
-        self.assertGreater(gain_100, 0.72)
-        self.assertLess(gain_100, 0.92)
-        self.assertGreater(gain_300, 0.68)
-        self.assertLess(gain_300, 0.92)
-        self.assertLess(gain_3000, gain_300 * 0.25)
-        self.assertLess(gain_6000, gain_3000 * 0.25)
-        self.assertGreater(gain_6000, gain_3000 * 0.08)
+        self.assertGreater(gain_100, 0.55)
+        self.assertLess(gain_100, 0.68)
+        self.assertGreater(gain_300, 0.62)
+        self.assertLess(gain_300, 0.76)
+        self.assertLess(gain_100, gain_300)
+        self.assertLess(gain_3000, gain_300 * 0.14)
+        self.assertLess(gain_6000, gain_3000 * 0.15)
+        self.assertGreater(gain_6000, gain_3000 * 0.04)
         self.assertLess(float(np.max(response)), 1.0)
 
     def test_audio_dc_blocker_tracks_dc_without_damaging_audio_tone(self) -> None:

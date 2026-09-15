@@ -8,10 +8,10 @@ from numpy.typing import NDArray
 
 PCM_SCALE = 32768.0
 NWR_DEEMPHASIS_LOW_HZ = 300.0
-NWR_DEEMPHASIS_HIGH_HZ = 3000.0
-NWR_DEEMPHASIS_LOW_SHELF_END_HZ = 500.0
-NWR_DEEMPHASIS_LOW_SHELF_GAIN = 0.8
-NWR_DEEMPHASIS_POST_HIGH_ROLLOFF = 2.5
+NWR_DEEMPHASIS_HIGH_HZ = 2600.0
+NWR_DEEMPHASIS_LOW_SHELF_END_HZ = 700.0
+NWR_DEEMPHASIS_LOW_SHELF_GAIN = 0.58
+NWR_DEEMPHASIS_POST_HIGH_ROLLOFF = 3.2
 NWR_DEEMPHASIS_TAPS = 257
 
 
@@ -99,15 +99,16 @@ def generate_nwr_deemphasis_curve(
 
     NWR transmit audio is pre-emphasized at +6 dB/octave from 300 Hz
     through 3000 Hz. The receive side applies the inverse -6 dB/octave
-    curve over the same range, with unity gain below 300 Hz.
+    curve through the speech range, with additional receiver-like shaping
+    at the low and high ends.
 
     A practical weather-radio receiver still needs to keep demodulated
     wideband hiss from sitting on a flat shelf above 3000 Hz. Above the
-    specified pre-emphasis range, continue with a gentle noise taper
-    instead of a sharp lowpass so upper speech detail remains audible.
-    A shallow low shelf keeps the 250-350 Hz region from sounding too
-    forward without removing the low-frequency body entirely. Overall
-    gain is normalized conservatively to avoid introducing clipping.
+    specified pre-emphasis range, continue with a noise taper instead of
+    a sharp lowpass so upper speech detail remains audible while hiss is
+    still pushed down. A wider low shelf keeps the 250-350 Hz region from
+    sounding too forward without removing the low-frequency body entirely.
+    Overall gain is normalized conservatively to avoid introducing clipping.
     """
     if sample_rate <= 0:
         raise ValueError("sample_rate must be greater than 0")
