@@ -51,6 +51,100 @@ class WebRtcTests(unittest.TestCase):
         controller.update(available_bitrate_bps=200_000)
         self.assertEqual(controller.current_kbps, 128)
 
+    def test_tcp_opus_bitrate_controller_uses_coarse_ladder_without_jumping(self) -> None:
+        controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=2, recovery_hold_feedbacks=0)
+
+        self.assertEqual(controller.current_kbps, 128)
+        decision = controller.update(send_seconds=0.08)
+        self.assertEqual(decision.bitrate_kbps, 96)
+        self.assertEqual(decision.reason, "send backpressure")
+        self.assertEqual(controller.update(send_seconds=0.08).bitrate_kbps, 64)
+        self.assertEqual(controller.update(send_seconds=0.08).bitrate_kbps, 32)
+        self.assertEqual(controller.update(send_seconds=0.08).bitrate_kbps, 16)
+        self.assertEqual(controller.update(send_seconds=0.08).bitrate_kbps, 12)
+        self.assertEqual(controller.update(send_seconds=0.08).bitrate_kbps, 8)
+        self.assertEqual(controller.update(send_seconds=0.08).bitrate_kbps, 6)
+        self.assertEqual(controller.update(send_seconds=0.08).bitrate_kbps, 6)
+
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 6)
+        decision = controller.update(send_seconds=0.001)
+        self.assertEqual(decision.bitrate_kbps, 8)
+        self.assertEqual(decision.reason, "recovery probe")
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 8)
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 12)
+
+    def test_tcp_opus_bitrate_controller_responds_to_client_latency_drops(self) -> None:
+        controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=3, recovery_hold_feedbacks=0)
+
+        decision = controller.update(send_seconds=0.001, latency_drop_count=1)
+        self.assertEqual(decision.bitrate_kbps, 96)
+        self.assertEqual(decision.reason, "client latency feedback")
+        self.assertEqual(controller.update(send_seconds=0.001, above_max_drop_count=1).bitrate_kbps, 64)
+
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 64)
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 64)
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 96)
+
+    def test_tcp_opus_bitrate_controller_responds_to_throughput_feedback(self) -> None:
+        controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=2, recovery_hold_feedbacks=0)
+
+        decision = controller.update(send_seconds=0.001, network_receive_kbps=90.0)
+        self.assertEqual(decision.bitrate_kbps, 128)
+        self.assertEqual(decision.reason, "stable")
+        decision = controller.update(send_seconds=0.001, network_receive_kbps=90.0)
+        self.assertEqual(decision.bitrate_kbps, 96)
+        self.assertEqual(decision.reason, "client throughput feedback")
+        self.assertEqual(controller.update(send_seconds=0.001, media_delivery_ratio=0.80).bitrate_kbps, 64)
+
+        self.assertEqual(controller.update(send_seconds=0.001, network_receive_kbps=120.0, media_delivery_ratio=1.0).bitrate_kbps, 64)
+        self.assertEqual(controller.update(send_seconds=0.001, network_receive_kbps=120.0, media_delivery_ratio=1.0).bitrate_kbps, 96)
+
+    def test_tcp_opus_bitrate_controller_ignores_single_mixed_throughput_window_after_probe(self) -> None:
+        controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=1, recovery_hold_feedbacks=0)
+        controller.current_kbps = 32
+
+        decision = controller.update(send_seconds=0.001)
+        self.assertEqual(decision.bitrate_kbps, 64)
+        self.assertEqual(decision.reason, "recovery probe")
+
+        decision = controller.update(
+            send_seconds=0.001,
+            network_receive_kbps=44.0,
+            media_delivery_ratio=1.0,
+        )
+        self.assertEqual(decision.bitrate_kbps, 64)
+        self.assertEqual(decision.reason, "stable")
+
+        decision = controller.update(
+            send_seconds=0.001,
+            network_receive_kbps=44.0,
+            media_delivery_ratio=1.0,
+        )
+        self.assertEqual(decision.bitrate_kbps, 32)
+        self.assertEqual(decision.reason, "client throughput feedback")
+
+    def test_tcp_opus_bitrate_controller_reacts_immediately_to_severe_throughput_feedback(self) -> None:
+        controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=2, recovery_hold_feedbacks=0)
+
+        decision = controller.update(send_seconds=0.001, network_receive_kbps=70.0)
+        self.assertEqual(decision.bitrate_kbps, 96)
+        self.assertEqual(decision.reason, "client throughput feedback")
+
+    def test_tcp_opus_bitrate_controller_holds_before_recovery_probe(self) -> None:
+        controller = self.webrtc.TcpOpusBitrateController(
+            recovery_stable_feedbacks=2,
+            recovery_hold_feedbacks=3,
+        )
+
+        self.assertEqual(controller.update(send_seconds=0.08).bitrate_kbps, 96)
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 96)
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 96)
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 96)
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 96)
+        decision = controller.update(send_seconds=0.001)
+        self.assertEqual(decision.bitrate_kbps, 128)
+        self.assertEqual(decision.reason, "recovery probe")
+
     def test_audio_source_keeps_latest_frames_when_slow_consumer_falls_behind(self) -> None:
         source = self.webrtc.WebRtcAudioSource(max_frames=1, prebuffer_frames=0)
         source.push_pcm(b"old")

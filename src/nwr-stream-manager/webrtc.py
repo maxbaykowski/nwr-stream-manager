@@ -31,6 +31,16 @@ WEBRTC_TARGET_BITRATE_KBPS = 128
 WEBRTC_MIN_BITRATE_KBPS = 32
 WEBRTC_BITRATE_STEP_KBPS = 8
 WEBRTC_RECOVERY_STABLE_FEEDBACKS = 12
+LIVE_AUDIO_TCP_BITRATE_LADDER_KBPS = (6, 8, 12, 16, 32, 64, 96, 128)
+LIVE_AUDIO_TCP_TARGET_BITRATE_KBPS = 128
+LIVE_AUDIO_TCP_SEND_SLOW_SECONDS = 0.06
+LIVE_AUDIO_TCP_RECOVERY_STABLE_FEEDBACKS = 150
+LIVE_AUDIO_TCP_THROUGHPUT_MARGIN = 0.82
+LIVE_AUDIO_TCP_SEVERE_THROUGHPUT_MARGIN = 0.65
+LIVE_AUDIO_TCP_REALTIME_DELIVERY_FLOOR = 0.92
+LIVE_AUDIO_TCP_SEVERE_REALTIME_DELIVERY_FLOOR = 0.85
+LIVE_AUDIO_TCP_THROUGHPUT_LIMIT_FEEDBACKS = 2
+LIVE_AUDIO_TCP_RECOVERY_HOLD_FEEDBACKS = 500
 WEBRTC_MONITOR_PREBUFFER_FRAMES = 6
 WEBRTC_MONITOR_TARGET_LATENCY_FRAMES = 6
 WEBRTC_MONITOR_LOW_WATER_FRAMES = 3
@@ -39,6 +49,12 @@ WEBRTC_MONITOR_LATENCY_TRIM_TO_FRAMES = 8
 WEBRTC_MONITOR_MAX_BUFFER_FRAMES = 32
 WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS = 0.24
 WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS = 0.06
+
+
+@dataclass(frozen=True)
+class TcpOpusBitrateDecision:
+    bitrate_kbps: int
+    reason: str
 
 
 class WebRtcError(RuntimeError):
@@ -181,15 +197,134 @@ class OpusBitrateController:
         return self.current_kbps
 
 
+class TcpOpusBitrateController:
+    def __init__(
+        self,
+        *,
+        ladder_kbps: tuple[int, ...] = LIVE_AUDIO_TCP_BITRATE_LADDER_KBPS,
+        target_kbps: int = LIVE_AUDIO_TCP_TARGET_BITRATE_KBPS,
+        slow_send_seconds: float = LIVE_AUDIO_TCP_SEND_SLOW_SECONDS,
+        recovery_stable_feedbacks: int = LIVE_AUDIO_TCP_RECOVERY_STABLE_FEEDBACKS,
+        recovery_hold_feedbacks: int = LIVE_AUDIO_TCP_RECOVERY_HOLD_FEEDBACKS,
+    ) -> None:
+        ladder = tuple(sorted({int(value) for value in ladder_kbps if int(value) > 0}))
+        if not ladder:
+            raise ValueError("bitrate ladder must not be empty")
+        if target_kbps not in ladder:
+            raise ValueError("target bitrate must be present in bitrate ladder")
+        self.ladder_kbps = ladder
+        self.target_kbps = int(target_kbps)
+        self.slow_send_seconds = max(0.0, float(slow_send_seconds))
+        self.recovery_stable_feedbacks = max(1, int(recovery_stable_feedbacks))
+        self.recovery_hold_feedbacks = max(0, int(recovery_hold_feedbacks))
+        self.current_kbps = self.target_kbps
+        self._stable_feedbacks = 0
+        self._throughput_limited_feedbacks = 0
+        self._recovery_hold_remaining = 0
+
+    def update(
+        self,
+        *,
+        send_seconds: float,
+        send_failed: bool = False,
+        latency_drop_count: int = 0,
+        above_max_drop_count: int = 0,
+        network_receive_kbps: float | None = None,
+        media_delivery_ratio: float | None = None,
+    ) -> TcpOpusBitrateDecision:
+        send_limited = False
+        try:
+            send_limited = float(send_seconds) >= self.slow_send_seconds
+        except (TypeError, ValueError):
+            send_limited = False
+        latency_limited = int(latency_drop_count) > 0 or int(above_max_drop_count) > 0
+        throughput_limited = False
+        severe_throughput_limited = False
+        if network_receive_kbps is not None:
+            try:
+                receive_kbps = float(network_receive_kbps)
+                throughput_limited = receive_kbps < self.current_kbps * LIVE_AUDIO_TCP_THROUGHPUT_MARGIN
+                severe_throughput_limited = receive_kbps < self.current_kbps * LIVE_AUDIO_TCP_SEVERE_THROUGHPUT_MARGIN
+            except (TypeError, ValueError):
+                throughput_limited = False
+                severe_throughput_limited = False
+        realtime_limited = False
+        severe_realtime_limited = False
+        if media_delivery_ratio is not None:
+            try:
+                delivery_ratio = float(media_delivery_ratio)
+                realtime_limited = delivery_ratio < LIVE_AUDIO_TCP_REALTIME_DELIVERY_FLOOR
+                severe_realtime_limited = delivery_ratio < LIVE_AUDIO_TCP_SEVERE_REALTIME_DELIVERY_FLOOR
+            except (TypeError, ValueError):
+                realtime_limited = False
+                severe_realtime_limited = False
+        throughput_feedback_limited = throughput_limited or realtime_limited
+        severe_feedback_limited = severe_throughput_limited or severe_realtime_limited
+        if throughput_feedback_limited:
+            self._throughput_limited_feedbacks += 1
+        else:
+            self._throughput_limited_feedbacks = 0
+        confirmed_throughput_limited = (
+            severe_feedback_limited
+            or throughput_feedback_limited
+            and self._throughput_limited_feedbacks >= LIVE_AUDIO_TCP_THROUGHPUT_LIMIT_FEEDBACKS
+        )
+        slow = (
+            bool(send_failed)
+            or send_limited
+            or latency_limited
+            or confirmed_throughput_limited
+        )
+        index = self.ladder_kbps.index(self.current_kbps)
+        target_index = self.ladder_kbps.index(self.target_kbps)
+
+        if slow:
+            self._stable_feedbacks = 0
+            if index > 0:
+                self.current_kbps = self.ladder_kbps[index - 1]
+                self._recovery_hold_remaining = self.recovery_hold_feedbacks
+            if not throughput_feedback_limited:
+                self._throughput_limited_feedbacks = 0
+            if latency_limited:
+                reason = "client latency feedback"
+            elif confirmed_throughput_limited:
+                reason = "client throughput feedback"
+            else:
+                reason = "send backpressure"
+            return TcpOpusBitrateDecision(self.current_kbps, reason)
+
+        if throughput_feedback_limited:
+            self._stable_feedbacks = 0
+            return TcpOpusBitrateDecision(self.current_kbps, "stable")
+
+        if self._recovery_hold_remaining > 0:
+            self._stable_feedbacks = 0
+            self._recovery_hold_remaining -= 1
+            return TcpOpusBitrateDecision(self.current_kbps, "stable")
+
+        if index >= target_index:
+            self._stable_feedbacks = 0
+            return TcpOpusBitrateDecision(self.current_kbps, "stable")
+
+        self._stable_feedbacks += 1
+        if self._stable_feedbacks >= self.recovery_stable_feedbacks:
+            self.current_kbps = self.ladder_kbps[index + 1]
+            self._stable_feedbacks = 0
+            return TcpOpusBitrateDecision(self.current_kbps, "recovery probe")
+        return TcpOpusBitrateDecision(self.current_kbps, "stable")
+
+
 class OpusEncoder:
     def __init__(
         self,
         *,
         input_sample_rate: int = IQ_SAMPLE_RATE,
         bitrate_kbps: int = WEBRTC_TARGET_BITRATE_KBPS,
+        minimum_bitrate_kbps: int = WEBRTC_MIN_BITRATE_KBPS,
     ) -> None:
         self.opus = _load_opus_module()
         self.input_sample_rate = input_sample_rate
+        self.minimum_bitrate_kbps = max(1, int(minimum_bitrate_kbps))
         self.resampler = PcmResampler(input_sample_rate, WEBRTC_OPUS_SAMPLE_RATE)
         self.closed = False
         self._pending_samples = np.array([], dtype=np.int16)
@@ -240,7 +375,7 @@ class OpusEncoder:
 
     def set_bitrate(self, bitrate_kbps: int) -> None:
         bitrate_kbps = max(
-            WEBRTC_MIN_BITRATE_KBPS,
+            self.minimum_bitrate_kbps,
             min(WEBRTC_TARGET_BITRATE_KBPS, int(bitrate_kbps)),
         )
         if bitrate_kbps == self.bitrate_kbps:

@@ -97,6 +97,7 @@ if __package__:
     from .webrtc import (
         AiortcSessionManager,
         OpusEncoder,
+        TcpOpusBitrateController,
         WebRtcAsyncRunner,
         WebRtcAudioSource,
         WebRtcError,
@@ -185,6 +186,7 @@ else:
     SameSuppressionProcessor = same_live.SameSuppressionProcessor
     AiortcSessionManager = webrtc.AiortcSessionManager
     OpusEncoder = webrtc.OpusEncoder
+    TcpOpusBitrateController = webrtc.TcpOpusBitrateController
     WebRtcAsyncRunner = webrtc.WebRtcAsyncRunner
     WebRtcAudioSource = webrtc.WebRtcAudioSource
     WebRtcError = webrtc.WebRtcError
@@ -259,6 +261,10 @@ STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
 STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
 STREAM_SILENCE_FLOAT_FRAME = np.zeros(STREAM_FRAME_SAMPLES, dtype=np.float32)
+LIVE_AUDIO_BINARY_MAGIC = b"NWA1"
+LIVE_AUDIO_BINARY_HEADER = struct.Struct("!4sBBHII")
+LIVE_AUDIO_CODEC_OPUS = 1
+LIVE_AUDIO_CODEC_PCM_S16LE = 2
 RTL_RESET_COMMAND_TIMEOUT_SECONDS = 5.0
 RTL_RESET_REAPPEAR_TIMEOUT_SECONDS = 10.0
 STREAM_WORKER_RAW_QUEUE_SECONDS = 1.50
@@ -2324,6 +2330,7 @@ class LiveAudioWebSocketWriter:
         key = self.handler.headers.get("Sec-WebSocket-Key", "").strip()
         if not key:
             raise LiveAudioWebSocketError("missing WebSocket key")
+        self._configure_socket()
         accept = base64.b64encode(hashlib.sha1((key + self.GUID).encode("ascii")).digest()).decode("ascii")
         self.handler.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
         self.handler.send_header("Upgrade", "websocket")
@@ -2334,6 +2341,31 @@ class LiveAudioWebSocketWriter:
 
     def send_json(self, payload: dict[str, Any]) -> None:
         self._send_frame(json.dumps(payload, separators=(",", ":")).encode("utf-8"), opcode=0x1)
+
+    def send_binary(self, payload: bytes) -> None:
+        self._send_frame(payload, opcode=0x2)
+
+    def send_audio(
+        self,
+        *,
+        codec: str,
+        sequence: int,
+        duration_ms: int,
+        sample_rate: int,
+        payload: bytes,
+    ) -> float:
+        codec_id = LIVE_AUDIO_CODEC_OPUS if codec == "opus" else LIVE_AUDIO_CODEC_PCM_S16LE
+        header = LIVE_AUDIO_BINARY_HEADER.pack(
+            LIVE_AUDIO_BINARY_MAGIC,
+            codec_id,
+            0,
+            max(0, min(0xFFFF, int(duration_ms))),
+            int(sequence) & 0xFFFFFFFF,
+            max(1, int(sample_rate)) & 0xFFFFFFFF,
+        )
+        started_at = time.monotonic()
+        self.send_binary(header + payload)
+        return time.monotonic() - started_at
 
     def _send_frame(self, payload: bytes, *, opcode: int = 0x1) -> None:
         length = len(payload)
@@ -2347,6 +2379,19 @@ class LiveAudioWebSocketWriter:
         self.handler.wfile.write(bytes(header))
         self.handler.wfile.write(payload)
         self.handler.wfile.flush()
+
+    def _configure_socket(self) -> None:
+        connection = getattr(self.handler, "connection", None)
+        if connection is None:
+            return
+        for level, option, value in (
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        ):
+            try:
+                connection.setsockopt(level, option, value)
+            except OSError:
+                pass
 
 
 class SharedSoundcardOutputManager:
@@ -3766,6 +3811,7 @@ class RtlControlService:
         self.monitor_accounts_by_client: dict[str, int] = {}
         self.receiver_workers: dict[str, WeatherReceiverWorker] = {}
         self.receiver_accounts_by_client: dict[str, int] = {}
+        self.live_audio_feedback_by_client: dict[tuple[str, str], dict[str, Any]] = {}
         self.iq_recorder: IqRecorderWorker | None = None
         self.iq_recorder_account_id: int | None = None
         self.iq_recording_downloads: set[str] = set()
@@ -3788,6 +3834,83 @@ class RtlControlService:
             self._start_or_update_capture_locked()
         else:
             self._select_only_connected_device()
+
+    def record_live_audio_feedback(self, client_id: str, mode: str, message: str, details: dict[str, Any]) -> None:
+        client_id = str(client_id or "").strip()
+        mode = str(mode or "").strip().lower()
+        message = str(message or "").strip()
+        if not client_id or mode not in {"monitor", "receiver"}:
+            return
+        reason = str(details.get("reason", "")).strip().lower()
+        try:
+            scheduled_lead_seconds = float(details.get("scheduled_lead_seconds", 0.0))
+        except (TypeError, ValueError):
+            scheduled_lead_seconds = 0.0
+        try:
+            network_receive_kbps = float(details["receive_kbps"]) if "receive_kbps" in details else None
+        except (TypeError, ValueError):
+            network_receive_kbps = None
+        try:
+            media_delivery_ratio = float(details["media_delivery_ratio"]) if "media_delivery_ratio" in details else None
+        except (TypeError, ValueError):
+            media_delivery_ratio = None
+        with self.lock:
+            feedback = self.live_audio_feedback_by_client.setdefault(
+                (mode, client_id),
+                {
+                    "latency_drop_count": 0,
+                    "above_max_drop_count": 0,
+                    "max_scheduled_lead_seconds": 0.0,
+                    "network_receive_kbps": None,
+                    "media_delivery_ratio": None,
+                    "last_feedback_at": 0.0,
+                },
+            )
+            if (
+                message == "dropped live audio frame to reduce playback latency"
+                and reason in {"above-max", "post-reset-max"}
+            ):
+                feedback["latency_drop_count"] = int(feedback.get("latency_drop_count", 0)) + 1
+                feedback["above_max_drop_count"] = int(feedback.get("above_max_drop_count", 0)) + 1
+            feedback["max_scheduled_lead_seconds"] = max(
+                float(feedback.get("max_scheduled_lead_seconds", 0.0)),
+                scheduled_lead_seconds,
+            )
+            if network_receive_kbps is not None and network_receive_kbps > 0:
+                previous = feedback.get("network_receive_kbps")
+                feedback["network_receive_kbps"] = (
+                    network_receive_kbps
+                    if previous is None
+                    else min(float(previous), network_receive_kbps)
+                )
+            if media_delivery_ratio is not None and media_delivery_ratio > 0:
+                previous = feedback.get("media_delivery_ratio")
+                feedback["media_delivery_ratio"] = (
+                    media_delivery_ratio
+                    if previous is None
+                    else min(float(previous), media_delivery_ratio)
+                )
+            feedback["last_feedback_at"] = time.monotonic()
+
+    def consume_live_audio_feedback(self, client_id: str, mode: str) -> dict[str, Any]:
+        client_id = str(client_id or "").strip()
+        mode = str(mode or "").strip().lower()
+        if not client_id or mode not in {"monitor", "receiver"}:
+            return {}
+        with self.lock:
+            return self.live_audio_feedback_by_client.pop((mode, client_id), {})
+
+    def clear_live_audio_feedback(self, client_id: str, mode: str = "") -> None:
+        client_id = str(client_id or "").strip()
+        mode = str(mode or "").strip().lower()
+        if not client_id:
+            return
+        with self.lock:
+            if mode in {"monitor", "receiver"}:
+                self.live_audio_feedback_by_client.pop((mode, client_id), None)
+            else:
+                self.live_audio_feedback_by_client.pop(("monitor", client_id), None)
+                self.live_audio_feedback_by_client.pop(("receiver", client_id), None)
 
     def close(self) -> None:
         try:
@@ -6387,7 +6510,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             if codec not in {"opus", "pcm"}:
                 codec = "opus"
             if codec == "opus":
-                encoder = OpusEncoder(input_sample_rate=source.sample_rate)
+                encoder = OpusEncoder(input_sample_rate=source.sample_rate, minimum_bitrate_kbps=6)
             writer.handshake()
             writer.send_json(
                 {
@@ -6398,11 +6521,20 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                     "input_sample_rate": source.sample_rate,
                     "channels": 1,
                     "frame_ms": 20,
+                    "binary_audio": True,
                     "status": status,
                 }
             )
             LOG.info("started %s live-audio WebSocket for client %s using %s", mode, client_id, codec)
-            self._stream_live_audio_websocket(writer, source, event_queue, encoder=encoder, codec=codec)
+            self._stream_live_audio_websocket(
+                writer,
+                source,
+                event_queue,
+                encoder=encoder,
+                codec=codec,
+                mode=mode,
+                client_id=client_id,
+            )
         except (BrokenPipeError, ConnectionResetError, OSError):
             LOG.info("live-audio WebSocket disconnected for client %s", client_id)
         except Exception as exc:
@@ -6416,6 +6548,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         finally:
             if encoder is not None:
                 encoder.close()
+            self.service.clear_live_audio_feedback(client_id, mode)
             detached_receiver = None
             detached_monitor_source = None
             try:
@@ -6440,10 +6573,12 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         *,
         encoder: OpusEncoder | None,
         codec: str,
+        mode: str,
+        client_id: str,
     ) -> None:
         sequence = 0
-        started_at = time.monotonic()
         last_event_check = 0.0
+        bitrate_controller = TcpOpusBitrateController() if codec == "opus" and encoder is not None else None
         next_frame_at = time.monotonic()
         while True:
             if source.audio_source.closed.is_set():
@@ -6458,33 +6593,57 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                         break
                     writer.send_json({"type": "same_event", "event": event})
             pcm = source.read_pcm_blocking(timeout=0.12)
+            source_paused = source.is_paused()
             if codec == "opus" and encoder is not None:
                 packets = encoder.encode(pcm)
                 if not packets:
                     continue
                 for packet in packets:
-                    writer.send_json(
-                        {
-                            "type": "audio",
-                            "codec": "opus",
-                            "seq": sequence,
-                            "timestamp_ms": round((time.monotonic() - started_at) * 1000.0, 3),
-                            "duration_ms": 20,
-                            "data": base64.b64encode(packet).decode("ascii"),
-                        }
+                    send_seconds = writer.send_audio(
+                        codec="opus",
+                        sequence=sequence,
+                        duration_ms=20,
+                        sample_rate=48_000,
+                        payload=packet,
                     )
+                    if bitrate_controller is not None and encoder is not None and not source_paused:
+                        feedback = self.service.consume_live_audio_feedback(client_id, mode)
+                        latency_drop_count = int(feedback.get("latency_drop_count", 0)) if feedback else 0
+                        above_max_drop_count = int(feedback.get("above_max_drop_count", 0)) if feedback else 0
+                        network_receive_kbps = feedback.get("network_receive_kbps") if feedback else None
+                        media_delivery_ratio = feedback.get("media_delivery_ratio") if feedback else None
+                        bitrate_decision = bitrate_controller.update(
+                            send_seconds=send_seconds,
+                            latency_drop_count=latency_drop_count,
+                            above_max_drop_count=above_max_drop_count,
+                            network_receive_kbps=network_receive_kbps,
+                            media_delivery_ratio=media_delivery_ratio,
+                        )
+                        next_bitrate = bitrate_decision.bitrate_kbps
+                        if next_bitrate != encoder.bitrate_kbps:
+                            previous_bitrate = encoder.bitrate_kbps
+                            encoder.set_bitrate(next_bitrate)
+                            LOG.info(
+                                "live-audio WebSocket adjusted Opus bitrate for %s client %s from %s to %s Kbps after %.3fs send (%s, latency_drops=%s, above_max_drops=%s, receive_kbps=%s, media_ratio=%s)",
+                                mode,
+                                client_id,
+                                previous_bitrate,
+                                next_bitrate,
+                                send_seconds,
+                                bitrate_decision.reason,
+                                latency_drop_count,
+                                above_max_drop_count,
+                                None if network_receive_kbps is None else round(float(network_receive_kbps), 1),
+                                None if media_delivery_ratio is None else round(float(media_delivery_ratio), 3),
+                            )
                     sequence += 1
             else:
-                writer.send_json(
-                    {
-                        "type": "audio",
-                        "codec": "pcm_s16le",
-                        "seq": sequence,
-                        "timestamp_ms": round((time.monotonic() - started_at) * 1000.0, 3),
-                        "sample_rate": source.sample_rate,
-                        "duration_ms": 20,
-                        "data": base64.b64encode(pcm).decode("ascii"),
-                    }
+                writer.send_audio(
+                    codec="pcm_s16le",
+                    sequence=sequence,
+                    duration_ms=20,
+                    sample_rate=source.sample_rate,
+                    payload=pcm,
                 )
                 sequence += 1
             next_frame_at += 0.02
@@ -6772,6 +6931,20 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 area = str(payload.get("area", "client"))[:40]
                 message = str(payload.get("message", ""))[:240]
                 details = payload.get("details", {})
+                if (
+                    area == "live-audio"
+                    and message in {
+                        "dropped live audio frame to reduce playback latency",
+                        "live audio throughput sample",
+                    }
+                    and isinstance(details, dict)
+                ):
+                    self.service.record_live_audio_feedback(
+                        str(details.get("client_id", "")),
+                        str(details.get("mode", "")),
+                        message,
+                        details,
+                    )
                 detail_text = json.dumps(details, sort_keys=True)[:1000] if isinstance(details, dict) else str(details)[:1000]
                 log_message = "client %s from %s: %s %s" % (area, self._client_address(), message, detail_text)
                 if level in {"warning", "warn", "error"}:
@@ -10230,6 +10403,12 @@ let liveAudioDecoder = null;
 let liveAudioScheduledTime = 0;
 let liveAudioScheduledSources = new Set();
 let liveAudioPacketCount = 0;
+let liveAudioDroppedLateFrames = 0;
+let liveAudioRecoveryFadePending = false;
+let liveAudioLastScheduledSample = 0;
+let liveAudioThroughputWindowStartedAt = 0;
+let liveAudioThroughputBytes = 0;
+let liveAudioThroughputMediaMs = 0;
 let unloadLiveAudioStopSent = false;
 let mediaSessionAnchorUrl = "";
 let mediaSessionAnchorStarted = false;
@@ -10238,8 +10417,16 @@ let accountsSignature = "";
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
 const WEBRTC_JITTER_BUFFER_TARGET_SECONDS = 0.06;
-const LIVE_AUDIO_TARGET_LATENCY_SECONDS = 0.22;
-const LIVE_AUDIO_MAX_LATENCY_SECONDS = 0.42;
+const LIVE_AUDIO_TARGET_LATENCY_SECONDS = 0.26;
+const LIVE_AUDIO_MAX_LATENCY_SECONDS = 0.55;
+const LIVE_AUDIO_HARD_RESET_LATENCY_SECONDS = 1.2;
+const LIVE_AUDIO_RECOVERY_LATENCY_SECONDS = 0.34;
+const LIVE_AUDIO_RECOVERY_CROSSFADE_SECONDS = 0.004;
+const LIVE_AUDIO_THROUGHPUT_REPORT_INTERVAL_MS = 2000;
+const LIVE_AUDIO_BINARY_HEADER_BYTES = 16;
+const LIVE_AUDIO_BINARY_MAGIC = "NWA1";
+const LIVE_AUDIO_CODEC_OPUS = 1;
+const LIVE_AUDIO_CODEC_PCM_S16LE = 2;
 const MEDIA_SESSION_ANCHOR_SECONDS = 8;
 const MEDIA_SESSION_ANCHOR_SAMPLE_RATE = 8000;
 const SAME_MARK_HZ = 2083.3;
@@ -10928,6 +11115,8 @@ function stopScheduledLiveAudioSources() {
     }
   }
   liveAudioScheduledSources.clear();
+  liveAudioRecoveryFadePending = false;
+  liveAudioLastScheduledSample = 0;
   if (liveAudioContext) liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
   else liveAudioScheduledTime = 0;
 }
@@ -10958,6 +11147,23 @@ function pcmS16BytesToFloat32(bytes) {
   return samples;
 }
 
+function liveAudioBinaryMagic(view) {
+  if (!view || view.byteLength < 4) return "";
+  return String.fromCharCode(
+    view.getUint8(0),
+    view.getUint8(1),
+    view.getUint8(2),
+    view.getUint8(3)
+  );
+}
+
+async function liveAudioMessageBytes(data) {
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  if (data instanceof Blob) return new Uint8Array(await data.arrayBuffer());
+  return null;
+}
+
 function audioDataToFloat32(audioData) {
   const frames = audioData.numberOfFrames || 0;
   const channels = audioData.numberOfChannels || 1;
@@ -10980,15 +11186,105 @@ function audioDataToFloat32(audioData) {
   return {samples, sampleRate};
 }
 
+function dropLiveAudioFrameForLatency(scheduledLead, reason = "latency") {
+  liveAudioDroppedLateFrames += 1;
+  liveAudioRecoveryFadePending = true;
+  if (liveAudioDroppedLateFrames === 1 || liveAudioDroppedLateFrames % 50 === 0) {
+    logClientEvent("warning", "live-audio", "dropped live audio frame to reduce playback latency", {
+      mode: liveAudioMode,
+      client_id: liveAudioClientIdForCurrentMode(),
+      dropped_late_frames: liveAudioDroppedLateFrames,
+      scheduled_lead_seconds: Number(scheduledLead.toFixed(3)),
+      reason
+    });
+  }
+}
+
+function liveAudioClientIdForCurrentMode() {
+  if (liveAudioMode === "receiver") return pageReceiverClientId();
+  if (liveAudioMode === "monitor") return pageMonitorClientId();
+  return "";
+}
+
+function resetLiveAudioThroughputWindow() {
+  liveAudioThroughputWindowStartedAt = performance.now();
+  liveAudioThroughputBytes = 0;
+  liveAudioThroughputMediaMs = 0;
+}
+
+function recordLiveAudioThroughput(byteLength, durationMs) {
+  const now = performance.now();
+  if (!liveAudioThroughputWindowStartedAt) {
+    resetLiveAudioThroughputWindow();
+  }
+  liveAudioThroughputBytes += Math.max(0, Number(byteLength || 0));
+  liveAudioThroughputMediaMs += Math.max(0, Number(durationMs || 0));
+  const elapsedMs = now - liveAudioThroughputWindowStartedAt;
+  if (elapsedMs < LIVE_AUDIO_THROUGHPUT_REPORT_INTERVAL_MS) return;
+  const receiveKbps = (liveAudioThroughputBytes * 8) / Math.max(1, elapsedMs);
+  const mediaDeliveryRatio = liveAudioThroughputMediaMs / Math.max(1, elapsedMs);
+  logClientEvent("info", "live-audio", "live audio throughput sample", {
+    mode: liveAudioMode,
+    client_id: liveAudioClientIdForCurrentMode(),
+    codec: liveAudioCodec,
+    received_bytes: liveAudioThroughputBytes,
+    elapsed_ms: Math.round(elapsedMs),
+    media_ms: Math.round(liveAudioThroughputMediaMs),
+    receive_kbps: Number(receiveKbps.toFixed(1)),
+    media_delivery_ratio: Number(mediaDeliveryRatio.toFixed(3))
+  });
+  resetLiveAudioThroughputWindow();
+}
+
+function applyLiveAudioRecoveryCrossfade(samples, sampleRate) {
+  if (!liveAudioRecoveryFadePending || !samples || !samples.length) return samples;
+  liveAudioRecoveryFadePending = false;
+  const fadeSamples = Math.min(
+    samples.length,
+    Math.max(1, Math.round(Number(sampleRate || 1) * LIVE_AUDIO_RECOVERY_CROSSFADE_SECONDS))
+  );
+  const output = new Float32Array(samples);
+  const startSample = Number.isFinite(liveAudioLastScheduledSample) ? liveAudioLastScheduledSample : 0;
+  for (let index = 0; index < fadeSamples; index += 1) {
+    const mix = (index + 1) / fadeSamples;
+    output[index] = startSample * (1 - mix) + samples[index] * mix;
+  }
+  return output;
+}
+
 function scheduleLiveAudioSamples(samples, sampleRate) {
   if (!samples || !samples.length || !liveAudioContext) return;
   const now = liveAudioContext.currentTime;
   if (!liveAudioScheduledTime || liveAudioScheduledTime < now + LIVE_AUDIO_TARGET_LATENCY_SECONDS * 0.5) {
     liveAudioScheduledTime = now + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
   }
-  if (liveAudioScheduledTime - now > LIVE_AUDIO_MAX_LATENCY_SECONDS) {
+  const scheduledLead = liveAudioScheduledTime - now;
+  if (scheduledLead > LIVE_AUDIO_HARD_RESET_LATENCY_SECONDS) {
     stopScheduledLiveAudioSources();
+  } else if (scheduledLead > LIVE_AUDIO_MAX_LATENCY_SECONDS) {
+    dropLiveAudioFrameForLatency(scheduledLead, "above-max");
+    return;
+  } else if (scheduledLead > LIVE_AUDIO_RECOVERY_LATENCY_SECONDS) {
+    const frameSeconds = samples.length / Math.max(1, Number(sampleRate || 1));
+    const excessSeconds = scheduledLead - LIVE_AUDIO_TARGET_LATENCY_SECONDS;
+    const recoveryDropInterval = Math.max(2, Math.ceil(LIVE_AUDIO_TARGET_LATENCY_SECONDS / Math.max(frameSeconds, excessSeconds)));
+    if (liveAudioPacketCount % recoveryDropInterval === 0) {
+      dropLiveAudioFrameForLatency(scheduledLead, "recovery");
+      return;
+    }
+  } else if (scheduledLead <= LIVE_AUDIO_TARGET_LATENCY_SECONDS * 1.15 && liveAudioDroppedLateFrames) {
+    liveAudioDroppedLateFrames = 0;
   }
+  if (!liveAudioScheduledTime || liveAudioScheduledTime < liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS * 0.5) {
+    liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
+  }
+  const adjustedLead = liveAudioScheduledTime - liveAudioContext.currentTime;
+  if (adjustedLead > LIVE_AUDIO_MAX_LATENCY_SECONDS) {
+    dropLiveAudioFrameForLatency(adjustedLead, "post-reset-max");
+    return;
+  }
+  samples = applyLiveAudioRecoveryCrossfade(samples, sampleRate);
+  liveAudioLastScheduledSample = samples.length ? samples[samples.length - 1] : liveAudioLastScheduledSample;
   const buffer = liveAudioContext.createBuffer(1, samples.length, sampleRate);
   buffer.copyToChannel(samples, 0);
   const source = liveAudioContext.createBufferSource();
@@ -11016,6 +11312,32 @@ async function configureLiveAudioDecoder() {
 }
 
 async function handleLiveAudioMessage(event) {
+  const binary = await liveAudioMessageBytes(event.data);
+  if (binary) {
+    if (binary.byteLength < LIVE_AUDIO_BINARY_HEADER_BYTES) return;
+    const view = new DataView(binary.buffer, binary.byteOffset, binary.byteLength);
+    if (liveAudioBinaryMagic(view) !== LIVE_AUDIO_BINARY_MAGIC) return;
+    const codecId = view.getUint8(4);
+    const durationMs = view.getUint16(6, false) || 20;
+    const sequence = view.getUint32(8, false);
+    const sampleRate = view.getUint32(12, false) || 24000;
+    const payload = binary.slice(LIVE_AUDIO_BINARY_HEADER_BYTES);
+    liveAudioPacketCount += 1;
+    recordLiveAudioThroughput(binary.byteLength, durationMs);
+    clearMonitorUnstableTimer();
+    clearReceiverUnstableTimer();
+    if (codecId === LIVE_AUDIO_CODEC_OPUS && liveAudioDecoder) {
+      liveAudioDecoder.decode(new EncodedAudioChunk({
+        type: "key",
+        timestamp: Math.round(sequence * durationMs * 1000),
+        duration: Math.round(durationMs * 1000),
+        data: payload
+      }));
+    } else if (codecId === LIVE_AUDIO_CODEC_PCM_S16LE) {
+      scheduleLiveAudioSamples(pcmS16BytesToFloat32(payload), sampleRate);
+    }
+    return;
+  }
   if (typeof event.data !== "string") return;
   const message = JSON.parse(event.data);
   if (message.type === "start") {
@@ -11029,9 +11351,10 @@ async function handleLiveAudioMessage(event) {
   }
   if (message.type !== "audio") return;
   liveAudioPacketCount += 1;
+  const bytes = bytesFromBase64(message.data);
+  recordLiveAudioThroughput(bytes.byteLength, Number(message.duration_ms || 20));
   clearMonitorUnstableTimer();
   clearReceiverUnstableTimer();
-  const bytes = bytesFromBase64(message.data);
   if (message.codec === "opus" && liveAudioDecoder) {
     liveAudioDecoder.decode(new EncodedAudioChunk({
       type: "key",
@@ -11052,6 +11375,7 @@ function closeLiveAudioSocket(expectedSocket = null) {
     liveAudioMode = "";
     closeLiveAudioDecoder();
     stopScheduledLiveAudioSources();
+    resetLiveAudioThroughputWindow();
   }
   if (!socket) return;
   try {
@@ -11065,8 +11389,12 @@ function closeLiveAudioSocket(expectedSocket = null) {
 function liveAudioSocketPeer(mode, socket) {
   return {
     transport: "websocket",
-    connectionState: "connected",
-    iceConnectionState: "connected",
+    get connectionState() {
+      return socket && socket.readyState === WebSocket.OPEN ? "connected" : "closed";
+    },
+    get iceConnectionState() {
+      return socket && socket.readyState === WebSocket.OPEN ? "connected" : "closed";
+    },
     socket,
     getStats() {
       const packetsReceived = socket && socket === liveAudioSocket ? liveAudioPacketCount : 0;
@@ -11083,6 +11411,14 @@ function liveAudioPeerUsesWebSocket(peer) {
   return Boolean(peer && peer.transport === "websocket");
 }
 
+function liveAudioPeerSocketIsClosed(peer) {
+  return liveAudioPeerUsesWebSocket(peer) && (!peer.socket || peer.socket.readyState >= WebSocket.CLOSING);
+}
+
+function isInactiveLiveAudioSessionError(error) {
+  return /client session is not active|receiver is not playing|monitor is not active/i.test(String(error && error.message || error || ""));
+}
+
 async function startLiveAudioSocket(params) {
   await ensureLiveAudioContext();
   const opus = await supportsWebCodecsOpusAudio();
@@ -11090,9 +11426,14 @@ async function startLiveAudioSocket(params) {
   liveAudioMode = params.mode;
   liveAudioCodec = opus ? "opus" : "pcm";
   liveAudioPacketCount = 0;
+  liveAudioDroppedLateFrames = 0;
+  liveAudioRecoveryFadePending = false;
+  liveAudioLastScheduledSample = 0;
+  resetLiveAudioThroughputWindow();
   liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
   applyLiveAudioVolume();
   const socket = new WebSocket(liveAudioUrl({...params, codec: liveAudioCodec}));
+  socket.binaryType = "arraybuffer";
   liveAudioSocket = socket;
   return await new Promise((resolve, reject) => {
     let opened = false;
@@ -11147,6 +11488,7 @@ function pageMonitorClientId() {
 
 function liveAudioPeerIsUnusable(peer) {
   if (!peer) return false;
+  if (liveAudioPeerSocketIsClosed(peer)) return true;
   return (
     ["closed", "failed", "disconnected"].includes(peer.connectionState) ||
     ["closed", "failed", "disconnected"].includes(peer.iceConnectionState)
@@ -11507,11 +11849,19 @@ async function pauseStreamMonitor() {
 async function resumeStreamMonitor() {
   if (!monitorPeerConnection || !monitorStreamId) return;
   const streamId = monitorStreamId;
-  await request("/api/monitor/resume", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({client_id: pageMonitorClientId()})
-  });
+  try {
+    await request("/api/monitor/resume", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({client_id: pageMonitorClientId()})
+    });
+  } catch (error) {
+    if (!isInactiveLiveAudioSessionError(error)) throw error;
+    logClientEvent("info", "monitor", "restarting inactive monitor live-audio session", {stream_id: streamId});
+    await stopStreamMonitor({notifyServer: false});
+    await startStreamMonitor(streamId);
+    return;
+  }
   monitorPaused = false;
   clearMonitorUnstableTimer();
   await startMediaSessionAnchor("monitor-resume");
@@ -11743,13 +12093,23 @@ function setReceiverAudioTracksEnabled(enabled) {
 async function startWeatherReceiver() {
   pauseCurrentEasAlert();
   if (receiverPeerConnection) {
-    if (liveAudioPeerUsesWebSocket(receiverPeerConnection)) {
+    if (liveAudioPeerIsUnusable(receiverPeerConnection) || !receiverRemoteStream) {
+      logClientEvent("info", "receiver", "restarting stale receiver live-audio session", {frequency: currentReceiverChannel().label});
+      await stopWeatherReceiver({notifyServer: true});
+    } else if (liveAudioPeerUsesWebSocket(receiverPeerConnection)) {
       logClientEvent("info", "receiver", "receiver WebSocket resume requested", {frequency: currentReceiverChannel().label});
-      await request("/api/receiver/resume", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({client_id: pageReceiverClientId()})
-      });
+      try {
+        await request("/api/receiver/resume", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({client_id: pageReceiverClientId()})
+        });
+      } catch (error) {
+        if (!isInactiveLiveAudioSessionError(error)) throw error;
+        logClientEvent("info", "receiver", "restarting inactive receiver live-audio session", {frequency: currentReceiverChannel().label});
+        await stopWeatherReceiver({notifyServer: false});
+        return startWeatherReceiver();
+      }
       receiverPlaying = true;
       receiverPaused = false;
       clearReceiverUnstableTimer();
@@ -11761,10 +12121,6 @@ async function startWeatherReceiver() {
       renderReceiverControls();
       setReceiverResult(`Listening to ${currentReceiverChannel().label}.`, "success");
       return;
-    }
-    if (liveAudioPeerIsUnusable(receiverPeerConnection) || !receiverRemoteStream) {
-      logClientEvent("info", "receiver", "restarting stale receiver WebRTC session", {frequency: currentReceiverChannel().label});
-      await stopWeatherReceiver({notifyServer: true});
     } else {
       logClientEvent("info", "receiver", "receiver resume requested", {frequency: currentReceiverChannel().label});
       await request("/api/receiver/resume", {
@@ -11981,14 +12337,28 @@ async function setReceiverChannel(index) {
   updateReceiverMediaSession();
   if (!receiverPeerConnection) return;
   const channel = currentReceiverChannel();
-  await request("/api/receiver/tune", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      client_id: pageReceiverClientId(),
-      frequency_hz: channel.frequency_hz
-    })
-  });
+  if (liveAudioPeerIsUnusable(receiverPeerConnection)) {
+    logClientEvent("info", "receiver", "restarting stale receiver live-audio session before tune", {frequency: channel.label});
+    await stopWeatherReceiver({notifyServer: true});
+    await startWeatherReceiver();
+    return;
+  }
+  try {
+    await request("/api/receiver/tune", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        client_id: pageReceiverClientId(),
+        frequency_hz: channel.frequency_hz
+      })
+    });
+  } catch (error) {
+    if (!isInactiveLiveAudioSessionError(error)) throw error;
+    logClientEvent("info", "receiver", "restarting inactive receiver before tune", {frequency: channel.label});
+    await stopWeatherReceiver({notifyServer: false});
+    await startWeatherReceiver();
+    return;
+  }
   setReceiverResult(`Listening to ${channel.label}.`, "success");
 }
 

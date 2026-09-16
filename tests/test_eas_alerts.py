@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import importlib.util
 import importlib
 import json
@@ -2881,6 +2882,38 @@ class EasAlertTests(unittest.TestCase):
             raw=170_000.0,
         )
         self.assertEqual(smoothed, 170_000.0)
+
+    def test_live_audio_writer_sends_compact_binary_audio_frames(self) -> None:
+        class Handler:
+            def __init__(self) -> None:
+                self.wfile = io.BytesIO()
+
+        handler = Handler()
+        writer = self.web_control.LiveAudioWebSocketWriter(handler)
+        payload = b"opus-packet"
+
+        writer.send_audio(
+            codec="opus",
+            sequence=7,
+            duration_ms=20,
+            sample_rate=48_000,
+            payload=payload,
+        )
+
+        frame = handler.wfile.getvalue()
+        self.assertEqual(frame[0], 0x82)
+        length = frame[1]
+        self.assertEqual(length, self.web_control.LIVE_AUDIO_BINARY_HEADER.size + len(payload))
+        header = frame[2 : 2 + self.web_control.LIVE_AUDIO_BINARY_HEADER.size]
+        data = frame[2 + self.web_control.LIVE_AUDIO_BINARY_HEADER.size :]
+        magic, codec, flags, duration_ms, sequence, sample_rate = self.web_control.LIVE_AUDIO_BINARY_HEADER.unpack(header)
+        self.assertEqual(magic, self.web_control.LIVE_AUDIO_BINARY_MAGIC)
+        self.assertEqual(codec, self.web_control.LIVE_AUDIO_CODEC_OPUS)
+        self.assertEqual(flags, 0)
+        self.assertEqual(duration_ms, 20)
+        self.assertEqual(sequence, 7)
+        self.assertEqual(sample_rate, 48_000)
+        self.assertEqual(data, payload)
 
     @staticmethod
     def _complex_to_rtl_u8(iq: np.ndarray) -> bytes:
