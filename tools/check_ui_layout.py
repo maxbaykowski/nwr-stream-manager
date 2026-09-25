@@ -39,6 +39,7 @@ STATIC_SCENARIOS = (
     ("receiver", "receiver"),
     ("iq-recorder", "iq_recorder"),
     ("new-iq-recording", "iq_recorder_start"),
+    ("notifications", "notifications"),
     ("logs", "logs"),
     ("eas-alerts", "eas_alerts"),
     ("eas-alert-export", "eas_alert_export"),

@@ -8,6 +8,8 @@ import tempfile
 import types
 import unittest
 import threading
+import struct
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -71,6 +73,313 @@ class AuthTests(unittest.TestCase):
         self.assertIn("/api/setup-state", html)
         self.assertIn("pageshow", html)
         self.assertIn("window.location.replace", html)
+
+    def test_control_html_uses_existing_select_sync_helper(self) -> None:
+        html = self.web_control.INDEX_HTML
+
+        self.assertIn("function syncSelectOptions", html)
+        self.assertIn("syncSelectOptions(select, optionSpecs)", html)
+        self.assertNotIn("updateSelectOptions(", html)
+
+    def test_notification_custom_access_url_accepts_missing_scheme(self) -> None:
+        settings = self.web_control.validate_notification_settings_payload(
+            {
+                "enabled": True,
+                "server_url": "https://ntfy.sh",
+                "topic": "NWRSTMGR-test",
+                "access_url_mode": "custom",
+                "custom_access_url": "nwr.example.com",
+            }
+        )
+
+        self.assertEqual(settings.custom_access_url, "https://nwr.example.com")
+
+    def test_notification_access_url_selection_falls_back_when_unavailable(self) -> None:
+        settings = self.web_control.WebNotificationSettings(
+            access_url_mode="tailscale:tailscale0:100.113.206.20",
+        )
+
+        reconciled = self.web_control.reconcile_notification_access_url_selection(
+            settings,
+            [{"id": "interface:wlp9s0:192.168.1.79", "url": "http://192.168.1.79:8080"}],
+        )
+
+        self.assertEqual(reconciled.access_url_mode, "auto")
+
+    def test_notification_access_url_selection_preserves_available_or_custom(self) -> None:
+        selected = self.web_control.WebNotificationSettings(
+            access_url_mode="tailscale:tailscale0:100.113.206.20",
+        )
+        custom = self.web_control.WebNotificationSettings(
+            access_url_mode="custom",
+            custom_access_url="https://nwr.example.com",
+        )
+        options = [{"id": "tailscale:tailscale0:100.113.206.20", "url": "http://100.113.206.20:8080"}]
+
+        self.assertIs(self.web_control.reconcile_notification_access_url_selection(selected, options), selected)
+        self.assertIs(self.web_control.reconcile_notification_access_url_selection(custom, []), custom)
+
+    def test_ntfy_notification_sets_click_header(self) -> None:
+        settings = self.web_control.WebNotificationSettings(
+            enabled=True,
+            server_url="https://ntfy.sh",
+            topic="NWRSTMGR-test",
+        )
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            captured["headers"] = dict(request.header_items())
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch.object(self.web_control, "urlopen", fake_urlopen):
+            self.web_control.send_ntfy_notification(
+                settings,
+                title="NWR Stream Manager",
+                message="Test",
+                click_url="192.0.2.5:8080",
+            )
+
+        self.assertEqual(captured["headers"]["Click"], "http://192.0.2.5:8080")
+
+    def test_stream_notification_failures_include_enabled_icecast_failure(self) -> None:
+        stream = {
+            "id": "stream-1",
+            "station": {"callsign": "WXN99"},
+            "notifications": {"icecast_failures": True, "soundcard_failures": False},
+        }
+        snapshot = {
+            "id": "stream-1",
+            "status": "needs-attention",
+            "outputs": [
+                {
+                    "id": "icecast-1",
+                    "type": "icecast",
+                    "status": "needs-attention",
+                    "icecast": {"host": "example.test", "port": 8000, "mount": "/WXN99.mp3"},
+                }
+            ],
+        }
+
+        failures = self.web_control.stream_notification_failures(
+            stream,
+            snapshot,
+            self.web_control.stream_notification_settings_from_stream(stream),
+        )
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["key"], "stream-1:icecast:icecast-1")
+        self.assertIn("WXN99", failures[0]["message"])
+        self.assertIn("http://example.test:8000/WXN99.mp3", failures[0]["message"])
+
+    def test_stream_notification_failures_skip_disabled_categories(self) -> None:
+        stream = {
+            "id": "stream-1",
+            "station": {"callsign": "WXN99"},
+            "notifications": {"icecast_failures": False, "soundcard_failures": False},
+        }
+        snapshot = {
+            "id": "stream-1",
+            "status": "needs-attention",
+            "outputs": [
+                {
+                    "id": "icecast-1",
+                    "type": "icecast",
+                    "status": "needs-attention",
+                    "icecast": {"host": "example.test", "port": 8000, "mount": "/WXN99.mp3"},
+                }
+            ],
+        }
+
+        self.assertEqual(
+            self.web_control.stream_notification_failures(
+                stream,
+                snapshot,
+                self.web_control.stream_notification_settings_from_stream(stream),
+            ),
+            [],
+        )
+
+    def test_stream_notification_failures_include_enabled_soundcard_failure(self) -> None:
+        stream = {
+            "id": "stream-1",
+            "station": {"callsign": "WXN99"},
+            "notifications": {"icecast_failures": False, "soundcard_failures": True},
+        }
+        snapshot = {
+            "id": "stream-1",
+            "outputs": [
+                {
+                    "id": "soundcard-1",
+                    "type": "soundcard",
+                    "status": "needs-attention",
+                    "soundcard": {"display_name": "Yeti X"},
+                }
+            ],
+        }
+
+        failures = self.web_control.stream_notification_failures(
+            stream,
+            snapshot,
+            self.web_control.stream_notification_settings_from_stream(stream),
+        )
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["key"], "stream-1:soundcard:soundcard-1")
+        self.assertIn("sound card Yeti X is not currently connected", failures[0]["message"])
+
+    def test_stream_notification_settings_include_recorded_eas_alerts(self) -> None:
+        settings = self.web_control.validate_stream_notification_payload(
+            {
+                "icecast_failures": True,
+                "soundcard_failures": True,
+                "recorded_eas_alerts": True,
+            }
+        )
+
+        self.assertTrue(settings.icecast_failures)
+        self.assertTrue(settings.soundcard_failures)
+        self.assertTrue(settings.recorded_eas_alerts)
+
+    def test_eas_alert_notification_message_uses_same_lookup_data(self) -> None:
+        stream = {"station": {"callsign": "WXN99"}}
+        alert = {
+            "event_type": "SVR",
+            "fips_codes": ["026005", "026139"],
+            "expires_at_utc": "2026-07-26T20:30:00Z",
+            "start_time_utc": "2026-07-26T20:00:00Z",
+            "raw_same_header": "ZCZC-WXR-SVR-026005-026139+0030-2072000-KGRR/NWS-",
+            "file_path": "/tmp/alert.wav",
+        }
+
+        message = self.web_control.eas_alert_notification_message(stream, alert)
+
+        self.assertIn("Severe Thunderstorm Warning received on WXN99", message)
+        self.assertIn("Allegan, MI", message)
+        self.assertIn("Ottawa, MI", message)
+        self.assertIn("until", message)
+
+    def test_eas_alert_notification_id_is_independent_of_index_position(self) -> None:
+        alert = {
+            "event_type": "TOR",
+            "start_time_utc": "2026-07-26T20:00:00Z",
+            "expires_at_utc": "2026-07-26T20:30:00Z",
+            "raw_same_header": "ZCZC-WXR-TOR-026139+0030-2072000-KGRR/NWS-",
+            "file_path": "/tmp/alert.wav",
+        }
+
+        self.assertNotEqual(
+            self.web_control.eas_alert_id(alert, 0),
+            self.web_control.eas_alert_id(alert, 1),
+        )
+        self.assertEqual(
+            self.web_control.eas_alert_notification_id(alert),
+            self.web_control.eas_alert_notification_id(dict(alert)),
+        )
+
+    def test_interface_is_up_accepts_unknown_operstate_with_up_flag(self) -> None:
+        def fake_read_text(path, encoding=None):
+            text_path = str(path)
+            if text_path.endswith("/operstate"):
+                return "unknown\n"
+            if text_path.endswith("/flags"):
+                return "0x1091\n"
+            raise OSError("unexpected path")
+
+        with patch.object(self.web_control.Path, "read_text", fake_read_text):
+            self.assertTrue(self.web_control.interface_is_up("tailscale0"))
+
+    def test_dns_ptr_response_parser_decodes_compressed_ptr_name(self) -> None:
+        query_id = 0x1234
+        qname = self.web_control.dns_encode_name("20.206.113.100.in-addr.arpa")
+        target = self.web_control.dns_encode_name("max-thinkpad.example.ts.net")
+        response = (
+            struct.pack("!HHHHHH", query_id, 0x8180, 1, 1, 0, 0)
+            + qname
+            + struct.pack("!HH", self.web_control.DNS_TYPE_PTR, self.web_control.DNS_CLASS_IN)
+            + b"\xc0\x0c"
+            + struct.pack("!HHIH", self.web_control.DNS_TYPE_PTR, self.web_control.DNS_CLASS_IN, 30, len(target))
+            + target
+        )
+        offset = 12
+        _question_name, offset = self.web_control.dns_decode_name(response, offset)
+        offset += 4
+        _answer_name, offset = self.web_control.dns_decode_name(response, offset)
+        _answer_type, _answer_class, _ttl, rdlength = struct.unpack("!HHIH", response[offset : offset + 10])
+        offset += 10
+
+        decoded, _unused = self.web_control.dns_decode_name(response, offset)
+
+        self.assertEqual(rdlength, len(target))
+        self.assertEqual(decoded, "max-thinkpad.example.ts.net")
+
+    def test_notification_access_urls_include_tailscale_magicdns_when_detected(self) -> None:
+        with (
+            patch.object(self.web_control.socket, "if_nameindex", return_value=[(1, "tailscale0"), (2, "wlp9s0")]),
+            patch.object(self.web_control, "interface_is_up", return_value=True),
+            patch.object(self.web_control, "interface_is_physical_or_tailscale", return_value=True),
+            patch.object(
+                self.web_control,
+                "interface_ipv4_address",
+                side_effect=lambda name: "100.113.206.20" if name == "tailscale0" else "192.168.1.79",
+            ),
+            patch.object(self.web_control, "tailscale_magicdns_name", return_value="max-thinkpad.example.ts.net"),
+        ):
+            options = self.web_control.notification_access_url_options("0.0.0.0", 8080)
+
+        self.assertEqual(options[0]["id"], "tailscale-magicdns:tailscale0:max-thinkpad.example.ts.net")
+        self.assertEqual(options[0]["url"], "http://max-thinkpad.example.ts.net:8080")
+        self.assertIn("Tailscale MagicDNS", options[0]["label"])
+        self.assertTrue(any(option["url"] == "http://100.113.206.20:8080" for option in options))
+
+    def test_notification_access_urls_prefer_default_route_after_tailscale(self) -> None:
+        with (
+            patch.object(
+                self.web_control.socket,
+                "if_nameindex",
+                return_value=[(1, "wlp9s0"), (2, "enp0s31f6")],
+            ),
+            patch.object(self.web_control, "interface_is_up", return_value=True),
+            patch.object(self.web_control, "interface_is_physical_or_tailscale", return_value=True),
+            patch.object(
+                self.web_control,
+                "interface_ipv4_address",
+                side_effect=lambda name: "192.168.1.79" if name == "wlp9s0" else "10.0.0.24",
+            ),
+            patch.object(self.web_control, "default_route_ipv4_address", return_value="10.0.0.24"),
+        ):
+            options = self.web_control.notification_access_url_options("0.0.0.0", 8080)
+
+        self.assertEqual(options[0]["url"], "http://10.0.0.24:8080")
+        self.assertEqual(options[0]["interface"], "enp0s31f6")
+
+    def test_notification_access_urls_use_default_route_when_no_interfaces_match(self) -> None:
+        with (
+            patch.object(self.web_control.socket, "if_nameindex", return_value=[]),
+            patch.object(self.web_control, "default_route_ipv4_address", return_value="172.20.10.2"),
+        ):
+            options = self.web_control.notification_access_url_options("0.0.0.0", 8080)
+
+        self.assertEqual(
+            options,
+            [
+                {
+                    "id": "interface:default:172.20.10.2",
+                    "label": "Default network route (172.20.10.2)",
+                    "url": "http://172.20.10.2:8080",
+                    "interface": "default",
+                }
+            ],
+        )
 
     def test_setup_state_reports_setup_required_before_account_exists(self) -> None:
         handler = object.__new__(self.web_control.RtlControlHandler)
@@ -363,6 +672,7 @@ class AuthTests(unittest.TestCase):
             ("PUT", "/api/fallback-settings"),
             ("PATCH", "/api/eas-recording"),
             ("PATCH", "/api/audio-effects"),
+            ("PATCH", "/api/stream-notifications"),
             ("PATCH", "/api/settings"),
             ("PUT", "/api/settings"),
             ("POST", "/api/rtl-reset"),

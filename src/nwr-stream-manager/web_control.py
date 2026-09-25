@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import fcntl
 import hmac
 import hashlib
 from http.cookies import SimpleCookie
@@ -32,7 +33,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import Request, urlopen
 
 if __package__:
     from .audio_effects import AudioEffectsProcessor, deemphasis_makeup_gain
@@ -331,6 +334,10 @@ RECEIVER_AUDIO_CONFIG = parse_audio_config(
     }
 )
 FALLBACK_STATE_FILE_NAME = "fallback.json"
+NOTIFICATION_STATE_FILE_NAME = "notifications.json"
+STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS = 30.0
+STREAM_NOTIFICATION_RECOVERY_SECONDS = 300.0
+STREAM_NOTIFICATION_REPEAT_SECONDS = 3600.0
 
 
 @dataclass(frozen=True)
@@ -360,6 +367,67 @@ class WebFallbackSettings:
     enabled: bool = True
     silence_timeout_seconds: float = 30.0
     loop_delay_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class WebNotificationSettings:
+    enabled: bool = False
+    server_url: str = "https://ntfy.sh"
+    topic: str = ""
+    priority: int = 3
+    access_url_mode: str = "auto"
+    custom_access_url: str = ""
+    access_token: str = ""
+    username: str = ""
+    password: str = ""
+
+    def public_dict(self) -> dict[str, Any]:
+        effective_access_url = self.custom_access_url if self.access_url_mode == "custom" else ""
+        return {
+            "enabled": self.enabled,
+            "server_url": self.server_url,
+            "topic": self.topic,
+            "priority": self.priority,
+            "access_url_mode": self.access_url_mode,
+            "custom_access_url": self.custom_access_url,
+            "effective_access_url": effective_access_url,
+            "access_token_set": bool(self.access_token),
+            "username": self.username,
+            "password_set": bool(self.password),
+        }
+
+
+@dataclass(frozen=True)
+class WebStreamNotificationSettings:
+    icecast_failures: bool = False
+    soundcard_failures: bool = False
+    recorded_eas_alerts: bool = False
+
+
+def normalize_notification_access_url(raw: Any, *, default_scheme: str = "https") -> str:
+    value = str(raw or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"{default_scheme}://{value}"
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("NWR Stream Manager URL must start with http:// or https://")
+    if parsed.query or parsed.fragment:
+        raise ValueError("NWR Stream Manager URL cannot include a query string or fragment")
+    return value.rstrip("/")
+
+
+def reconcile_notification_access_url_selection(
+    settings: WebNotificationSettings,
+    options: list[dict[str, str]],
+) -> WebNotificationSettings:
+    mode = settings.access_url_mode or "auto"
+    if mode in {"auto", "custom"}:
+        return settings
+    if any(option.get("id") == mode for option in options):
+        return settings
+    return replace(settings, access_url_mode="auto")
 
 
 @dataclass
@@ -3770,7 +3838,10 @@ class RtlControlService:
         self.iq_recordings_index_path = self.iq_recordings_directory / IQ_RECORDINGS_INDEX_FILE_NAME
         self.iq_test_sources_directory = state_path.parent / IQ_TEST_SOURCES_DIRECTORY_NAME
         self.development_iq_sources_enabled = bool(development_iq_sources_enabled)
+        self.web_host = "0.0.0.0"
+        self.web_port = 8080
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
+        self.notification_state_path = state_path.with_name(NOTIFICATION_STATE_FILE_NAME)
         self.accounts = AccountStore(state_path.parent / ACCOUNTS_DATABASE_FILE_NAME)
         self.auth_sessions = AuthSessionStore()
         self.log_handler = log_handler
@@ -3791,6 +3862,7 @@ class RtlControlService:
         self.settings = load_settings(state_path)
         self.streams = load_streams(self.streams_directory, self.streams_state_path)
         self.fallback_settings = load_fallback_settings(self.fallback_state_path)
+        self.notification_settings = load_notification_settings(self.notification_state_path)
         self.stations = load_station_database()
         self.capture: RtlCaptureSource | IqFileCaptureSource | None = None
         self.iq_file_source_config: IqFileSourceConfig | None = None
@@ -3807,11 +3879,19 @@ class RtlControlService:
             name="soundcard-preview-cleanup",
             daemon=True,
         )
+        self.stream_notification_stop = threading.Event()
+        self.stream_notification_thread = threading.Thread(
+            target=self._stream_notification_loop,
+            name="stream-notification-monitor",
+            daemon=True,
+        )
         self.monitor_streams_by_client: dict[str, str] = {}
         self.monitor_accounts_by_client: dict[str, int] = {}
         self.receiver_workers: dict[str, WeatherReceiverWorker] = {}
         self.receiver_accounts_by_client: dict[str, int] = {}
         self.live_audio_feedback_by_client: dict[tuple[str, str], dict[str, Any]] = {}
+        self.stream_notification_states: dict[str, dict[str, Any]] = {}
+        self.stream_eas_alert_notification_seen: dict[str, set[str]] = {}
         self.iq_recorder: IqRecorderWorker | None = None
         self.iq_recorder_account_id: int | None = None
         self.iq_recording_downloads: set[str] = set()
@@ -3830,6 +3910,7 @@ class RtlControlService:
         self.storage_monitor.add_path(self.iq_recordings_directory)
         self.storage_monitor.start()
         self.preview_cleanup_thread.start()
+        self.stream_notification_thread.start()
         if self.settings.serial:
             self._start_or_update_capture_locked()
         else:
@@ -3919,7 +4000,9 @@ class RtlControlService:
             LOG.debug("WebRTC monitor cleanup failed: %s", exc)
         self.webrtc_runner.stop()
         self.preview_cleanup_stop.set()
+        self.stream_notification_stop.set()
         self.preview_cleanup_thread.join(timeout=2.0)
+        self.stream_notification_thread.join(timeout=2.0)
         with self.lock:
             recorder = self.iq_recorder
             self.iq_recorder = None
@@ -4003,6 +4086,14 @@ class RtlControlService:
         while not self.preview_cleanup_stop.wait(SOUNDCARD_PREVIEW_CLEANUP_SECONDS):
             self._cleanup_expired_soundcard_previews()
 
+    def _stream_notification_loop(self) -> None:
+        while not self.stream_notification_stop.wait(10.0):
+            try:
+                with self.lock:
+                    self._process_stream_notifications_locked(self._active_streams_locked())
+            except Exception as exc:
+                LOG.warning("stream notification monitor failed: %s", exc)
+
     def _cleanup_expired_soundcard_previews(self) -> None:
         now = time.time()
         expired: list[tuple[str, IcecastStreamWorker | None]] = []
@@ -4047,6 +4138,12 @@ class RtlControlService:
             active_streams = self._active_streams_locked()
             if read_only:
                 active_streams = [public_active_stream_snapshot(snapshot) for snapshot in active_streams]
+            else:
+                self._process_stream_notifications_locked(active_streams)
+            notification_settings = self._reconcile_notification_access_url_selection_locked() if not read_only else None
+            notifications = {} if read_only or notification_settings is None else notification_settings.public_dict()
+            if notifications:
+                notifications["effective_access_url"] = self.notification_effective_access_url()
             return {
                 "settings": asdict(settings),
                 "gain_values": gain_values,
@@ -4070,6 +4167,7 @@ class RtlControlService:
                 "received_bytes": self.received_bytes,
                 "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
                 "fallback": asdict(self.fallback_settings),
+                "notifications": notifications,
                 "streams": streams,
                 "active_streams": active_streams,
                 "active_eas_recorders": self._active_eas_recorders_locked(),
@@ -5057,6 +5155,212 @@ class RtlControlService:
     def fallback_settings_snapshot(self) -> WebFallbackSettings:
         with self.lock:
             return self.fallback_settings
+
+    def update_notification_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            settings = validate_notification_settings_payload(payload, current=self.notification_settings)
+            self.notification_settings = settings
+            save_notification_settings(self.notification_state_path, settings)
+        LOG.info(
+            "updated notification settings: enabled=%s server=%s topic=%s priority=%s token=%s username=%s password=%s",
+            settings.enabled,
+            settings.server_url,
+            settings.topic or "<none>",
+            settings.priority,
+            "set" if settings.access_token else "unset",
+            settings.username or "<none>",
+            "set" if settings.password else "unset",
+        )
+        return self.status()
+
+    def _notification_access_url_options(self) -> list[dict[str, str]]:
+        return notification_access_url_options(self.web_host, self.web_port)
+
+    def _reconcile_notification_access_url_selection_locked(
+        self,
+        options: list[dict[str, str]] | None = None,
+    ) -> WebNotificationSettings:
+        if options is None:
+            options = self._notification_access_url_options()
+        settings = reconcile_notification_access_url_selection(self.notification_settings, options)
+        if settings is not self.notification_settings:
+            LOG.info(
+                "notification access URL selection %s is unavailable; falling back to automatic",
+                self.notification_settings.access_url_mode,
+            )
+            self.notification_settings = settings
+            save_notification_settings(self.notification_state_path, settings)
+        return self.notification_settings
+
+    def test_notification_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            settings = validate_notification_settings_payload(payload, current=self.notification_settings)
+            settings = reconcile_notification_access_url_selection(settings, self._notification_access_url_options())
+        send_ntfy_notification(
+            settings,
+            title="NWR Stream Manager",
+            message="This is a test notification from NWR Stream Manager.",
+            priority=settings.priority,
+            click_url=self.notification_effective_access_url_for_settings(settings),
+        )
+        LOG.info("sent test notification to ntfy topic %s", settings.topic)
+        return {"success": True, "message": "Test notification sent."}
+
+    def notification_access_url_options(self) -> dict[str, Any]:
+        options = self._notification_access_url_options()
+        with self.lock:
+            settings = self._reconcile_notification_access_url_selection_locked(options)
+        return {
+            "options": options,
+            "selected": settings.access_url_mode,
+            "custom_access_url": settings.custom_access_url,
+        }
+
+    def notification_settings_snapshot(self) -> WebNotificationSettings:
+        with self.lock:
+            return self._reconcile_notification_access_url_selection_locked()
+
+    def notification_effective_access_url(self) -> str:
+        with self.lock:
+            return self.notification_effective_access_url_for_settings(self._reconcile_notification_access_url_selection_locked())
+
+    def notification_effective_access_url_for_settings(self, settings: WebNotificationSettings) -> str:
+        if settings.access_url_mode == "custom":
+            return settings.custom_access_url
+        options = self._notification_access_url_options()
+        settings = reconcile_notification_access_url_selection(settings, options)
+        if settings.access_url_mode and settings.access_url_mode != "auto":
+            for option in options:
+                if option.get("id") == settings.access_url_mode:
+                    return str(option.get("url", ""))
+        return str(options[0].get("url", "")) if options else ""
+
+    def update_stream_notifications(self, payload: dict[str, Any]) -> dict[str, Any]:
+        stream_id = str(payload.get("stream_id", "")).strip()
+        settings = validate_stream_notification_payload(payload.get("notifications", payload))
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            stream["notifications"] = asdict(settings)
+            stream["updated_at"] = time.time()
+            save_streams(self.streams_directory, self.streams)
+        LOG.info(
+            "updated stream notification settings for %s: icecast_failures=%s soundcard_failures=%s recorded_eas_alerts=%s",
+            stream_id,
+            settings.icecast_failures,
+            settings.soundcard_failures,
+            settings.recorded_eas_alerts,
+        )
+        return self.stream_status()
+
+    def _notification_globally_ready_locked(self) -> bool:
+        self._reconcile_notification_access_url_selection_locked()
+        return bool(self.notification_settings.enabled and self.notification_settings.topic)
+
+    def _process_stream_notifications_locked(self, active_streams: list[dict[str, Any]]) -> None:
+        now = time.time()
+        configured_by_id = {str(stream.get("id", "")): stream for stream in self.streams}
+        active_failure_keys: set[str] = set()
+        if not self._notification_globally_ready_locked():
+            self.stream_notification_states.clear()
+            self.stream_eas_alert_notification_seen.clear()
+            return
+        for snapshot in active_streams:
+            stream_id = str(snapshot.get("id", ""))
+            stream = configured_by_id.get(stream_id)
+            if not stream or stream.get("enabled", True) is False:
+                continue
+            settings = stream_notification_settings_from_stream(stream)
+            for failure in stream_notification_failures(stream, snapshot, settings):
+                key = str(failure["key"])
+                active_failure_keys.add(key)
+                state = self.stream_notification_states.setdefault(
+                    key,
+                    {
+                        "first_seen": now,
+                        "last_seen": now,
+                        "last_clear": 0.0,
+                        "last_sent": 0.0,
+                    },
+                )
+                state["last_seen"] = now
+                if now - float(state.get("first_seen", now)) < STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS:
+                    continue
+                last_sent = float(state.get("last_sent", 0.0))
+                if last_sent and now - last_sent < STREAM_NOTIFICATION_REPEAT_SECONDS:
+                    continue
+                self._send_stream_problem_notification_async(failure)
+                state["last_sent"] = now
+        for key, state in list(self.stream_notification_states.items()):
+            if key in active_failure_keys:
+                continue
+            last_seen = float(state.get("last_seen", 0.0))
+            if now - last_seen >= STREAM_NOTIFICATION_RECOVERY_SECONDS:
+                self.stream_notification_states.pop(key, None)
+        self._process_recorded_eas_alert_notifications_locked()
+
+    def _process_recorded_eas_alert_notifications_locked(self) -> None:
+        active_stream_ids = {str(stream.get("id", "")) for stream in self.streams}
+        for stream_id in list(self.stream_eas_alert_notification_seen):
+            if stream_id not in active_stream_ids:
+                self.stream_eas_alert_notification_seen.pop(stream_id, None)
+        for stream in self.streams:
+            stream_id = str(stream.get("id", ""))
+            if not stream_id:
+                continue
+            settings = stream_notification_settings_from_stream(stream)
+            eas_settings = eas_recording_settings_from_stream(stream)
+            index_path = eas_alert_index_path(self.streams_directory, stream)
+            try:
+                alerts = load_eas_alert_entries(index_path)
+            except Exception as exc:
+                callsign = stream_callsign(stream)
+                LOG.warning("could not read EAS alert index for notifications for %s: %s", callsign, exc)
+                continue
+            current_ids = {eas_alert_notification_id(alert) for alert in alerts}
+            seen = self.stream_eas_alert_notification_seen.get(stream_id)
+            if seen is None:
+                self.stream_eas_alert_notification_seen[stream_id] = current_ids
+                continue
+            if not settings.recorded_eas_alerts or not eas_settings.enabled:
+                self.stream_eas_alert_notification_seen[stream_id] = current_ids
+                continue
+            new_alerts = [
+                alert for alert in alerts
+                if eas_alert_notification_id(alert) not in seen
+            ]
+            self.stream_eas_alert_notification_seen[stream_id] = current_ids
+            for alert in new_alerts:
+                message = eas_alert_notification_message(stream, alert)
+                self._send_stream_problem_notification_async(
+                    {
+                        "key": f"{stream_id}:eas:{eas_alert_notification_id(alert)}",
+                        "message": message,
+                        "priority": 3,
+                    }
+                )
+
+    def _send_stream_problem_notification_async(self, failure: dict[str, Any]) -> None:
+        settings = self.notification_settings
+        click_url = self.notification_effective_access_url_for_settings(settings)
+        message = str(failure.get("message", "")).strip()
+        priority = int(failure.get("priority", 4) or 4)
+        if not message:
+            return
+
+        def send() -> None:
+            try:
+                send_ntfy_notification(
+                    settings,
+                    title="NWR Stream Manager",
+                    message=message,
+                    priority=priority,
+                    click_url=click_url,
+                )
+                LOG.info("sent stream notification: %s", message)
+            except Exception as exc:
+                LOG.warning("failed to send stream notification: %s", exc)
+
+        threading.Thread(target=send, name="stream-notification-send", daemon=True).start()
 
     def start_monitor(self, payload: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
         client_id = str(payload.get("client_id", "")).strip()
@@ -6689,6 +6993,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_json(response)
         elif path == "/api/devices":
             self._send_json(self.service.devices())
+        elif path == "/api/notification-settings":
+            self._send_json({"notifications": self.service.notification_settings_snapshot().public_dict()})
+        elif path == "/api/notification-access-urls":
+            self._send_json(self.service.notification_access_url_options())
         elif path == "/api/iq-test-sources":
             try:
                 self._send_json(self.service.iq_test_sources())
@@ -6919,6 +7227,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                     str(payload.get("start", "")),
                     str(payload.get("end", "")),
                 )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/notification-test":
+            try:
+                payload = self._read_json()
+                response = self.service.test_notification_settings(payload)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -7314,6 +7631,24 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(response)
             return
+        if path == "/api/notification-settings":
+            try:
+                payload = self._read_json()
+                response = self.service.update_notification_settings(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/stream-notifications":
+            try:
+                payload = self._read_json()
+                response = self.service.update_stream_notifications(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path == "/api/eas-recording":
             try:
                 payload = self._read_json()
@@ -7573,6 +7908,28 @@ def save_fallback_settings(path: Path, settings: WebFallbackSettings) -> None:
     path.write_text(json.dumps(asdict(settings), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def load_notification_settings(path: Path) -> WebNotificationSettings:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return WebNotificationSettings()
+    except Exception as exc:
+        LOG.warning("failed to load notification settings from %s: %s", path, exc)
+        return WebNotificationSettings()
+    if not isinstance(raw, dict):
+        return WebNotificationSettings()
+    try:
+        return validate_notification_settings_payload(raw)
+    except Exception as exc:
+        LOG.warning("notification settings in %s are invalid: %s", path, exc)
+        return WebNotificationSettings()
+
+
+def save_notification_settings(path: Path, settings: WebNotificationSettings) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(settings), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def eas_recording_settings_from_stream(stream: dict[str, Any]) -> WebEasRecordingSettings:
     raw = stream.get("eas_recording")
     if not isinstance(raw, dict):
@@ -7717,6 +8074,34 @@ def eas_alert_id(alert: dict[str, Any], index: int) -> str:
         ).encode("utf-8", errors="replace")
     ).hexdigest()
     return digest[:24]
+
+
+def eas_alert_notification_id(alert: dict[str, Any]) -> str:
+    digest = hashlib.sha256(
+        "\0".join(
+            [
+                str(alert.get("raw_same_header", "")),
+                str(alert.get("start_time_utc", "")),
+                str(alert.get("expires_at_utc", "")),
+                str(alert.get("event_type", "")),
+                str(alert.get("file_path", "")),
+            ]
+        ).encode("utf-8", errors="replace")
+    ).hexdigest()
+    return digest[:24]
+
+
+def eas_alert_notification_message(stream: dict[str, Any], alert: dict[str, Any]) -> str:
+    event = lookup_event(str(alert.get("event_type", "")))
+    callsign = stream_callsign(stream)
+    areas = [
+        format_same_location_for_alert(str(code))
+        for code in alert.get("fips_codes", [])
+        if isinstance(code, str) and code.strip()
+    ]
+    area_text = ", ".join(areas) if areas else "an unknown area"
+    expires_at = parse_utc_datetime(str(alert.get("expires_at_utc", "")))
+    return f"{event.display_name} received on {callsign} for {area_text} until {format_local_time(expires_at)}."
 
 
 def eas_alert_summary(stream: dict[str, Any], alert: dict[str, Any], index: int) -> dict[str, Any]:
@@ -8227,6 +8612,141 @@ def validate_fallback_settings_payload(raw: Any) -> WebFallbackSettings:
     )
 
 
+def stream_notification_settings_from_stream(stream: dict[str, Any]) -> WebStreamNotificationSettings:
+    raw = stream.get("notifications")
+    if not isinstance(raw, dict):
+        return WebStreamNotificationSettings()
+    return WebStreamNotificationSettings(
+        icecast_failures=bool(raw.get("icecast_failures", False)),
+        soundcard_failures=bool(raw.get("soundcard_failures", False)),
+        recorded_eas_alerts=bool(raw.get("recorded_eas_alerts", False)),
+    )
+
+
+def validate_stream_notification_payload(raw: Any) -> WebStreamNotificationSettings:
+    if not isinstance(raw, dict):
+        raise ValueError("stream notification settings are required")
+    return WebStreamNotificationSettings(
+        icecast_failures=bool(raw.get("icecast_failures", False)),
+        soundcard_failures=bool(raw.get("soundcard_failures", False)),
+        recorded_eas_alerts=bool(raw.get("recorded_eas_alerts", False)),
+    )
+
+
+def validate_notification_settings_payload(
+    raw: Any,
+    *,
+    current: WebNotificationSettings | None = None,
+) -> WebNotificationSettings:
+    if not isinstance(raw, dict):
+        raise ValueError("notification settings are required")
+    enabled = bool(raw.get("enabled", False))
+    server_url = str(raw.get("server_url", "https://ntfy.sh")).strip().rstrip("/")
+    if not server_url:
+        server_url = "https://ntfy.sh"
+    parsed = urlparse(server_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("ntfy server URL must start with http:// or https://")
+    if parsed.query or parsed.fragment:
+        raise ValueError("ntfy server URL cannot include a query string or fragment")
+    topic = str(raw.get("topic", "")).strip()
+    if topic and ("/" in topic or "\\" in topic or any(ord(char) < 33 for char in topic)):
+        raise ValueError("ntfy topic must be a single topic name without spaces or slashes")
+    if len(topic) > 128:
+        raise ValueError("ntfy topic must be 128 characters or fewer")
+    try:
+        priority = int(raw.get("priority", 3))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ntfy priority must be a number from 1 through 5") from exc
+    if not 1 <= priority <= 5:
+        raise ValueError("ntfy priority must be from 1 through 5")
+    access_url_mode = str(raw.get("access_url_mode", "auto")).strip() or "auto"
+    if any(ord(char) < 32 for char in access_url_mode) or len(access_url_mode) > 160:
+        raise ValueError("notification access URL selection is invalid")
+    custom_access_url = str(raw.get("custom_access_url", "")).strip().rstrip("/")
+    if access_url_mode == "custom":
+        custom_access_url = normalize_notification_access_url(custom_access_url)
+    elif custom_access_url:
+        try:
+            custom_access_url = normalize_notification_access_url(custom_access_url)
+        except ValueError:
+            custom_access_url = ""
+    access_token = str(raw.get("access_token", "")).strip()
+    username = str(raw.get("username", "")).strip()
+    password = str(raw.get("password", ""))
+    if current is not None:
+        if bool(raw.get("keep_access_token", False)) and not access_token:
+            access_token = current.access_token
+        if bool(raw.get("keep_password", False)) and not password:
+            password = current.password
+    if access_token and (username or password):
+        raise ValueError("Use either an access token or username/password, not both")
+    if password and not username:
+        raise ValueError("A username is required when a password is set")
+    if enabled and not topic:
+        raise ValueError("Enter an ntfy topic before enabling notifications")
+    return WebNotificationSettings(
+        enabled=enabled,
+        server_url=server_url,
+        topic=topic,
+        priority=priority,
+        access_url_mode=access_url_mode,
+        custom_access_url=custom_access_url,
+        access_token=access_token,
+        username=username,
+        password=password,
+    )
+
+
+def send_ntfy_notification(
+    settings: WebNotificationSettings,
+    *,
+    title: str,
+    message: str,
+    priority: int | None = None,
+    click_url: str = "",
+) -> None:
+    if not settings.topic:
+        raise ValueError("Enter an ntfy topic before sending a notification")
+    url = f"{settings.server_url}/{quote(settings.topic, safe='')}"
+    headers = {
+        "Title": str(title)[:120],
+        "Priority": str(max(1, min(5, int(priority if priority is not None else settings.priority)))),
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+    click_url = normalize_notification_access_url(click_url, default_scheme="http") if click_url else ""
+    if click_url:
+        headers["Click"] = click_url
+    if settings.access_token:
+        headers["Authorization"] = f"Bearer {settings.access_token}"
+    elif settings.username or settings.password:
+        token = base64.b64encode(f"{settings.username}:{settings.password}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+    request = Request(
+        url,
+        data=str(message).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            if response.status >= 400:
+                raise ValueError(f"ntfy returned HTTP {response.status}")
+    except HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise ValueError("ntfy rejected the credentials or topic permissions") from exc
+        if exc.code == 404:
+            raise ValueError("ntfy server or topic endpoint was not found") from exc
+        if exc.code == 429:
+            raise ValueError("ntfy rate limited the notification request") from exc
+        raise ValueError(f"ntfy returned HTTP {exc.code}") from exc
+    except URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        raise ValueError(f"Could not reach ntfy server: {reason}") from exc
+    except TimeoutError as exc:
+        raise ValueError("ntfy server took too long to respond") from exc
+
+
 def station_key(station: dict[str, Any]) -> str:
     return "|".join(
         str(station.get(key, "")).strip()
@@ -8488,6 +9008,75 @@ def public_active_stream_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     if isinstance(station, dict) and (station.get("callsign") or station.get("frequency")):
         public["station"] = dict(station)
     return public
+
+
+def icecast_mountpoint_url(icecast: dict[str, Any]) -> str:
+    host = str(icecast.get("host", "")).strip()
+    port = str(icecast.get("port", "")).strip()
+    mount = str(icecast.get("mount", "")).strip()
+    if mount and not mount.startswith("/"):
+        mount = f"/{mount}"
+    if not host:
+        return mount or "the configured Icecast mountpoint"
+    return f"http://{host}{':' + port if port else ''}{mount}"
+
+
+def soundcard_notification_name(output: dict[str, Any]) -> str:
+    soundcard = output.get("soundcard") if isinstance(output.get("soundcard"), dict) else {}
+    for key in ("device", "display_name", "card_name", "stable_id"):
+        value = str(soundcard.get(key, "")).strip()
+        if value:
+            return value
+    return "the configured sound card"
+
+
+def stream_callsign(stream: dict[str, Any], snapshot: dict[str, Any] | None = None) -> str:
+    station = stream.get("station") if isinstance(stream.get("station"), dict) else {}
+    if (not station or not station.get("callsign")) and snapshot is not None:
+        station = snapshot.get("station") if isinstance(snapshot.get("station"), dict) else {}
+    return str(station.get("callsign", "") or "Unknown")
+
+
+def stream_notification_failures(
+    stream: dict[str, Any],
+    snapshot: dict[str, Any],
+    settings: WebStreamNotificationSettings,
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    stream_id = str(stream.get("id", ""))
+    callsign = stream_callsign(stream, snapshot)
+    for output in snapshot.get("outputs", []):
+        if not isinstance(output, dict):
+            continue
+        status = str(output.get("status", snapshot.get("status", ""))).strip().lower()
+        if status != "needs-attention":
+            continue
+        output_type = str(output.get("type", "icecast") or "icecast")
+        output_id = str(output.get("id", ""))
+        if output_type == "soundcard":
+            if not settings.soundcard_failures:
+                continue
+            name = soundcard_notification_name(output)
+            failures.append(
+                {
+                    "key": f"{stream_id}:soundcard:{output_id}",
+                    "category": "soundcard",
+                    "message": f"{callsign}: sound card {name} is not currently connected.",
+                }
+            )
+        else:
+            if not settings.icecast_failures:
+                continue
+            icecast = output.get("icecast") if isinstance(output.get("icecast"), dict) else {}
+            destination = icecast_mountpoint_url(icecast)
+            failures.append(
+                {
+                    "key": f"{stream_id}:icecast:{output_id}",
+                    "category": "icecast",
+                    "message": f"{callsign}: failed to connect to the Icecast mountpoint at {destination}.",
+                }
+            )
+    return failures
 
 
 def enabled_output_count(
@@ -8774,11 +9363,255 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+VIRTUAL_INTERFACE_PREFIXES = (
+    "br-",
+    "cali",
+    "cni",
+    "docker",
+    "flannel",
+    "kube",
+    "lxc",
+    "podman",
+    "veth",
+    "virbr",
+)
+VIRTUAL_INTERFACE_NAMES = {"lo", "tunl0"}
+IFF_UP = 0x1
+TAILSCALE_DNS_RESOLVER = "100.100.100.100"
+DNS_TYPE_PTR = 12
+DNS_CLASS_IN = 1
+
+
+def interface_ipv4_address(name: str) -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        request = struct.pack("256s", name[:15].encode("utf-8"))
+        result = fcntl.ioctl(sock.fileno(), 0x8915, request)
+        return socket.inet_ntoa(result[20:24])
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+
+
+def interface_is_up(name: str) -> bool:
+    interface_path = Path("/sys/class/net") / name
+    try:
+        if (interface_path / "operstate").read_text(encoding="utf-8").strip() == "up":
+            return True
+    except OSError:
+        pass
+    try:
+        flags = int((interface_path / "flags").read_text(encoding="utf-8").strip(), 0)
+        return bool(flags & IFF_UP)
+    except (OSError, ValueError):
+        return False
+
+
+def interface_is_physical_or_tailscale(name: str) -> bool:
+    lowered = name.lower()
+    if lowered.startswith("tailscale"):
+        return True
+    if lowered in VIRTUAL_INTERFACE_NAMES:
+        return False
+    if lowered.startswith(VIRTUAL_INTERFACE_PREFIXES):
+        return False
+    if (Path("/sys/class/net") / name / "device").exists():
+        return True
+    return lowered.startswith(("en", "eth", "wl", "wlan", "ww", "usb"))
+
+
+def dns_encode_name(name: str) -> bytes:
+    encoded = bytearray()
+    labels = name.rstrip(".").split(".")
+    for label in labels:
+        if not label or len(label) > 63:
+            raise ValueError("invalid DNS label")
+        encoded.append(len(label))
+        encoded.extend(label.encode("ascii"))
+    encoded.append(0)
+    return bytes(encoded)
+
+
+def dns_decode_name(message: bytes, offset: int) -> tuple[str, int]:
+    labels: list[str] = []
+    jumped = False
+    next_offset = offset
+    seen_offsets: set[int] = set()
+    while True:
+        if offset >= len(message):
+            raise ValueError("truncated DNS name")
+        length = message[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(message):
+                raise ValueError("truncated DNS pointer")
+            pointer = ((length & 0x3F) << 8) | message[offset + 1]
+            if pointer in seen_offsets:
+                raise ValueError("DNS pointer loop")
+            seen_offsets.add(pointer)
+            if not jumped:
+                next_offset = offset + 2
+                jumped = True
+            offset = pointer
+            continue
+        if length & 0xC0:
+            raise ValueError("unsupported DNS name label")
+        offset += 1
+        if length == 0:
+            if not jumped:
+                next_offset = offset
+            return ".".join(labels), next_offset
+        if offset + length > len(message):
+            raise ValueError("truncated DNS label")
+        labels.append(message[offset : offset + length].decode("ascii", errors="strict"))
+        offset += length
+
+
+def reverse_ipv4_arpa(address: str) -> str:
+    packed = socket.inet_aton(address)
+    return ".".join(str(part) for part in reversed(packed)) + ".in-addr.arpa"
+
+
+def dns_ptr_lookup(server: str, address: str, *, timeout: float = 0.25) -> list[str]:
+    query_id = secrets.randbits(16)
+    qname = dns_encode_name(reverse_ipv4_arpa(address))
+    query = struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", DNS_TYPE_PTR, DNS_CLASS_IN)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        sock.sendto(query, (server, 53))
+        response, _addr = sock.recvfrom(2048)
+    if len(response) < 12:
+        raise ValueError("truncated DNS response")
+    rid, flags, qdcount, ancount, _nscount, _arcount = struct.unpack("!HHHHHH", response[:12])
+    if rid != query_id:
+        raise ValueError("mismatched DNS response")
+    if flags & 0x000F:
+        return []
+    offset = 12
+    for _idx in range(qdcount):
+        _name, offset = dns_decode_name(response, offset)
+        if offset + 4 > len(response):
+            raise ValueError("truncated DNS question")
+        offset += 4
+    results: list[str] = []
+    for _idx in range(ancount):
+        _name, offset = dns_decode_name(response, offset)
+        if offset + 10 > len(response):
+            raise ValueError("truncated DNS answer")
+        answer_type, answer_class, _ttl, rdlength = struct.unpack("!HHIH", response[offset : offset + 10])
+        offset += 10
+        rdata_offset = offset
+        offset += rdlength
+        if offset > len(response):
+            raise ValueError("truncated DNS rdata")
+        if answer_type == DNS_TYPE_PTR and answer_class == DNS_CLASS_IN:
+            target, _unused = dns_decode_name(response, rdata_offset)
+            if target:
+                results.append(target.rstrip("."))
+    return results
+
+
+def tailscale_magicdns_name(address: str) -> str:
+    try:
+        names = dns_ptr_lookup(TAILSCALE_DNS_RESOLVER, address)
+    except (OSError, ValueError, UnicodeError):
+        return ""
+    for name in names:
+        normalized = name.strip().rstrip(".")
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered.endswith(".ts.net") or ".ts.net." in lowered:
+            return normalized
+    return ""
+
+
+def default_route_ipv4_address() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 80))
+            address = sock.getsockname()[0]
+            return address if address and not address.startswith("127.") else ""
+    except OSError:
+        return ""
+
+
+def notification_access_url_options(host: str, port: int) -> list[dict[str, str]]:
+    options: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    default_route_address = default_route_ipv4_address()
+    if host not in {"0.0.0.0", "::", ""}:
+        url = f"http://{host}:{port}"
+        return [{"id": "auto", "label": f"Server bind address ({url})", "url": url, "interface": ""}]
+    try:
+        for _index, name in socket.if_nameindex():
+            if not interface_is_up(name) or not interface_is_physical_or_tailscale(name):
+                continue
+            address = interface_ipv4_address(name)
+            if not address or address.startswith("127."):
+                continue
+            url = f"http://{address}:{port}"
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            lowered = name.lower()
+            if lowered.startswith("tailscale"):
+                magicdns = tailscale_magicdns_name(address)
+                if magicdns:
+                    magic_url = f"http://{magicdns}:{port}"
+                    if magic_url not in seen_urls:
+                        seen_urls.add(magic_url)
+                        options.append(
+                            {
+                                "id": f"tailscale-magicdns:{name}:{magicdns}",
+                                "label": f"Tailscale MagicDNS ({magicdns})",
+                                "url": magic_url,
+                                "interface": name,
+                            }
+                        )
+                label = f"Tailscale ({address})"
+                option_id = f"tailscale:{name}:{address}"
+            else:
+                label = f"{name} ({address})"
+                option_id = f"interface:{name}:{address}"
+            options.append({"id": option_id, "label": label, "url": url, "interface": name})
+    except OSError:
+        pass
+    if not options:
+        if default_route_address:
+            options.append(
+                {
+                    "id": f"interface:default:{default_route_address}",
+                    "label": f"Default network route ({default_route_address})",
+                    "url": f"http://{default_route_address}:{port}",
+                    "interface": "default",
+                }
+            )
+
+    def option_sort_key(option: dict[str, str]) -> tuple[int, str, str]:
+        option_id = option["id"]
+        if option_id.startswith("tailscale-magicdns:"):
+            return (0, "", option["label"].lower())
+        if option_id.startswith("tailscale:"):
+            return (1, "", option["label"].lower())
+        parsed = urlparse(option.get("url", ""))
+        address = parsed.hostname or ""
+        default_rank = 0 if default_route_address and address == default_route_address else 1
+        return (2, str(default_rank), option["label"].lower())
+
+    options.sort(key=option_sort_key)
+    return options
+
+
 def access_urls(host: str, port: int) -> list[str]:
     if host not in {"0.0.0.0", "::", ""}:
         return [f"http://{host}:{port}"]
 
     hosts = {"127.0.0.1"}
+    for option in notification_access_url_options(host, port):
+        parsed = urlparse(option["url"])
+        if parsed.hostname:
+            hosts.add(parsed.hostname)
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("192.0.2.1", 80))
@@ -8891,6 +9724,8 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
         ring_handler,
         development_iq_sources_enabled=development_iq_sources,
     )
+    service.web_host = host
+    service.web_port = port
     RtlControlHandler.service = service
     server = ThreadingHTTPServer((host, port), RtlControlHandler)
     previous_signal_handlers = install_shutdown_signal_handlers(server)
@@ -9223,6 +10058,7 @@ nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #255
 .row label { margin: 0; display: flex; align-items: center; gap: 8px; min-width: 44px; min-height: 44px; }
 .checkbox-row { display: flex; align-items: center; gap: 8px; min-height: 44px; margin-top: 14px; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.control-block { display: grid; gap: 6px; margin: 12px 0 14px; justify-items: start; }
 .iq-test-source-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
 .iq-test-source-actions button { min-height: 44px; white-space: normal; }
 .receiver-controls { display: flex; flex-wrap: nowrap; gap: 10px; align-items: center; }
@@ -9331,6 +10167,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <span id="nav_more_menu" class="nav-more-menu" role="menu" hidden>
           <a id="nav_receiver" href="/?view=receiver" data-view="receiver" role="menuitem">Weather Radio Receiver</a>
           <a id="nav_iq_recorder" href="/?view=iq_recorder" data-view="iq_recorder" role="menuitem">I/Q Recorder</a>
+          <a id="nav_notifications" href="/?view=notifications" data-view="notifications" role="menuitem">Notification settings</a>
           <a id="nav_logs" href="/?view=logs" data-view="logs" role="menuitem">Logs</a>
           <a id="nav_accounts" href="/?view=accounts" data-view="accounts" role="menuitem">Manage accounts</a>
           <a id="nav_change_password" href="/?view=change_password" data-view="change_password" role="menuitem" hidden>Change account password</a>
@@ -9607,6 +10444,50 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
+  <div id="view_notifications" class="view" hidden>
+    <section>
+      <h2>Notification settings</h2>
+      <div id="notification-result" class="message"></div>
+      <div id="notification_intro">
+        <p>Get notifications on your computer or phone when a stream goes down, a sound card isn't working, or the SDR disconnects.</p>
+        <div class="actions">
+          <button id="start_notification_setup" type="button">Set up</button>
+        </div>
+      </div>
+      <div id="notification_configured" hidden>
+        <p id="notification_configured_summary"></p>
+        <label>Topic secret
+          <input id="notification_configured_topic_secret" type="text" readonly aria-describedby="notification_configured_topic_hint">
+        </label>
+        <div id="notification_configured_topic_hint" class="hint">Subscribe to this topic in the ntfy app to receive notifications.</div>
+        <div class="actions">
+          <button id="copy_configured_notification_topic" type="button">Copy to clipboard</button>
+          <button id="configured_test_notifications" type="button">Send test notification</button>
+          <button id="restart_notification_setup" type="button">Set up again</button>
+        </div>
+        <div class="control-block">
+          <button id="regenerate_notification_topic" type="button" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</button>
+          <div id="regenerate_notification_topic_hint" class="hint">Regenerate the topic secret if someone has figured out the current one.</div>
+        </div>
+        <label>Open NWR Stream Manager from notifications
+          <select id="notification_access_url_mode" aria-describedby="notification_access_url_hint"></select>
+        </label>
+        <div id="notification_access_url_hint" class="hint">Choose the address devices should open when a notification links back to NWR Stream Manager.</div>
+        <label id="notification_custom_access_url_label" hidden>Custom URL
+          <input id="notification_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com">
+        </label>
+      </div>
+      <div id="notification_wizard" hidden>
+        <div id="notification_wizard_body"></div>
+        <div class="actions">
+          <button id="notification_cancel" type="button">Cancel</button>
+          <button id="notification_back" type="button">Back</button>
+          <button id="notification_next" type="button">Next</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
   <div id="view_logs" class="view" hidden>
     <section>
       <h2>Logs</h2>
@@ -9867,6 +10748,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <button id="tab_eas" type="button" role="tab" aria-selected="false" aria-controls="panel_eas" tabindex="-1">EAS Recording</button>
         <button id="tab_fallback" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback" tabindex="-1">Fallback Audio</button>
         <button id="tab_audio" type="button" role="tab" aria-selected="false" aria-controls="panel_audio" tabindex="-1">Audio Effects</button>
+        <button id="tab_notifications" type="button" role="tab" aria-selected="false" aria-controls="panel_notifications" tabindex="-1" hidden>Notifications</button>
       </div>
       <div id="panel_outputs" class="tabpanel" role="tabpanel" aria-labelledby="tab_outputs">
         <div class="actions">
@@ -10066,6 +10948,26 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </div>
         <div class="hint">Uses the packaged default fallback.wav audio file.</div>
         <div id="fallback-result" class="message"></div>
+      </div>
+      <div id="panel_notifications" class="tabpanel" role="tabpanel" aria-labelledby="tab_notifications" hidden>
+        <h3>Notifications</h3>
+        <p class="hint">Choose which problems for this stream should send notifications.</p>
+        <div class="grid">
+          <label class="checkbox-row">
+            <input id="stream_notify_icecast_failures" type="checkbox">
+            Failed Icecast mountpoints
+          </label>
+          <label class="checkbox-row">
+            <input id="stream_notify_soundcard_failures" type="checkbox">
+            Disconnected sound cards
+          </label>
+          <label id="stream_notify_eas_alerts_label" class="checkbox-row" hidden>
+            <input id="stream_notify_eas_alerts" type="checkbox" aria-describedby="stream_notify_eas_alerts_hint">
+            Recorded EAS alerts
+          </label>
+          <span id="stream_notify_eas_alerts_hint" class="hint" hidden>Send a notification when a new EAS alert recording is saved.</span>
+        </div>
+        <div id="stream-notifications-result" class="message"></div>
       </div>
     </section>
   </div>
@@ -10330,6 +11232,8 @@ let easSignature = "";
 let easUpdateTimer = null;
 let audioEffectsSignature = "";
 let audioEffectsUpdateTimer = null;
+let streamNotificationsSignature = "";
+let streamNotificationsUpdateTimer = null;
 let selectedAudioEffect = "volume";
 let wizardStep = 0;
 let wizardMode = "add";
@@ -10414,6 +11318,7 @@ let mediaSessionAnchorUrl = "";
 let mediaSessionAnchorStarted = false;
 let currentAccount = null;
 let accountsSignature = "";
+let notificationSettingsSignature = "";
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
 const WEBRTC_JITTER_BUFFER_TARGET_SECONDS = 0.06;
@@ -13351,6 +14256,14 @@ function setAudioEffectsResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setStreamNotificationsResult(message, kind = "") {
+  const element = document.getElementById("stream-notifications-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
 function fallbackPayload() {
   return {
     enabled: document.getElementById("fallback_enabled").checked,
@@ -13535,6 +14448,23 @@ function audioEffectsPayload() {
   };
 }
 
+function streamNotificationSettingsForStream(stream) {
+  const settings = stream && stream.notifications ? stream.notifications : {};
+  return {
+    icecast_failures: Boolean(settings.icecast_failures),
+    soundcard_failures: Boolean(settings.soundcard_failures),
+    recorded_eas_alerts: Boolean(settings.recorded_eas_alerts)
+  };
+}
+
+function streamNotificationsPayload() {
+  return {
+    icecast_failures: document.getElementById("stream_notify_icecast_failures").checked,
+    soundcard_failures: document.getElementById("stream_notify_soundcard_failures").checked,
+    recorded_eas_alerts: document.getElementById("stream_notify_eas_alerts").checked
+  };
+}
+
 function easPayload() {
   const selectedFormat = document.querySelector("input[name='eas_format']:checked");
   return {
@@ -13650,24 +14580,54 @@ function setFallbackControls(fallback) {
   fallbackSignature = nextSignature;
 }
 
+function setStreamNotificationControls(stream) {
+  const configured = notificationIsConfigured() && !accountIsReadOnly();
+  setHidden("tab_notifications", !configured);
+  if (!configured) {
+    setHidden("panel_notifications", true);
+    if (activeSettingsTab() === "notifications") showSettingsTab("outputs");
+    return;
+  }
+  const settings = streamNotificationSettingsForStream(stream);
+  const easEnabled = easRecordingEnabled(stream);
+  const nextSignature = JSON.stringify({settings, easEnabled});
+  if (nextSignature === streamNotificationsSignature) return;
+  setChecked("stream_notify_icecast_failures", settings.icecast_failures);
+  setChecked("stream_notify_soundcard_failures", settings.soundcard_failures);
+  setChecked("stream_notify_eas_alerts", settings.recorded_eas_alerts);
+  setHidden("stream_notify_eas_alerts_label", !easEnabled);
+  setHidden("stream_notify_eas_alerts_hint", !easEnabled);
+  streamNotificationsSignature = nextSignature;
+}
+
 function activeSettingsTab() {
+  if (document.getElementById("tab_notifications").getAttribute("aria-selected") === "true") return "notifications";
   if (document.getElementById("tab_fallback").getAttribute("aria-selected") === "true") return "fallback";
   if (document.getElementById("tab_eas").getAttribute("aria-selected") === "true") return "eas";
   if (document.getElementById("tab_audio").getAttribute("aria-selected") === "true") return "audio";
   return "outputs";
 }
 
-function showSettingsTab(name) {
-  for (const tab of [
+function streamSettingsTabs() {
+  return [
     {name: "outputs", button: "tab_outputs", panel: "panel_outputs"},
     {name: "eas", button: "tab_eas", panel: "panel_eas"},
     {name: "fallback", button: "tab_fallback", panel: "panel_fallback"},
-    {name: "audio", button: "tab_audio", panel: "panel_audio"}
-  ]) {
-    const selected = tab.name === name;
-    document.getElementById(tab.button).setAttribute("aria-selected", selected ? "true" : "false");
-    document.getElementById(tab.button).setAttribute("tabindex", selected ? "0" : "-1");
-    document.getElementById(tab.panel).hidden = !selected;
+    {name: "audio", button: "tab_audio", panel: "panel_audio"},
+    {name: "notifications", button: "tab_notifications", panel: "panel_notifications"}
+  ];
+}
+
+function showSettingsTab(name) {
+  const requested = streamSettingsTabs().find(tab => tab.name === name);
+  const effectiveName = requested && !document.getElementById(requested.button).hidden ? name : "outputs";
+  for (const tab of streamSettingsTabs()) {
+    const button = document.getElementById(tab.button);
+    const panel = document.getElementById(tab.panel);
+    const selected = tab.name === effectiveName && !button.hidden;
+    button.setAttribute("aria-selected", selected ? "true" : "false");
+    button.setAttribute("tabindex", selected ? "0" : "-1");
+    panel.hidden = !selected;
   }
 }
 
@@ -14208,6 +15168,7 @@ function showStreamSettings(streamId) {
   soundcardOutputTableSignature = "";
   easSignature = "";
   audioEffectsSignature = "";
+  streamNotificationsSignature = "";
   selectAudioEffect(selectedAudioEffect, false);
   closeOutputForm();
   const station = stream.station || {};
@@ -14232,6 +15193,7 @@ function renderStreamSettings() {
   setChecked("stream_monitor_enabled", Boolean(enabled && monitorStreamId === stream.id));
   setAudioEffectsControls(stream);
   setEasControls(stream);
+  setStreamNotificationControls(stream);
   renderOutputPanels();
   renderIcecastOutputsTable(stream);
   renderSoundcardOutputsTable(stream);
@@ -14910,7 +15872,8 @@ function configuredStreamsRefreshSignature(streams) {
     })),
     eas_recording: stream.eas_recording || {},
     fallback: stream.fallback || {},
-    audio_effects: stream.audio_effects || {}
+    audio_effects: stream.audio_effects || {},
+    notifications: stream.notifications || {}
   })));
 }
 
@@ -15115,6 +16078,437 @@ function setChangePasswordResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setNotificationResult(message, kind = "") {
+  const element = document.getElementById("notification-result");
+  if (!element) return;
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+let notificationSettings = {};
+let notificationWizardActive = false;
+let notificationWizardStep = 0;
+let notificationWizardSelfHosted = false;
+let notificationWizardServerUrl = "https://ntfy.sh";
+let notificationWizardTopic = "";
+let notificationAccessUrlOptions = [];
+let notificationAccessUrlOptionsSignature = "";
+let notificationAccessUrlSelectionSignature = "";
+let notificationAccessUrlsLoading = false;
+
+const NOTIFICATION_STEP_SERVER_CHOICE = 0;
+const NOTIFICATION_STEP_SERVER_URL = 1;
+const NOTIFICATION_STEP_APP_INSTALL = 2;
+const NOTIFICATION_STEP_TOPIC = 3;
+const NOTIFICATION_STEP_TEST = 4;
+const NOTIFICATION_STEP_DONE = 5;
+
+function notificationPayload() {
+  return {
+    enabled: true,
+    server_url: notificationWizardServerUrl || "https://ntfy.sh",
+    topic: notificationWizardTopic || notificationSettings.topic || "",
+    priority: 3,
+    access_url_mode: notificationSettings.access_url_mode || "auto",
+    custom_access_url: notificationSettings.custom_access_url || "",
+    access_token: "",
+    username: "",
+    password: ""
+  };
+}
+
+function setNotificationSettings(settings = {}) {
+  const signature = JSON.stringify(settings || {});
+  if (signature === notificationSettingsSignature) return;
+  const panel = document.getElementById("view_notifications");
+  if (panel && containsFocusedElement(panel) && notificationWizardActive) return;
+  notificationSettingsSignature = signature;
+  notificationSettings = Object.assign({}, settings || {});
+  if (!notificationWizardActive) renderNotificationSettings();
+  if (settingsStreamId) renderStreamSettings();
+}
+
+function notificationIsConfigured() {
+  return Boolean(notificationSettings && notificationSettings.topic);
+}
+
+function renderNotificationSettings() {
+  const intro = document.getElementById("notification_intro");
+  const configured = document.getElementById("notification_configured");
+  const wizard = document.getElementById("notification_wizard");
+  if (!intro || !configured || !wizard) return;
+  intro.hidden = notificationWizardActive || notificationIsConfigured();
+  configured.hidden = notificationWizardActive || !notificationIsConfigured();
+  wizard.hidden = !notificationWizardActive;
+  if (notificationIsConfigured()) {
+    setText(
+      "notification_configured_summary",
+      `Notifications are set up using ${notificationSettings.server_url || "https://ntfy.sh"}.`
+    );
+    setValue("notification_configured_topic_secret", notificationSettings.topic || "");
+    renderNotificationAccessUrlControls();
+    loadNotificationAccessUrlOptions();
+  }
+  if (notificationWizardActive) renderNotificationWizard();
+}
+
+function notificationAccessUrlMode() {
+  const select = document.getElementById("notification_access_url_mode");
+  return select ? (select.value || "auto") : (notificationSettings.access_url_mode || "auto");
+}
+
+function notificationAccessPayload(overrides = {}) {
+  return {
+    enabled: true,
+    server_url: notificationSettings.server_url || "https://ntfy.sh",
+    topic: notificationSettings.topic || "",
+    priority: notificationSettings.priority || 3,
+    access_url_mode: overrides.access_url_mode || notificationAccessUrlMode(),
+    custom_access_url: overrides.custom_access_url !== undefined
+      ? overrides.custom_access_url
+      : (document.getElementById("notification_custom_access_url")?.value || notificationSettings.custom_access_url || ""),
+    access_token: "",
+    keep_access_token: Boolean(notificationSettings.access_token_set),
+    username: notificationSettings.username || "",
+    password: "",
+    keep_password: Boolean(notificationSettings.password_set)
+  };
+}
+
+function normalizeNotificationAccessUrl(value, defaultScheme = "https") {
+  let text = String(value || "").trim().replace(/[/]+$/, "");
+  if (!text) return "";
+  if (!text.includes("://")) text = `${defaultScheme}://${text}`;
+  const parsed = new URL(text);
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("invalid scheme");
+  return text;
+}
+
+function updateNotificationCustomUrlVisibility(mode = notificationAccessUrlMode()) {
+  setHidden("notification_custom_access_url_label", mode !== "custom");
+}
+
+function renderNotificationAccessUrlOptions() {
+  const select = document.getElementById("notification_access_url_mode");
+  if (!select) return;
+  const savedSelected = notificationSettings.access_url_mode || "auto";
+  const options = Array.isArray(notificationAccessUrlOptions) ? notificationAccessUrlOptions : [];
+  const optionSpecs = [{value: "auto", label: options.length ? `Automatic (${options[0].label})` : "Automatic"}];
+  for (const option of options) {
+    optionSpecs.push({value: option.id, label: option.label});
+  }
+  if (savedSelected && savedSelected !== "auto" && savedSelected !== "custom" && !options.some(option => option.id === savedSelected)) {
+    optionSpecs.push({value: savedSelected, label: "Previously selected address unavailable"});
+  }
+  optionSpecs.push({value: "custom", label: "Custom URL"});
+  const signature = JSON.stringify(optionSpecs);
+  const domSignature = JSON.stringify(Array.from(select.options).map(option => ({value: option.value, label: option.textContent || ""})));
+  if (notificationAccessUrlOptionsSignature === signature && domSignature === signature) return;
+  notificationAccessUrlOptionsSignature = signature;
+  syncSelectOptions(select, optionSpecs);
+}
+
+function syncNotificationAccessUrlSelection() {
+  const select = document.getElementById("notification_access_url_mode");
+  if (!select) return;
+  const selected = notificationSettings.access_url_mode || "auto";
+  const customUrl = notificationSettings.custom_access_url || "";
+  const signature = JSON.stringify({selected, customUrl});
+  if (notificationAccessUrlSelectionSignature !== signature) {
+    notificationAccessUrlSelectionSignature = signature;
+    if (document.activeElement !== select) {
+      setValue("notification_access_url_mode", selected);
+    }
+    setValue("notification_custom_access_url", customUrl);
+  }
+  updateNotificationCustomUrlVisibility(document.activeElement === select ? notificationAccessUrlMode() : selected);
+}
+
+function renderNotificationAccessUrlControls() {
+  renderNotificationAccessUrlOptions();
+  syncNotificationAccessUrlSelection();
+}
+
+async function loadNotificationAccessUrlOptions() {
+  if (notificationAccessUrlsLoading || accountIsReadOnly()) return;
+  notificationAccessUrlsLoading = true;
+  try {
+    const data = await request("/api/notification-access-urls");
+    notificationAccessUrlOptions = Array.isArray(data.options) ? data.options : [];
+    renderNotificationAccessUrlControls();
+  } catch (error) {
+    setNotificationResult(error.message, "error");
+  } finally {
+    notificationAccessUrlsLoading = false;
+  }
+}
+
+async function saveNotificationAccessUrlSettings() {
+  if (!notificationIsConfigured() || accountIsReadOnly()) return;
+  const mode = notificationAccessUrlMode();
+  const custom = document.getElementById("notification_custom_access_url");
+  if (mode === "custom") {
+    const value = custom ? custom.value.trim().replace(/[/]+$/, "") : "";
+    try {
+      const normalized = normalizeNotificationAccessUrl(value);
+      await saveNotificationSettings(notificationAccessPayload({access_url_mode: mode, custom_access_url: normalized}));
+    } catch (error) {
+      setNotificationResult("Enter a valid custom URL, such as nwr.example.com or https://nwr.example.com.", "error");
+      return;
+    }
+    return;
+  }
+  await saveNotificationSettings(notificationAccessPayload({access_url_mode: mode}));
+}
+
+function startNotificationWizard() {
+  notificationWizardActive = true;
+  notificationWizardStep = NOTIFICATION_STEP_SERVER_CHOICE;
+  notificationWizardSelfHosted = false;
+  notificationWizardServerUrl = notificationSettings.server_url || "https://ntfy.sh";
+  notificationWizardTopic = "";
+  setNotificationResult("");
+  renderNotificationSettings();
+}
+
+function cancelNotificationWizard() {
+  notificationWizardActive = false;
+  notificationWizardTopic = "";
+  setNotificationResult("");
+  renderNotificationSettings();
+}
+
+function generateNotificationTopic() {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = new Uint8Array(24);
+  if (window.crypto && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  }
+  let suffix = "";
+  for (const value of bytes) suffix += alphabet[value % alphabet.length];
+  return `NWRSTMGR-${suffix}`;
+}
+
+function notificationWebAppUrl() {
+  return `${(notificationWizardServerUrl || "https://ntfy.sh").replace(/[/]+$/, "")}/app`;
+}
+
+function escapeHtmlAttribute(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function renderNotificationWizard() {
+  const body = document.getElementById("notification_wizard_body");
+  const cancel = document.getElementById("notification_cancel");
+  const back = document.getElementById("notification_back");
+  const next = document.getElementById("notification_next");
+  if (!body || !cancel || !back || !next) return;
+  cancel.hidden = notificationWizardStep === NOTIFICATION_STEP_DONE;
+  setDisabled(back, notificationWizardStep === NOTIFICATION_STEP_SERVER_CHOICE);
+  next.textContent = notificationWizardStep === NOTIFICATION_STEP_DONE ? "Finish" : "Next";
+  setDisabled(next, false);
+  if (notificationWizardStep === NOTIFICATION_STEP_SERVER_CHOICE) {
+    body.innerHTML = `
+      <h3>Let's get notifications set up!</h3>
+      <fieldset>
+        <legend>Do you have your own self-hosted ntfy server?</legend>
+        <label><input id="notification_self_hosted_no" name="notification_self_hosted" type="radio" value="no"> No</label>
+        <label><input id="notification_self_hosted_yes" name="notification_self_hosted" type="radio" value="yes"> Yes</label>
+      </fieldset>
+    `;
+    setChecked("notification_self_hosted_yes", notificationWizardSelfHosted);
+    setChecked("notification_self_hosted_no", !notificationWizardSelfHosted);
+    return;
+  }
+  if (notificationWizardStep === NOTIFICATION_STEP_SERVER_URL) {
+    body.innerHTML = `
+      <p>Enter the URL of your self-hosted ntfy server.</p>
+      <label>ntfy server URL
+        <input id="notification_server_url" type="url" placeholder="https://ntfy.example.com" autocomplete="url">
+      </label>
+    `;
+    setValue("notification_server_url", notificationWizardServerUrl === "https://ntfy.sh" ? "" : notificationWizardServerUrl);
+    return;
+  }
+  if (notificationWizardStep === NOTIFICATION_STEP_APP_INSTALL) {
+    const webApp = notificationWebAppUrl();
+    body.innerHTML = `
+      <p>Download the ntfy app on your device, or use the ntfy web app.</p>
+      <ul>
+        <li><a href="https://apps.apple.com/us/app/ntfy/id1625396347" target="_blank" rel="noopener noreferrer">Download ntfy from the Apple App Store</a></li>
+        <li><a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy" target="_blank" rel="noopener noreferrer">Download ntfy from Google Play</a></li>
+        <li><a href="${escapeHtmlAttribute(webApp)}" target="_blank" rel="noopener noreferrer">Open the ntfy web app</a></li>
+      </ul>
+    `;
+    return;
+  }
+  if (notificationWizardStep === NOTIFICATION_STEP_TOPIC) {
+    if (!notificationWizardTopic) notificationWizardTopic = generateNotificationTopic();
+    body.innerHTML = `
+      <p>Almost done! To receive notifications, you'll need to subscribe to the NWR Stream Manager topic in the ntfy app. To do this, first copy the topic secret below, then go into the ntfy app and paste it into the topic name field. You can subscribe to the topic on as many devices as you want; notifications will be sent to all of them.</p>
+      <label>Topic secret
+        <input id="notification_topic_secret" readonly>
+      </label>
+      <div class="actions">
+        <button id="copy_notification_topic" type="button">Copy to clipboard</button>
+      </div>
+      <p>Topics are public, meaning anyone that knows the topic name can see notifications and send notifications themselves. The chance of a topic name being brute-forced is low, but if it does happen, or you start to receive notifications that do not originate from NWR Stream Manager, you can regenerate the topic name in the notification settings.</p>
+    `;
+    setValue("notification_topic_secret", notificationWizardTopic);
+    return;
+  }
+  if (notificationWizardStep === NOTIFICATION_STEP_TEST) {
+    body.innerHTML = `
+      <p>Send a test notification to make sure you can receive notifications from NWR Stream Manager on your other devices.</p>
+      <div class="actions">
+        <button id="wizard_test_notifications" type="button">Send test notification</button>
+      </div>
+    `;
+    return;
+  }
+  body.innerHTML = `
+    <p>Notification setup complete! To configure notifications for individual streams, click "Manage streams", click "More actions" on the stream you want to enable notifications for, click "Edit stream settings", and go to the notifications tab.</p>
+  `;
+}
+
+function notificationWizardServerChoice() {
+  const selected = document.querySelector("input[name='notification_self_hosted']:checked");
+  return selected ? selected.value : "no";
+}
+
+async function saveNotificationSettings(payload = notificationPayload()) {
+  if (accountIsReadOnly()) return;
+  setNotificationResult("Saving notification settings...");
+  const data = await request("/api/notification-settings", {
+    method: "PATCH",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  setNotificationSettings(data.notifications || {});
+  applyStatus(data, {syncControls: false});
+  setNotificationResult("Notification settings saved.", "success");
+}
+
+async function testNotificationSettings(payload = notificationPayload()) {
+  if (accountIsReadOnly()) return;
+  setNotificationResult("Sending test notification...");
+  const data = await request("/api/notification-test", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  setNotificationResult(data.message || "Test notification sent.", "success");
+}
+
+function notificationWizardPreviousStep() {
+  if (notificationWizardStep === NOTIFICATION_STEP_APP_INSTALL && !notificationWizardSelfHosted) return NOTIFICATION_STEP_SERVER_CHOICE;
+  if (notificationWizardStep === NOTIFICATION_STEP_APP_INSTALL) return NOTIFICATION_STEP_SERVER_URL;
+  if (notificationWizardStep === NOTIFICATION_STEP_SERVER_URL) return NOTIFICATION_STEP_SERVER_CHOICE;
+  return Math.max(NOTIFICATION_STEP_SERVER_CHOICE, notificationWizardStep - 1);
+}
+
+async function notificationWizardNext() {
+  if (notificationWizardStep === NOTIFICATION_STEP_SERVER_CHOICE) {
+    notificationWizardSelfHosted = notificationWizardServerChoice() === "yes";
+    notificationWizardServerUrl = notificationWizardSelfHosted ? notificationWizardServerUrl : "https://ntfy.sh";
+    notificationWizardStep = notificationWizardSelfHosted ? NOTIFICATION_STEP_SERVER_URL : NOTIFICATION_STEP_APP_INSTALL;
+    renderNotificationWizard();
+    return;
+  }
+  if (notificationWizardStep === NOTIFICATION_STEP_SERVER_URL) {
+    const input = document.getElementById("notification_server_url");
+    const value = input ? input.value.trim().replace(/[/]+$/, "") : "";
+    if (!value) {
+      setNotificationResult("Enter the URL of your self-hosted ntfy server.", "error");
+      return;
+    }
+    try {
+      const parsed = new URL(value);
+      if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("invalid scheme");
+      notificationWizardServerUrl = value;
+    } catch (error) {
+      setNotificationResult("Enter a valid ntfy server URL that starts with http:// or https://.", "error");
+      return;
+    }
+    setNotificationResult("");
+    notificationWizardStep = NOTIFICATION_STEP_APP_INSTALL;
+    renderNotificationWizard();
+    return;
+  }
+  if (notificationWizardStep === NOTIFICATION_STEP_APP_INSTALL) {
+    if (!notificationWizardTopic) notificationWizardTopic = generateNotificationTopic();
+    notificationWizardStep = NOTIFICATION_STEP_TOPIC;
+    renderNotificationWizard();
+    return;
+  }
+  if (notificationWizardStep === NOTIFICATION_STEP_TOPIC) {
+    notificationWizardStep = NOTIFICATION_STEP_TEST;
+    renderNotificationWizard();
+    return;
+  }
+  if (notificationWizardStep === NOTIFICATION_STEP_TEST) {
+    notificationWizardStep = NOTIFICATION_STEP_DONE;
+    renderNotificationWizard();
+    return;
+  }
+  await saveNotificationSettings(notificationPayload());
+  notificationWizardActive = false;
+  notificationWizardTopic = "";
+  renderNotificationSettings();
+}
+
+function notificationWizardBack() {
+  notificationWizardStep = notificationWizardPreviousStep();
+  setNotificationResult("");
+  renderNotificationWizard();
+}
+
+async function copyNotificationTopic(inputId = "notification_topic_secret") {
+  const input = document.getElementById(inputId);
+  const topic = input ? input.value : "";
+  if (!topic) return;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(topic);
+    } else if (!copyTextWithSelectionFallback(input)) {
+      throw new Error("clipboard API is unavailable");
+    }
+    setNotificationResult("Topic copied to clipboard.", "success");
+  } catch (error) {
+    setNotificationResult("Copy failed. Select the topic and copy it manually.", "error");
+  }
+}
+
+async function regenerateNotificationTopic() {
+  if (!notificationIsConfigured()) return;
+  if (!window.confirm("Regenerate the notification topic secret? You will need to unsubscribe from the old topic and subscribe to the new one on every device.")) {
+    return;
+  }
+  const nextTopic = generateNotificationTopic();
+  await saveNotificationSettings({
+    enabled: true,
+    server_url: notificationSettings.server_url || "https://ntfy.sh",
+    topic: nextTopic,
+    priority: notificationSettings.priority || 3,
+    access_url_mode: notificationSettings.access_url_mode || "auto",
+    custom_access_url: notificationSettings.custom_access_url || "",
+    access_token: "",
+    keep_access_token: Boolean(notificationSettings.access_token_set),
+    username: notificationSettings.username || "",
+    password: "",
+    keep_password: Boolean(notificationSettings.password_set)
+  });
+  setNotificationResult("Topic regenerated. Subscribe your devices to the new topic.", "success");
+}
+
 function applyAccountUi(account) {
   const previousRole = currentAccount ? currentAccount.role : "";
   const previousReadOnly = currentAccount ? Boolean(currentAccount.read_only) : false;
@@ -15123,6 +16517,7 @@ function applyAccountUi(account) {
   const readOnly = accountIsReadOnly();
   setHidden("nav_accounts", !owner);
   setHidden("nav_change_password", owner);
+  setHidden("nav_notifications", readOnly);
   setHidden("nav_rtl", readOnly);
   setHidden("dashboard_configure_sdr", readOnly);
   setHidden("open_add_stream", readOnly);
@@ -15152,7 +16547,7 @@ function applyAccountUi(account) {
 }
 
 function isReadOnlyRestrictedView(view) {
-  return ["rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "accounts", "create_account"].includes(view);
+  return ["rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "accounts", "create_account", "notifications"].includes(view);
 }
 
 function accountsTableSignature(accounts) {
@@ -16071,6 +17466,7 @@ function defaultViewTitle(name) {
     iq_recorder: "I/Q Recorder",
     iq_recorder_start: "New I/Q Recording",
     iq_recording_download: "Download I/Q Recording",
+    notifications: "Notification Settings",
     logs: "Logs",
     accounts: "Manage Accounts",
     create_account: "Create Account",
@@ -16112,6 +17508,9 @@ function showView(name) {
     view.hidden = view.id !== `view_${name}`;
   }
   setPageTitle(defaultViewTitle(name));
+  if (name === "notifications") {
+    renderNotificationSettings();
+  }
   focusViewHeading(name);
   const moreButton = document.getElementById("nav_more_button");
   for (const item of document.querySelectorAll("nav [data-view]")) {
@@ -16129,7 +17528,7 @@ function showView(name) {
     }
   }
   if (moreButton) {
-    if (["receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "accounts", "create_account", "change_password"].includes(name)) {
+    if (["receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "notifications", "logs", "accounts", "create_account", "change_password"].includes(name)) {
       moreButton.setAttribute("aria-current", "page");
     } else {
       moreButton.removeAttribute("aria-current");
@@ -16180,6 +17579,7 @@ function routeForView(name, params = {}) {
     query.set("view", "iq_recording_download");
     if (params.recordingId) query.set("recording", params.recordingId);
   }
+  if (name === "notifications") query.set("view", "notifications");
   if (name === "logs") query.set("view", "logs");
   if (name === "accounts") query.set("view", "accounts");
   if (name === "create_account") query.set("view", "create_account");
@@ -16226,7 +17626,7 @@ function routeForView(name, params = {}) {
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
-  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "accounts", "create_account", "change_password", "streams", "add_stream", "stream_settings", "stream_output", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
+  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "notifications", "logs", "accounts", "create_account", "change_password", "streams", "add_stream", "stream_settings", "stream_output", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
     return {
       view,
       streamId: query.get("stream") || "",
@@ -16285,6 +17685,7 @@ function applyRoute(route) {
       soundcardOutputTableSignature = "";
       easSignature = "";
       audioEffectsSignature = "";
+      streamNotificationsSignature = "";
       closeOutputForm();
       const station = stream.station || {};
       setText("stream_settings_title", `Edit stream ${streamCallsign(stream)}`);
@@ -16976,6 +18377,7 @@ function applyStatus(data, options = {}) {
   setText("logs", data.logs.join("\\n"));
   renderIqTestSourceStatus(data);
   setFallbackControls(data.fallback);
+  setNotificationSettings(data.notifications || {});
   syncConfiguredStreamsFromStatus(data);
   updateDashboard(data);
   const now = Date.now();
@@ -17094,6 +18496,28 @@ function scheduleAudioEffectsUpdate() {
   }, 250);
 }
 
+function scheduleStreamNotificationsUpdate() {
+  if (applying || !settingsStreamId || !notificationIsConfigured() || accountIsReadOnly()) return;
+  clearTimeout(streamNotificationsUpdateTimer);
+  streamNotificationsUpdateTimer = setTimeout(async () => {
+    try {
+      const payload = streamNotificationsPayload();
+      const data = await request("/api/stream-notifications", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          stream_id: settingsStreamId,
+          notifications: payload
+        })
+      });
+      renderStreams(data.streams || []);
+      setStreamNotificationsResult("Notification settings saved.", "success");
+    } catch (error) {
+      setStreamNotificationsResult(error.message, "error");
+    }
+  }, 250);
+}
+
 for (const id of controls) {
   document.addEventListener("input", event => {
     if (event.target && event.target.id === id) {
@@ -17135,6 +18559,88 @@ for (const id of ["fallback_enabled", "fallback_delay", "fallback_loop_delay"]) 
     }
   });
 }
+
+document.getElementById("start_notification_setup").addEventListener("click", startNotificationWizard);
+document.getElementById("restart_notification_setup").addEventListener("click", startNotificationWizard);
+document.getElementById("notification_cancel").addEventListener("click", cancelNotificationWizard);
+document.getElementById("notification_back").addEventListener("click", notificationWizardBack);
+document.getElementById("notification_next").addEventListener("click", async () => {
+  try {
+    await notificationWizardNext();
+  } catch (error) {
+    setNotificationResult(error.message, "error");
+  }
+});
+document.getElementById("regenerate_notification_topic").addEventListener("click", async () => {
+  try {
+    await regenerateNotificationTopic();
+  } catch (error) {
+    setNotificationResult(error.message, "error");
+  }
+});
+document.getElementById("copy_configured_notification_topic").addEventListener("click", async () => {
+  await copyNotificationTopic("notification_configured_topic_secret");
+});
+document.getElementById("notification_access_url_mode").addEventListener("change", async () => {
+  updateNotificationCustomUrlVisibility();
+  try {
+    await saveNotificationAccessUrlSettings();
+  } catch (error) {
+    setNotificationResult(error.message, "error");
+  }
+});
+document.getElementById("notification_custom_access_url").addEventListener("change", async () => {
+  try {
+    await saveNotificationAccessUrlSettings();
+  } catch (error) {
+    setNotificationResult(error.message, "error");
+  }
+});
+document.getElementById("configured_test_notifications").addEventListener("click", async event => {
+  const button = event.currentTarget;
+  setDisabled(button, true);
+  try {
+    await testNotificationSettings({
+      enabled: true,
+      server_url: notificationSettings.server_url || "https://ntfy.sh",
+      topic: notificationSettings.topic || "",
+      priority: notificationSettings.priority || 3,
+      access_url_mode: notificationSettings.access_url_mode || "auto",
+      custom_access_url: notificationSettings.custom_access_url || "",
+      access_token: "",
+      keep_access_token: Boolean(notificationSettings.access_token_set),
+      username: notificationSettings.username || "",
+      password: "",
+      keep_password: Boolean(notificationSettings.password_set)
+    });
+  } catch (error) {
+    setNotificationResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
+  }
+});
+document.getElementById("notification_wizard").addEventListener("change", event => {
+  if (event.target && event.target.name === "notification_self_hosted") {
+    notificationWizardSelfHosted = event.target.value === "yes";
+  }
+});
+document.getElementById("notification_wizard").addEventListener("click", async event => {
+  if (event.target && event.target.id === "copy_notification_topic") {
+    await copyNotificationTopic("notification_topic_secret");
+    return;
+  }
+  if (event.target && event.target.id === "wizard_test_notifications") {
+    const button = event.target;
+    setDisabled(button, true);
+    try {
+      await testNotificationSettings(notificationPayload());
+    } catch (error) {
+      setNotificationResult(error.message, "error");
+    } finally {
+      setDisabled(button, false);
+    }
+  }
+});
 
 for (const id of ["eas_enabled", "eas_pre_seconds", "eas_post_seconds", "eas_max_seconds"]) {
   document.addEventListener("input", event => {
@@ -17531,8 +19037,11 @@ document.getElementById("tab_outputs").addEventListener("click", () => showSetti
 document.getElementById("tab_audio").addEventListener("click", () => showSettingsTab("audio"));
 document.getElementById("tab_eas").addEventListener("click", () => showSettingsTab("eas"));
 document.getElementById("tab_fallback").addEventListener("click", () => showSettingsTab("fallback"));
+document.getElementById("tab_notifications").addEventListener("click", () => showSettingsTab("notifications"));
 document.querySelector(".tabs").addEventListener("keydown", event => {
-  const tabs = [document.getElementById("tab_outputs"), document.getElementById("tab_eas"), document.getElementById("tab_fallback"), document.getElementById("tab_audio")];
+  const tabs = streamSettingsTabs()
+    .map(tab => document.getElementById(tab.button))
+    .filter(tab => tab && !tab.hidden);
   const index = tabs.indexOf(event.target);
   if (index < 0) return;
   let nextIndex = index;
@@ -17545,6 +19054,10 @@ document.querySelector(".tabs").addEventListener("keydown", event => {
   tabs[nextIndex].focus();
   showSettingsTab(tabs[nextIndex].id.replace(/^tab_/, ""));
 });
+
+for (const id of ["stream_notify_icecast_failures", "stream_notify_soundcard_failures", "stream_notify_eas_alerts"]) {
+  document.getElementById(id).addEventListener("change", scheduleStreamNotificationsUpdate);
+}
 
 document.getElementById("audio_effects_list").addEventListener("click", event => {
   const button = event.target && event.target.closest ? event.target.closest("[data-audio-effect]") : null;
