@@ -246,6 +246,98 @@ class AuthTests(unittest.TestCase):
             "/?view=stream_output&stream=stream-1&output=icecast-1",
         )
 
+    def test_rtl_failure_notification_waits_for_grace_then_repeats_hourly(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.settings = self.web_control.RtlControlSettings(serial="00000001", notify_sdr_failures=True)
+        service.iq_file_source_config = None
+        service.capture = None
+        service.capture_error = ""
+        service.last_batch_at = None
+        service.rtl_notification_states = {}
+        service.rtl_device_name_cache = {}
+        service.devices = lambda: {"devices": [{"serial": "00000001", "name": "RTLSDRBlog Blog V4", "vendor": ""}]}
+        sent: list[dict[str, object]] = []
+        service._send_stream_problem_notification_async = sent.append
+
+        service._process_rtl_notifications_locked(1000.0)
+        service._process_rtl_notifications_locked(1029.0)
+        self.assertEqual(sent, [])
+
+        service._process_rtl_notifications_locked(1031.0)
+        self.assertEqual(sent[-1]["message"], "RTLSDRBlog Blog V4 has disconnected.")
+        self.assertEqual(sent[-1]["target_path"], "/?view=rtl")
+
+        service._process_rtl_notifications_locked(1200.0)
+        self.assertEqual(len(sent), 1)
+        service.capture = object()
+        service.last_batch_at = 1232.0
+        service._process_rtl_notifications_locked(1232.0)
+        self.assertEqual(service.rtl_notification_states, {})
+        service.capture = None
+        service.last_batch_at = None
+        service._process_rtl_notifications_locked(1270.0)
+        self.assertEqual(len(sent), 1)
+        service._process_rtl_notifications_locked(1301.0)
+        self.assertEqual(len(sent), 2)
+        service._process_rtl_notifications_locked(1400.0)
+        self.assertEqual(len(sent), 2)
+        service._process_rtl_notifications_locked(4902.0)
+        self.assertEqual(len(sent), 3)
+
+    def test_rtl_notification_classifies_permission_and_no_data_failures(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.settings = self.web_control.RtlControlSettings(serial="00000001", notify_sdr_failures=True)
+        service.iq_file_source_config = None
+        service.capture = object()
+        service.last_batch_at = 900.0
+        service.rtl_notification_states = {}
+        service.rtl_device_name_cache = {}
+        service.devices = lambda: {"devices": [{"serial": "00000001", "name": "RTLSDRBlog Blog V4", "vendor": ""}]}
+
+        service.capture_error = "Access denied while opening RTL-SDR"
+        failure = service._rtl_notification_failure_locked(1000.0)
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure["message"], "Insufficient permissions to access RTLSDRBlog Blog V4.")
+
+        service.capture_error = ""
+        failure = service._rtl_notification_failure_locked(1000.0)
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure["message"], "RTLSDRBlog Blog V4 has stopped outputting data.")
+
+        service.last_batch_at = 995.0
+        self.assertIsNone(service._rtl_notification_failure_locked(1000.0))
+
+    def test_rtl_notification_prefers_usb_disconnected_over_no_data(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.settings = self.web_control.RtlControlSettings(serial="00000001", notify_sdr_failures=True)
+        service.iq_file_source_config = None
+        service.capture = object()
+        service.capture_error = ""
+        service.last_batch_at = 900.0
+        service.rtl_notification_states = {}
+        service.rtl_device_name_cache = {"00000001": "RTLSDRBlog Blog V4"}
+        service.devices = lambda: {"devices": []}
+
+        failure = service._rtl_notification_failure_locked(1000.0)
+
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure["key"], "rtl:00000001:disconnected")
+        self.assertEqual(failure["message"], "RTLSDRBlog Blog V4 has disconnected.")
+
+    def test_rtl_notification_device_name_uses_friendly_label_without_serial(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.rtl_device_name_cache = {}
+
+        label = service._rtl_notification_device_name_locked(
+            "00000001",
+            [{"serial": "00000001", "name": "RTLSDRBlog, Blog V4", "vendor": "Realtek"}],
+        )
+
+        self.assertEqual(label, "RTLSDRBlog Blog V4")
+        self.assertEqual(service.rtl_device_name_cache["00000001"], "RTLSDRBlog Blog V4")
+        self.assertEqual(service._rtl_notification_device_name_locked("00000001", []), "RTLSDRBlog Blog V4")
+        self.assertEqual(service._rtl_notification_device_name_locked("12345678", []), "the configured RTL-SDR")
+
     def test_stream_notification_failures_skip_disabled_categories(self) -> None:
         stream = {
             "id": "stream-1",
@@ -300,11 +392,59 @@ class AuthTests(unittest.TestCase):
 
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["key"], "stream-1:soundcard:soundcard-1")
-        self.assertIn("sound card Yeti X is not currently connected", failures[0]["message"])
+        self.assertIn("sound card Yeti X has disconnected", failures[0]["message"])
         self.assertEqual(
             failures[0]["target_path"],
             "/?view=stream_output&stream=stream-1&output=soundcard-1",
         )
+
+    def test_soundcard_notification_name_does_not_expose_stable_id(self) -> None:
+        self.assertEqual(
+            self.web_control.soundcard_notification_name(
+                {"soundcard": {"stable_id": "alsa:usb:Generic_USB_Audio-00", "display_name": "Yeti X, USB"}}
+            ),
+            "Yeti X, USB",
+        )
+        self.assertEqual(
+            self.web_control.soundcard_notification_name({"soundcard": {"stable_id": "alsa:usb:Generic_USB_Audio-00"}}),
+            "the configured sound card",
+        )
+
+    def test_soundcard_name_cache_backfills_stream_config_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.soundcard_names_path = Path(temp_dir) / "soundcard-devices.json"
+            service.streams_directory = Path(temp_dir) / "streams"
+            service.preview_streams = {}
+            service.soundcard_name_cache = {
+                "alsa:usb:046d:0aaf:yeti-x": "Yeti X, USB",
+            }
+            service.streams = [
+                {
+                    "id": "stream-1",
+                    "station": {"callsign": "WXN99"},
+                    "outputs": [
+                        {
+                            "id": "soundcard-1",
+                            "type": "soundcard",
+                            "soundcard": {
+                                "stable_id": "alsa:usb:046d:0aaf:yeti-x",
+                                "channel_mode": "left",
+                                "volume": 1.0,
+                                "sample_rate": 48000,
+                            },
+                        }
+                    ],
+                }
+            ]
+
+            service._enrich_stream_soundcard_names_from_cache_locked()
+
+            soundcard = service.streams[0]["outputs"][0]["soundcard"]
+            self.assertEqual(soundcard["display_name"], "Yeti X, USB")
+            saved = self.web_control.load_stream_configs(service.streams_directory)
+            self.assertEqual(saved[0]["outputs"][0]["soundcard"]["display_name"], "Yeti X, USB")
 
     def test_stream_notification_settings_include_recorded_eas_alerts(self) -> None:
         settings = self.web_control.validate_stream_notification_payload(

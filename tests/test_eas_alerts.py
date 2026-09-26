@@ -226,12 +226,17 @@ class EasAlertTests(unittest.TestCase):
             settings_path = Path(temp_dir) / "rtl-control.json"
             web_control.save_settings(
                 settings_path,
-                web_control.RtlControlSettings(serial="12345678", alias_filter_strength=50),
+                web_control.RtlControlSettings(
+                    serial="12345678",
+                    alias_filter_strength=50,
+                    notify_sdr_failures=True,
+                ),
             )
 
             settings = web_control.load_settings(settings_path)
 
         self.assertEqual(settings.alias_filter_strength, 50)
+        self.assertTrue(settings.notify_sdr_failures)
 
     def test_alias_filter_strength_scales_all_transition_widths_from_current_default(self) -> None:
         web_control = self.web_control

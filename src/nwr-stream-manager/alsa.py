@@ -524,6 +524,11 @@ class AlsaStreamPlaybackTap:
             "error": error,
             "stable_id": self.config.stable_id,
             "device": device.hw_device if device is not None else "",
+            "display_name": device.display_name if device is not None else "",
+            "card_name": device.card_name if device is not None else "",
+            "card_long_name": device.card_long_name if device is not None else "",
+            "pcm_name": device.pcm_name if device is not None else "",
+            "bus": device.bus if device is not None else "",
             "buffer": self.buffer.stats(),
             "playback": playback.snapshot() if playback is not None else {},
         }
@@ -717,6 +722,11 @@ class AlsaSharedPlaybackTap:
             "error": error,
             "stable_id": self.stable_id,
             "device": device.hw_device if device is not None else "",
+            "display_name": device.display_name if device is not None else "",
+            "card_name": device.card_name if device is not None else "",
+            "card_long_name": device.card_long_name if device is not None else "",
+            "pcm_name": device.pcm_name if device is not None else "",
+            "bus": device.bus if device is not None else "",
             "inputs": input_stats,
             "playback": playback.snapshot() if playback is not None else {},
         }

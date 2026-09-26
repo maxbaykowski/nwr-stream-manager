@@ -337,9 +337,11 @@ RECEIVER_AUDIO_CONFIG = parse_audio_config(
 )
 FALLBACK_STATE_FILE_NAME = "fallback.json"
 NOTIFICATION_STATE_FILE_NAME = "notifications.json"
+SOUNDCARD_DEVICE_NAMES_FILE_NAME = "soundcard-devices.json"
 STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS = 30.0
 STREAM_NOTIFICATION_RECOVERY_SECONDS = 30.0
 STREAM_NOTIFICATION_REPEAT_SECONDS = 3600.0
+RTL_NOTIFICATION_NO_DATA_SECONDS = 30.0
 READ_ONLY_RESTRICTED_NOTIFICATION_VIEWS = {
     "rtl",
     "add_stream",
@@ -392,6 +394,7 @@ class RtlControlSettings:
     ppm_correction: int = 0
     bias_tee: bool = False
     alias_filter_strength: int = ALIAS_FILTER_STRENGTH_DEFAULT
+    notify_sdr_failures: bool = False
 
     def to_rtl_config(self) -> RtlConfig:
         if not self.serial:
@@ -3120,8 +3123,14 @@ class IcecastStreamWorker:
         snapshots = [output.snapshot() for output in list(self.outputs.values())]
         with self.lock:
             output_ids = list(self.soundcard_outputs)
+            configured_soundcards = {
+                str(output.get("id", "")): dict(output.get("soundcard", {}))
+                for output in stream_outputs(self.stream)
+                if output.get("type") == "soundcard"
+            }
         for output_id in output_ids:
             snapshot = self.soundcard_manager.snapshot(output_id) if self.soundcard_manager is not None else {"status": "disabled"}
+            configured_soundcard = configured_soundcards.get(output_id, {})
             snapshot.update(
                 {
                     "id": self.id,
@@ -3134,8 +3143,12 @@ class IcecastStreamWorker:
                             "type": "soundcard",
                             "status": snapshot.get("status"),
                             "soundcard": {
-                                "stable_id": snapshot.get("stable_id", ""),
+                                "stable_id": snapshot.get("stable_id", "") or configured_soundcard.get("stable_id", ""),
                                 "device": snapshot.get("device", ""),
+                                "display_name": snapshot.get("display_name", "") or configured_soundcard.get("display_name", ""),
+                                "card_name": snapshot.get("card_name", "") or configured_soundcard.get("card_name", ""),
+                                "card_long_name": snapshot.get("card_long_name", "") or configured_soundcard.get("card_long_name", ""),
+                                "pcm_name": snapshot.get("pcm_name", "") or configured_soundcard.get("pcm_name", ""),
                             },
                             "error": snapshot.get("error", ""),
                         }
@@ -4509,6 +4522,7 @@ class RtlControlService:
         self.web_port = 8080
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.notification_state_path = state_path.with_name(NOTIFICATION_STATE_FILE_NAME)
+        self.soundcard_names_path = state_path.with_name(SOUNDCARD_DEVICE_NAMES_FILE_NAME)
         self.accounts = AccountStore(state_path.parent / ACCOUNTS_DATABASE_FILE_NAME)
         self.auth_sessions = AuthSessionStore()
         self.log_handler = log_handler
@@ -4558,7 +4572,11 @@ class RtlControlService:
         self.receiver_workers: dict[str, WeatherReceiverWorker] = {}
         self.receiver_accounts_by_client: dict[str, int] = {}
         self.live_audio_feedback_by_client: dict[tuple[str, str], dict[str, Any]] = {}
+        self.rtl_device_name_cache: dict[str, str] = {}
+        self.soundcard_name_cache: dict[str, str] = load_soundcard_name_cache(self.soundcard_names_path)
+        self._enrich_stream_soundcard_names_from_cache_locked()
         self.stream_notification_states: dict[str, dict[str, Any]] = {}
+        self.rtl_notification_states: dict[str, dict[str, Any]] = {}
         self.stream_eas_alert_notification_seen: dict[str, set[str]] = {}
         self.stream_test_mode: dict[str, Any] | None = None
         self.iq_recorder: IqRecorderWorker | None = None
@@ -4926,12 +4944,76 @@ class RtlControlService:
             entry["name"] = device.description or entry["name"]
             entry["librtlsdr_index"] = device.index
         devices = sorted(by_serial.values(), key=lambda item: (item["name"], item["serial"]))
+        soundcard_payloads = [self._soundcard_device_payload(device) for device in soundcards]
+        self._remember_device_names_locked(devices, soundcard_payloads)
         return {
             "devices": devices,
-            "soundcards": [self._soundcard_device_payload(device) for device in soundcards],
+            "soundcards": soundcard_payloads,
             "errors": errors,
             "probed_at": snapshot.probed_at,
         }
+
+    def _remember_device_names_locked(
+        self,
+        rtl_devices: list[dict[str, Any]],
+        soundcards: list[dict[str, Any]],
+    ) -> None:
+        soundcard_names_changed = False
+        streams_changed = False
+        with self.lock:
+            for device in rtl_devices:
+                serial = str(device.get("serial", "")).strip()
+                label = friendly_rtl_device_label(device)
+                if serial and label:
+                    self.rtl_device_name_cache[serial] = label
+            for device in soundcards:
+                stable_id = str(device.get("stable_id", "")).strip()
+                label = friendly_soundcard_device_label(device)
+                if stable_id and label:
+                    if self.soundcard_name_cache.get(stable_id) != label:
+                        self.soundcard_name_cache[stable_id] = label
+                        soundcard_names_changed = True
+                    if self._apply_soundcard_label_to_streams_locked(stable_id, label):
+                        streams_changed = True
+            if soundcard_names_changed:
+                save_soundcard_name_cache(self.soundcard_names_path, self.soundcard_name_cache)
+            if streams_changed:
+                save_streams(self.streams_directory, self.streams)
+
+    def _enrich_stream_soundcard_names_from_cache_locked(self) -> None:
+        changed = False
+        with self.lock:
+            for stable_id, label in list(getattr(self, "soundcard_name_cache", {}).items()):
+                if self._apply_soundcard_label_to_streams_locked(stable_id, label):
+                    changed = True
+            if changed:
+                save_streams(self.streams_directory, self.streams)
+
+    def _apply_soundcard_label_to_streams_locked(self, stable_id: str, label: str) -> bool:
+        stable_id = str(stable_id or "").strip()
+        label = str(label or "").strip()
+        if not stable_id or not label:
+            return False
+        changed = False
+        for stream in list(self.streams) + list(getattr(self, "preview_streams", {}).values()):
+            for output in stream_outputs(stream):
+                if output.get("type") != "soundcard":
+                    continue
+                soundcard = output.get("soundcard") if isinstance(output.get("soundcard"), dict) else {}
+                if str(soundcard.get("stable_id", "")).strip() != stable_id:
+                    continue
+                if str(soundcard.get("display_name", "")).strip() == label:
+                    continue
+                soundcard = dict(soundcard)
+                soundcard["display_name"] = label
+                output["soundcard"] = soundcard
+                changed = True
+        return changed
+
+    def _remember_soundcard_devices_locked(self, devices: list[Any]) -> None:
+        if not devices:
+            return
+        self._remember_device_names_locked([], [self._soundcard_device_payload(device) for device in devices])
 
     def _cached_rtl_devices(self) -> list[Any]:
         return list(self.device_probe.devices("rtl"))
@@ -4940,10 +5022,14 @@ class RtlControlService:
         return list(self.device_probe.devices("rtl_usb"))
 
     def _cached_soundcards(self) -> list[Any]:
-        return list(self.device_probe.devices("alsa_playback"))
+        devices = list(self.device_probe.devices("alsa_playback"))
+        self._remember_soundcard_devices_locked(devices)
+        return devices
 
     def _refresh_soundcards(self) -> list[Any]:
-        return list(self.device_probe.snapshot(force=True).devices("alsa_playback"))
+        devices = list(self.device_probe.snapshot(force=True).devices("alsa_playback"))
+        self._remember_soundcard_devices_locked(devices)
+        return devices
 
     @staticmethod
     def _soundcard_device_payload(device) -> dict[str, Any]:
@@ -4976,10 +5062,27 @@ class RtlControlService:
         if not matches:
             matches = [device for device in self._refresh_soundcards() if device.stable_id == stable_id]
         if not matches:
-            raise ValueError("Sound card is not currently connected.")
+            raise ValueError("Sound card has disconnected.")
         if len(matches) > 1:
             raise ValueError("Sound card stable ID is ambiguous.")
         return matches[0]
+
+    def _friendly_soundcard_name_for_stable_id_locked(self, stable_id: str) -> str:
+        stable_id = str(stable_id or "").strip()
+        if not stable_id:
+            return ""
+        if not hasattr(self, "device_probe"):
+            return getattr(self, "soundcard_name_cache", {}).get(stable_id, "")
+        matches = [device for device in self._cached_soundcards() if device.stable_id == stable_id]
+        if not matches:
+            matches = [device for device in self._refresh_soundcards() if device.stable_id == stable_id]
+        if not matches:
+            return getattr(self, "soundcard_name_cache", {}).get(stable_id, "")
+        payload = self._soundcard_device_payload(matches[0])
+        label = friendly_soundcard_device_label(payload)
+        if label:
+            getattr(self, "soundcard_name_cache", {})[stable_id] = label
+        return label
 
     def reset_soundcard_device(self, stable_id: str) -> dict[str, Any]:
         if not self.reset_lock.acquire(blocking=False):
@@ -5947,13 +6050,15 @@ class RtlControlService:
         return bool(self.notification_settings.enabled and self.notification_settings.topic)
 
     def _process_stream_notifications_locked(self, active_streams: list[dict[str, Any]]) -> None:
-        now = time.time()
+        now = time.monotonic()
         configured_by_id = {str(stream.get("id", "")): stream for stream in self.streams}
         active_failure_keys: set[str] = set()
         if not self._notification_globally_ready_locked():
             self.stream_notification_states.clear()
+            self.rtl_notification_states.clear()
             self.stream_eas_alert_notification_seen.clear()
             return
+        self._process_rtl_notifications_locked(now)
         for snapshot in active_streams:
             stream_id = str(snapshot.get("id", ""))
             stream = configured_by_id.get(stream_id)
@@ -5987,6 +6092,112 @@ class RtlControlService:
             if now - last_seen >= STREAM_NOTIFICATION_RECOVERY_SECONDS:
                 self.stream_notification_states.pop(key, None)
         self._process_recorded_eas_alert_notifications_locked()
+
+    def _process_rtl_notifications_locked(self, now: float) -> None:
+        failure = self._rtl_notification_failure_locked(now)
+        if failure is None:
+            for key, state in list(self.rtl_notification_states.items()):
+                last_seen = float(state.get("last_seen", 0.0))
+                if now - last_seen >= STREAM_NOTIFICATION_RECOVERY_SECONDS:
+                    self.rtl_notification_states.pop(key, None)
+            return
+        key = str(failure["key"])
+        for stale_key in list(self.rtl_notification_states):
+            if stale_key != key:
+                self.rtl_notification_states.pop(stale_key, None)
+        state = self.rtl_notification_states.setdefault(
+            key,
+            {
+                "first_seen": now,
+                "last_seen": now,
+                "last_clear": 0.0,
+                "last_sent": 0.0,
+            },
+        )
+        state["last_seen"] = now
+        if now - float(state.get("first_seen", now)) < STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS:
+            return
+        last_sent = float(state.get("last_sent", 0.0))
+        if last_sent and now - last_sent < STREAM_NOTIFICATION_REPEAT_SECONDS:
+            return
+        self._send_stream_problem_notification_async(failure)
+        state["last_sent"] = now
+
+    def _rtl_notification_failure_locked(self, now: float) -> dict[str, Any] | None:
+        if not self.settings.notify_sdr_failures:
+            self.rtl_notification_states.clear()
+            return None
+        if self.iq_file_source_config is not None:
+            self.rtl_notification_states.clear()
+            return None
+        serial = str(self.settings.serial or "").strip()
+        if not serial:
+            self.rtl_notification_states.clear()
+            return None
+        devices_payload = self.devices()
+        rtl_devices = list(devices_payload.get("devices", []))
+        device_name = self._rtl_notification_device_name_locked(serial, rtl_devices)
+        serial_connected = any(str(device.get("serial", "")).strip() == serial for device in rtl_devices)
+        if not serial_connected:
+            return {
+                "key": f"rtl:{serial}:disconnected",
+                "category": "disconnected",
+                "target_path": "/?view=rtl",
+                "message": f"{device_name} has disconnected.",
+            }
+        error = str(self.capture_error or "").strip()
+        if error:
+            lower = error.lower()
+            if "permission" in lower or "access denied" in lower or "udev" in lower:
+                message = f"Insufficient permissions to access {device_name}."
+                category = "permission"
+            elif "claim" in lower or "busy" in lower or "resource busy" in lower:
+                message = f"Failed to claim {device_name}."
+                category = "claim"
+            elif "not found" in lower or "disconnect" in lower or "no such device" in lower:
+                message = f"{device_name} has disconnected."
+                category = "disconnected"
+            else:
+                message = f"{device_name} has stopped outputting data."
+                category = "error"
+            return {
+                "key": f"rtl:{serial}:{category}",
+                "category": category,
+                "target_path": "/?view=rtl",
+                "message": message,
+            }
+        if self.capture is None:
+            return {
+                "key": f"rtl:{serial}:disconnected",
+                "category": "disconnected",
+                "target_path": "/?view=rtl",
+                "message": f"{device_name} has disconnected.",
+            }
+        last_batch_at = self.last_batch_at
+        if last_batch_at is None or now - float(last_batch_at) >= RTL_NOTIFICATION_NO_DATA_SECONDS:
+            return {
+                "key": f"rtl:{serial}:no-data",
+                "category": "no-data",
+                "target_path": "/?view=rtl",
+                "message": f"{device_name} has stopped outputting data.",
+            }
+        return None
+
+    def _rtl_notification_device_name_locked(
+        self,
+        serial: str,
+        devices: list[dict[str, Any]] | None = None,
+    ) -> str:
+        if devices is None:
+            devices = list(self.devices().get("devices", []))
+        for device in devices:
+            if str(device.get("serial", "")).strip() != serial:
+                continue
+            label = friendly_rtl_device_label(device)
+            if label:
+                getattr(self, "rtl_device_name_cache", {})[serial] = label
+                return label
+        return getattr(self, "rtl_device_name_cache", {}).get(serial, "") or "the configured RTL-SDR"
 
     def _process_recorded_eas_alert_notifications_locked(self) -> None:
         active_stream_ids = {str(stream.get("id", "")) for stream in self.streams}
@@ -6757,18 +6968,21 @@ class RtlControlService:
         *,
         enabled: bool,
     ) -> dict[str, Any]:
+        normalized = dict(soundcard)
+        stable_id = str(normalized.get("stable_id", "")).strip()
+        display_name = self._friendly_soundcard_name_for_stable_id_locked(stable_id)
+        if display_name:
+            normalized["display_name"] = display_name
         if not enabled:
-            return soundcard
-        stable_id = str(soundcard.get("stable_id", ""))
+            return normalized
         occupied = self._occupied_soundcard_channels_locked(ignore_output_id=output_id).get(stable_id, set())
-        requested = soundcard_channels(soundcard.get("channel_mode", ALSA_CHANNEL_BOTH))
+        requested = soundcard_channels(normalized.get("channel_mode", ALSA_CHANNEL_BOTH))
         if requested and requested.isdisjoint(occupied):
-            return soundcard
+            return normalized
         available = [channel for channel in (ALSA_CHANNEL_LEFT, ALSA_CHANNEL_RIGHT) if channel not in occupied]
         if not available:
             raise ValueError("That sound card has no available output channels.")
-        normalized = dict(soundcard)
-        if len(available) == 2 and soundcard.get("channel_mode") == ALSA_CHANNEL_BOTH:
+        if len(available) == 2 and normalized.get("channel_mode") == ALSA_CHANNEL_BOTH:
             normalized["channel_mode"] = ALSA_CHANNEL_BOTH
         else:
             normalized["channel_mode"] = available[0]
@@ -6869,13 +7083,14 @@ class RtlControlService:
             self.settings = settings
             save_settings(self.state_path, settings)
             LOG.info(
-                "saved RTL settings: serial=%s sample_rate=%s gain=%s ppm=%s bias_tee=%s alias_filter_strength=%s",
+                "saved RTL settings: serial=%s sample_rate=%s gain=%s ppm=%s bias_tee=%s alias_filter_strength=%s notify_sdr_failures=%s",
                 settings.serial or "<none>",
                 settings.sample_rate,
                 "auto" if settings.gain is None else f"{settings.gain:g} dB",
                 settings.ppm_correction,
                 settings.bias_tee,
                 settings.alias_filter_strength,
+                settings.notify_sdr_failures,
             )
             if self.iq_file_source_config is not None:
                 if self.intermediate_fanout is not None:
@@ -6903,6 +7118,8 @@ class RtlControlService:
             changes["gain"] = None if gain is None or gain == "" else float(gain)
         if "alias_filter_strength" in payload:
             changes["alias_filter_strength"] = validate_alias_filter_strength(payload["alias_filter_strength"])
+        if "notify_sdr_failures" in payload:
+            changes["notify_sdr_failures"] = bool(payload["notify_sdr_failures"])
         return replace(settings, **changes)
 
     def _start_or_update_capture_locked(self) -> None:
@@ -8783,6 +9000,7 @@ def load_settings(path: Path) -> RtlControlSettings:
             alias_filter_strength=validate_alias_filter_strength(
                 raw.get("alias_filter_strength", ALIAS_FILTER_STRENGTH_DEFAULT)
             ),
+            notify_sdr_failures=bool(raw.get("notify_sdr_failures", False)),
         )
     except Exception as exc:
         LOG.warning("RTL control settings in %s are invalid: %s", path, exc)
@@ -9234,6 +9452,37 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
+
+
+def load_soundcard_name_cache(path: Path) -> dict[str, str]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        LOG.warning("failed to load sound card device name cache from %s: %s", path, exc)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    names = raw.get("soundcards", raw)
+    if not isinstance(names, dict):
+        return {}
+    loaded: dict[str, str] = {}
+    for stable_id, label in names.items():
+        stable_id_text = str(stable_id).strip()
+        label_text = str(label).strip()
+        if stable_id_text and label_text:
+            loaded[stable_id_text] = label_text
+    return loaded
+
+
+def save_soundcard_name_cache(path: Path, names: dict[str, str]) -> None:
+    clean = {
+        str(stable_id).strip(): str(label).strip()
+        for stable_id, label in names.items()
+        if str(stable_id).strip() and str(label).strip()
+    }
+    atomic_write_json(path, {"soundcards": clean})
 
 
 def http_header_filename(value: str) -> str:
@@ -9979,9 +10228,40 @@ def icecast_mountpoint_url(icecast: dict[str, Any]) -> str:
     return f"http://{host}{':' + port if port else ''}{mount}"
 
 
+def friendly_rtl_device_label(device: dict[str, Any]) -> str:
+    name = str(device.get("name", "")).strip()
+    vendor = str(device.get("vendor", "")).strip()
+    if name:
+        label = name
+        if vendor and vendor.lower() not in label.lower() and vendor.lower() not in {"realtek", "0bda"}:
+            label = f"{vendor} {label}"
+    else:
+        label = vendor or "RTL-SDR"
+    return re.sub(r"\s+", " ", label.replace(",", " ")).strip()
+
+
+def friendly_soundcard_device_label(device: dict[str, Any]) -> str:
+    card = str(device.get("card_long_name") or device.get("card_name") or device.get("card_id") or "").strip()
+    pcm = str(device.get("pcm_name") or device.get("pcm_id") or "").strip()
+    bus_value = str(device.get("bus", "")).strip().lower()
+    bus = "USB" if bus_value == "usb" else "PCI" if bus_value == "pci" else ""
+    parts: list[str] = []
+    if card:
+        parts.append(card)
+    if pcm and pcm.lower() not in card.lower():
+        parts.append(pcm)
+    if bus:
+        parts.append(bus)
+    label = ", ".join(parts)
+    label = re.sub(r"\b(Generic USB|SOF[- ]DSP|sof[- ]hdadsp)\b", "", label, flags=re.IGNORECASE)
+    label = re.sub(r"\s+,", ",", label)
+    label = re.sub(r"\s{2,}", " ", label).strip(" ,")
+    return label or str(device.get("display_name") or device.get("device") or device.get("hw_device") or "Sound card").strip()
+
+
 def soundcard_notification_name(output: dict[str, Any]) -> str:
     soundcard = output.get("soundcard") if isinstance(output.get("soundcard"), dict) else {}
-    for key in ("device", "display_name", "card_name", "stable_id"):
+    for key in ("display_name", "card_long_name", "card_name", "device"):
         value = str(soundcard.get(key, "")).strip()
         if value:
             return value
@@ -10020,7 +10300,7 @@ def stream_notification_failures(
                     "key": f"{stream_id}:soundcard:{output_id}",
                     "category": "soundcard",
                     "target_path": stream_output_route_path(stream_id, output_id),
-                    "message": f"{callsign}: sound card {name} is not currently connected.",
+                    "message": f"{callsign}: sound card {name} has disconnected.",
                 }
             )
         else:
@@ -11286,6 +11566,14 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.
       </div>
     </section>
+    <section id="rtl_notifications_section" hidden>
+      <h3>Notifications</h3>
+      <label class="checkbox-row">
+        <input id="notify_sdr_failures" type="checkbox" aria-describedby="notify_sdr_failures_hint">
+        Notify when the RTL-SDR requires attention
+      </label>
+      <span id="notify_sdr_failures_hint" class="hint">Send an ntfy notification when the configured RTL-SDR disconnects, cannot be opened, or stops sending I/Q data.</span>
+    </section>
     <section id="iq_test_source_section" hidden>
       <h3>I/Q test source</h3>
       <p class="hint">Use an interleaved complex float32 I/Q file as the receiver source for testing. Files loop until you switch back to the RTL-SDR.</p>
@@ -12187,7 +12475,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <audio id="media_session_anchor_audio" class="media-session-audio" loop preload="auto" playsinline aria-hidden="true" tabindex="-1"></audio>
 </main>
 <script>
-const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto", "alias_filter_strength"];
+const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto", "alias_filter_strength", "notify_sdr_failures"];
 const DEFAULT_STREAM_SAMPLE_RATE = 24000;
 const DEFAULT_STREAM_BITRATES = {mp3: 64, ogg: 48};
 const STREAM_SERVICE_CUSTOM = "custom";
@@ -14439,7 +14727,7 @@ function renderSettingsSoundcardDevices(selectedStableId = "") {
   setText(
     "settings_soundcard_device_hint",
     selectedStableId && !selectedDevice
-      ? "The configured sound card is not currently connected."
+      ? "The configured sound card has disconnected."
       : options[0] && options[0].value
         ? "NWR Stream Manager will open the hardware device directly."
         : "No sound cards have available channels."
@@ -16340,7 +16628,7 @@ function outputDestination(icecast) {
 
 function soundcardDestination(soundcard) {
   const device = soundcardDevices.find(item => item.stable_id === soundcard.stable_id);
-  return device ? friendlySoundcardLabel(device) : soundcard.stable_id || "Sound card";
+  return device ? friendlySoundcardLabel(device) : soundcard.display_name || soundcard.card_long_name || soundcard.card_name || soundcard.device || "Sound card";
 }
 
 function soundcardDeviceForStableId(stableId) {
@@ -16711,11 +16999,11 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
   const items = Array.from(byStream.values()).map(item => {
     let detail = "";
     if (item.icecastFailed && item.soundcardFailed) {
-      detail = "One or more Icecast destinations failed to connect and one or more sound cards are not currently connected.";
+      detail = "One or more Icecast destinations failed to connect and one or more sound cards have disconnected.";
     } else if (item.icecastFailed) {
       detail = "One or more Icecast destinations failed to connect.";
     } else if (item.soundcardFailed) {
-      detail = "One or more sound cards are not currently connected.";
+      detail = "One or more sound cards have disconnected.";
     } else {
       detail = item.errors[0] || "This stream needs attention.";
     }
@@ -17100,6 +17388,7 @@ function controlSignature(data) {
     ppm_correction: s.ppm_correction,
     bias_tee: s.bias_tee,
     alias_filter_strength: s.alias_filter_strength,
+    notify_sdr_failures: Boolean(s.notify_sdr_failures),
     gain_values: data.gain_values || []
   });
 }
@@ -17239,11 +17528,16 @@ function setNotificationSettings(settings = {}) {
   notificationSettingsSignature = signature;
   notificationSettings = Object.assign({}, settings || {});
   if (!notificationWizardActive) renderNotificationSettings();
+  updateRtlNotificationControlsVisibility();
   if (settingsStreamId) renderStreamSettings();
 }
 
 function notificationIsConfigured() {
   return Boolean(notificationSettings && notificationSettings.topic);
+}
+
+function updateRtlNotificationControlsVisibility() {
+  setHidden("rtl_notifications_section", !notificationIsConfigured() || accountIsReadOnly());
 }
 
 function renderNotificationSettings() {
@@ -17638,6 +17932,7 @@ function applyAccountUi(account) {
   setHidden("open_eas_delete", readOnly);
   setHidden("eas_delete_alerts", readOnly);
   setHidden("remove_eas_alert", readOnly);
+  updateRtlNotificationControlsVisibility();
   if (previousRole !== (currentAccount ? currentAccount.role : "") || previousReadOnly !== readOnly) {
     activeStreamsSignature = "";
     icecastOutputTableSignature = "";
@@ -19472,6 +19767,8 @@ function syncControls(data) {
   setChecked("bias_tee", s.bias_tee);
   setValue("alias_filter_strength", s.alias_filter_strength);
   setText("alias_filter_strength_label", `${s.alias_filter_strength}%`);
+  setChecked("notify_sdr_failures", s.notify_sdr_failures);
+  updateRtlNotificationControlsVisibility();
   lastControlSignature = controlSignature(data);
 }
 
@@ -19523,7 +19820,8 @@ function currentPayload() {
     gain: auto || gainValues.length === 0 ? null : gainValues[gainIndex],
     ppm_correction: numericControlValue("ppm_correction"),
     bias_tee: document.getElementById("bias_tee").checked,
-    alias_filter_strength: Number(document.getElementById("alias_filter_strength").value)
+    alias_filter_strength: Number(document.getElementById("alias_filter_strength").value),
+    notify_sdr_failures: document.getElementById("notify_sdr_failures").checked
   };
 }
 
