@@ -98,6 +98,7 @@ if __package__:
     )
     from .same_data import lookup_event, lookup_location
     from .same_live import SameEventQueue, SameSuppressionProcessor, generate_same_message
+    from .signal_meter import ChannelSignalMeter, noise_reference_band_for_transition
     from .webrtc import (
         AiortcSessionManager,
         OpusEncoder,
@@ -132,6 +133,7 @@ else:
     rtl = importlib.import_module(f"{package_name}.rtl")
     same_data = importlib.import_module(f"{package_name}.same_data")
     same_live = importlib.import_module(f"{package_name}.same_live")
+    signal_meter = importlib.import_module(f"{package_name}.signal_meter")
     webrtc = importlib.import_module(f"{package_name}.webrtc")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
     deemphasis_makeup_gain = audio_effects.deemphasis_makeup_gain
@@ -189,6 +191,8 @@ else:
     SameEventQueue = same_live.SameEventQueue
     SameSuppressionProcessor = same_live.SameSuppressionProcessor
     generate_same_message = same_live.generate_same_message
+    ChannelSignalMeter = signal_meter.ChannelSignalMeter
+    noise_reference_band_for_transition = signal_meter.noise_reference_band_for_transition
     AiortcSessionManager = webrtc.AiortcSessionManager
     OpusEncoder = webrtc.OpusEncoder
     TcpOpusBitrateController = webrtc.TcpOpusBitrateController
@@ -449,6 +453,7 @@ class WebStreamNotificationSettings:
     icecast_failures: bool = False
     soundcard_failures: bool = False
     recorded_eas_alerts: bool = False
+    bad_reception: bool = False
 
 
 def normalize_notification_access_url(raw: Any, *, default_scheme: str = "https") -> str:
@@ -3018,6 +3023,7 @@ class IcecastStreamWorker:
         fallback_settings_provider,
         alias_filter_strength_provider,
         state_directory: Path,
+        gain_provider=lambda: None,
         soundcard_devices_provider=None,
         soundcard_manager: SharedSoundcardOutputManager | None = None,
         storage_monitor: StorageMonitor | None = None,
@@ -3026,6 +3032,7 @@ class IcecastStreamWorker:
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
         self.alias_filter_strength_provider = alias_filter_strength_provider
+        self.gain_provider = gain_provider
         self._soundcard_devices_provider = soundcard_devices_provider or discover_playback_devices
         self.soundcard_manager = soundcard_manager
         self.state_directory = state_directory
@@ -3061,6 +3068,10 @@ class IcecastStreamWorker:
         self.eas_error: str | None = None
         self.last_audio_at: float | None = None
         self.test_mode_source: SyntheticNwrTestModeSource | None = None
+        self.signal_meter = ChannelSignalMeter(IQ_SAMPLE_RATE)
+        self._configure_signal_meter(
+            alias_filter_transition_hz(CHANNEL_IQ_ALIAS_TRANSITION_HZ, self.alias_filter_strength_provider())
+        )
         self._soundcard_owner = object()
         self.lock = threading.Lock()
 
@@ -3163,6 +3174,15 @@ class IcecastStreamWorker:
         if subscriber_stats is None:
             return {}
         return subscriber_stats(self.queue)
+
+    def signal_snapshot(self) -> dict[str, Any]:
+        return self.signal_meter.snapshot()
+
+    def _configure_signal_meter(self, channel_transition_hz: float) -> None:
+        self.signal_meter.reset()
+        self.signal_meter.set_noise_reference(
+            *noise_reference_band_for_transition(IQ_SAMPLE_RATE, channel_transition_hz)
+        )
 
     def eas_snapshot(self) -> dict[str, Any] | None:
         with self.lock:
@@ -3338,6 +3358,7 @@ class IcecastStreamWorker:
         channelizer_target_frequency_hz: int | None = (
             int(getattr(channelizer, "target_frequency_hz", 0)) if channelizer is not None else None
         )
+        signal_meter_gain = self.gain_provider()
         startup_backlog_drained = False
         last_slow_batch_log_at = 0.0
         demodulator = ComplexNfmDemodulator()
@@ -3492,6 +3513,7 @@ class IcecastStreamWorker:
             if test_mode_source is not None:
                 if not test_mode_was_active:
                     test_demodulator.reset()
+                    self.signal_meter.reset()
                     test_frame_buffer.clear()
                     real_test_iq_frame_buffer.clear()
                     real_test_iq_frames.clear()
@@ -3512,6 +3534,7 @@ class IcecastStreamWorker:
                 real_iq = next_real_test_iq_frame()
                 real_weight, test_weight, fade_complete = test_crossfade_weights(len(test_iq), test_mode_source)
                 mixed_iq = mix_test_mode_iq_crossfade(real_iq, test_iq, real_weight, test_weight)
+                self.signal_meter.process(mixed_iq)
                 audio = test_demodulator.process(mixed_iq)
                 test_mode_next_frame_at += STREAM_FRAME_SECONDS
                 if test_mode_next_frame_at < time.monotonic() - 0.25:
@@ -3546,6 +3569,9 @@ class IcecastStreamWorker:
                 test_crossfade_state = "off"
                 test_crossfade_position = 0
                 test_demodulator.reset()
+                self._configure_signal_meter(
+                    alias_filter_transition_hz(CHANNEL_IQ_ALIAS_TRANSITION_HZ, self.alias_filter_strength_provider())
+                )
                 test_frame_buffer.clear()
                 real_test_iq_frame_buffer.clear()
                 real_test_iq_frames.clear()
@@ -3609,6 +3635,7 @@ class IcecastStreamWorker:
                 channelizer_alias_filter_strength = None
                 channelizer_target_frequency_hz = None
                 demodulator = ComplexNfmDemodulator()
+                self.signal_meter.reset()
                 frame_buffer.clear()
                 fallback_state.reset()
                 idle_next_frame_at = None
@@ -3647,6 +3674,7 @@ class IcecastStreamWorker:
                 channelizer_alias_filter_strength = alias_filter_strength
                 channelizer_target_frequency_hz = target_frequency_hz
                 demodulator = ComplexNfmDemodulator()
+                self._configure_signal_meter(channel_transition_hz)
                 frame_buffer.clear()
             elif channelizer_alias_filter_strength != alias_filter_strength:
                 channelizer.update_alias_filter(
@@ -3654,14 +3682,26 @@ class IcecastStreamWorker:
                     attenuation_db=channel_attenuation_db,
                 )
                 channelizer_alias_filter_strength = alias_filter_strength
+                self._configure_signal_meter(channel_transition_hz)
             if channelizer is not None:
                 if channelizer_target_frequency_hz != target_frequency_hz:
                     channelizer.set_target_frequency(target_frequency_hz)
                     channelizer_target_frequency_hz = target_frequency_hz
                     demodulator.reset()
+                    self.signal_meter.reset()
+            current_gain = self.gain_provider()
+            if current_gain != signal_meter_gain:
+                # RTL-SDR gain scales signal and noise together, so a step
+                # change would otherwise leave the meter's noise-floor and
+                # band-power smoothing mixing pre- and post-change samples
+                # for several seconds, biasing the reported SNR.
+                signal_meter_gain = current_gain
+                self._configure_signal_meter(channel_transition_hz)
             iq = iq_batch_complex(batch)
             process_started_at = time.monotonic()
-            audio = demodulator.process(channelizer.process_complex(iq))
+            channel_iq = channelizer.process_complex(iq)
+            self.signal_meter.process(channel_iq)
+            audio = demodulator.process(channel_iq)
             process_seconds = time.monotonic() - process_started_at
             batch_seconds = float(iq.size) / float(max(1, batch.sample_rate))
             if process_seconds > batch_seconds and process_started_at - last_slow_batch_log_at >= 60.0:
@@ -4877,6 +4917,7 @@ class RtlControlService:
                 "notifications": notifications,
                 "streams": streams,
                 "active_streams": active_streams,
+                "stream_signals": self._stream_signals_locked(),
                 "active_eas_recorders": self._active_eas_recorders_locked(),
                 "test_mode": {"active": False} if read_only else self._stream_test_mode_status_locked(),
                 "recent_eas_alerts": self._recent_eas_alerts_locked(),
@@ -6037,11 +6078,12 @@ class RtlControlService:
             stream["updated_at"] = time.time()
             save_streams(self.streams_directory, self.streams)
         LOG.info(
-            "updated stream notification settings for %s: icecast_failures=%s soundcard_failures=%s recorded_eas_alerts=%s",
+            "updated stream notification settings for %s: icecast_failures=%s soundcard_failures=%s recorded_eas_alerts=%s bad_reception=%s",
             stream_id,
             settings.icecast_failures,
             settings.soundcard_failures,
             settings.recorded_eas_alerts,
+            settings.bad_reception,
         )
         return self.stream_status()
 
@@ -6059,32 +6101,41 @@ class RtlControlService:
             self.stream_eas_alert_notification_seen.clear()
             return
         self._process_rtl_notifications_locked(now)
+        failures: list[dict[str, Any]] = []
         for snapshot in active_streams:
             stream_id = str(snapshot.get("id", ""))
             stream = configured_by_id.get(stream_id)
             if not stream or stream.get("enabled", True) is False:
                 continue
             settings = stream_notification_settings_from_stream(stream)
-            for failure in stream_notification_failures(stream, snapshot, settings):
-                key = str(failure["key"])
-                active_failure_keys.add(key)
-                state = self.stream_notification_states.setdefault(
-                    key,
-                    {
-                        "first_seen": now,
-                        "last_seen": now,
-                        "last_clear": 0.0,
-                        "last_sent": 0.0,
-                    },
-                )
-                state["last_seen"] = now
-                if now - float(state.get("first_seen", now)) < STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS:
-                    continue
-                last_sent = float(state.get("last_sent", 0.0))
-                if last_sent and now - last_sent < STREAM_NOTIFICATION_REPEAT_SECONDS:
-                    continue
-                self._send_stream_problem_notification_async(failure)
-                state["last_sent"] = now
+            failures.extend(stream_notification_failures(stream, snapshot, settings))
+        for stream_id, signal in self._stream_signals_locked().items():
+            stream = configured_by_id.get(stream_id)
+            if not stream or stream.get("enabled", True) is False:
+                continue
+            failure = stream_reception_failure(stream, signal, stream_notification_settings_from_stream(stream))
+            if failure is not None:
+                failures.append(failure)
+        for failure in failures:
+            key = str(failure["key"])
+            active_failure_keys.add(key)
+            state = self.stream_notification_states.setdefault(
+                key,
+                {
+                    "first_seen": now,
+                    "last_seen": now,
+                    "last_clear": 0.0,
+                    "last_sent": 0.0,
+                },
+            )
+            state["last_seen"] = now
+            if now - float(state.get("first_seen", now)) < STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS:
+                continue
+            last_sent = float(state.get("last_sent", 0.0))
+            if last_sent and now - last_sent < STREAM_NOTIFICATION_REPEAT_SECONDS:
+                continue
+            self._send_stream_problem_notification_async(failure)
+            state["last_sent"] = now
         for key, state in list(self.stream_notification_states.items()):
             if key in active_failure_keys:
                 continue
@@ -7159,6 +7210,17 @@ class RtlControlService:
         with self.lock:
             return self.settings.alias_filter_strength
 
+    def _gain_signature(self) -> float | None:
+        # None means hardware/tuner AGC is enabled. A manual gain change (or
+        # switching in/out of AGC) resets each stream's signal meter, since
+        # gain applies to signal and noise together and mixing pre- and
+        # post-change samples in the meter's smoothing windows would bias the
+        # SNR reading for several seconds. Continuous drift from the tuner's
+        # own AGC while enabled is not tracked here; see the signal_meter
+        # module docstring for why live gain readback is not used.
+        with self.lock:
+            return self.settings.gain
+
     def _effective_settings_locked(self) -> RtlControlSettings:
         if not isinstance(self.capture, RtlCaptureSource):
             return self.settings
@@ -7478,6 +7540,7 @@ class RtlControlService:
                 fanout=fanout,
                 fallback_settings_provider=self.fallback_settings_snapshot,
                 alias_filter_strength_provider=self._alias_filter_strength,
+                gain_provider=self._gain_signature,
                 soundcard_devices_provider=self._cached_soundcards,
                 soundcard_manager=self.soundcard_manager,
                 state_directory=self.state_path.parent,
@@ -7635,6 +7698,13 @@ class RtlControlService:
             else:
                 snapshots.append(worker.snapshot())
         return snapshots
+
+    def _stream_signals_locked(self) -> dict[str, dict[str, Any]]:
+        return {
+            str(stream_id): worker.signal_snapshot()
+            for stream_id, worker in self.stream_workers.items()
+            if hasattr(worker, "signal_snapshot")
+        }
 
     def _active_eas_recorders_locked(self) -> list[dict[str, Any]]:
         snapshots = []
@@ -9777,6 +9847,7 @@ def stream_notification_settings_from_stream(stream: dict[str, Any]) -> WebStrea
         icecast_failures=bool(raw.get("icecast_failures", False)),
         soundcard_failures=bool(raw.get("soundcard_failures", False)),
         recorded_eas_alerts=bool(raw.get("recorded_eas_alerts", False)),
+        bad_reception=bool(raw.get("bad_reception", False)),
     )
 
 
@@ -9787,6 +9858,7 @@ def validate_stream_notification_payload(raw: Any) -> WebStreamNotificationSetti
         icecast_failures=bool(raw.get("icecast_failures", False)),
         soundcard_failures=bool(raw.get("soundcard_failures", False)),
         recorded_eas_alerts=bool(raw.get("recorded_eas_alerts", False)),
+        bad_reception=bool(raw.get("bad_reception", False)),
     )
 
 
@@ -9927,6 +9999,10 @@ def notification_app_url(base_url: str, target_path: str = "/") -> str:
     base = normalize_notification_access_url(base_url, default_scheme="http").rstrip("/")
     target = sanitize_local_notification_path(target_path)
     return f"{base}{target}"
+
+
+def stream_settings_route_path(stream_id: str) -> str:
+    return f"/?view=stream_settings&stream={quote(str(stream_id or ''), safe='')}"
 
 
 def stream_output_route_path(stream_id: str, output_id: str) -> str:
@@ -10317,6 +10393,28 @@ def stream_notification_failures(
                 }
             )
     return failures
+
+
+def stream_reception_failure(
+    stream: dict[str, Any],
+    signal: dict[str, Any] | None,
+    settings: WebStreamNotificationSettings,
+) -> dict[str, Any] | None:
+    if not settings.bad_reception or not isinstance(signal, dict) or not signal.get("bad_reception"):
+        return None
+    stream_id = str(stream.get("id", ""))
+    snr_db = signal.get("snr_db")
+    detail = (
+        f"the signal-to-noise ratio is {float(snr_db):.0f} dB"
+        if isinstance(snr_db, (int, float))
+        else "no carrier is detected"
+    )
+    return {
+        "key": f"{stream_id}:reception",
+        "category": "reception",
+        "target_path": stream_settings_route_path(stream_id),
+        "message": f"{stream_callsign(stream)}: bad reception, {detail}.",
+    }
 
 
 def enabled_output_count(
@@ -11319,6 +11417,10 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .status-enabled { color: #0f7a34; }
 .status-needs-attention { color: #b00020; }
 .status-disabled { color: inherit; font-weight: 600; }
+.signal-excellent { color: #0f7a34; }
+.signal-good { color: #5a7d00; }
+.signal-fair { color: #9a5b00; }
+.signal-poor { color: #b00020; }
 .menu-cell { position: relative; }
 .stream-actions-menu { position: absolute; right: 10px; z-index: 10; display: grid; gap: 4px; min-width: 190px; margin-top: 6px; padding: 6px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; box-shadow: 0 8px 18px rgb(20 24 31 / 18%); }
 .stream-actions-menu[hidden] { display: none; }
@@ -11326,6 +11428,7 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .details-list { display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; margin: 0 0 16px; }
 .details-list dt { font-weight: 700; }
 .details-list dd { margin: 0; }
+#stream_settings_signal { margin-top: 16px; }
 .tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #d8dde6; margin: 16px 0; }
 .tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: -1px; }
 .tabs button[aria-selected="true"] { border-color: #2557a7; border-bottom-color: #fff; box-shadow: inset 0 2px 0 #2557a7; }
@@ -11366,6 +11469,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .status-enabled { color: #5fd27a; }
   .status-connected { color: #5fd27a; }
   .status-needs-attention { color: #ff6b7a; }
+  .signal-excellent { color: #5fd27a; }
+  .signal-good { color: #b5d65a; }
+  .signal-fair { color: #f0b44c; }
+  .signal-poor { color: #ff6b7a; }
   .success { color: #5fd27a; }
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
   .nav-more-menu { background: #181d24; border-color: #333b48; }
@@ -11389,6 +11496,22 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .effects-layout:not(.effect-detail-active) .effects-detail { display: none; }
   .audio-effects-back { display: inline-block; margin-bottom: 12px; }
   .desktop-volume-control { display: none; }
+  /* Stacked cards for phones. Explicit ARIA roles on the table keep its
+     semantics once display changes, the header row stays available to screen
+     readers, and the visible cell labels use empty alt text so they are not
+     announced twice. */
+  .responsive-table thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  .responsive-table, .responsive-table tbody, .responsive-table tr, .responsive-table td { display: block; }
+  .responsive-table { margin-top: 12px; }
+  .responsive-table tr { border: 1px solid #d8dde6; border-radius: 6px; margin-bottom: 10px; padding: 4px 0; }
+  .responsive-table td { display: grid; grid-template-columns: minmax(6.5rem, 34%) minmax(0, 1fr); gap: 10px; align-items: baseline; border-bottom: 0; padding: 6px 12px; }
+  .responsive-table td:not([data-label]) { display: block; }
+  .responsive-table td[data-label]::before { content: attr(data-label); content: attr(data-label) / ""; color: #526070; font-size: 12px; font-weight: 700; text-transform: uppercase; }
+  .responsive-table .menu-cell .stream-actions-menu { right: 12px; }
+}
+@media (max-width: 680px) and (prefers-color-scheme: dark) {
+  .responsive-table tr { border-color: #333b48; }
+  .responsive-table td[data-label]::before { color: #9aa8ba; }
 }
 @media (max-width: 900px) and (orientation: landscape) {
   .topbar { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 14px; padding: 10px 16px; }
@@ -11846,19 +11969,20 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div class="actions">
         <button id="open_add_stream" type="button">Add stream</button>
       </div>
-      <table aria-label="Manage streams">
-        <thead>
-          <tr>
-            <th>Callsign</th>
-            <th>Frequency</th>
-            <th>Outputs</th>
-            <th>Status</th>
-            <th>Actions</th>
+      <table class="responsive-table" role="table" aria-label="Manage streams">
+        <thead role="rowgroup">
+          <tr role="row">
+            <th role="columnheader">Callsign</th>
+            <th role="columnheader">Frequency</th>
+            <th role="columnheader">Outputs</th>
+            <th role="columnheader">Signal</th>
+            <th role="columnheader">Status</th>
+            <th role="columnheader">Actions</th>
           </tr>
         </thead>
-        <tbody id="active-streams-body" aria-live="off">
-          <tr id="active-streams-empty">
-            <td colspan="5" class="hint">No streams configured.</td>
+        <tbody id="active-streams-body" role="rowgroup" aria-live="off">
+          <tr id="active-streams-empty" role="row">
+            <td colspan="6" class="hint" role="cell">No streams configured.</td>
           </tr>
         </tbody>
       </table>
@@ -12022,6 +12146,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       </label>
       <span id="stream_monitor_hint" class="hint">Listen to this stream's audio in your browser.</span>
       <div id="stream-settings-result" class="message"></div>
+      <dl id="stream_settings_signal" class="details-list">
+        <dt>Signal</dt><dd id="stream_settings_signal_value" class="hint">No signal data</dd>
+        <dt id="stream_settings_signal_levels_label" hidden>Levels</dt><dd id="stream_settings_signal_levels" hidden></dd>
+      </dl>
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
         <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
         <button id="tab_eas" type="button" role="tab" aria-selected="false" aria-controls="panel_eas" tabindex="-1">EAS Recording</button>
@@ -12240,6 +12368,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <label class="checkbox-row">
             <input id="stream_notify_soundcard_failures" type="checkbox">
             Disconnected sound cards
+          </label>
+          <label class="checkbox-row">
+            <input id="stream_notify_bad_reception" type="checkbox">
+            Bad reception
           </label>
           <label id="stream_notify_eas_alerts_label" class="checkbox-row" hidden>
             <input id="stream_notify_eas_alerts" type="checkbox" aria-describedby="stream_notify_eas_alerts_hint">
@@ -12526,6 +12658,7 @@ let outputFormOriginalSignature = "";
 let icecastOutputTableSignature = "";
 let soundcardOutputTableSignature = "";
 let activeStreamSnapshots = [];
+let streamSignals = {};
 let fallbackSignature = "";
 let fallbackUpdateTimer = null;
 let easSignature = "";
@@ -15767,7 +15900,8 @@ function streamNotificationSettingsForStream(stream) {
   return {
     icecast_failures: Boolean(settings.icecast_failures),
     soundcard_failures: Boolean(settings.soundcard_failures),
-    recorded_eas_alerts: Boolean(settings.recorded_eas_alerts)
+    recorded_eas_alerts: Boolean(settings.recorded_eas_alerts),
+    bad_reception: Boolean(settings.bad_reception)
   };
 }
 
@@ -15775,7 +15909,8 @@ function streamNotificationsPayload() {
   return {
     icecast_failures: document.getElementById("stream_notify_icecast_failures").checked,
     soundcard_failures: document.getElementById("stream_notify_soundcard_failures").checked,
-    recorded_eas_alerts: document.getElementById("stream_notify_eas_alerts").checked
+    recorded_eas_alerts: document.getElementById("stream_notify_eas_alerts").checked,
+    bad_reception: document.getElementById("stream_notify_bad_reception").checked
   };
 }
 
@@ -15988,6 +16123,7 @@ function setStreamNotificationControls(stream) {
   setChecked("stream_notify_icecast_failures", settings.icecast_failures);
   setChecked("stream_notify_soundcard_failures", settings.soundcard_failures);
   setChecked("stream_notify_eas_alerts", settings.recorded_eas_alerts);
+  setChecked("stream_notify_bad_reception", settings.bad_reception);
   setHidden("stream_notify_eas_alerts_label", !easEnabled);
   setHidden("stream_notify_eas_alerts_hint", !easEnabled);
   streamNotificationsSignature = nextSignature;
@@ -16593,6 +16729,7 @@ function renderStreamSettings() {
   setAudioEffectsControls(stream);
   setEasControls(stream);
   setStreamNotificationControls(stream);
+  renderStreamSettingsSignal(stream);
   setTestModeControls();
   renderOutputPanels();
   renderIcecastOutputsTable(stream);
@@ -16848,14 +16985,17 @@ function activeStreamRows(activeStreams, configured = configuredStreams) {
   }
   for (const stream of configured || []) {
     const activeItems = activeById.get(stream.id) || [];
+    const signal = streamIsEnabled(stream) ? streamSignalFor(stream.id) : null;
     if (activeItems.length) {
       const statuses = activeItems.map(item => normalizeStreamStatus(item.status));
+      if (streamHasBadReception(signal)) statuses.push("needs-attention");
       const status = statuses.includes("needs-attention") ? "needs-attention" : statuses.includes("enabled") ? "enabled" : "disabled";
       rows.push({
         id: stream.id,
         enabled: streamIsEnabled(stream),
         station: stream.station,
         outputs: streamOutputs(stream),
+        signal,
         status
       });
       activeById.delete(stream.id);
@@ -16865,7 +17005,8 @@ function activeStreamRows(activeStreams, configured = configuredStreams) {
         enabled: streamIsEnabled(stream),
         station: stream.station,
         outputs: streamOutputs(stream),
-        status: "disabled"
+        signal,
+        status: streamHasBadReception(signal) ? "needs-attention" : "disabled"
       });
     }
   }
@@ -16889,6 +17030,7 @@ function activeStreamSignature(rows) {
         type: output.type || "icecast"
       })),
       monitoring: monitorStreamId === stream.id,
+      signal: streamSignalDisplay(stream.signal),
       status: normalizeStreamStatus(stream.status),
       read_only: accountIsReadOnly()
     };
@@ -16909,8 +17051,10 @@ function renderActiveStreams(activeStreams, configured = configuredStreams, opti
   if (rows.length === 0) {
     const row = document.createElement("tr");
     row.id = "active-streams-empty";
+    row.setAttribute("role", "row");
     const cell = document.createElement("td");
-    cell.colSpan = 5;
+    cell.setAttribute("role", "cell");
+    cell.colSpan = 6;
     cell.className = "hint";
     cell.textContent = "No streams configured.";
     row.appendChild(cell);
@@ -16979,6 +17123,7 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
         status: "needs-attention",
         icecastFailed: false,
         soundcardFailed: false,
+        badReception: false,
         errors: []
       };
       byStream.set(streamId, item);
@@ -16996,6 +17141,25 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
       }
     }
   }
+  for (const stream of configured || []) {
+    if (!streamIsEnabled(stream) || !streamHasBadReception(streamSignalFor(stream.id))) continue;
+    let item = byStream.get(stream.id);
+    if (!item) {
+      const station = stream.station || {};
+      item = {
+        id: stream.id,
+        callsign: station.callsign || "Unknown",
+        frequency: station.frequency || "",
+        status: "needs-attention",
+        icecastFailed: false,
+        soundcardFailed: false,
+        badReception: false,
+        errors: []
+      };
+      byStream.set(stream.id, item);
+    }
+    item.badReception = true;
+  }
   const items = Array.from(byStream.values()).map(item => {
     let detail = "";
     if (item.icecastFailed && item.soundcardFailed) {
@@ -17004,8 +17168,11 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
       detail = "One or more Icecast destinations failed to connect.";
     } else if (item.soundcardFailed) {
       detail = "One or more sound cards have disconnected.";
-    } else {
+    } else if (!item.badReception) {
       detail = item.errors[0] || "This stream needs attention.";
+    }
+    if (item.badReception) {
+      detail = detail ? `Bad reception. ${detail}` : "Bad reception. The signal is too weak or noisy to be usable.";
     }
     return Object.assign(item, {detail});
   });
@@ -17126,6 +17293,8 @@ function renderDashboardRecentAlerts(alerts) {
   }
 }
 
+const ACTIVE_STREAM_COLUMN_LABELS = ["Callsign", "Frequency", "Outputs", "Signal", "Status", "Actions"];
+
 function activeStreamRow(stream) {
   const station = stream.station || {};
   const status = normalizeStreamStatus(stream.status);
@@ -17133,11 +17302,77 @@ function activeStreamRow(stream) {
   row.appendChild(tableCell(station.callsign || "Unknown"));
   row.appendChild(tableCell(station.frequency ? `${station.frequency} MHz` : "Unknown"));
   row.appendChild(tableCell(streamOutputCount(stream)));
+  row.appendChild(streamSignalCell(stream.signal));
   const statusCell = tableCell(streamStatusLabel(status));
   statusCell.className = `status-text status-${status}`;
   row.appendChild(statusCell);
   row.appendChild(streamActionsCell(stream));
+  labelResponsiveTableRow(row, ACTIVE_STREAM_COLUMN_LABELS);
   return row;
+}
+
+function labelResponsiveTableRow(row, labels) {
+  row.setAttribute("role", "row");
+  Array.from(row.children).forEach((cell, index) => {
+    cell.setAttribute("role", "cell");
+    if (labels[index]) cell.dataset.label = labels[index];
+  });
+}
+
+const SIGNAL_QUALITY_LABELS = {excellent: "Excellent", good: "Good", fair: "Fair", poor: "Poor"};
+
+function streamSignalFor(streamId) {
+  const signal = streamSignals && streamSignals[streamId];
+  return signal && signal.available ? signal : null;
+}
+
+function streamHasBadReception(signal) {
+  return Boolean(signal && signal.available && signal.bad_reception);
+}
+
+function streamSignalDisplay(signal) {
+  if (!signal || !signal.available) return {text: "No signal data", quality: "", detail: ""};
+  const quality = SIGNAL_QUALITY_LABELS[signal.quality] ? signal.quality : "poor";
+  const snr = Number(signal.snr_db);
+  const text = signal.snr_db === null || !Number.isFinite(snr)
+    ? `${SIGNAL_QUALITY_LABELS[quality]} (no carrier)`
+    : `${SIGNAL_QUALITY_LABELS[quality]} (${Math.round(snr)} dB SNR)`;
+  const parts = [];
+  if (Number.isFinite(Number(signal.signal_dbfs)) && signal.signal_dbfs !== null) parts.push(`Signal ${Number(signal.signal_dbfs).toFixed(0)} dBFS`);
+  if (Number.isFinite(Number(signal.noise_floor_dbfs)) && signal.noise_floor_dbfs !== null) parts.push(`noise floor ${Number(signal.noise_floor_dbfs).toFixed(0)} dBFS`);
+  return {text, quality, detail: parts.join(", ")};
+}
+
+function renderStreamSettingsSignal(stream) {
+  const value = document.getElementById("stream_settings_signal_value");
+  const enabled = Boolean(stream) && streamIsEnabled(stream);
+  const signal = enabled ? streamSignalFor(stream.id) : null;
+  const display = streamSignalDisplay(signal);
+  let text = display.text;
+  if (!enabled) {
+    text = "Not measured while this stream is disabled.";
+  } else if (streamHasBadReception(signal)) {
+    text = `${display.text}. Bad reception: the signal is too weak or noisy to be usable.`;
+  }
+  setText("stream_settings_signal_value", text);
+  const className = display.quality ? `status-text signal-${display.quality}` : "hint";
+  if (value.className !== className) value.className = className;
+  const showLevels = Boolean(display.detail);
+  setHidden("stream_settings_signal_levels_label", !showLevels);
+  setHidden("stream_settings_signal_levels", !showLevels);
+  setText("stream_settings_signal_levels", display.detail);
+}
+
+function streamSignalCell(signal) {
+  const display = streamSignalDisplay(signal);
+  const cell = tableCell(display.text);
+  if (display.quality) {
+    cell.className = `status-text signal-${display.quality}`;
+    if (display.detail) cell.title = display.detail;
+  } else {
+    cell.className = "hint";
+  }
+  return cell;
 }
 
 function tableCell(value) {
@@ -19743,6 +19978,7 @@ function updateDashboard(data) {
   renderDashboardSdr(data);
   renderStorageSummary(data.storage || {});
   activeStreamSnapshots = data.active_streams || [];
+  streamSignals = data.stream_signals || {};
   renderActiveStreams(data.active_streams || [], configuredStreams);
   renderDashboardStreamAttention(data.active_streams || [], configuredStreams);
   renderDashboardRecentAlerts(data.recent_eas_alerts || []);
@@ -20679,7 +20915,7 @@ document.querySelector(".tabs").addEventListener("keydown", event => {
   showSettingsTab(tabs[nextIndex].id.replace(/^tab_/, ""));
 });
 
-for (const id of ["stream_notify_icecast_failures", "stream_notify_soundcard_failures", "stream_notify_eas_alerts"]) {
+for (const id of ["stream_notify_icecast_failures", "stream_notify_soundcard_failures", "stream_notify_eas_alerts", "stream_notify_bad_reception"]) {
   document.getElementById(id).addEventListener("change", scheduleStreamNotificationsUpdate);
 }
 
