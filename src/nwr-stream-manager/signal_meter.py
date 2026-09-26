@@ -19,9 +19,13 @@ Signal power is the signal-band power minus the noise expected in that band.
 All levels are dBFS where a full-scale complex exponential (|x| = 1) is 0 dBFS.
 
 Reception quality is graded from the SNR in the channel bandwidth. NBFM hits
-its threshold around 10 dB, so "poor" starts just above it; "bad reception"
-is flagged once the SNR (or a missing carrier) stays below the bad threshold
-for a sustained period, and clears with some hysteresis.
+its threshold around 10 dB, so "poor" starts just above it. Below 0 dB the
+carrier may still be measurable but can never break through the FM noise
+floor, so it is reported as "no signal" rather than a meaningless SNR. A
+reception problem is flagged once the SNR (or a missing carrier) stays below
+the bad threshold for a sustained period and clears with some hysteresis; it
+is reported as "no_signal" while the SNR is below 0 dB and "bad_reception"
+otherwise.
 
 SNR is inherently invariant to RTL-SDR gain: gain scales the signal and the
 noise together, so their ratio does not move once both sides of the meter
@@ -78,16 +82,22 @@ SIGNAL_QUALITY_EXCELLENT = "excellent"
 SIGNAL_QUALITY_GOOD = "good"
 SIGNAL_QUALITY_FAIR = "fair"
 SIGNAL_QUALITY_POOR = "poor"
+SIGNAL_QUALITY_NO_SIGNAL = "no_signal"
 SIGNAL_QUALITY_EXCELLENT_SNR_DB = 30.0
 SIGNAL_QUALITY_GOOD_SNR_DB = 20.0
 SIGNAL_QUALITY_FAIR_SNR_DB = 12.0
+SIGNAL_QUALITY_NO_SIGNAL_SNR_DB = 0.0
+RECEPTION_PROBLEM_BAD_RECEPTION = "bad_reception"
+RECEPTION_PROBLEM_NO_SIGNAL = "no_signal"
 BAD_RECEPTION_SNR_DB = 6.0
 BAD_RECEPTION_RECOVERY_SNR_DB = 9.0
 BAD_RECEPTION_SUSTAIN_SECONDS = 20.0
 
 
 def signal_quality(snr_db: float | None) -> str:
-    if snr_db is None or snr_db < SIGNAL_QUALITY_FAIR_SNR_DB:
+    if snr_db is None or snr_db < SIGNAL_QUALITY_NO_SIGNAL_SNR_DB:
+        return SIGNAL_QUALITY_NO_SIGNAL
+    if snr_db < SIGNAL_QUALITY_FAIR_SNR_DB:
         return SIGNAL_QUALITY_POOR
     if snr_db < SIGNAL_QUALITY_GOOD_SNR_DB:
         return SIGNAL_QUALITY_FAIR
@@ -107,8 +117,8 @@ class SignalMeasurement:
     carrier_detected: bool
     channel_bandwidth_hz: float
     measured_at: float
-    quality: str = SIGNAL_QUALITY_POOR
-    bad_reception: bool = False
+    quality: str = SIGNAL_QUALITY_NO_SIGNAL
+    reception_problem: str | None = None
 
 
 def noise_reference_band_for_transition(
@@ -247,7 +257,7 @@ class ChannelSignalMeter:
             "carrier_detected": measurement.carrier_detected,
             "channel_bandwidth_hz": round(measurement.channel_bandwidth_hz, 1),
             "quality": measurement.quality,
-            "bad_reception": measurement.bad_reception and age <= SIGNAL_METER_STALE_SECONDS,
+            "reception_problem": measurement.reception_problem if age <= SIGNAL_METER_STALE_SECONDS else None,
             "measured_at": measurement.measured_at,
             "age_seconds": round(age, 3),
         }
@@ -285,7 +295,12 @@ class ChannelSignalMeter:
         signal_power = smoothed_band_power - noise_in_band
         snr_db = _power_dbfs(signal_power / noise_in_band) if noise_in_band > 0.0 and signal_power > 0.0 else None
         self._stream_seconds += block.size / self.sample_rate
-        bad_reception = self._update_bad_reception(snr_db)
+        quality = signal_quality(snr_db)
+        reception_problem = None
+        if self._update_bad_reception(snr_db):
+            reception_problem = (
+                RECEPTION_PROBLEM_NO_SIGNAL if quality == SIGNAL_QUALITY_NO_SIGNAL else RECEPTION_PROBLEM_BAD_RECEPTION
+            )
         measurement = SignalMeasurement(
             channel_power_dbfs=_power_dbfs(smoothed_band_power),
             noise_floor_dbfs=_power_dbfs(noise_in_band),
@@ -296,8 +311,8 @@ class ChannelSignalMeter:
             carrier_detected=snr_db is not None and snr_db >= SIGNAL_METER_CARRIER_DETECT_SNR_DB,
             channel_bandwidth_hz=self.channel_bandwidth_hz,
             measured_at=time.time(),
-            quality=signal_quality(snr_db),
-            bad_reception=bad_reception,
+            quality=quality,
+            reception_problem=reception_problem,
         )
         with self._lock:
             self._measurement = measurement

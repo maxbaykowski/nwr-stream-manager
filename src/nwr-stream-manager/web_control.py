@@ -5103,7 +5103,7 @@ class RtlControlService:
         if not matches:
             matches = [device for device in self._refresh_soundcards() if device.stable_id == stable_id]
         if not matches:
-            raise ValueError("Sound card has disconnected.")
+            raise ValueError("Sound card is not connected.")
         if len(matches) > 1:
             raise ValueError("Sound card stable ID is ambiguous.")
         return matches[0]
@@ -6194,7 +6194,7 @@ class RtlControlService:
                 "key": f"rtl:{serial}:disconnected",
                 "category": "disconnected",
                 "target_path": "/?view=rtl",
-                "message": f"{device_name} has disconnected.",
+                "message": f"{device_name} is not connected.",
             }
         error = str(self.capture_error or "").strip()
         if error:
@@ -6206,7 +6206,7 @@ class RtlControlService:
                 message = f"Failed to claim {device_name}."
                 category = "claim"
             elif "not found" in lower or "disconnect" in lower or "no such device" in lower:
-                message = f"{device_name} has disconnected."
+                message = f"{device_name} is not connected."
                 category = "disconnected"
             else:
                 message = f"{device_name} has stopped outputting data."
@@ -6222,7 +6222,7 @@ class RtlControlService:
                 "key": f"rtl:{serial}:disconnected",
                 "category": "disconnected",
                 "target_path": "/?view=rtl",
-                "message": f"{device_name} has disconnected.",
+                "message": f"{device_name} is not connected.",
             }
         last_batch_at = self.last_batch_at
         if last_batch_at is None or now - float(last_batch_at) >= RTL_NOTIFICATION_NO_DATA_SECONDS:
@@ -10376,7 +10376,7 @@ def stream_notification_failures(
                     "key": f"{stream_id}:soundcard:{output_id}",
                     "category": "soundcard",
                     "target_path": stream_output_route_path(stream_id, output_id),
-                    "message": f"{callsign}: sound card {name} has disconnected.",
+                    "message": f"{callsign}: sound card {name} is not connected.",
                 }
             )
         else:
@@ -10400,20 +10400,22 @@ def stream_reception_failure(
     signal: dict[str, Any] | None,
     settings: WebStreamNotificationSettings,
 ) -> dict[str, Any] | None:
-    if not settings.bad_reception or not isinstance(signal, dict) or not signal.get("bad_reception"):
+    problem = signal.get("reception_problem") if isinstance(signal, dict) else None
+    if not settings.bad_reception or problem not in {"bad_reception", "no_signal"}:
         return None
     stream_id = str(stream.get("id", ""))
     snr_db = signal.get("snr_db")
-    detail = (
-        f"the signal-to-noise ratio is {float(snr_db):.0f} dB"
-        if isinstance(snr_db, (int, float))
-        else "no carrier is detected"
-    )
+    if problem == "no_signal" or not isinstance(snr_db, (int, float)):
+        message = f"{stream_callsign(stream)}: no signal, only static is being received."
+    else:
+        message = f"{stream_callsign(stream)}: bad reception, the signal-to-noise ratio is {float(snr_db):.0f} dB."
+    # One key for both problems so a signal wavering between them does not
+    # send a fresh notification each time it crosses 0 dB.
     return {
         "key": f"{stream_id}:reception",
         "category": "reception",
         "target_path": stream_settings_route_path(stream_id),
-        "message": f"{stream_callsign(stream)}: bad reception, {detail}.",
+        "message": message,
     }
 
 
@@ -11420,7 +11422,7 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .signal-excellent { color: #0f7a34; }
 .signal-good { color: #5a7d00; }
 .signal-fair { color: #9a5b00; }
-.signal-poor { color: #b00020; }
+.signal-poor, .signal-no_signal { color: #b00020; }
 .menu-cell { position: relative; }
 .stream-actions-menu { position: absolute; right: 10px; z-index: 10; display: grid; gap: 4px; min-width: 190px; margin-top: 6px; padding: 6px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; box-shadow: 0 8px 18px rgb(20 24 31 / 18%); }
 .stream-actions-menu[hidden] { display: none; }
@@ -11472,7 +11474,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .signal-excellent { color: #5fd27a; }
   .signal-good { color: #b5d65a; }
   .signal-fair { color: #f0b44c; }
-  .signal-poor { color: #ff6b7a; }
+  .signal-poor, .signal-no_signal { color: #ff6b7a; }
   .success { color: #5fd27a; }
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
   .nav-more-menu { background: #181d24; border-color: #333b48; }
@@ -12371,7 +12373,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </label>
           <label class="checkbox-row">
             <input id="stream_notify_bad_reception" type="checkbox">
-            Bad reception
+            Bad reception or no signal
           </label>
           <label id="stream_notify_eas_alerts_label" class="checkbox-row" hidden>
             <input id="stream_notify_eas_alerts" type="checkbox" aria-describedby="stream_notify_eas_alerts_hint">
@@ -14728,7 +14730,7 @@ function deviceLabel(device) {
 }
 
 function configuredDeviceLabel(serial) {
-  return `Configured SDR, serial ${serial} (disconnected)`;
+  return `Configured SDR, serial ${serial} (not connected)`;
 }
 
 function friendlySoundcardLabel(device) {
@@ -14842,7 +14844,7 @@ function renderSettingsSoundcardDevices(selectedStableId = "") {
   const ignoreOutputId = editingOutputId || "";
   const selectedDevice = soundcardDevices.find(device => device.stable_id === selectedStableId);
   if (selectedStableId && !selectedDevice) {
-    options.push({value: selectedStableId, label: `Configured sound card, ${selectedStableId} (disconnected)`});
+    options.push({value: selectedStableId, label: `Configured sound card, ${selectedStableId} (not connected)`});
   }
   for (const device of soundcardDevices) {
     if (device.stable_id !== selectedStableId && !soundcardDeviceHasAvailableChannels(device.stable_id, ignoreOutputId)) continue;
@@ -14860,7 +14862,7 @@ function renderSettingsSoundcardDevices(selectedStableId = "") {
   setText(
     "settings_soundcard_device_hint",
     selectedStableId && !selectedDevice
-      ? "The configured sound card has disconnected."
+      ? "The configured sound card is not connected."
       : options[0] && options[0].value
         ? "NWR Stream Manager will open the hardware device directly."
         : "No sound cards have available channels."
@@ -16988,7 +16990,7 @@ function activeStreamRows(activeStreams, configured = configuredStreams) {
     const signal = streamIsEnabled(stream) ? streamSignalFor(stream.id) : null;
     if (activeItems.length) {
       const statuses = activeItems.map(item => normalizeStreamStatus(item.status));
-      if (streamHasBadReception(signal)) statuses.push("needs-attention");
+      if (streamReceptionProblem(signal)) statuses.push("needs-attention");
       const status = statuses.includes("needs-attention") ? "needs-attention" : statuses.includes("enabled") ? "enabled" : "disabled";
       rows.push({
         id: stream.id,
@@ -17006,7 +17008,7 @@ function activeStreamRows(activeStreams, configured = configuredStreams) {
         station: stream.station,
         outputs: streamOutputs(stream),
         signal,
-        status: streamHasBadReception(signal) ? "needs-attention" : "disabled"
+        status: streamReceptionProblem(signal) ? "needs-attention" : "disabled"
       });
     }
   }
@@ -17123,7 +17125,7 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
         status: "needs-attention",
         icecastFailed: false,
         soundcardFailed: false,
-        badReception: false,
+        receptionProblem: null,
         errors: []
       };
       byStream.set(streamId, item);
@@ -17142,7 +17144,8 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
     }
   }
   for (const stream of configured || []) {
-    if (!streamIsEnabled(stream) || !streamHasBadReception(streamSignalFor(stream.id))) continue;
+    const receptionProblem = streamIsEnabled(stream) ? streamReceptionProblem(streamSignalFor(stream.id)) : null;
+    if (!receptionProblem) continue;
     let item = byStream.get(stream.id);
     if (!item) {
       const station = stream.station || {};
@@ -17153,26 +17156,27 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
         status: "needs-attention",
         icecastFailed: false,
         soundcardFailed: false,
-        badReception: false,
+        receptionProblem: null,
         errors: []
       };
       byStream.set(stream.id, item);
     }
-    item.badReception = true;
+    item.receptionProblem = receptionProblem;
   }
   const items = Array.from(byStream.values()).map(item => {
-    let detail = "";
-    if (item.icecastFailed && item.soundcardFailed) {
-      detail = "One or more Icecast destinations failed to connect and one or more sound cards have disconnected.";
-    } else if (item.icecastFailed) {
-      detail = "One or more Icecast destinations failed to connect.";
-    } else if (item.soundcardFailed) {
-      detail = "One or more sound cards have disconnected.";
-    } else if (!item.badReception) {
+    // One sentence per stream, listing every problem it currently has.
+    const reasons = [];
+    if (item.receptionProblem) reasons.push(RECEPTION_PROBLEM_REASONS[item.receptionProblem]);
+    if (item.icecastFailed) reasons.push("one or more Icecast destinations failed to connect");
+    if (item.soundcardFailed) reasons.push("one or more sound cards are not connected");
+    let detail;
+    if (!reasons.length) {
       detail = item.errors[0] || "This stream needs attention.";
-    }
-    if (item.badReception) {
-      detail = detail ? `Bad reception. ${detail}` : "Bad reception. The signal is too weak or noisy to be usable.";
+    } else if (reasons.length === 1 && item.receptionProblem) {
+      detail = RECEPTION_PROBLEM_DETAILS[item.receptionProblem];
+    } else {
+      const sentence = sentenceList(reasons);
+      detail = `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
     }
     return Object.assign(item, {detail});
   });
@@ -17319,27 +17323,35 @@ function labelResponsiveTableRow(row, labels) {
   });
 }
 
-const SIGNAL_QUALITY_LABELS = {excellent: "Excellent", good: "Good", fair: "Fair", poor: "Poor"};
+const SIGNAL_QUALITY_LABELS = {excellent: "Excellent", good: "Good", fair: "Fair", poor: "Poor", no_signal: "No signal"};
+const RECEPTION_PROBLEM_DETAILS = {
+  bad_reception: "Bad reception: the signal is too weak or noisy to be usable.",
+  no_signal: "No signal: only static is being received."
+};
+const RECEPTION_PROBLEM_REASONS = {bad_reception: "bad reception", no_signal: "no signal"};
 
 function streamSignalFor(streamId) {
   const signal = streamSignals && streamSignals[streamId];
   return signal && signal.available ? signal : null;
 }
 
-function streamHasBadReception(signal) {
-  return Boolean(signal && signal.available && signal.bad_reception);
+function streamReceptionProblem(signal) {
+  if (!signal || !signal.available) return null;
+  return RECEPTION_PROBLEM_DETAILS[signal.reception_problem] ? signal.reception_problem : null;
 }
 
 function streamSignalDisplay(signal) {
   if (!signal || !signal.available) return {text: "No signal data", quality: "", detail: ""};
-  const quality = SIGNAL_QUALITY_LABELS[signal.quality] ? signal.quality : "poor";
   const snr = Number(signal.snr_db);
-  const text = signal.snr_db === null || !Number.isFinite(snr)
-    ? `${SIGNAL_QUALITY_LABELS[quality]} (no carrier)`
-    : `${SIGNAL_QUALITY_LABELS[quality]} (${Math.round(snr)} dB SNR)`;
+  const hasSnr = signal.snr_db !== null && Number.isFinite(snr);
+  const quality = !hasSnr ? "no_signal" : SIGNAL_QUALITY_LABELS[signal.quality] ? signal.quality : "poor";
+  // Below 0 dB the station never breaks through the FM noise floor, so an SNR
+  // figure or signal level would only suggest there is something to hear.
+  const noSignal = quality === "no_signal";
+  const text = noSignal ? SIGNAL_QUALITY_LABELS.no_signal : `${SIGNAL_QUALITY_LABELS[quality]} (${Math.round(snr)} dB SNR)`;
   const parts = [];
-  if (Number.isFinite(Number(signal.signal_dbfs)) && signal.signal_dbfs !== null) parts.push(`Signal ${Number(signal.signal_dbfs).toFixed(0)} dBFS`);
-  if (Number.isFinite(Number(signal.noise_floor_dbfs)) && signal.noise_floor_dbfs !== null) parts.push(`noise floor ${Number(signal.noise_floor_dbfs).toFixed(0)} dBFS`);
+  if (!noSignal && Number.isFinite(Number(signal.signal_dbfs)) && signal.signal_dbfs !== null) parts.push(`Signal ${Number(signal.signal_dbfs).toFixed(0)} dBFS`);
+  if (Number.isFinite(Number(signal.noise_floor_dbfs)) && signal.noise_floor_dbfs !== null) parts.push(`${parts.length ? "noise" : "Noise"} floor ${Number(signal.noise_floor_dbfs).toFixed(0)} dBFS`);
   return {text, quality, detail: parts.join(", ")};
 }
 
@@ -17351,8 +17363,10 @@ function renderStreamSettingsSignal(stream) {
   let text = display.text;
   if (!enabled) {
     text = "Not measured while this stream is disabled.";
-  } else if (streamHasBadReception(signal)) {
-    text = `${display.text}. Bad reception: the signal is too weak or noisy to be usable.`;
+  } else if (streamReceptionProblem(signal) === "no_signal") {
+    text = RECEPTION_PROBLEM_DETAILS.no_signal;
+  } else if (streamReceptionProblem(signal)) {
+    text = `${display.text}. ${RECEPTION_PROBLEM_DETAILS.bad_reception}`;
   }
   setText("stream_settings_signal_value", text);
   const className = display.quality ? `status-text signal-${display.quality}` : "hint";

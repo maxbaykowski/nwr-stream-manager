@@ -264,7 +264,7 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(sent, [])
 
         service._process_rtl_notifications_locked(1031.0)
-        self.assertEqual(sent[-1]["message"], "RTLSDRBlog Blog V4 has disconnected.")
+        self.assertEqual(sent[-1]["message"], "RTLSDRBlog Blog V4 is not connected.")
         self.assertEqual(sent[-1]["target_path"], "/?view=rtl")
 
         service._process_rtl_notifications_locked(1200.0)
@@ -322,7 +322,7 @@ class AuthTests(unittest.TestCase):
 
         self.assertIsNotNone(failure)
         self.assertEqual(failure["key"], "rtl:00000001:disconnected")
-        self.assertEqual(failure["message"], "RTLSDRBlog Blog V4 has disconnected.")
+        self.assertEqual(failure["message"], "RTLSDRBlog Blog V4 is not connected.")
 
     def test_rtl_notification_device_name_uses_friendly_label_without_serial(self) -> None:
         service = object.__new__(self.web_control.RtlControlService)
@@ -392,7 +392,7 @@ class AuthTests(unittest.TestCase):
 
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["key"], "stream-1:soundcard:soundcard-1")
-        self.assertIn("sound card Yeti X has disconnected", failures[0]["message"])
+        self.assertIn("sound card Yeti X is not connected", failures[0]["message"])
         self.assertEqual(
             failures[0]["target_path"],
             "/?view=stream_output&stream=stream-1&output=soundcard-1",

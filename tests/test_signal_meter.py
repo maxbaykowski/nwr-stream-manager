@@ -180,7 +180,9 @@ class ChannelSignalMeterTests(unittest.TestCase):
         self.assertEqual(quality(25.0), "good")
         self.assertEqual(quality(15.0), "fair")
         self.assertEqual(quality(8.0), "poor")
-        self.assertEqual(quality(None), "poor")
+        self.assertEqual(quality(0.0), "poor")
+        self.assertEqual(quality(-0.5), "no_signal")
+        self.assertEqual(quality(None), "no_signal")
 
     def test_bad_reception_requires_sustained_low_snr_and_recovers_with_hysteresis(self) -> None:
         rng = np.random.default_rng(7)
@@ -198,14 +200,19 @@ class ChannelSignalMeterTests(unittest.TestCase):
             run_meter(meter, iq)
             return meter.snapshot()
 
-        self.assertFalse(feed(25.0, 3.0)["bad_reception"])
+        self.assertIsNone(feed(25.0, 3.0)["reception_problem"])
         weak = feed(2.0, self.signal_meter.BAD_RECEPTION_SUSTAIN_SECONDS / 2.0)
         self.assertEqual(weak["quality"], "poor")
-        self.assertFalse(weak["bad_reception"])
-        self.assertTrue(feed(None, self.signal_meter.BAD_RECEPTION_SUSTAIN_SECONDS)["bad_reception"])
-        # Just above the bad threshold but below recovery keeps the flag latched.
-        self.assertTrue(feed(7.5, 4.0)["bad_reception"])
-        self.assertFalse(feed(20.0, 3.0)["bad_reception"])
+        self.assertIsNone(weak["reception_problem"])
+        # The 2 dB stretch and the carrier dropping out count toward one
+        # continuous period, reported as no signal because it is now below 0 dB.
+        gone = feed(None, self.signal_meter.BAD_RECEPTION_SUSTAIN_SECONDS)
+        self.assertEqual(gone["quality"], "no_signal")
+        self.assertEqual(gone["reception_problem"], "no_signal")
+        # Back above 0 dB but still under the recovery threshold: the problem
+        # stays latched and is reported as bad reception instead.
+        self.assertEqual(feed(7.5, 4.0)["reception_problem"], "bad_reception")
+        self.assertIsNone(feed(20.0, 3.0)["reception_problem"])
 
 
 class StreamSignalMeterIntegrationTests(unittest.TestCase):
@@ -234,7 +241,7 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
     def test_reception_failure_requires_toggle_and_bad_reception(self) -> None:
         wc = self.web_control
         stream = {"id": "stream-1", "station": {"callsign": "KEC49", "frequency": "162.550"}}
-        bad = {"available": True, "bad_reception": True, "snr_db": 3.4}
+        bad = {"available": True, "reception_problem": "bad_reception", "snr_db": 3.4}
         enabled = wc.WebStreamNotificationSettings(bad_reception=True)
 
         failure = wc.stream_reception_failure(stream, bad, enabled)
@@ -243,9 +250,11 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
         self.assertEqual(failure["target_path"], "/?view=stream_settings&stream=stream-1")
         self.assertEqual(failure["message"], "KEC49: bad reception, the signal-to-noise ratio is 3 dB.")
         self.assertIsNone(wc.stream_reception_failure(stream, bad, wc.WebStreamNotificationSettings()))
-        self.assertIsNone(wc.stream_reception_failure(stream, dict(bad, bad_reception=False), enabled))
-        no_carrier = wc.stream_reception_failure(stream, dict(bad, snr_db=None), enabled)
-        self.assertEqual(no_carrier["message"], "KEC49: bad reception, no carrier is detected.")
+        self.assertIsNone(wc.stream_reception_failure(stream, dict(bad, reception_problem=None), enabled))
+        no_signal = wc.stream_reception_failure(stream, dict(bad, reception_problem="no_signal", snr_db=-4.0), enabled)
+        self.assertEqual(no_signal["message"], "KEC49: no signal, only static is being received.")
+        # Same key as bad reception, so crossing 0 dB does not re-notify.
+        self.assertEqual(no_signal["key"], failure["key"])
 
     def test_bad_reception_notification_setting_round_trips(self) -> None:
         wc = self.web_control
@@ -260,9 +269,12 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
 
         self.assertIn('id="stream_notify_bad_reception"', source)
         self.assertIn("streamSignals = data.stream_signals || {};", source)
-        self.assertIn('"Bad reception. The signal is too weak or noisy to be usable."', source)
-        for quality in ("excellent", "good", "fair", "poor"):
+        self.assertIn('"Bad reception: the signal is too weak or noisy to be usable."', source)
+        self.assertIn('"No signal: only static is being received."', source)
+        self.assertIn("Bad reception or no signal", source)
+        for quality in ("excellent", "good", "fair"):
             self.assertIn(f".signal-{quality} {{", source)
+        self.assertIn(".signal-poor, .signal-no_signal {", source)
 
     def test_stream_settings_shows_signal_above_tabs(self) -> None:
         source = (PACKAGE_PATH / "web_control.py").read_text(encoding="utf-8")
