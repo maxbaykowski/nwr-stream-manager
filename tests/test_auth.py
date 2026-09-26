@@ -151,6 +151,67 @@ class AuthTests(unittest.TestCase):
 
         self.assertEqual(captured["headers"]["Click"], "http://192.0.2.5:8080")
 
+    def test_ntfy_notification_allows_click_header_with_app_query(self) -> None:
+        settings = self.web_control.WebNotificationSettings(
+            enabled=True,
+            server_url="https://ntfy.sh",
+            topic="NWRSTMGR-test",
+        )
+        click_url = self.web_control.notification_click_url(
+            "nwr.example.com:8080",
+            "/?view=stream_output&stream=stream-1&output=icecast-1",
+        )
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            captured["headers"] = dict(request.header_items())
+            return FakeResponse()
+
+        with patch.object(self.web_control, "urlopen", fake_urlopen):
+            self.web_control.send_ntfy_notification(
+                settings,
+                title="NWR Stream Manager",
+                message="Test",
+                click_url=click_url,
+            )
+
+        self.assertEqual(captured["headers"]["Click"], click_url)
+
+    def test_notification_click_url_forces_notification_auth_entry(self) -> None:
+        url = self.web_control.notification_click_url(
+            "nwr.example.com:8080",
+            "/?view=stream_output&stream=stream-1&output=icecast-1",
+        )
+
+        self.assertEqual(
+            url,
+            "http://nwr.example.com:8080/notification?next=%2F%3Fview%3Dstream_output%26stream%3Dstream-1%26output%3Dicecast-1",
+        )
+
+    def test_notification_app_url_preserves_session_for_eas_alert_detail(self) -> None:
+        alert_path = self.web_control.eas_alert_detail_route_path("stream-1", "alert-1")
+        url = self.web_control.notification_app_url("nwr.example.com:8080", alert_path)
+
+        self.assertEqual(alert_path, "/?view=eas_alert_detail&stream=stream-1&alert=alert-1")
+        self.assertEqual(url, "http://nwr.example.com:8080/?view=eas_alert_detail&stream=stream-1&alert=alert-1")
+
+    def test_notification_target_restricted_for_read_only_output_details(self) -> None:
+        self.assertTrue(
+            self.web_control.notification_target_restricted_for_read_only(
+                "/?view=stream_output&stream=stream-1&output=icecast-1"
+            )
+        )
+        self.assertFalse(self.web_control.notification_target_restricted_for_read_only("/"))
+
     def test_stream_notification_failures_include_enabled_icecast_failure(self) -> None:
         stream = {
             "id": "stream-1",
@@ -180,6 +241,10 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(failures[0]["key"], "stream-1:icecast:icecast-1")
         self.assertIn("WXN99", failures[0]["message"])
         self.assertIn("http://example.test:8000/WXN99.mp3", failures[0]["message"])
+        self.assertEqual(
+            failures[0]["target_path"],
+            "/?view=stream_output&stream=stream-1&output=icecast-1",
+        )
 
     def test_stream_notification_failures_skip_disabled_categories(self) -> None:
         stream = {
@@ -236,6 +301,10 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["key"], "stream-1:soundcard:soundcard-1")
         self.assertIn("sound card Yeti X is not currently connected", failures[0]["message"])
+        self.assertEqual(
+            failures[0]["target_path"],
+            "/?view=stream_output&stream=stream-1&output=soundcard-1",
+        )
 
     def test_stream_notification_settings_include_recorded_eas_alerts(self) -> None:
         settings = self.web_control.validate_stream_notification_payload(
@@ -812,6 +881,7 @@ class AuthTests(unittest.TestCase):
                 self.assertFalse(handler._read_only_request_allowed(path, method))
 
         allowed = [
+            ("GET", "/notification"),
             ("GET", "/api/streams"),
             ("POST", "/api/monitor/start"),
             ("POST", "/api/monitor/stop"),

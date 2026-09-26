@@ -338,8 +338,19 @@ RECEIVER_AUDIO_CONFIG = parse_audio_config(
 FALLBACK_STATE_FILE_NAME = "fallback.json"
 NOTIFICATION_STATE_FILE_NAME = "notifications.json"
 STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS = 30.0
-STREAM_NOTIFICATION_RECOVERY_SECONDS = 300.0
+STREAM_NOTIFICATION_RECOVERY_SECONDS = 30.0
 STREAM_NOTIFICATION_REPEAT_SECONDS = 3600.0
+READ_ONLY_RESTRICTED_NOTIFICATION_VIEWS = {
+    "rtl",
+    "add_stream",
+    "stream_settings",
+    "stream_output",
+    "iq_recorder_start",
+    "eas_alert_delete",
+    "accounts",
+    "create_account",
+    "notifications",
+}
 STREAM_TEST_MODE_HEARTBEAT_TIMEOUT_SECONDS = 12.0
 STREAM_TEST_MODE_IDLE_SECONDS = 300.0
 STREAM_TEST_MODE_DEVIATION_HZ = 5_000.0
@@ -449,6 +460,18 @@ def normalize_notification_access_url(raw: Any, *, default_scheme: str = "https"
     if parsed.query or parsed.fragment:
         raise ValueError("NWR Stream Manager URL cannot include a query string or fragment")
     return value.rstrip("/")
+
+
+def normalize_notification_click_url(raw: Any, *, default_scheme: str = "http") -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"{default_scheme}://{value}"
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("notification click URL must start with http:// or https://")
+    return value
 
 
 def reconcile_notification_access_url_selection(
@@ -5868,7 +5891,7 @@ class RtlControlService:
             title="NWR Stream Manager",
             message="This is a test notification from NWR Stream Manager.",
             priority=settings.priority,
-            click_url=self.notification_effective_access_url_for_settings(settings),
+            click_url=notification_click_url(self.notification_effective_access_url_for_settings(settings), "/"),
         )
         LOG.info("sent test notification to ntfy topic %s", settings.topic)
         return {"success": True, "message": "Test notification sent."}
@@ -5992,23 +6015,33 @@ class RtlControlService:
                 self.stream_eas_alert_notification_seen[stream_id] = current_ids
                 continue
             new_alerts = [
-                alert for alert in alerts
+                (index, alert) for index, alert in enumerate(alerts)
                 if eas_alert_notification_id(alert) not in seen
             ]
             self.stream_eas_alert_notification_seen[stream_id] = current_ids
-            for alert in new_alerts:
+            for index, alert in new_alerts:
                 message = eas_alert_notification_message(stream, alert)
+                alert_id = eas_alert_id(alert, index)
                 self._send_stream_problem_notification_async(
                     {
                         "key": f"{stream_id}:eas:{eas_alert_notification_id(alert)}",
                         "message": message,
                         "priority": 3,
+                        "target_path": eas_alert_detail_route_path(stream_id, alert_id),
+                        "force_auth": False,
                     }
                 )
 
     def _send_stream_problem_notification_async(self, failure: dict[str, Any]) -> None:
         settings = self.notification_settings
-        click_url = self.notification_effective_access_url_for_settings(settings)
+        base_url = self.notification_effective_access_url_for_settings(settings)
+        target_path = str(failure.get("target_path", "/") or "/")
+        force_auth = bool(failure.get("force_auth", True))
+        click_url = (
+            notification_click_url(base_url, target_path)
+            if force_auth
+            else notification_app_url(base_url, target_path)
+        )
         message = str(failure.get("message", "")).strip()
         priority = int(failure.get("priority", 4) or 4)
         if not message:
@@ -7455,6 +7488,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == "/api/setup-account":
             self.send_error(HTTPStatus.NOT_FOUND)
             return False
+        if path == "/notification":
+            return self._notification_auth_ok_or_response(path, method)
         account = self._session_auth_valid()
         if isinstance(account, AccountRecord):
             self.current_account = account
@@ -7521,10 +7556,32 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _notification_auth_ok_or_response(self, path: str, method: str) -> bool:
+        if method != "GET":
+            self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
+            return False
+        if not self.headers.get("Authorization", "").startswith("Basic "):
+            self._invalidate_request_auth_session_cookie()
+            self._send_auth_required()
+            return False
+        account = self._basic_auth_valid()
+        if not isinstance(account, AccountRecord):
+            self._invalidate_request_auth_session_cookie()
+            self._send_auth_required()
+            return False
+        self.current_account = account
+        self._pending_auth_session_cookie = self.service.auth_sessions.cookie_header(
+            self.service.auth_sessions.create(account.id)
+        )
+        if not self._account_authorized_or_response(path, method, account):
+            return False
+        return True
+
     def _read_only_request_allowed(self, path: str, method: str) -> bool:
         if method == "GET":
             return path in {
                 "/",
+                "/notification",
                 "/api/status",
                 "/api/stations",
                 "/api/streams",
@@ -7560,6 +7617,20 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 "/api/account/password",
             }
         return False
+
+    def _invalidate_request_auth_session_cookie(self) -> None:
+        cookie_header = self.headers.get("Cookie", "")
+        if cookie_header:
+            try:
+                cookies = SimpleCookie(cookie_header)
+                morsel = cookies.get(AUTH_SESSION_COOKIE_NAME)
+                if morsel is not None:
+                    self.service.auth_sessions.invalidate_token(morsel.value)
+            except Exception:
+                pass
+        self._pending_auth_session_cookie = (
+            f"{AUTH_SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
+        )
 
     def _send_auth_required(self) -> None:
         payload = b'{"error":"authentication required"}'
@@ -7761,6 +7832,18 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/live-audio":
             self._handle_live_audio_websocket(parsed)
+        elif path == "/notification":
+            target = notification_next_path(parsed.query)
+            account = getattr(self, "current_account", None)
+            if isinstance(account, AccountRecord) and account.is_read_only and notification_target_restricted_for_read_only(target):
+                self._send_notification_forbidden()
+                return
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", target)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self._send_pending_auth_session_cookie()
+            self.end_headers()
         elif path == "/":
             self._send_html(INDEX_HTML)
         elif path == "/api/status":
@@ -8534,6 +8617,25 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError, OSError):
             LOG.debug("client disconnected before HTML response could be written")
+
+    def _send_notification_forbidden(self) -> None:
+        data = (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            "<title>Access denied - NWR Stream Manager</title></head><body>"
+            "<h1>Access denied</h1>"
+            "<p>This account is read-only and cannot access output details.</p>"
+            "</body></html>"
+        ).encode("utf-8")
+        self.send_response(HTTPStatus.FORBIDDEN)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self._send_pending_auth_session_cookie()
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            LOG.debug("client disconnected before notification forbidden response could be written")
 
     def _send_file(self, path: Path, download_name: str, download: bool, *, delete_after: bool = False) -> None:
         content_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
@@ -9520,7 +9622,7 @@ def send_ntfy_notification(
         "Priority": str(max(1, min(5, int(priority if priority is not None else settings.priority)))),
         "Content-Type": "text/plain; charset=utf-8",
     }
-    click_url = normalize_notification_access_url(click_url, default_scheme="http") if click_url else ""
+    click_url = normalize_notification_click_url(click_url, default_scheme="http") if click_url else ""
     if click_url:
         headers["Click"] = click_url
     if settings.access_token:
@@ -9551,6 +9653,56 @@ def send_ntfy_notification(
         raise ValueError(f"Could not reach ntfy server: {reason}") from exc
     except TimeoutError as exc:
         raise ValueError("ntfy server took too long to respond") from exc
+
+
+def sanitize_local_notification_path(raw: Any) -> str:
+    value = str(raw or "").strip() or "/"
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc or not value.startswith("/"):
+        return "/"
+    return value
+
+
+def notification_next_path(raw_query: str) -> str:
+    query = parse_qs(raw_query)
+    return sanitize_local_notification_path(query.get("next", ["/"])[0])
+
+
+def notification_click_url(base_url: str, target_path: str = "/") -> str:
+    base = normalize_notification_access_url(base_url, default_scheme="http").rstrip("/")
+    target = sanitize_local_notification_path(target_path)
+    return f"{base}/notification?next={quote(target, safe='')}"
+
+
+def notification_app_url(base_url: str, target_path: str = "/") -> str:
+    base = normalize_notification_access_url(base_url, default_scheme="http").rstrip("/")
+    target = sanitize_local_notification_path(target_path)
+    return f"{base}{target}"
+
+
+def stream_output_route_path(stream_id: str, output_id: str) -> str:
+    return (
+        "/?view=stream_output"
+        f"&stream={quote(str(stream_id or ''), safe='')}"
+        f"&output={quote(str(output_id or ''), safe='')}"
+    )
+
+
+def eas_alert_detail_route_path(stream_id: str, alert_id: str) -> str:
+    return (
+        "/?view=eas_alert_detail"
+        f"&stream={quote(str(stream_id or ''), safe='')}"
+        f"&alert={quote(str(alert_id or ''), safe='')}"
+    )
+
+
+def notification_target_restricted_for_read_only(target_path: str) -> bool:
+    target = sanitize_local_notification_path(target_path)
+    parsed = urlparse(target)
+    if parsed.path != "/":
+        return False
+    view = parse_qs(parsed.query).get("view", ["dashboard"])[0]
+    return view in READ_ONLY_RESTRICTED_NOTIFICATION_VIEWS
 
 
 def station_key(station: dict[str, Any]) -> str:
@@ -9867,6 +10019,7 @@ def stream_notification_failures(
                 {
                     "key": f"{stream_id}:soundcard:{output_id}",
                     "category": "soundcard",
+                    "target_path": stream_output_route_path(stream_id, output_id),
                     "message": f"{callsign}: sound card {name} is not currently connected.",
                 }
             )
@@ -9879,6 +10032,7 @@ def stream_notification_failures(
                 {
                     "key": f"{stream_id}:icecast:{output_id}",
                     "category": "icecast",
+                    "target_path": stream_output_route_path(stream_id, output_id),
                     "message": f"{callsign}: failed to connect to the Icecast mountpoint at {destination}.",
                 }
             )
