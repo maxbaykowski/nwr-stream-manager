@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import uuid
+import wave
 import zipfile
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
@@ -96,7 +97,7 @@ if __package__:
         validate_ppm_correction,
     )
     from .same_data import lookup_event, lookup_location
-    from .same_live import SameEventQueue, SameSuppressionProcessor
+    from .same_live import SameEventQueue, SameSuppressionProcessor, generate_same_message
     from .webrtc import (
         AiortcSessionManager,
         OpusEncoder,
@@ -187,6 +188,7 @@ else:
     lookup_location = same_data.lookup_location
     SameEventQueue = same_live.SameEventQueue
     SameSuppressionProcessor = same_live.SameSuppressionProcessor
+    generate_same_message = same_live.generate_same_message
     AiortcSessionManager = webrtc.AiortcSessionManager
     OpusEncoder = webrtc.OpusEncoder
     TcpOpusBitrateController = webrtc.TcpOpusBitrateController
@@ -338,6 +340,37 @@ NOTIFICATION_STATE_FILE_NAME = "notifications.json"
 STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS = 30.0
 STREAM_NOTIFICATION_RECOVERY_SECONDS = 300.0
 STREAM_NOTIFICATION_REPEAT_SECONDS = 3600.0
+STREAM_TEST_MODE_HEARTBEAT_TIMEOUT_SECONDS = 12.0
+STREAM_TEST_MODE_IDLE_SECONDS = 300.0
+STREAM_TEST_MODE_DEVIATION_HZ = 5_000.0
+STREAM_TEST_MODE_NOISE_DBFS = -68.0
+STREAM_TEST_MODE_MIN_SIGNAL_DBFS = -80.0
+STREAM_TEST_MODE_MAX_SIGNAL_DBFS = 0.0
+STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS = -20.0
+STREAM_TEST_MODE_AUDIO_PEAK_LIMIT = 0.96
+STREAM_TEST_MODE_AUDIO_DRIVE = 5.0
+STREAM_TEST_MODE_TONE_PEAK = 0.90
+STREAM_TEST_MODE_SIGNAL_FADE_SECONDS = 1.0
+STREAM_TEST_MODE_CROSSFADE_SECONDS = 1.0
+STREAM_TEST_MODE_LOOP_PERIOD_SECONDS = 5.0
+STREAM_TEST_MODE_PRE_EOM_SILENCE_SECONDS = 2.0
+STREAM_TEST_MODE_AUDIO = "test_mode.wav"
+STREAM_TEST_MODE_SAME_AUDIO = "same_test.wav"
+STREAM_TEST_MODE_SAME_LOCATION = "999000"
+STREAM_TEST_MODE_SAME_SENDER_ID = "NWRSTMGR"
+STREAM_TEST_MODE_TRANSMIT_EQ_POINTS: tuple[tuple[float, float], ...] = (
+    (0.0, -18.0),
+    (120.0, -16.0),
+    (250.0, -12.0),
+    (400.0, -8.0),
+    (800.0, 0.0),
+    (1_500.0, 5.0),
+    (3_000.0, 5.0),
+    (4_500.0, -2.0),
+    (6_000.0, -16.0),
+    (8_000.0, -32.0),
+    (12_000.0, -48.0),
+)
 
 
 @dataclass(frozen=True)
@@ -1551,6 +1584,35 @@ def subscribe_raw_fanout(
         return fanout.subscribe(max_chunks=max_chunks, max_seconds=max_seconds)
 
 
+class NullIqFanout:
+    generation = 0
+
+    def subscribe(
+        self,
+        *,
+        max_chunks: int | None = None,
+        max_seconds: float | None = None,
+        name: str = "subscriber",
+    ) -> queue.Queue:
+        maxsize = max_chunks or max(1, int(round((max_seconds or 1.0) / STREAM_FRAME_SECONDS)))
+        return queue.Queue(maxsize=maxsize)
+
+    def unsubscribe(self, subscriber: queue.Queue) -> None:
+        clear_queue_items(subscriber)
+
+    def subscriber_stats(self, subscriber: queue.Queue | None) -> dict[str, Any]:
+        if subscriber is None:
+            return {}
+        return {
+            "name": "test-mode-null-fanout",
+            "queue_depth": subscriber.qsize(),
+            "queue_capacity": subscriber.maxsize,
+            "max_queue_depth": 0,
+            "dropped_batches": 0,
+            "dropped_samples": 0,
+        }
+
+
 def fanout_channel_profile(fanout: RawRtlFanout | IntermediateIqFanout) -> tuple[int, int] | None:
     if not isinstance(fanout, IntermediateIqFanout):
         return None
@@ -1633,6 +1695,326 @@ class ComplexNfmDemodulator:
                 output[1:] = np.angle(iq[1:] * np.conj(iq[:-1])).astype(np.float32)
         self.previous_sample = iq[-1]
         return (output / np.pi * 1.5).astype(np.float32, copy=False)
+
+
+def clamp_test_mode_signal_dbfs(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS
+    return float(min(STREAM_TEST_MODE_MAX_SIGNAL_DBFS, max(STREAM_TEST_MODE_MIN_SIGNAL_DBFS, number)))
+
+
+def dbfs_to_linear(dbfs: float | np.ndarray) -> float | np.ndarray:
+    values = np.asarray(dbfs, dtype=np.float32)
+    linear = np.power(10.0, values / 20.0)
+    if linear.shape == ():
+        return float(linear)
+    return linear.astype(np.float32, copy=False)
+
+
+def asset_path(name: str) -> Path:
+    return Path(__file__).resolve().parent / "assets" / name
+
+
+def load_mono_wav_float(path: Path, sample_rate: int) -> np.ndarray:
+    with wave.open(str(path), "rb") as wav:
+        channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        rate = wav.getframerate()
+        frame_count = wav.getnframes()
+        compression = wav.getcomptype()
+        if sample_width != 2 or compression != "NONE":
+            raise ValueError(f"{path.name} must be PCM S16_LE WAV")
+        raw = wav.readframes(frame_count)
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1).astype(np.float32, copy=False)
+    if rate != sample_rate:
+        pcm = np.clip(samples * 32768.0, -32768, 32767).astype("<i2").tobytes()
+        resampler = PcmResampler(rate, sample_rate)
+        converted = resampler.process(pcm) + resampler.flush()
+        samples = np.frombuffer(converted, dtype="<i2").astype(np.float32) / 32768.0
+    return np.clip(samples, -1.0, 1.0).astype(np.float32, copy=False)
+
+
+def shape_test_mode_program_audio(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    audio = np.asarray(samples, dtype=np.float32)
+    if audio.size == 0:
+        return audio
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be greater than 0")
+    nfft = 1
+    target = int(audio.size * 2)
+    while nfft < target:
+        nfft *= 2
+    frequencies = np.fft.rfftfreq(nfft, d=1.0 / float(sample_rate))
+    point_frequencies = np.array([point[0] for point in STREAM_TEST_MODE_TRANSMIT_EQ_POINTS], dtype=np.float64)
+    point_gains = np.array([10.0 ** (point[1] / 20.0) for point in STREAM_TEST_MODE_TRANSMIT_EQ_POINTS], dtype=np.float64)
+    response = np.interp(frequencies, point_frequencies, point_gains)
+    spectrum = np.fft.rfft(audio.astype(np.float64), n=nfft)
+    shaped = np.fft.irfft(spectrum * response, n=nfft)[: audio.size]
+    shaped -= float(np.mean(shaped))
+    return condition_test_mode_audio(shaped)
+
+
+def condition_test_mode_audio(samples: np.ndarray, *, drive: float = STREAM_TEST_MODE_AUDIO_DRIVE) -> np.ndarray:
+    audio = np.asarray(samples, dtype=np.float32)
+    if audio.size == 0:
+        return audio
+    peak = float(np.max(np.abs(audio)))
+    if peak <= 1e-9:
+        return audio.astype(np.float32, copy=False)
+    driven = audio * max(0.0, float(drive))
+    return (STREAM_TEST_MODE_AUDIO_PEAK_LIMIT * np.tanh(driven / STREAM_TEST_MODE_AUDIO_PEAK_LIMIT)).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def condition_test_mode_tone_audio(samples: np.ndarray) -> np.ndarray:
+    audio = np.asarray(samples, dtype=np.float32)
+    if audio.size == 0:
+        return audio
+    peak = float(np.max(np.abs(audio)))
+    if peak <= 1e-9:
+        return audio.astype(np.float32, copy=False)
+    gain = STREAM_TEST_MODE_TONE_PEAK / peak
+    return np.clip(audio * gain, -STREAM_TEST_MODE_TONE_PEAK, STREAM_TEST_MODE_TONE_PEAK).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def mix_test_mode_iq_crossfade(
+    real_iq: np.ndarray,
+    test_iq: np.ndarray,
+    real_weight: np.ndarray | float,
+    test_weight: np.ndarray | float,
+) -> np.ndarray:
+    real = np.asarray(real_iq, dtype=np.complex64)
+    test = np.asarray(test_iq, dtype=np.complex64)
+    mixed = (real * real_weight + test * test_weight).astype(np.complex64, copy=False)
+    if mixed.size == 0:
+        return mixed
+    real_power = float(np.mean(np.abs(real.astype(np.complex128, copy=False)) ** 2))
+    test_power = float(np.mean(np.abs(test.astype(np.complex128, copy=False)) ** 2))
+    mixed_power = float(np.mean(np.abs(mixed.astype(np.complex128, copy=False)) ** 2))
+    real_weight_power = float(np.mean(np.asarray(real_weight, dtype=np.float32) ** 2))
+    test_weight_power = float(np.mean(np.asarray(test_weight, dtype=np.float32) ** 2))
+    target_power = real_power * real_weight_power + test_power * test_weight_power
+    if target_power <= 1e-18 or mixed_power <= target_power:
+        return mixed
+    mixed *= math.sqrt(target_power / mixed_power)
+    return mixed.astype(np.complex64, copy=False)
+
+
+def stream_test_mode_same_header(origin_time: datetime | None = None) -> str:
+    now = origin_time or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    timestamp = f"{now.timetuple().tm_yday:03d}{now.hour:02d}{now.minute:02d}"
+    return f"ZCZC-WXR-DMO-{STREAM_TEST_MODE_SAME_LOCATION}+0015-{timestamp}-{STREAM_TEST_MODE_SAME_SENDER_ID}-"
+
+
+class SyntheticNwrTestModeSource:
+    def __init__(self, *, sample_rate: int = IQ_SAMPLE_RATE) -> None:
+        self.sample_rate = int(sample_rate)
+        self.signal_dbfs = STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS
+        self.current_signal_dbfs = STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS
+        self.phase = 0.0
+        self.rng = np.random.default_rng()
+        self.loop_audio = self._build_loop_audio()
+        self.loop_position = 0
+        self.alert_segments: deque[tuple[str, np.ndarray, bool]] = deque()
+        self.alert_segment: tuple[str, np.ndarray, bool] | None = None
+        self.alert_position = 0
+        self.alert_active = False
+        self.stop_requested = False
+        self.stop_ready = False
+        self.lock = threading.Lock()
+
+    def set_signal_dbfs(self, value: Any, *, immediate: bool = False) -> None:
+        with self.lock:
+            signal_dbfs = clamp_test_mode_signal_dbfs(value)
+            self.signal_dbfs = signal_dbfs
+            if immediate:
+                self.current_signal_dbfs = signal_dbfs
+
+    def request_stop(self) -> dict[str, Any]:
+        with self.lock:
+            self.stop_requested = True
+            if not self.alert_active:
+                self.stop_ready = True
+            return self.snapshot_locked()
+
+    def queue_same_test(self) -> bool:
+        with self.lock:
+            if self.alert_active or self.stop_requested:
+                return False
+            self.alert_segments = deque(self._build_same_alert_segments())
+            self.alert_segment = None
+            self.alert_position = 0
+            self.alert_active = True
+            self.loop_position = 0
+            return True
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return self.snapshot_locked()
+
+    def snapshot_locked(self) -> dict[str, Any]:
+        return {
+            "signal_dbfs": self.signal_dbfs,
+            "current_signal_dbfs": self.current_signal_dbfs,
+            "same_active": self.alert_active,
+            "stop_requested": self.stop_requested,
+            "stop_ready": self.stop_ready,
+        }
+
+    def process(self, samples: int) -> np.ndarray:
+        count = max(0, int(samples))
+        if count <= 0:
+            return np.array([], dtype=np.complex64)
+        with self.lock:
+            audio = self._next_audio_locked(count)
+            signal_start_dbfs, signal_end_dbfs = self._signal_ramp_locked(count)
+        return self._fm_modulate(audio, signal_start_dbfs, signal_end_dbfs)
+
+    def _build_loop_audio(self) -> np.ndarray:
+        audio = load_mono_wav_float(asset_path(STREAM_TEST_MODE_AUDIO), self.sample_rate)
+        audio = shape_test_mode_program_audio(audio, self.sample_rate)
+        period_samples = max(round(STREAM_TEST_MODE_LOOP_PERIOD_SECONDS * self.sample_rate), int(audio.size))
+        if audio.size < period_samples:
+            audio = np.concatenate((audio, np.zeros(period_samples - audio.size, dtype=np.float32)))
+        return audio.astype(np.float32, copy=False)
+
+    def _build_same_alert_segments(self) -> list[tuple[str, np.ndarray, bool]]:
+        header = stream_test_mode_same_header()
+        header_audio = condition_test_mode_tone_audio(generate_same_message(header, self.sample_rate))
+        eom_audio = condition_test_mode_tone_audio(generate_same_message("NNNN", self.sample_rate))
+        attention = condition_test_mode_tone_audio(self._tone(1050.0, 8.0, amplitude=1.0))
+        message = load_mono_wav_float(asset_path(STREAM_TEST_MODE_SAME_AUDIO), self.sample_rate)
+        message = shape_test_mode_program_audio(message, self.sample_rate)
+        return [
+            ("header", header_audio, True),
+            ("header_silence", np.zeros(round(self.sample_rate * 2.0), dtype=np.float32), False),
+            ("attention", attention, True),
+            ("attention_silence", np.zeros(round(self.sample_rate * 0.5), dtype=np.float32), False),
+            ("message", message, False),
+            ("pre_eom_silence", np.zeros(round(self.sample_rate * STREAM_TEST_MODE_PRE_EOM_SILENCE_SECONDS), dtype=np.float32), False),
+            ("eom", eom_audio, True),
+            ("post_eom_silence", np.zeros(round(self.sample_rate * 1.0), dtype=np.float32), False),
+        ]
+
+    def _build_eom_segments(self) -> deque[tuple[str, np.ndarray, bool]]:
+        eom_audio = condition_test_mode_tone_audio(generate_same_message("NNNN", self.sample_rate))
+        return deque(
+            [
+                ("pre_eom_silence", np.zeros(round(self.sample_rate * STREAM_TEST_MODE_PRE_EOM_SILENCE_SECONDS), dtype=np.float32), False),
+                ("eom", eom_audio, True),
+                ("post_eom_silence", np.zeros(round(self.sample_rate * 1.0), dtype=np.float32), False),
+            ]
+        )
+
+    def _next_audio_locked(self, count: int) -> np.ndarray:
+        if self.alert_active:
+            return self._next_alert_audio_locked(count)
+        return self._loop_audio_locked(count)
+
+    def _can_interrupt_same_segment_for_eom(self, kind: str, protected: bool) -> bool:
+        if kind in {"eom", "post_eom_silence", "pre_eom_silence"}:
+            return False
+        if protected:
+            return False
+        pending_kinds = {segment_kind for segment_kind, _audio, _protected in self.alert_segments}
+        return "attention" not in pending_kinds
+
+    def _next_alert_audio_locked(self, count: int) -> np.ndarray:
+        output = np.empty(count, dtype=np.float32)
+        written = 0
+        while written < count:
+            if self.stop_requested and self.alert_segment is not None:
+                kind, _audio, protected = self.alert_segment
+                if self._can_interrupt_same_segment_for_eom(kind, protected):
+                    self.alert_segments = self._build_eom_segments()
+                    self.alert_segment = None
+                    self.alert_position = 0
+            if self.alert_segment is None:
+                if not self.alert_segments:
+                    self.alert_active = False
+                    self.alert_position = 0
+                    self.loop_position = 0
+                    if self.stop_requested:
+                        self.stop_ready = True
+                    tail = self._loop_audio_locked(count - written)
+                    output[written:] = tail
+                    break
+                self.alert_segment = self.alert_segments.popleft()
+                self.alert_position = 0
+            kind, audio, protected = self.alert_segment
+            stop = min(self.alert_position + (count - written), int(audio.size))
+            take = stop - self.alert_position
+            if take > 0:
+                output[written : written + take] = audio[self.alert_position:stop]
+                written += take
+                self.alert_position = stop
+            if self.alert_position >= int(audio.size):
+                if self.stop_requested and kind not in {"eom", "post_eom_silence"} and not self.alert_segments:
+                    self.alert_segments = self._build_eom_segments()
+                elif self.stop_requested and self._can_interrupt_same_segment_for_eom(kind, protected):
+                    self.alert_segments = self._build_eom_segments()
+                self.alert_segment = None
+                self.alert_position = 0
+        return output
+
+    def _loop_audio_locked(self, count: int) -> np.ndarray:
+        if self.loop_audio.size == 0:
+            return np.zeros(count, dtype=np.float32)
+        output = np.empty(count, dtype=np.float32)
+        written = 0
+        while written < count:
+            available = int(self.loop_audio.size) - self.loop_position
+            take = min(count - written, available)
+            output[written : written + take] = self.loop_audio[self.loop_position : self.loop_position + take]
+            written += take
+            self.loop_position = (self.loop_position + take) % int(self.loop_audio.size)
+        return output
+
+    def _tone(self, frequency_hz: float, seconds: float, *, amplitude: float) -> np.ndarray:
+        count = max(0, round(float(seconds) * self.sample_rate))
+        t = np.arange(count, dtype=np.float32) / float(self.sample_rate)
+        return (np.sin(2.0 * np.pi * float(frequency_hz) * t) * float(amplitude)).astype(np.float32)
+
+    def _signal_ramp_locked(self, count: int) -> tuple[float, float]:
+        start = float(self.current_signal_dbfs)
+        target = float(self.signal_dbfs)
+        if count <= 0 or abs(target - start) < 1e-6:
+            self.current_signal_dbfs = target
+            return start, target
+        progress = min(1.0, float(count) / max(1.0, STREAM_TEST_MODE_SIGNAL_FADE_SECONDS * self.sample_rate))
+        end = start + (target - start) * progress
+        self.current_signal_dbfs = end
+        return start, end
+
+    def _fm_modulate(self, audio: np.ndarray, signal_start_dbfs: float, signal_end_dbfs: float) -> np.ndarray:
+        audio = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+        increments = (2.0 * np.pi * STREAM_TEST_MODE_DEVIATION_HZ / float(self.sample_rate)) * audio
+        phases = self.phase + np.cumsum(increments.astype(np.float64), dtype=np.float64)
+        if phases.size:
+            self.phase = float(phases[-1] % (2.0 * np.pi))
+        if abs(signal_end_dbfs - signal_start_dbfs) < 1e-6:
+            amplitude = dbfs_to_linear(signal_end_dbfs)
+        else:
+            amplitude = dbfs_to_linear(np.linspace(signal_start_dbfs, signal_end_dbfs, audio.size, dtype=np.float32))
+        iq = amplitude * np.exp(1j * phases).astype(np.complex64)
+        noise_level = dbfs_to_linear(STREAM_TEST_MODE_NOISE_DBFS)
+        noise = (
+            self.rng.normal(0.0, noise_level, audio.size)
+            + 1j * self.rng.normal(0.0, noise_level, audio.size)
+        ).astype(np.complex64)
+        return (iq + noise).astype(np.complex64, copy=False)
 
 
 def rms_float(samples: np.ndarray) -> float:
@@ -1771,6 +2153,30 @@ class FloatFrameBuffer:
 
     def push(self, samples: np.ndarray):
         samples = samples.astype(np.float32, copy=False)
+        if self.offset:
+            self.pending = self.pending[self.offset :]
+            self.offset = 0
+        self.pending = samples if len(self.pending) == 0 else np.concatenate((self.pending, samples))
+        while len(self.pending) - self.offset >= self.frame_samples:
+            frame = self.pending[self.offset : self.offset + self.frame_samples]
+            self.offset += self.frame_samples
+            yield frame
+        if self.offset and self.offset >= len(self.pending):
+            self.clear()
+
+
+class ComplexFrameBuffer:
+    def __init__(self, frame_samples: int) -> None:
+        self.frame_samples = frame_samples
+        self.pending = np.empty(0, dtype=np.complex64)
+        self.offset = 0
+
+    def clear(self) -> None:
+        self.pending = np.empty(0, dtype=np.complex64)
+        self.offset = 0
+
+    def push(self, samples: np.ndarray):
+        samples = samples.astype(np.complex64, copy=False)
         if self.offset:
             self.pending = self.pending[self.offset :]
             self.offset = 0
@@ -2628,6 +3034,7 @@ class IcecastStreamWorker:
         self.eas_status = "disabled"
         self.eas_error: str | None = None
         self.last_audio_at: float | None = None
+        self.test_mode_source: SyntheticNwrTestModeSource | None = None
         self._soundcard_owner = object()
         self.lock = threading.Lock()
 
@@ -2766,6 +3173,52 @@ class IcecastStreamWorker:
             source = self.monitor_sources.get(client_id)
         return source.stats() if source is not None else {}
 
+    def set_test_mode(self, enabled: bool, signal_dbfs: Any = STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS) -> dict[str, Any]:
+        with self.lock:
+            if enabled:
+                created = self.test_mode_source is None or self.test_mode_source.stop_requested
+                if self.test_mode_source is None or self.test_mode_source.stop_requested:
+                    self.test_mode_source = SyntheticNwrTestModeSource()
+                self.test_mode_source.set_signal_dbfs(signal_dbfs, immediate=created)
+            else:
+                if self.test_mode_source is not None:
+                    return self.test_mode_source.request_stop()
+            return self.test_mode_snapshot_locked()
+
+    def update_test_mode_signal(self, signal_dbfs: Any) -> dict[str, Any]:
+        with self.lock:
+            if self.test_mode_source is None:
+                raise ValueError("test mode is not active for this stream")
+            self.test_mode_source.set_signal_dbfs(signal_dbfs)
+            return self.test_mode_snapshot_locked()
+
+    def trigger_test_mode_same(self) -> dict[str, Any]:
+        with self.lock:
+            if self.test_mode_source is None:
+                raise ValueError("test mode is not active for this stream")
+            queued = self.test_mode_source.queue_same_test()
+            snapshot = self.test_mode_snapshot_locked()
+        if not queued:
+            raise ValueError("A SAME test is already running")
+        return snapshot
+
+    def test_mode_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return self.test_mode_snapshot_locked()
+
+    def test_mode_snapshot_locked(self) -> dict[str, Any]:
+        if self.test_mode_source is None:
+            return {"active": False, "same_active": False, "signal_dbfs": STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS}
+        snapshot = self.test_mode_source.snapshot()
+        return {
+            "active": True,
+            "same_active": bool(snapshot.get("same_active", False)),
+            "stopping": bool(snapshot.get("stop_requested", False)),
+            "stop_ready": bool(snapshot.get("stop_ready", False)),
+            "signal_dbfs": float(snapshot.get("signal_dbfs", STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS)),
+            "current_signal_dbfs": float(snapshot.get("current_signal_dbfs", snapshot.get("signal_dbfs", STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS))),
+        }
+
     def has_monitor_sources(self) -> bool:
         with self.lock:
             return bool(self.monitor_sources)
@@ -2861,6 +3314,131 @@ class IcecastStreamWorker:
         idle_output_active = False
         idle_next_frame_at: float | None = None
         source_generation = getattr(self.fanout, "generation", 0)
+        test_mode_was_active = False
+        test_mode_next_frame_at: float | None = None
+        test_demodulator = ComplexNfmDemodulator()
+        test_frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
+        real_test_iq_frame_buffer = ComplexFrameBuffer(STREAM_FRAME_SAMPLES)
+        real_test_iq_frames: deque[np.ndarray] = deque()
+        test_crossfade_state = "off"
+        test_crossfade_position = 0
+        test_crossfade_samples = max(1, int(round(STREAM_TEST_MODE_CROSSFADE_SECONDS * IQ_SAMPLE_RATE)))
+
+        def append_real_test_frames(batch: RtlSampleBatch) -> None:
+            nonlocal channelizer
+            nonlocal channelizer_key
+            nonlocal channelizer_alias_filter_strength
+            nonlocal channelizer_target_frequency_hz
+            nonlocal source_generation
+            nonlocal demodulator
+            nonlocal startup_backlog_drained
+            current_generation = getattr(self.fanout, "generation", source_generation)
+            incoming_generation = batch_generation(batch)
+            if incoming_generation < current_generation:
+                return
+            if incoming_generation != source_generation:
+                source_generation = incoming_generation
+                channelizer = None
+                channelizer_key = None
+                channelizer_alias_filter_strength = None
+                channelizer_target_frequency_hz = None
+                demodulator = ComplexNfmDemodulator()
+                real_test_iq_frame_buffer.clear()
+                real_test_iq_frames.clear()
+                startup_backlog_drained = False
+            with self.lock:
+                station = self.stream["station"]
+            target_frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
+            alias_filter_strength = self.alias_filter_strength_provider()
+            channel_transition_hz = alias_filter_transition_hz(
+                CHANNEL_IQ_ALIAS_TRANSITION_HZ,
+                alias_filter_strength,
+            )
+            channel_attenuation_db = alias_filter_attenuation_db(
+                DEFAULT_ALIAS_ATTENUATION_DB,
+                alias_filter_strength,
+            )
+            next_channelizer_key = (
+                batch.sample_rate,
+                batch.center_frequency_hz,
+            )
+            if channelizer is None or channelizer_key != next_channelizer_key:
+                channelizer = IqChannelizer(
+                    input_rate=batch.sample_rate,
+                    center_frequency_hz=batch.center_frequency_hz,
+                    target_frequency_hz=target_frequency_hz,
+                    output_rate=IQ_SAMPLE_RATE,
+                    transition_hz=channel_transition_hz,
+                    alias_attenuation_db=channel_attenuation_db,
+                )
+                channelizer_key = next_channelizer_key
+                channelizer_alias_filter_strength = alias_filter_strength
+                channelizer_target_frequency_hz = target_frequency_hz
+                demodulator = ComplexNfmDemodulator()
+                real_test_iq_frame_buffer.clear()
+                real_test_iq_frames.clear()
+            elif channelizer_alias_filter_strength != alias_filter_strength:
+                channelizer.update_alias_filter(
+                    transition_hz=channel_transition_hz,
+                    attenuation_db=channel_attenuation_db,
+                )
+                channelizer_alias_filter_strength = alias_filter_strength
+            if channelizer is not None and channelizer_target_frequency_hz != target_frequency_hz:
+                channelizer.set_target_frequency(target_frequency_hz)
+                channelizer_target_frequency_hz = target_frequency_hz
+                demodulator.reset()
+                real_test_iq_frame_buffer.clear()
+                real_test_iq_frames.clear()
+            iq = iq_batch_complex(batch)
+            channel_iq = channelizer.process_complex(iq)
+            for real_iq_frame in real_test_iq_frame_buffer.push(channel_iq):
+                real_test_iq_frames.append(real_iq_frame)
+
+        def next_real_test_iq_frame() -> np.ndarray:
+            while not real_test_iq_frames:
+                try:
+                    batch = self.queue.get_nowait()
+                except queue.Empty:
+                    return np.zeros(STREAM_FRAME_SAMPLES, dtype=np.complex64)
+                batch = drain_queue_to_latest(self.queue, batch)
+                append_real_test_frames(batch)
+            return real_test_iq_frames.popleft()
+
+        def test_crossfade_weights(count: int, source: SyntheticNwrTestModeSource) -> tuple[np.ndarray | float, np.ndarray | float, bool]:
+            nonlocal test_crossfade_state
+            nonlocal test_crossfade_position
+            if test_crossfade_state == "enter":
+                start = test_crossfade_position
+                stop = min(test_crossfade_samples, start + count)
+                ramp = np.linspace(
+                    start / test_crossfade_samples,
+                    stop / test_crossfade_samples,
+                    count,
+                    endpoint=False,
+                    dtype=np.float32,
+                )
+                test_crossfade_position = stop
+                if stop >= test_crossfade_samples:
+                    test_crossfade_state = "active"
+                return (1.0 - ramp), ramp, False
+            if test_crossfade_state == "exit":
+                start = test_crossfade_position
+                stop = min(test_crossfade_samples, start + count)
+                ramp = np.linspace(
+                    start / test_crossfade_samples,
+                    stop / test_crossfade_samples,
+                    count,
+                    endpoint=False,
+                    dtype=np.float32,
+                )
+                test_crossfade_position = stop
+                complete = stop >= test_crossfade_samples
+                return ramp, (1.0 - ramp), complete
+            if source.stop_ready:
+                test_crossfade_state = "exit"
+                test_crossfade_position = 0
+                return test_crossfade_weights(count, source)
+            return 0.0, 1.0, False
         while not self.stop_event.is_set():
             if not self._has_connected_outputs():
                 try:
@@ -2870,7 +3448,73 @@ class IcecastStreamWorker:
                 fallback_state.reset()
                 frame_buffer.clear()
                 idle_next_frame_at = None
+                test_mode_next_frame_at = None
                 continue
+            with self.lock:
+                test_mode_source = self.test_mode_source
+                test_mode_station = self.stream.get("station", {})
+            if test_mode_source is not None:
+                if not test_mode_was_active:
+                    test_demodulator.reset()
+                    test_frame_buffer.clear()
+                    real_test_iq_frame_buffer.clear()
+                    real_test_iq_frames.clear()
+                    fallback_state.reset()
+                    idle_next_frame_at = None
+                    test_mode_next_frame_at = time.monotonic()
+                    test_crossfade_state = "enter"
+                    test_crossfade_position = 0
+                    LOG.info("entered test mode for %s", test_mode_station.get("callsign"))
+                test_mode_was_active = True
+                now = time.monotonic()
+                if test_mode_next_frame_at is None:
+                    test_mode_next_frame_at = now
+                delay = test_mode_next_frame_at - now
+                if delay > 0 and self.stop_event.wait(delay):
+                    break
+                test_iq = test_mode_source.process(STREAM_FRAME_SAMPLES)
+                real_iq = next_real_test_iq_frame()
+                real_weight, test_weight, fade_complete = test_crossfade_weights(len(test_iq), test_mode_source)
+                mixed_iq = mix_test_mode_iq_crossfade(real_iq, test_iq, real_weight, test_weight)
+                audio = test_demodulator.process(mixed_iq)
+                test_mode_next_frame_at += STREAM_FRAME_SECONDS
+                if test_mode_next_frame_at < time.monotonic() - 0.25:
+                    test_mode_next_frame_at = time.monotonic() + STREAM_FRAME_SECONDS
+                if len(audio) == 0:
+                    continue
+                last_real_audio = time.monotonic()
+                fallback_state.reset()
+                with self.lock:
+                    self.last_audio_at = time.time()
+                    station = self.stream.get("station", {})
+                for frame in test_frame_buffer.push(audio):
+                    next_audio_config = self.audio_config()
+                    if next_audio_config != audio_config:
+                        audio_config = next_audio_config
+                        changed_effects = effects.update_config(audio_config)
+                        LOG.info(
+                            "applied audio effects update for %s without reconnecting Icecast: %s",
+                            station.get("callsign"),
+                            ", ".join(changed_effects) or "none",
+                        )
+                    processed_frame = effects.process(frame)
+                    self._write_pcm(float_to_s16(processed_frame), processed_frame)
+                if fade_complete:
+                    with self.lock:
+                        if self.test_mode_source is test_mode_source:
+                            self.test_mode_source = None
+                continue
+            if test_mode_was_active:
+                test_mode_was_active = False
+                test_mode_next_frame_at = None
+                test_crossfade_state = "off"
+                test_crossfade_position = 0
+                test_demodulator.reset()
+                test_frame_buffer.clear()
+                real_test_iq_frame_buffer.clear()
+                real_test_iq_frames.clear()
+                startup_backlog_drained = False
+                LOG.info("left test mode for %s", self.stream.get("station", {}).get("callsign"))
             try:
                 if idle_output_active:
                     now = time.monotonic()
@@ -3868,6 +4512,7 @@ class RtlControlService:
         self.iq_file_source_config: IqFileSourceConfig | None = None
         self.raw_fanout: RawRtlFanout | None = None
         self.intermediate_fanout: IntermediateIqFanout | None = None
+        self.test_mode_fanout = NullIqFanout()
         self.monitor_queue: queue.Queue | None = None
         self.drain_thread: threading.Thread | None = None
         self.drain_stop = threading.Event()
@@ -3892,6 +4537,7 @@ class RtlControlService:
         self.live_audio_feedback_by_client: dict[tuple[str, str], dict[str, Any]] = {}
         self.stream_notification_states: dict[str, dict[str, Any]] = {}
         self.stream_eas_alert_notification_seen: dict[str, set[str]] = {}
+        self.stream_test_mode: dict[str, Any] | None = None
         self.iq_recorder: IqRecorderWorker | None = None
         self.iq_recorder_account_id: int | None = None
         self.iq_recording_downloads: set[str] = set()
@@ -4085,6 +4731,7 @@ class RtlControlService:
     def _preview_cleanup_loop(self) -> None:
         while not self.preview_cleanup_stop.wait(SOUNDCARD_PREVIEW_CLEANUP_SECONDS):
             self._cleanup_expired_soundcard_previews()
+            self._cleanup_expired_stream_test_mode()
 
     def _stream_notification_loop(self) -> None:
         while not self.stream_notification_stop.wait(10.0):
@@ -4109,6 +4756,24 @@ class RtlControlService:
                 worker.stop()
             LOG.info("expired temporary soundcard preview %s", preview_id)
 
+    def _cleanup_expired_stream_test_mode(self) -> None:
+        with self.lock:
+            self._cleanup_expired_stream_test_mode_locked(time.time())
+
+    def _cleanup_expired_stream_test_mode_locked(self, now: float) -> None:
+        session = self.stream_test_mode
+        if not session:
+            return
+        heartbeat_at = float(session.get("heartbeat_at", session.get("started_at", now)))
+        last_same_at = float(session.get("last_same_at", session.get("started_at", now)))
+        reason = ""
+        if now - heartbeat_at > STREAM_TEST_MODE_HEARTBEAT_TIMEOUT_SECONDS:
+            reason = "client heartbeat expired"
+        elif now - last_same_at > STREAM_TEST_MODE_IDLE_SECONDS:
+            reason = "SAME test idle timeout"
+        if reason:
+            self._stop_stream_test_mode_locked(reason=reason)
+
     def heartbeat_soundcard_preview_stream(self, preview_id: str) -> None:
         preview_id = str(preview_id).strip()
         if not preview_id:
@@ -4121,6 +4786,7 @@ class RtlControlService:
     def status(self, *, read_only: bool = False) -> dict[str, Any]:
         self._cleanup_expired_soundcard_previews()
         with self.lock:
+            self._cleanup_expired_stream_test_mode_locked(time.time())
             capture = self.capture
             settings = self._effective_settings_locked()
             active = capture is not None
@@ -4171,6 +4837,7 @@ class RtlControlService:
                 "streams": streams,
                 "active_streams": active_streams,
                 "active_eas_recorders": self._active_eas_recorders_locked(),
+                "test_mode": {"active": False} if read_only else self._stream_test_mode_status_locked(),
                 "recent_eas_alerts": self._recent_eas_alerts_locked(),
                 "storage": self._storage_status_snapshot_locked(),
                 "iq_recorder": self._iq_recorder_status_locked(),
@@ -5362,6 +6029,119 @@ class RtlControlService:
 
         threading.Thread(target=send, name="stream-notification-send", daemon=True).start()
 
+    def stream_test_mode_status(self) -> dict[str, Any]:
+        with self.lock:
+            self._cleanup_expired_stream_test_mode_locked(time.time())
+            return self._stream_test_mode_status_locked()
+
+    def _stream_test_mode_status_locked(self) -> dict[str, Any]:
+        session = self.stream_test_mode
+        if not session:
+            return {"active": False}
+        stream_id = str(session.get("stream_id", ""))
+        worker = self.stream_workers.get(stream_id)
+        worker_status = worker.test_mode_snapshot() if worker is not None else {}
+        if bool(session.get("stopping", False)) and not bool(worker_status.get("active", False)):
+            self.stream_test_mode = None
+            return {"active": False}
+        return {
+            "active": True,
+            "stream_id": stream_id,
+            "client_id": str(session.get("client_id", "")),
+            "signal_dbfs": float(worker_status.get("signal_dbfs", session.get("signal_dbfs", STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS))),
+            "same_active": bool(worker_status.get("same_active", False)),
+            "stopping": bool(session.get("stopping", False) or worker_status.get("stopping", False)),
+            "started_at": float(session.get("started_at", 0.0) or 0.0),
+            "heartbeat_at": float(session.get("heartbeat_at", 0.0) or 0.0),
+            "last_same_at": float(session.get("last_same_at", 0.0) or 0.0),
+        }
+
+    def update_stream_test_mode(self, payload: dict[str, Any]) -> dict[str, Any]:
+        action = str(payload.get("action", "")).strip().lower()
+        stream_id = str(payload.get("stream_id", "")).strip()
+        client_id = str(payload.get("client_id", "")).strip()
+        now = time.time()
+        if action not in {"start", "stop", "heartbeat", "signal", "same"}:
+            raise ValueError("test mode action is required")
+        if not client_id:
+            raise ValueError("test mode client id is required")
+        with self.lock:
+            self._cleanup_expired_stream_test_mode_locked(now)
+            if action == "stop":
+                if self.stream_test_mode and str(self.stream_test_mode.get("client_id", "")) == client_id:
+                    self._stop_stream_test_mode_locked(reason="client stopped test mode")
+                return {"test_mode": self._stream_test_mode_status_locked(), "streams": list(self.streams)}
+            if not stream_id:
+                raise ValueError("stream id is required")
+            stream = self._stream_locked(stream_id)
+            if stream.get("enabled", True) is False:
+                raise ValueError("stream must be enabled before test mode can be started")
+            if action == "start":
+                signal_dbfs = clamp_test_mode_signal_dbfs(payload.get("signal_dbfs", STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS))
+                if self.stream_test_mode and str(self.stream_test_mode.get("client_id", "")) != client_id:
+                    raise ValueError("test mode is owned by another browser")
+                if self.stream_test_mode and str(self.stream_test_mode.get("stream_id", "")) != stream_id:
+                    self._stop_stream_test_mode_locked(reason="another stream entered test mode")
+                self.stream_test_mode = {
+                    "stream_id": stream_id,
+                    "client_id": client_id,
+                    "signal_dbfs": signal_dbfs,
+                    "started_at": now,
+                    "heartbeat_at": now,
+                    "last_same_at": now,
+                }
+                self._sync_stream_workers_locked()
+                worker = self.stream_workers.get(stream_worker_key(stream))
+                if worker is None:
+                    self.stream_test_mode = None
+                    raise ValueError("test mode stream worker could not be started")
+                worker.set_test_mode(True, signal_dbfs)
+                LOG.info("started test mode for %s", stream.get("station", {}).get("callsign", stream_id))
+                return {"test_mode": self._stream_test_mode_status_locked(), "streams": list(self.streams)}
+            session = self.stream_test_mode
+            if not session or str(session.get("stream_id", "")) != stream_id:
+                raise ValueError("test mode is not active for this stream")
+            if str(session.get("client_id", "")) != client_id:
+                raise ValueError("test mode is owned by another browser")
+            session["heartbeat_at"] = now
+            worker = self.stream_workers.get(stream_worker_key(stream))
+            if worker is None:
+                self._stop_stream_test_mode_locked(reason="test mode worker missing")
+                raise ValueError("test mode stream worker is not running")
+            if action == "heartbeat":
+                return {"test_mode": self._stream_test_mode_status_locked(), "streams": list(self.streams)}
+            if action == "signal":
+                signal_dbfs = clamp_test_mode_signal_dbfs(payload.get("signal_dbfs", session.get("signal_dbfs", STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS)))
+                session["signal_dbfs"] = signal_dbfs
+                worker.update_test_mode_signal(signal_dbfs)
+                return {"test_mode": self._stream_test_mode_status_locked(), "streams": list(self.streams)}
+            if action == "same":
+                session["last_same_at"] = now
+                worker.trigger_test_mode_same()
+                LOG.info("queued SAME test in test mode for %s", stream.get("station", {}).get("callsign", stream_id))
+                return {"test_mode": self._stream_test_mode_status_locked(), "streams": list(self.streams)}
+        raise ValueError("unsupported test mode action")
+
+    def _stop_stream_test_mode_locked(self, *, reason: str) -> None:
+        session = self.stream_test_mode
+        if not session:
+            return
+        stream_id = str(session.get("stream_id", ""))
+        worker = self.stream_workers.get(stream_id)
+        if worker is not None:
+            try:
+                snapshot = worker.set_test_mode(False)
+                if snapshot.get("active", False):
+                    session["stopping"] = True
+                    session["stop_reason"] = reason
+                    LOG.info("stopping stream test mode for %s: %s", stream_id or "unknown", reason)
+                    return
+            except Exception as exc:
+                LOG.debug("failed to stop stream test mode for %s: %s", stream_id, exc)
+        self.stream_test_mode = None
+        self._sync_stream_workers_locked()
+        LOG.info("stopped stream test mode for %s: %s", stream_id or "unknown", reason)
+
     def start_monitor(self, payload: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
         client_id = str(payload.get("client_id", "")).strip()
         stream_id = str(payload.get("stream_id", "")).strip()
@@ -6398,7 +7178,15 @@ class RtlControlService:
                 self.received_bytes += iq_batch_byte_count(batch)
 
     def _sync_stream_workers_locked(self) -> None:
-        fanout = self.intermediate_fanout
+        active_test_stream_id = str(self.stream_test_mode.get("stream_id", "")) if self.stream_test_mode else ""
+        if active_test_stream_id and not any(
+            str(stream.get("id", "")) == active_test_stream_id and stream.get("enabled", True)
+            for stream in self.streams
+        ):
+            LOG.info("stopped stream test mode for %s: stream is no longer enabled", active_test_stream_id)
+            self.stream_test_mode = None
+            active_test_stream_id = ""
+        fanout = self.intermediate_fanout or (self.test_mode_fanout if active_test_stream_id else None)
         desired: dict[str, dict[str, Any]] = {}
         monitored_stream_ids = set(self.monitor_streams_by_client.values())
         if fanout is not None:
@@ -6410,6 +7198,7 @@ class RtlControlService:
                     any(output.get("enabled", True) for output in stream_outputs(stream))
                     or stream_id in monitored_stream_ids
                     or eas_recording_settings_from_stream(stream).enabled
+                    or stream_id == active_test_stream_id
                 ):
                     desired[stream_worker_key(stream)] = stream
 
@@ -6422,6 +7211,14 @@ class RtlControlService:
             return
 
         for key, stream in desired.items():
+            worker = self.stream_workers.get(key)
+            if worker is not None:
+                if worker.fanout is not fanout:
+                    self.stream_workers.pop(key, None)
+                    self._stop_stream_worker_async(worker, reason="fanout changed")
+                else:
+                    worker.sync_stream(stream)
+                    continue
             worker = self.stream_workers.get(key)
             if worker is not None:
                 worker.sync_stream(stream)
@@ -7503,6 +8300,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json()
                 response = self.service.discard_soundcard_preview_stream(str(payload.get("preview_id", "")))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
+        if path == "/api/stream-test-mode":
+            try:
+                payload = self._read_json()
+                response = self.service.update_stream_test_mode(payload)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -10107,6 +10913,12 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 .notice-dialog { position: fixed; right: 24px; bottom: 24px; z-index: 20; max-width: min(420px, calc(100vw - 48px)); padding: 16px; border: 1px solid #b9c0cc; border-radius: 8px; background: #fff; box-shadow: 0 12px 30px rgb(20 24 31 / 22%); }
 .notice-dialog h2 { font-size: 18px; margin-bottom: 8px; }
 .notice-dialog p { margin: 0 0 14px; }
+.fullscreen-dialog { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 24px; background: #f6f7f9; }
+.fullscreen-dialog[hidden] { display: none; }
+.fullscreen-dialog-panel { width: min(760px, 100%); max-height: calc(100vh - 48px); overflow: auto; padding: 24px; border: 1px solid #b9c0cc; border-radius: 8px; background: #fff; box-shadow: 0 18px 42px rgb(20 24 31 / 35%); }
+.fullscreen-dialog-panel h2 { margin-top: 0; }
+.fullscreen-dialog-panel p { margin: 0 0 14px; }
+.fullscreen-dialog-panel .checkbox-row { margin-top: 18px; }
 .same-alert-flash { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 25; width: min(720px, calc(100vw - 32px)); padding: 14px 16px; border: 2px solid #b00020; border-radius: 8px; background: #fff4f4; color: #14181f; box-shadow: 0 12px 30px rgb(20 24 31 / 22%); font-weight: 700; }
 .screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .media-session-audio { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
@@ -10126,6 +10938,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .tabs { border-color: #333b48; }
   .tabs button[aria-selected="true"] { border-bottom-color: #181d24; }
   .notice-dialog { background: #181d24; border-color: #333b48; }
+  .fullscreen-dialog { background: #101318; }
+  .fullscreen-dialog-panel { background: #181d24; border-color: #333b48; }
   .same-alert-flash { background: #2a1518; color: #eef2f7; border-color: #ff6b7a; }
 }
 @media (max-width: 680px) {
@@ -10210,6 +11024,29 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div class="actions">
     <button id="copy_account_secret" type="button">Copy to clipboard</button>
     <button id="dismiss_account_secret" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="same_test_warning_dialog" class="fullscreen-dialog" role="dialog" aria-modal="true" aria-labelledby="same_test_warning_title" hidden>
+  <div class="fullscreen-dialog-panel">
+    <h2 id="same_test_warning_title">Send SAME test?</h2>
+    <p>
+      An EAS alert with valid SAME tones will be transmitted on <strong>all</strong> configured outputs, including Icecast mountpoints and sound cards.
+    </p>
+    <p>
+      This means any EAS equipment potentially monitoring the stream will receive the alert.
+    </p>
+    <p>
+      The alert will be sent as a Practice/Demo Warning with an invalid FIPS code of <strong>999000</strong> to mitigate unintentional activations.
+      Nevertheless, disable any outputs you do not want the alert sent to before proceeding, especially if streaming to public services such as NOAA Weather Radio Org or WeatherUSA.
+    </p>
+    <label class="checkbox-row">
+      <input id="same_test_warning_ack" type="checkbox">
+      I understand that this SAME test will be sent to all configured outputs.
+    </label>
+    <div class="actions">
+      <button id="cancel_same_test_warning" type="button">Cancel</button>
+      <button id="confirm_same_test_warning" type="button" class="primary" hidden>Send SAME test</button>
+    </div>
   </div>
 </div>
 <div id="iq_recording_banner" class="global-status-banner" hidden>
@@ -10749,6 +11586,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <button id="tab_fallback" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback" tabindex="-1">Fallback Audio</button>
         <button id="tab_audio" type="button" role="tab" aria-selected="false" aria-controls="panel_audio" tabindex="-1">Audio Effects</button>
         <button id="tab_notifications" type="button" role="tab" aria-selected="false" aria-controls="panel_notifications" tabindex="-1" hidden>Notifications</button>
+        <button id="tab_test_mode" type="button" role="tab" aria-selected="false" aria-controls="panel_test_mode" tabindex="-1">Test Mode</button>
       </div>
       <div id="panel_outputs" class="tabpanel" role="tabpanel" aria-labelledby="tab_outputs">
         <div class="actions">
@@ -10968,6 +11806,25 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <span id="stream_notify_eas_alerts_hint" class="hint" hidden>Send a notification when a new EAS alert recording is saved.</span>
         </div>
         <div id="stream-notifications-result" class="message"></div>
+      </div>
+      <div id="panel_test_mode" class="tabpanel" role="tabpanel" aria-labelledby="tab_test_mode" hidden>
+        <h3>Test mode</h3>
+        <p class="hint">Replace this stream's real radio channel with a simulated NOAA Weather Radio channel for testing outputs and SAME handling.</p>
+        <div class="grid">
+          <label class="checkbox-row">
+            <input id="test_mode_enabled" type="checkbox">
+            Enable test mode
+          </label>
+          <label>Signal strength
+            <input id="test_mode_signal" type="range" min="-80" max="0" step="1" value="-20" aria-describedby="test_mode_signal_hint">
+          </label>
+          <span id="test_mode_signal_hint" class="hint">Signal strength in dBFS.</span>
+          <div id="test_mode_signal_value" class="hint">-20 dBFS</div>
+        </div>
+        <div class="actions">
+          <button id="test_mode_same" type="button">Send SAME test</button>
+        </div>
+        <div id="test-mode-result" class="message"></div>
       </div>
     </section>
   </div>
@@ -11199,6 +12056,7 @@ const STREAM_SERVICE_HELP = {
   weatherusa: `If you do not yet have icecast credentials for streaming this station to this service, you must <a href="https://www.weatherusa.net/members/new" target="_blank" rel="noopener noreferrer">create an account on WeatherUSA</a> and <a href="https://www.weatherusa.net/members/services/radio" target="_blank" rel="noopener noreferrer">create a stream</a>. Once your stream is created, you must enter the icecast credentials into this page.`,
   nwrorg: `Use the <a href="https://noaaweatherradio.org/N2radio-finder.php" target="_blank" rel="noopener noreferrer">Weather Radio Station Lookup Utility</a> from NOAA Weather Radio Org to determine what the mountpoint should be.`
 };
+const SAME_TEST_ACK_STORAGE_KEY = "nwr-stream-manager:same-test-warning-ack";
 const ADD_OUTPUT_TYPE_STEP = 10;
 const ADD_OUTPUT_ICECAST_SERVICE_STEP = 11;
 const ADD_OUTPUT_ICECAST_CODEC_STEP = 12;
@@ -11234,6 +12092,12 @@ let audioEffectsSignature = "";
 let audioEffectsUpdateTimer = null;
 let streamNotificationsSignature = "";
 let streamNotificationsUpdateTimer = null;
+let streamTestMode = {active: false};
+let streamTestModeSignature = "";
+let streamTestModeClientId = "";
+let streamTestModeHeartbeatTimer = null;
+let streamTestModeSignalTimer = null;
+let sameTestWarningPreviousFocus = null;
 let selectedAudioEffect = "volume";
 let wizardStep = 0;
 let wizardMode = "add";
@@ -14264,6 +15128,14 @@ function setStreamNotificationsResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setTestModeResult(message, kind = "") {
+  const element = document.getElementById("test-mode-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
 function fallbackPayload() {
   return {
     enabled: document.getElementById("fallback_enabled").checked,
@@ -14465,6 +15337,85 @@ function streamNotificationsPayload() {
   };
 }
 
+function pageTestModeClientId() {
+  if (!streamTestModeClientId) {
+    streamTestModeClientId = window.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  }
+  return streamTestModeClientId;
+}
+
+function testModeSignalValue() {
+  const value = Number(document.getElementById("test_mode_signal").value);
+  return Number.isFinite(value) ? value : -20;
+}
+
+function activeTestModeBelongsToThisPage() {
+  return Boolean(
+    streamTestMode &&
+    streamTestMode.active &&
+    streamTestMode.client_id === pageTestModeClientId()
+  );
+}
+
+function activeTestModeForCurrentStream() {
+  return Boolean(streamTestMode && streamTestMode.active && streamTestMode.stream_id === settingsStreamId);
+}
+
+function testModeVisibleForCurrentPage() {
+  return Boolean(!streamTestMode || !streamTestMode.active || activeTestModeBelongsToThisPage());
+}
+
+function updateTestModeSignalText() {
+  setText("test_mode_signal_value", `${testModeSignalValue()} dBFS`);
+}
+
+function setStreamTestModeStatus(status) {
+  streamTestMode = status || {active: false};
+  if (settingsStreamId) setTestModeControls();
+  updateStreamTestModeHeartbeat();
+}
+
+function setTestModeControls() {
+  const stream = currentSettingsStream();
+  const visible = testModeVisibleForCurrentPage();
+  setHidden("tab_test_mode", !visible);
+  if (!visible) {
+    setHidden("panel_test_mode", true);
+    if (activeSettingsTab() === "test_mode") showSettingsTab("outputs");
+    setTestModeResult("");
+    streamTestModeSignature = "";
+    return;
+  }
+  const activeForStream = activeTestModeForCurrentStream();
+  const sameActive = activeForStream && Boolean(streamTestMode.same_active);
+  const stopping = activeForStream && Boolean(streamTestMode.stopping);
+  const nextSignature = JSON.stringify({
+    stream_id: settingsStreamId || "",
+    enabled: streamIsEnabled(stream),
+    visible,
+    active_stream_id: streamTestMode.stream_id || "",
+    active_client_id: streamTestMode.client_id || "",
+    signal_dbfs: streamTestMode.signal_dbfs,
+    same_active: sameActive,
+    stopping
+  });
+  if (nextSignature === streamTestModeSignature) return;
+  if (activeForStream) setValue("test_mode_signal", streamTestMode.signal_dbfs ?? -20);
+  setChecked("test_mode_enabled", activeForStream);
+  setDisabled(document.getElementById("test_mode_enabled"), !stream || !streamIsEnabled(stream) || sameActive || stopping);
+  setDisabled(document.getElementById("test_mode_signal"), !activeForStream || stopping);
+  setDisabled(document.getElementById("test_mode_same"), !activeForStream || sameActive || stopping);
+  updateTestModeSignalText();
+  if (activeForStream) {
+    setTestModeResult(stopping ? "Test mode is stopping." : sameActive ? "SAME test is running." : "Test mode is active.", "success");
+  } else if (streamTestMode.active) {
+    setTestModeResult("Test mode is active for another stream.", "");
+  } else {
+    setTestModeResult("");
+  }
+  streamTestModeSignature = nextSignature;
+}
+
 function easPayload() {
   const selectedFormat = document.querySelector("input[name='eas_format']:checked");
   return {
@@ -14601,6 +15552,7 @@ function setStreamNotificationControls(stream) {
 }
 
 function activeSettingsTab() {
+  if (document.getElementById("tab_test_mode").getAttribute("aria-selected") === "true") return "test_mode";
   if (document.getElementById("tab_notifications").getAttribute("aria-selected") === "true") return "notifications";
   if (document.getElementById("tab_fallback").getAttribute("aria-selected") === "true") return "fallback";
   if (document.getElementById("tab_eas").getAttribute("aria-selected") === "true") return "eas";
@@ -14614,7 +15566,8 @@ function streamSettingsTabs() {
     {name: "eas", button: "tab_eas", panel: "panel_eas"},
     {name: "fallback", button: "tab_fallback", panel: "panel_fallback"},
     {name: "audio", button: "tab_audio", panel: "panel_audio"},
-    {name: "notifications", button: "tab_notifications", panel: "panel_notifications"}
+    {name: "notifications", button: "tab_notifications", panel: "panel_notifications"},
+    {name: "test_mode", button: "tab_test_mode", panel: "panel_test_mode"}
   ];
 }
 
@@ -15163,12 +16116,16 @@ function showStreamSettings(streamId) {
     setStreamResult("Stream was not found.", "error");
     return;
   }
+  if (activeTestModeBelongsToThisPage() && streamTestMode.stream_id !== streamId) {
+    stopStreamTestMode({beacon: true});
+  }
   settingsStreamId = streamId;
   icecastOutputTableSignature = "";
   soundcardOutputTableSignature = "";
   easSignature = "";
   audioEffectsSignature = "";
   streamNotificationsSignature = "";
+  streamTestModeSignature = "";
   selectAudioEffect(selectedAudioEffect, false);
   closeOutputForm();
   const station = stream.station || {};
@@ -15194,6 +16151,7 @@ function renderStreamSettings() {
   setAudioEffectsControls(stream);
   setEasControls(stream);
   setStreamNotificationControls(stream);
+  setTestModeControls();
   renderOutputPanels();
   renderIcecastOutputsTable(stream);
   renderSoundcardOutputsTable(stream);
@@ -17504,6 +18462,9 @@ function focusViewHeading(name) {
 }
 
 function showView(name) {
+  if (name !== "stream_settings" && activeTestModeBelongsToThisPage()) {
+    stopStreamTestMode({beacon: true});
+  }
   for (const view of document.querySelectorAll(".view")) {
     view.hidden = view.id !== `view_${name}`;
   }
@@ -17680,12 +18641,16 @@ function applyRoute(route) {
     const streamId = route.streamId || settingsStreamId;
     const stream = configuredStreams.find(item => item.id === streamId);
     if (stream) {
+      if (activeTestModeBelongsToThisPage() && streamTestMode.stream_id !== streamId) {
+        stopStreamTestMode({beacon: true});
+      }
       settingsStreamId = streamId;
       icecastOutputTableSignature = "";
       soundcardOutputTableSignature = "";
       easSignature = "";
       audioEffectsSignature = "";
       streamNotificationsSignature = "";
+      streamTestModeSignature = "";
       closeOutputForm();
       const station = stream.station || {};
       setText("stream_settings_title", `Edit stream ${streamCallsign(stream)}`);
@@ -18378,6 +19343,7 @@ function applyStatus(data, options = {}) {
   renderIqTestSourceStatus(data);
   setFallbackControls(data.fallback);
   setNotificationSettings(data.notifications || {});
+  setStreamTestModeStatus(data.test_mode || {});
   syncConfiguredStreamsFromStatus(data);
   updateDashboard(data);
   const now = Date.now();
@@ -18516,6 +19482,211 @@ function scheduleStreamNotificationsUpdate() {
       setStreamNotificationsResult(error.message, "error");
     }
   }, 250);
+}
+
+async function sendStreamTestMode(action, extra = {}) {
+  const payload = Object.assign({
+    action,
+    stream_id: settingsStreamId,
+    client_id: pageTestModeClientId()
+  }, extra);
+  const data = await request("/api/stream-test-mode", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  setStreamTestModeStatus(data.test_mode || {});
+  if (Array.isArray(data.streams)) renderStreams(data.streams);
+  return data;
+}
+
+function sameTestWarningAcknowledged() {
+  try {
+    return localStorage.getItem(SAME_TEST_ACK_STORAGE_KEY) === "true";
+  } catch (error) {
+    return false;
+  }
+}
+
+function setSameTestWarningAcknowledged(value) {
+  try {
+    localStorage.setItem(SAME_TEST_ACK_STORAGE_KEY, value ? "true" : "false");
+  } catch (error) {
+    console.debug("failed to store SAME test warning acknowledgement", error);
+  }
+}
+
+function updateSameTestWarningControls() {
+  const checkbox = document.getElementById("same_test_warning_ack");
+  const confirm = document.getElementById("confirm_same_test_warning");
+  const acknowledged = Boolean(checkbox && checkbox.checked);
+  if (confirm) confirm.hidden = !acknowledged;
+  if (!acknowledged && document.activeElement === confirm && checkbox) checkbox.focus();
+}
+
+function sameTestWarningModalTargets() {
+  return [
+    document.querySelector("header"),
+    document.querySelector("main"),
+    document.getElementById("iq_recording_banner"),
+    document.getElementById("same_alert_flash"),
+    document.getElementById("same_alert_live")
+  ].filter(Boolean);
+}
+
+function setSameTestWarningModalOpen(open) {
+  for (const element of sameTestWarningModalTargets()) {
+    if ("inert" in element) element.inert = open;
+    if (open) element.setAttribute("aria-hidden", "true");
+    else element.removeAttribute("aria-hidden");
+  }
+}
+
+function sameTestWarningFocusableElements() {
+  const dialog = document.getElementById("same_test_warning_dialog");
+  if (!dialog || dialog.hidden) return [];
+  return Array.from(dialog.querySelectorAll("a[href], button, input, select, textarea, [tabindex]:not([tabindex='-1'])"))
+    .filter(element => !element.disabled && !element.hidden && element.getClientRects().length > 0);
+}
+
+function focusSameTestWarningInitialControl() {
+  const checkbox = document.getElementById("same_test_warning_ack");
+  const confirm = document.getElementById("confirm_same_test_warning");
+  const cancel = document.getElementById("cancel_same_test_warning");
+  const focusTarget = checkbox && checkbox.checked && confirm && !confirm.hidden ? confirm : checkbox || cancel;
+  if (focusTarget) focusTarget.focus();
+}
+
+function trapSameTestWarningFocus(event) {
+  if (event.key !== "Tab") return;
+  const focusable = sameTestWarningFocusableElements();
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function guardSameTestWarningFocus(event) {
+  const dialog = document.getElementById("same_test_warning_dialog");
+  if (!dialog || dialog.hidden || dialog.contains(event.target)) return;
+  event.preventDefault();
+  focusSameTestWarningInitialControl();
+}
+
+function openSameTestWarning() {
+  if (!activeTestModeForCurrentStream()) return;
+  const dialog = document.getElementById("same_test_warning_dialog");
+  const checkbox = document.getElementById("same_test_warning_ack");
+  if (!dialog || !checkbox) return;
+  sameTestWarningPreviousFocus = document.activeElement;
+  checkbox.checked = sameTestWarningAcknowledged();
+  updateSameTestWarningControls();
+  setSameTestWarningModalOpen(true);
+  dialog.hidden = false;
+  focusSameTestWarningInitialControl();
+}
+
+function closeSameTestWarning() {
+  const dialog = document.getElementById("same_test_warning_dialog");
+  if (dialog) dialog.hidden = true;
+  setSameTestWarningModalOpen(false);
+  const previousFocus = sameTestWarningPreviousFocus;
+  sameTestWarningPreviousFocus = null;
+  if (previousFocus && typeof previousFocus.focus === "function") {
+    previousFocus.focus();
+    return;
+  }
+  const button = document.getElementById("test_mode_same");
+  if (button && !button.disabled) button.focus();
+}
+
+async function triggerSameTestFromWarning() {
+  if (!activeTestModeForCurrentStream()) return;
+  const checkbox = document.getElementById("same_test_warning_ack");
+  if (!checkbox || !checkbox.checked) return;
+  setSameTestWarningAcknowledged(true);
+  closeSameTestWarning();
+  setDisabled(document.getElementById("test_mode_same"), true);
+  try {
+    await sendStreamTestMode("same");
+    setTestModeResult("SAME test is running.", "success");
+  } catch (error) {
+    setTestModeResult(error.message, "error");
+  } finally {
+    setTestModeControls();
+  }
+}
+
+async function stopStreamTestMode(options = {}) {
+  if (!activeTestModeBelongsToThisPage()) return;
+  const payload = JSON.stringify({
+    action: "stop",
+    stream_id: streamTestMode.stream_id || settingsStreamId,
+    client_id: pageTestModeClientId()
+  });
+  clearInterval(streamTestModeHeartbeatTimer);
+  streamTestModeHeartbeatTimer = null;
+  if (options.beacon && navigator.sendBeacon) {
+    navigator.sendBeacon("/api/stream-test-mode", new Blob([payload], {type: "application/json"}));
+    streamTestMode = Object.assign({}, streamTestMode, {stopping: true});
+    streamTestModeSignature = "";
+    return;
+  }
+  try {
+    const data = await request("/api/stream-test-mode", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: payload
+    });
+    setStreamTestModeStatus(data.test_mode || {});
+  } catch (error) {
+    console.debug("failed to stop stream test mode", error);
+  }
+  streamTestModeSignature = "";
+  setTestModeControls();
+}
+
+function updateStreamTestModeHeartbeat() {
+  if (!activeTestModeBelongsToThisPage()) {
+    clearInterval(streamTestModeHeartbeatTimer);
+    streamTestModeHeartbeatTimer = null;
+    return;
+  }
+  if (streamTestModeHeartbeatTimer) return;
+  streamTestModeHeartbeatTimer = setInterval(async () => {
+    if (!activeTestModeBelongsToThisPage()) {
+      clearInterval(streamTestModeHeartbeatTimer);
+      streamTestModeHeartbeatTimer = null;
+      return;
+    }
+    try {
+      await sendStreamTestMode("heartbeat", {stream_id: streamTestMode.stream_id || settingsStreamId});
+    } catch (error) {
+      setTestModeResult(error.message, "error");
+    }
+  }, 5000);
+}
+
+function scheduleStreamTestModeSignalUpdate() {
+  updateTestModeSignalText();
+  if (!activeTestModeForCurrentStream()) return;
+  clearTimeout(streamTestModeSignalTimer);
+  streamTestModeSignalTimer = setTimeout(async () => {
+    try {
+      await sendStreamTestMode("signal", {signal_dbfs: testModeSignalValue()});
+    } catch (error) {
+      setTestModeResult(error.message, "error");
+    }
+  }, 150);
 }
 
 for (const id of controls) {
@@ -19038,6 +20209,7 @@ document.getElementById("tab_audio").addEventListener("click", () => showSetting
 document.getElementById("tab_eas").addEventListener("click", () => showSettingsTab("eas"));
 document.getElementById("tab_fallback").addEventListener("click", () => showSettingsTab("fallback"));
 document.getElementById("tab_notifications").addEventListener("click", () => showSettingsTab("notifications"));
+document.getElementById("tab_test_mode").addEventListener("click", () => showSettingsTab("test_mode"));
 document.querySelector(".tabs").addEventListener("keydown", event => {
   const tabs = streamSettingsTabs()
     .map(tab => document.getElementById(tab.button))
@@ -19058,6 +20230,38 @@ document.querySelector(".tabs").addEventListener("keydown", event => {
 for (const id of ["stream_notify_icecast_failures", "stream_notify_soundcard_failures", "stream_notify_eas_alerts"]) {
   document.getElementById(id).addEventListener("change", scheduleStreamNotificationsUpdate);
 }
+
+document.getElementById("test_mode_enabled").addEventListener("change", async event => {
+  if (!settingsStreamId) return;
+  try {
+    if (event.target.checked) {
+      await sendStreamTestMode("start", {signal_dbfs: testModeSignalValue()});
+    } else {
+      await stopStreamTestMode();
+    }
+  } catch (error) {
+    setChecked("test_mode_enabled", activeTestModeForCurrentStream());
+    setTestModeResult(error.message, "error");
+  }
+});
+
+document.getElementById("test_mode_signal").addEventListener("input", scheduleStreamTestModeSignalUpdate);
+
+document.getElementById("test_mode_same").addEventListener("click", openSameTestWarning);
+document.getElementById("cancel_same_test_warning").addEventListener("click", closeSameTestWarning);
+document.getElementById("same_test_warning_ack").addEventListener("change", event => {
+  if (event.target.checked) setSameTestWarningAcknowledged(true);
+  updateSameTestWarningControls();
+});
+document.getElementById("confirm_same_test_warning").addEventListener("click", triggerSameTestFromWarning);
+document.getElementById("same_test_warning_dialog").addEventListener("keydown", event => {
+  trapSameTestWarningFocus(event);
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeSameTestWarning();
+  }
+});
+document.addEventListener("focusin", guardSameTestWarningFocus);
 
 document.getElementById("audio_effects_list").addEventListener("click", event => {
   const button = event.target && event.target.closest ? event.target.closest("[data-audio-effect]") : null;
@@ -20046,6 +21250,7 @@ if (liveAudioElement) {
 
 window.addEventListener("beforeunload", event => {
   sendWizardSoundcardPreviewDiscardBeacon();
+  stopStreamTestMode({beacon: true});
   sendLiveAudioStopBeacon({forceReceiverStop: true});
   if (!hasUnsavedNavigationState()) return;
   event.preventDefault();

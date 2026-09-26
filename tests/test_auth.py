@@ -286,6 +286,127 @@ class AuthTests(unittest.TestCase):
             self.web_control.eas_alert_notification_id(dict(alert)),
         )
 
+    def test_stream_test_mode_same_header_uses_required_values(self) -> None:
+        header = self.web_control.stream_test_mode_same_header()
+
+        self.assertIn("-DMO-999000+", header)
+        self.assertIn("-NWRSTMGR-", header)
+
+    def test_synthetic_test_mode_source_generates_complex_iq(self) -> None:
+        source = self.web_control.SyntheticNwrTestModeSource(sample_rate=self.web_control.IQ_SAMPLE_RATE)
+        iq = source.process(480)
+
+        self.assertEqual(iq.dtype, self.web_control.np.complex64)
+        self.assertEqual(iq.shape, (480,))
+        self.assertGreater(float(self.web_control.np.mean(self.web_control.np.abs(iq))), 0.0)
+        self.assertTrue(source.queue_same_test())
+        self.assertFalse(source.queue_same_test())
+        self.assertTrue(source.snapshot()["same_active"])
+
+    def test_synthetic_test_mode_source_demodulates_at_normal_level(self) -> None:
+        source = self.web_control.SyntheticNwrTestModeSource(sample_rate=self.web_control.IQ_SAMPLE_RATE)
+        demodulator = self.web_control.ComplexNfmDemodulator()
+        effects = self.web_control.AudioEffectsProcessor(self.web_control.RECEIVER_AUDIO_CONFIG)
+        frames = []
+        for _ in range(int(1.0 / self.web_control.STREAM_FRAME_SECONDS)):
+            iq = source.process(self.web_control.STREAM_FRAME_SAMPLES)
+            frames.append(effects.process(demodulator.process(iq)))
+        audio = self.web_control.np.concatenate(frames)
+
+        self.assertGreater(float(self.web_control.np.max(self.web_control.np.abs(audio))), 0.15)
+        self.assertGreater(self.web_control.rms_float(audio), 0.04)
+        self.assertLess(float(self.web_control.np.mean(self.web_control.np.abs(audio) >= 1.0)), 0.001)
+
+    def test_synthetic_test_mode_signal_change_ramps(self) -> None:
+        source = self.web_control.SyntheticNwrTestModeSource(sample_rate=self.web_control.IQ_SAMPLE_RATE)
+        source.set_signal_dbfs(-80.0)
+        source.process(self.web_control.STREAM_FRAME_SAMPLES)
+        snapshot = source.snapshot()
+
+        self.assertEqual(snapshot["signal_dbfs"], -80.0)
+        self.assertGreater(snapshot["current_signal_dbfs"], -80.0)
+        self.assertLess(snapshot["current_signal_dbfs"], self.web_control.STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS)
+
+    def test_synthetic_test_mode_signal_can_be_set_immediately(self) -> None:
+        source = self.web_control.SyntheticNwrTestModeSource(sample_rate=self.web_control.IQ_SAMPLE_RATE)
+        source.set_signal_dbfs(-60.0, immediate=True)
+        source.process(self.web_control.STREAM_FRAME_SAMPLES)
+        snapshot = source.snapshot()
+
+        self.assertEqual(snapshot["signal_dbfs"], -60.0)
+        self.assertEqual(snapshot["current_signal_dbfs"], -60.0)
+
+    def test_test_mode_iq_crossfade_does_not_overdrive_overlap(self) -> None:
+        real = self.web_control.np.ones(480, dtype=self.web_control.np.complex64)
+        test = self.web_control.np.ones(480, dtype=self.web_control.np.complex64)
+        real_weight = self.web_control.np.full(480, 0.5, dtype=self.web_control.np.float32)
+        test_weight = self.web_control.np.full(480, 0.5, dtype=self.web_control.np.float32)
+
+        mixed = self.web_control.mix_test_mode_iq_crossfade(real, test, real_weight, test_weight)
+        mixed_power = float(self.web_control.np.mean(self.web_control.np.abs(mixed) ** 2))
+
+        self.assertLessEqual(mixed_power, 0.5001)
+
+    def test_synthetic_test_mode_stop_during_same_finishes_before_ready(self) -> None:
+        source = self.web_control.SyntheticNwrTestModeSource(sample_rate=self.web_control.IQ_SAMPLE_RATE)
+        self.assertTrue(source.queue_same_test())
+        stopping = source.request_stop()
+
+        self.assertTrue(stopping["same_active"])
+        self.assertFalse(stopping["stop_ready"])
+
+        for _ in range(int(7.0 / self.web_control.STREAM_FRAME_SECONDS)):
+            source.process(self.web_control.STREAM_FRAME_SAMPLES)
+        self.assertEqual(source.alert_segment[0], "attention")
+
+        for _ in range(int(20.0 / self.web_control.STREAM_FRAME_SECONDS)):
+            source.process(self.web_control.STREAM_FRAME_SAMPLES)
+            snapshot = source.snapshot()
+            if snapshot["stop_ready"]:
+                break
+
+        self.assertFalse(snapshot["same_active"])
+        self.assertTrue(snapshot["stop_ready"])
+
+    def test_stream_test_mode_start_cannot_steal_existing_client_session(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.lock = threading.RLock()
+        service.streams = [{"id": "stream-1", "enabled": True, "station": {"callsign": "WXN99"}}]
+        service.stream_test_mode = None
+
+        class Worker:
+            def __init__(self) -> None:
+                self.active = False
+                self.signal_dbfs = -20.0
+
+            def set_test_mode(self, enabled, signal_dbfs=-20.0):
+                self.active = bool(enabled)
+                self.signal_dbfs = float(signal_dbfs)
+                return self.test_mode_snapshot()
+
+            def test_mode_snapshot(self):
+                return {
+                    "active": self.active,
+                    "signal_dbfs": self.signal_dbfs,
+                    "same_active": False,
+                    "stopping": False,
+                }
+
+        service.stream_workers = {"stream-1": Worker()}
+        service._sync_stream_workers_locked = lambda: None
+
+        first = service.update_stream_test_mode(
+            {"action": "start", "stream_id": "stream-1", "client_id": "client-a"}
+        )
+
+        self.assertTrue(first["test_mode"]["active"])
+        self.assertEqual(first["test_mode"]["client_id"], "client-a")
+        with self.assertRaisesRegex(ValueError, "owned by another browser"):
+            service.update_stream_test_mode(
+                {"action": "start", "stream_id": "stream-1", "client_id": "client-b"}
+            )
+        self.assertEqual(service.stream_test_mode["client_id"], "client-a")
+
     def test_interface_is_up_accepts_unknown_operstate_with_up_flag(self) -> None:
         def fake_read_text(path, encoding=None):
             text_path = str(path)
@@ -667,6 +788,7 @@ class AuthTests(unittest.TestCase):
             ("DELETE", "/api/stream-output"),
             ("POST", "/api/stream-soundcard-preview"),
             ("DELETE", "/api/stream-soundcard-preview"),
+            ("POST", "/api/stream-test-mode"),
             ("POST", "/api/icecast-auth"),
             ("PATCH", "/api/fallback-settings"),
             ("PUT", "/api/fallback-settings"),
@@ -742,6 +864,43 @@ class AuthTests(unittest.TestCase):
         self.assertNotIn("username", output["icecast"])
         self.assertNotIn("auth_signature", output)
         self.assertEqual(output["icecast"]["mount"], "/WXN99.mp3")
+
+    def test_read_only_status_hides_test_mode_state(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.lock = self.web_control.threading.RLock()
+        service.capture = None
+        service.settings = self.web_control.RtlControlSettings()
+        service._effective_settings_locked = lambda: service.settings
+        service.raw_fanout = None
+        service.intermediate_fanout = None
+        service.iq_file_source_config = None
+        service.streams = []
+        service.fallback_settings = self.web_control.WebFallbackSettings()
+        service.capture_error = None
+        service.last_batch_at = None
+        service.received_chunks = 0
+        service.received_bytes = 0
+        service.development_iq_sources_enabled = False
+        service.log_handler = type("LogHandler", (), {"snapshot": lambda self: []})()
+        now = self.web_control.time.time()
+        service.stream_test_mode = {
+            "stream_id": "stream-1",
+            "client_id": "client-a",
+            "signal_dbfs": -20.0,
+            "started_at": now,
+            "heartbeat_at": now,
+            "last_same_at": now,
+        }
+        service.stream_workers = {}
+        service._active_streams_locked = lambda: []
+        service._active_eas_recorders_locked = lambda: []
+        service._recent_eas_alerts_locked = lambda: []
+        service._storage_status_snapshot_locked = lambda: {}
+        service._iq_recorder_status_locked = lambda: {}
+
+        status = service.status(read_only=True)
+
+        self.assertEqual(status["test_mode"], {"active": False})
 
     def test_webrtc_client_controls_require_matching_account(self) -> None:
         service = object.__new__(self.web_control.RtlControlService)
