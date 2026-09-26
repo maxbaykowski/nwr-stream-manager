@@ -2119,20 +2119,63 @@ class EasAlertTests(unittest.TestCase):
 
         response = np.abs(np.fft.rfft(curve, n=8192))
         freqs = np.fft.rfftfreq(8192, d=1.0 / 24_000.0)
-        gain_100 = float(response[np.argmin(np.abs(freqs - 100.0))])
-        gain_300 = float(response[np.argmin(np.abs(freqs - 300.0))])
-        gain_3000 = float(response[np.argmin(np.abs(freqs - 3000.0))])
-        gain_6000 = float(response[np.argmin(np.abs(freqs - 6000.0))])
+        def gain_at(hz: float) -> float:
+            return float(response[np.argmin(np.abs(freqs - hz))])
 
-        self.assertGreater(gain_100, 0.55)
-        self.assertLess(gain_100, 0.68)
-        self.assertGreater(gain_300, 0.62)
-        self.assertLess(gain_300, 0.76)
+        gain_100 = gain_at(100.0)
+        gain_300 = gain_at(300.0)
+        gain_1000 = gain_at(1000.0)
+        gain_1800 = gain_at(1800.0)
+        gain_2200 = gain_at(2200.0)
+        gain_2600 = gain_at(2600.0)
+        gain_3000 = gain_at(3000.0)
+        gain_3500 = gain_at(3500.0)
+        gain_4000 = gain_at(4000.0)
+        gain_4500 = gain_at(4500.0)
+        gain_6000 = gain_at(6000.0)
+        gain_8000 = gain_at(8000.0)
+
+        # Low shelf keeps some body below the 300 Hz knee without
+        # overtaking it.
+        self.assertGreater(gain_100, 0.63)
+        self.assertLess(gain_100, 0.75)
+        self.assertGreater(gain_300, 0.65)
+        self.assertLess(gain_300, 0.78)
         self.assertLess(gain_100, gain_300)
-        self.assertLess(gain_3000, gain_300 * 0.14)
-        self.assertLess(gain_6000, gain_3000 * 0.15)
-        self.assertGreater(gain_6000, gain_3000 * 0.04)
+
+        # The midrange dip keeps the 1 kHz region from dominating.
+        self.assertLess(gain_1000, gain_300 * 0.40)
+        self.assertGreater(gain_1000, gain_300 * 0.30)
+
+        # The presence bell holds up the 1800-2600 Hz band that actually
+        # carries intelligibility, so speech does not sound muffled.
+        self.assertGreater(gain_1800, gain_1000 * 0.72)
+        self.assertLess(gain_1800, gain_1000 * 0.90)
+        self.assertGreater(gain_2200, gain_1000 * 0.65)
+
+        # That lift has to be centred in the speech band, not up in the
+        # 3-4 kHz range where the channel carries mostly hiss.
+        self.assertGreater(gain_1800, gain_2600)
+        self.assertLess(gain_3000, gain_300 * 0.20)
+        self.assertGreater(gain_3000, gain_300 * 0.12)
+
+        # Above the pre-emphasis range the taper has to dominate, or the
+        # 3-4 kHz region stands out on voice.
+        self.assertLess(gain_4000, gain_3000 * 0.40)
+        self.assertLess(gain_4500, gain_3500 * 0.45)
+
+        # Hiss further up still falls away hard, so the recovered speech
+        # band does not come with high-pitched static.
+        self.assertLess(gain_6000, gain_3000 * 0.10)
+        self.assertGreater(gain_6000, gain_3000 * 0.02)
+        self.assertLess(gain_8000, gain_6000 * 0.45)
         self.assertLess(float(np.max(response)), 1.0)
+
+        # Above the presence peak the curve must fall away smoothly all
+        # the way out rather than rolling off and shelving back up.
+        upper = response[(freqs >= 2200.0) & (freqs <= 11500.0)]
+        rise_db = 20.0 * np.log10(upper / np.minimum.accumulate(upper))
+        self.assertLess(float(np.max(rise_db)), 0.5)
 
     def test_audio_dc_blocker_tracks_dc_without_damaging_audio_tone(self) -> None:
         sample_rate = 24_000

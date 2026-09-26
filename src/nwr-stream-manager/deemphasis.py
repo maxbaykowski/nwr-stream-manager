@@ -8,10 +8,16 @@ from numpy.typing import NDArray
 
 PCM_SCALE = 32768.0
 NWR_DEEMPHASIS_LOW_HZ = 300.0
-NWR_DEEMPHASIS_HIGH_HZ = 2600.0
+NWR_DEEMPHASIS_HIGH_HZ = 3000.0
 NWR_DEEMPHASIS_LOW_SHELF_END_HZ = 700.0
-NWR_DEEMPHASIS_LOW_SHELF_GAIN = 0.58
-NWR_DEEMPHASIS_POST_HIGH_ROLLOFF = 3.2
+NWR_DEEMPHASIS_LOW_SHELF_GAIN = 0.68
+NWR_DEEMPHASIS_POST_HIGH_ROLLOFF = 3.5
+NWR_DEEMPHASIS_MID_DIP_HZ = 1000.0
+NWR_DEEMPHASIS_MID_DIP_GAIN = 0.82
+NWR_DEEMPHASIS_MID_DIP_OCTAVES = 1.15
+NWR_DEEMPHASIS_PRESENCE_HZ = 2200.0
+NWR_DEEMPHASIS_PRESENCE_GAIN = 1.50
+NWR_DEEMPHASIS_PRESENCE_OCTAVES = 0.40
 NWR_DEEMPHASIS_TAPS = 257
 
 
@@ -99,7 +105,7 @@ def generate_nwr_deemphasis_curve(
 
     NWR transmit audio is pre-emphasized at +6 dB/octave from 300 Hz
     through 3000 Hz. The receive side applies the inverse -6 dB/octave
-    curve through the speech range, with additional receiver-like shaping
+    curve across that full range, with additional receiver-like shaping
     at the low and high ends.
 
     A practical weather-radio receiver still needs to keep demodulated
@@ -108,7 +114,27 @@ def generate_nwr_deemphasis_curve(
     a sharp lowpass so upper speech detail remains audible while hiss is
     still pushed down. A wider low shelf keeps the 250-350 Hz region from
     sounding too forward without removing the low-frequency body entirely.
-    Overall gain is normalized conservatively to avoid introducing clipping.
+
+    The inverse slope alone leaves the voice sounding muffled: the band
+    the slope favours most, roughly 500-1500 Hz, dominates while the
+    consonant range sits far too low. Two gentle log-symmetric bells
+    correct that balance. A shallow dip around 1 kHz pulls the midrange
+    back by about 1.5 dB, and a presence bell restores the upper speech
+    band so consonants come through.
+
+    Where that presence bell sits matters more than how tall it is. NWR
+    voice detail that actually carries intelligibility lives around
+    1800-2600 Hz; by 3-4 kHz the channel holds mostly demodulated hiss,
+    because the transmit pre-emphasis stops at 3000 Hz and the source
+    audio is band-limited not far above it. A bell centred near 3 kHz
+    therefore buys very little clarity while making the 3-4 kHz region
+    audibly hot. So the bell is centred at 2200 Hz and kept modest: it
+    adds a little over 2 dB through 1800-2600 Hz relative to a plain
+    inverse slope, holds the 3 kHz excess to under 4 dB, and lets the
+    post-3000 Hz taper dominate from there out. The result falls
+    monotonically from the bell peak to Nyquist rather than shelving off
+    and recovering higher up. Overall gain is normalized conservatively
+    to avoid introducing clipping.
     """
     if sample_rate <= 0:
         raise ValueError("sample_rate must be greater than 0")
@@ -149,6 +175,18 @@ def generate_nwr_deemphasis_curve(
             post_high_ratio,
             NWR_DEEMPHASIS_POST_HIGH_ROLLOFF,
         )
+    response *= _log_bell(
+        frequencies,
+        NWR_DEEMPHASIS_MID_DIP_HZ,
+        NWR_DEEMPHASIS_MID_DIP_GAIN,
+        NWR_DEEMPHASIS_MID_DIP_OCTAVES,
+    )
+    response *= _log_bell(
+        frequencies,
+        NWR_DEEMPHASIS_PRESENCE_HZ,
+        NWR_DEEMPHASIS_PRESENCE_GAIN,
+        NWR_DEEMPHASIS_PRESENCE_OCTAVES,
+    )
 
     impulse = np.fft.irfft(response, n=nfft)
     centered = np.fft.fftshift(impulse)
@@ -160,3 +198,20 @@ def generate_nwr_deemphasis_curve(
     if peak > 1.0:
         kernel /= peak
     return kernel.astype(np.float32)
+
+
+def _log_bell(
+    frequencies: NDArray[np.float64],
+    center_hz: float,
+    gain: float,
+    octaves: float,
+) -> NDArray[np.float64]:
+    """Return a peaking/dipping bell that is symmetric on a log-frequency axis.
+
+    ``gain`` is the multiplier at ``center_hz`` and ``octaves`` is the
+    Gaussian width, so the shape stays the same regardless of sample rate.
+    """
+    if gain == 1.0 or octaves <= 0.0 or center_hz <= 0.0:
+        return np.ones_like(frequencies, dtype=np.float64)
+    distance = np.log2(np.maximum(frequencies, 1e-6) / center_hz) / octaves
+    return 1.0 + (gain - 1.0) * np.exp(-0.5 * distance * distance)
