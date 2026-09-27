@@ -655,6 +655,7 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(peak_hz, 1_000.0, delta=60.0)
 
         generation = batch.source_generation
+        wait_for(lambda: fanout.jitter.stats()["state"] == "playing")
         fanout.set_target_frequency(162_400_000)
         wait_for(lambda: self.backend.sources[-1].retunes == [162_400_000])
         deadline = time.time() + 5.0
@@ -663,7 +664,11 @@ class RemoteSdrProtocolTests(unittest.TestCase):
             if batch.center_frequency_hz == 162_400_000:
                 break
         self.assertEqual(batch.center_frequency_hz, 162_400_000)
-        self.assertGreater(batch.source_generation, generation)
+        # A retune continues the same sample stream: the buffered audio of the
+        # old channel plays out instead of being thrown away, so there is no gap.
+        self.assertEqual(batch.source_generation, generation)
+        self.assertEqual(fanout.jitter.stats()["state"], "playing")
+        self.assertEqual(fanout.jitter.stats()["underruns"], 0)
         self.assertEqual(len(self.backend.sources), 1)  # retuned in place, not reopened
 
     def test_channel_feed_prebuffers_then_plays_in_real_time(self) -> None:
@@ -892,6 +897,73 @@ class RemoteSdrServiceTests(unittest.TestCase):
         recording = client.iq_recordings()["recordings"][0]
         self.assertEqual(recording["sample_rate"], 192_000)
 
+        # The weather radio receiver plays from the remote SDR too.
+        source, _events, _status = client.open_receiver_audio_source(client_id="phone", frequency_hz=162_550_000)
+        wait_for(lambda: client.receiver_status("phone").get("last_audio_at"), timeout=15.0)
+        time.sleep(1.0)  # let the network buffer fill
+        client.tune_receiver({"client_id": "phone", "frequency_hz": 162_475_000})
+        # Changing channels must not interrupt the audio while the new
+        # channel crosses the network buffer.
+        longest_gap = 0.0
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            last_audio_at = client.receiver_status("phone").get("last_audio_at") or 0.0
+            longest_gap = max(longest_gap, time.time() - last_audio_at)
+            time.sleep(0.01)
+        self.assertLess(longest_gap, 0.25)
+        client.stop_receiver({"client_id": "phone"})
+
+    def test_receiver_and_streams_survive_source_switches(self) -> None:
+        hosts = []
+        for name in ("host-a", "host-b"):
+            host = self.service(name, development=True)
+            self.synthetic_source(host)
+            host.update({"serial": "00000001", "remote_access_enabled": True})
+            hosts.append(host)
+        client = self.service("client", development=True)
+        for host in hosts:
+            code = host.start_remote_sdr_pairing()["sharing"]["pairing"]["code"]
+            client.pair_remote_sdr({"address": "127.0.0.1", "port": host.remote_server.port, "code": code})
+        client.update({"serial": "00000001"})
+        self.synthetic_source(client)  # this machine's own SDR
+
+        with client.lock:
+            client.streams = [{
+                "id": "s1", "enabled": True, "station": {"callsign": "KEC49", "frequency": "162.550"},
+                "outputs": [], "eas_recording": {"enabled": True},
+            }]
+            client._sync_stream_workers_locked()
+        stream = client.stream_workers[next(iter(client.stream_workers))]
+        client.open_receiver_audio_source(client_id="phone", frequency_hz=162_550_000)
+        receiver = client.receiver_workers["phone"]
+
+        def playing() -> bool:
+            started = time.time()
+            wait_for(
+                lambda: (client.receiver_status("phone").get("last_audio_at") or 0) > started
+                and (stream.last_audio_at or 0) > started,
+                timeout=15.0,
+            )
+            return True
+
+        self.assertTrue(playing())
+        switches = [
+            {"source_mode": "remote", "remote_host_id": hosts[0].remote_identity.fingerprint},
+            {"source_mode": "remote", "remote_host_id": hosts[1].remote_identity.fingerprint},
+            {"source_mode": "local", "serial": "00000001"},
+        ]
+        for switch in switches:
+            with self.subTest(switch=switch):
+                client.update(switch)
+                if switch["source_mode"] == "local":
+                    self.synthetic_source(client)
+                self.assertIs(client.receiver_workers.get("phone"), receiver)
+                self.assertIs(client.stream_workers.get(next(iter(client.stream_workers))), stream)
+                self.assertTrue(playing())
+        users = [host.remote_sdr_status()["devices"][0]["using_this_sdr"] for host in hosts]
+        self.assertEqual(users, [False, False])  # the remote feeds were released
+        client.stop_receiver({"client_id": "phone"})
+
     def test_roles_reverse_without_pairing_again(self) -> None:
         a = self.service("a", development=True)
         b = self.service("b", development=True)
@@ -1020,10 +1092,13 @@ class RemoteSdrServiceTests(unittest.TestCase):
             }]
             client._sync_stream_workers_locked()
         worker = next(iter(client.stream_workers.values()))
-        self.assertEqual(worker.fanout.jitter.target_seconds, 0.5)
+        wait_for(lambda: worker.fanout.upstream is not None)
+        remote_feed = worker.fanout.upstream
+        self.assertEqual(remote_feed.jitter.target_seconds, 0.5)
 
         client.update({"remote_buffer_seconds": 3})
-        self.assertEqual(worker.fanout.jitter.target_seconds, 3.0)  # same feed, no restart
+        self.assertEqual(remote_feed.jitter.target_seconds, 3.0)  # same feed, no restart
+        self.assertIs(worker.fanout.upstream, remote_feed)
         self.assertIs(next(iter(client.stream_workers.values())), worker)
         for bad in (0, 10.5, "fast"):
             with self.subTest(value=bad), self.assertRaisesRegex(ValueError, "network buffer"):
@@ -1036,10 +1111,152 @@ class RemoteSdrServiceTests(unittest.TestCase):
         client.remote_devices.add("h" * 64, "weather-pi", token="t" * 43, peer_token="p" * 43, address="127.0.0.1", port=1)
         client.update({"source_mode": "remote", "remote_host_id": "h" * 64, "notify_sdr_failures": True})
         with client.lock:
+            # Still making its first connection: not unreachable yet.
+            client.remote_client.connecting = True
+            self.assertIsNone(client._rtl_notification_failure_locked(time.monotonic()))
+            self.assertIsNone(client.status()["capture_error"])
+        wait_for(lambda: not client.remote_client.status()["connecting"], timeout=15.0)
+        with client.lock:
             failure = client._rtl_notification_failure_locked(time.monotonic())
 
         self.assertEqual(failure["message"], "The remote SDR on weather-pi is not reachable.")
         self.assertEqual(failure["recovery_message"], "The remote SDR on weather-pi is reachable again.")
+
+    def notification_harness(self):
+        """A client whose remote SDR reachability the test sets, and the
+        SDR notifications it would send."""
+        client = self.service("client")
+        client.remote_devices.add("h" * 64, "weather-pi", token="t" * 43, peer_token="p" * 43, address="127.0.0.1", port=1)
+        client.update({"notify_sdr_failures": True})
+        sent: list[str] = []
+        client._send_stream_problem_notification_async = lambda failure: sent.append(failure["message"])
+        reachable = {"value": True}
+
+        def use_remote() -> None:
+            client.update({"source_mode": "remote", "remote_host_id": "h" * 64})
+            client.remote_client.status = lambda: {
+                "host_id": "h" * 64, "host_name": "weather-pi", "reachable": reachable["value"],
+                "connecting": False, "sdr": {"device_name": "RTL-SDR", "problem": None},
+            }
+
+        def tick(now: float) -> None:
+            with client.lock:
+                client._process_rtl_notifications_locked(now)
+
+        return client, sent, reachable, use_remote, tick
+
+    def test_switching_sources_quickly_does_not_report_the_remote_sdr_unreachable(self) -> None:
+        client, sent, reachable, use_remote, tick = self.notification_harness()
+        grace = self.wc.STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS
+        use_remote()
+        reachable["value"] = False  # a moment while it connected
+        tick(1000.0)
+        reachable["value"] = True
+        tick(1001.0)
+        client.update({"source_mode": "local"})
+        tick(1005.0)
+        use_remote()
+        reachable["value"] = False  # connecting again, well after the first blip
+        tick(1000.0 + grace + 5)
+        reachable["value"] = True
+        tick(1000.0 + grace + 6)
+        self.assertEqual(sent, [])
+
+        reachable["value"] = False  # really unreachable: reported after the grace period
+        tick(2000.0)
+        tick(2000.0 + grace - 1)
+        self.assertEqual(sent, [])
+        tick(2000.0 + grace)
+        self.assertEqual(sent, ["The remote SDR on weather-pi is not reachable."])
+
+    def test_a_brief_outage_does_not_shorten_the_grace_period_of_the_next(self) -> None:
+        client, sent, reachable, use_remote, tick = self.notification_harness()
+        grace = self.wc.STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS
+        use_remote()
+        reachable["value"] = False
+        tick(1000.0)
+        reachable["value"] = True
+        tick(1001.0)
+        reachable["value"] = False
+        tick(1000.0 + grace + 1)  # a new outage, not the first one continuing
+        self.assertEqual(sent, [])
+
+
+class LiveAudioUpstreamStallTests(unittest.TestCase):
+    """Monitoring bitrate must not fall because audio stopped before the browser."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.wc = load_web_control()
+
+    def run_send_loop(self, *, stall_at_frame: int | None, bad_feedback_frames: range, frames: int = 60):
+        wc = self.wc
+        frame_bytes = 960
+        state = {"frame": 0}
+        bitrate_changes: list[tuple[int, int]] = []
+
+        class Source:
+            sample_rate = 24_000
+
+            def __init__(self) -> None:
+                self.audio_source = types.SimpleNamespace(closed=threading.Event(), underrun_frames=0)
+
+            def read_pcm_blocking(self, timeout: float) -> bytes:
+                state["frame"] += 1
+                if state["frame"] >= frames:
+                    self.audio_source.closed.set()
+                if state["frame"] == stall_at_frame:
+                    time.sleep(0.25)  # nothing came from the SDR
+                    self.audio_source.underrun_frames += 1
+                return b"\x00" * frame_bytes
+
+            def is_paused(self) -> bool:
+                return False
+
+        class Encoder:
+            bitrate_kbps = 128
+
+            def encode(self, pcm: bytes) -> list[bytes]:
+                return [b"opus"]
+
+            def set_bitrate(self, kbps: int) -> None:
+                self.bitrate_kbps = kbps
+                bitrate_changes.append((state["frame"], kbps))
+
+        class Service:
+            def consume_live_audio_feedback(self, client_id: str, mode: str) -> dict:
+                if state["frame"] in bad_feedback_frames:
+                    return {"media_delivery_ratio": 0.3}
+                return {}
+
+        writer = types.SimpleNamespace(send_json=lambda payload: None, send_audio=lambda **kwargs: 0.001)
+        handler = types.SimpleNamespace(service=Service())
+        original_hold = wc.LIVE_AUDIO_UPSTREAM_HOLD_SECONDS
+        wc.LIVE_AUDIO_UPSTREAM_HOLD_SECONDS = 0.3
+        self.addCleanup(setattr, wc, "LIVE_AUDIO_UPSTREAM_HOLD_SECONDS", original_hold)
+        wc.RtlControlHandler._stream_live_audio_websocket(
+            handler,
+            writer,
+            Source(),
+            types.SimpleNamespace(queue=queue.Queue()),
+            encoder=Encoder(),
+            codec="opus",
+            mode="monitor",
+            client_id="phone",
+        )
+        return bitrate_changes
+
+    def test_feedback_during_an_upstream_stall_is_ignored(self) -> None:
+        # The browser reports the starved delivery right after the stall.
+        self.assertEqual(self.run_send_loop(stall_at_frame=10, bad_feedback_frames=range(10, 20)), [])
+
+    def test_browser_connection_problems_still_lower_the_bitrate(self) -> None:
+        self.assertEqual(self.run_send_loop(stall_at_frame=None, bad_feedback_frames=range(10, 20))[0], (10, 96))
+
+    def test_feedback_after_the_hold_counts_again(self) -> None:
+        # 0.3 s hold is about 15 frames; frame 45 is well past it.
+        changes = self.run_send_loop(stall_at_frame=10, bad_feedback_frames=range(45, 50))
+        self.assertEqual(changes[0], (45, 96))
 
 
 if __name__ == "__main__":

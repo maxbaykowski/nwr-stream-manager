@@ -34,6 +34,14 @@ LIVE_AUDIO_TCP_REALTIME_DELIVERY_FLOOR = 0.92
 LIVE_AUDIO_TCP_SEVERE_REALTIME_DELIVERY_FLOOR = 0.85
 LIVE_AUDIO_TCP_THROUGHPUT_LIMIT_FEEDBACKS = 2
 LIVE_AUDIO_TCP_RECOVERY_HOLD_FEEDBACKS = 500
+# The server's own audio source running dry (the SDR is lost, or a remote
+# SDR's network link falls behind) starves the browser too, and the browser
+# reports that as slow delivery. A read that waits this long means the audio
+# was not there to send.
+LIVE_AUDIO_UPSTREAM_STALL_SECONDS = 0.1
+# How long browser feedback is set aside after such a stall: the browser's
+# 2 s throughput window plus the time for its report to arrive.
+LIVE_AUDIO_UPSTREAM_HOLD_SECONDS = 4.0
 WEBRTC_MONITOR_PREBUFFER_FRAMES = 6
 WEBRTC_MONITOR_TARGET_LATENCY_FRAMES = 6
 WEBRTC_MONITOR_LOW_WATER_FRAMES = 3
@@ -120,12 +128,26 @@ class TcpOpusBitrateController:
         above_max_drop_count: int = 0,
         network_receive_kbps: float | None = None,
         media_delivery_ratio: float | None = None,
+        upstream_limited: bool = False,
     ) -> TcpOpusBitrateDecision:
         send_limited = False
         try:
             send_limited = float(send_seconds) >= self.slow_send_seconds
         except (TypeError, ValueError):
             send_limited = False
+        if upstream_limited:
+            # Audio stopped arriving before it reached this connection, so the
+            # browser's feedback says nothing about the path to the browser.
+            # Only send backpressure, which is that path alone, still counts.
+            # Otherwise hold, leaving the recovery counters where they were.
+            if send_failed or send_limited:
+                index = self.ladder_kbps.index(self.current_kbps)
+                self._stable_feedbacks = 0
+                if index > 0:
+                    self.current_kbps = self.ladder_kbps[index - 1]
+                    self._recovery_hold_remaining = self.recovery_hold_feedbacks
+                return TcpOpusBitrateDecision(self.current_kbps, "send backpressure")
+            return TcpOpusBitrateDecision(self.current_kbps, "upstream hold")
         latency_limited = int(latency_drop_count) > 0 or int(above_max_drop_count) > 0
         throughput_limited = False
         severe_throughput_limited = False

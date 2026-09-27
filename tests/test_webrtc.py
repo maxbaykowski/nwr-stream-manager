@@ -120,6 +120,39 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(decision.bitrate_kbps, 128)
         self.assertEqual(decision.reason, "recovery probe")
 
+    def test_tcp_opus_bitrate_controller_ignores_browser_feedback_during_upstream_stalls(self) -> None:
+        controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=2, recovery_hold_feedbacks=0)
+
+        # The SDR or a remote SDR's link stalled: the browser sees slow
+        # delivery and drops, but its own connection is fine.
+        decision = controller.update(
+            send_seconds=0.001,
+            latency_drop_count=3,
+            above_max_drop_count=3,
+            network_receive_kbps=20.0,
+            media_delivery_ratio=0.3,
+            upstream_limited=True,
+        )
+        self.assertEqual(decision.bitrate_kbps, 128)
+        self.assertEqual(decision.reason, "upstream hold")
+
+        # Send backpressure is the browser's path alone, so it still counts.
+        decision = controller.update(send_seconds=0.08, media_delivery_ratio=0.3, upstream_limited=True)
+        self.assertEqual(decision.bitrate_kbps, 96)
+        self.assertEqual(decision.reason, "send backpressure")
+
+    def test_tcp_opus_bitrate_controller_recovery_pauses_during_upstream_stalls(self) -> None:
+        controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=3, recovery_hold_feedbacks=0)
+        self.assertEqual(controller.update(send_seconds=0.08).bitrate_kbps, 96)
+
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 96)
+        self.assertEqual(controller.update(send_seconds=0.001).bitrate_kbps, 96)
+        for _ in range(10):  # an upstream stall neither advances nor resets recovery
+            self.assertEqual(controller.update(send_seconds=0.001, upstream_limited=True).bitrate_kbps, 96)
+        decision = controller.update(send_seconds=0.001)
+        self.assertEqual(decision.bitrate_kbps, 128)
+        self.assertEqual(decision.reason, "recovery probe")
+
     def test_audio_source_keeps_latest_frames_when_slow_consumer_falls_behind(self) -> None:
         source = self.webrtc.WebRtcAudioSource(max_frames=1, prebuffer_frames=0)
         source.push_pcm(b"old")

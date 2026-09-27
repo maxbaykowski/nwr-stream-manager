@@ -107,7 +107,6 @@ if __package__:
         REMOTE_SDR_TCP_PORT,
         PairedDeviceStore,
         is_tailscale_address,
-        RemoteIqFanout,
         RemoteSdrAuthError,
         RemoteSdrClient,
         RemoteSdrError,
@@ -117,6 +116,8 @@ if __package__:
         pair_with_host,
     )
     from .webrtc import (
+        LIVE_AUDIO_UPSTREAM_HOLD_SECONDS,
+        LIVE_AUDIO_UPSTREAM_STALL_SECONDS,
         OpusEncoder,
         TcpOpusBitrateController,
         WebRtcAudioSource,
@@ -213,7 +214,6 @@ else:
     REMOTE_SDR_TCP_PORT = remote_sdr.REMOTE_SDR_TCP_PORT
     PairedDeviceStore = remote_sdr.PairedDeviceStore
     is_tailscale_address = remote_sdr.is_tailscale_address
-    RemoteIqFanout = remote_sdr.RemoteIqFanout
     RemoteSdrAuthError = remote_sdr.RemoteSdrAuthError
     RemoteSdrClient = remote_sdr.RemoteSdrClient
     RemoteSdrError = remote_sdr.RemoteSdrError
@@ -224,6 +224,8 @@ else:
     noise_reference_band_for_transition = signal_meter.noise_reference_band_for_transition
     OpusEncoder = webrtc.OpusEncoder
     TcpOpusBitrateController = webrtc.TcpOpusBitrateController
+    LIVE_AUDIO_UPSTREAM_HOLD_SECONDS = webrtc.LIVE_AUDIO_UPSTREAM_HOLD_SECONDS
+    LIVE_AUDIO_UPSTREAM_STALL_SECONDS = webrtc.LIVE_AUDIO_UPSTREAM_STALL_SECONDS
     WebRtcAudioSource = webrtc.WebRtcAudioSource
 
 import numpy as np
@@ -1691,7 +1693,218 @@ class NullIqFanout:
         }
 
 
+@dataclass
+class ChannelFeedBatch:
+    """A batch as one SdrChannelFeed consumer sees it.
+
+    Local batches are shared by every subscriber of the intermediate fanout,
+    so a feed passes on its own copy (sharing the samples) rather than
+    re-stamping the shared batch's generation.
+    """
+
+    data: ComplexArray
+    sample_rate: int
+    center_frequency_hz: int
+    captured_at: float
+    source_generation: int = 0
+    prechannelized: bool = False
+
+
+class SdrChannelFeed:
+    """One consumer's IQ, following whichever SDR the service is using.
+
+    The weather radio receiver and each stream read from one of these instead
+    of from an SDR directly, so switching RTL-SDRs, remote hosts, or between
+    this machine's SDR and a remote one changes what feeds them without
+    stopping them. `source_provider` returns this machine's intermediate
+    fanout, a RemoteSdrClient, or None when there is no SDR. Local batches are
+    the wideband intermediate IQ; remote batches arrive already channelized
+    (`prechannelized`). A switch, or a restart of the underlying source, bumps
+    `generation`, which makes the consumer reset its channel state.
+    """
+
+    def __init__(self, source_provider, frequency_hz: int, name: str) -> None:
+        self.source_provider = source_provider
+        self.frequency_hz = int(frequency_hz)
+        self.name = name
+        self.generation = 0
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.subscriber: queue.Queue | None = None
+        self.subscriber_max_seconds: float | None = None
+        self.dropped_batches = 0
+        self.source = None
+        self.upstream = None
+        self.upstream_queue: queue.Queue | None = None
+        self.upstream_generation: int | None = None
+        self.remote = False
+
+    def current_source(self):
+        try:
+            return self.source_provider()
+        except Exception:
+            return None
+
+    def subscribe(self, max_chunks: int | None = None, max_seconds: float | None = None, name: str = "subscriber") -> queue.Queue:
+        if max_chunks is None:
+            max_chunks = max(8, int(round((max_seconds or 1.5) * 20)))
+        subscriber: queue.Queue = queue.Queue(maxsize=max_chunks)
+        with self.lock:
+            self.subscriber = subscriber
+            self.subscriber_max_seconds = max_seconds
+            if self.thread is None:
+                self.stop_event.clear()
+                self.thread = threading.Thread(target=self._run, name=f"sdr-feed-{self.name}", daemon=True)
+                self.thread.start()
+        return subscriber
+
+    def unsubscribe(self, subscriber: queue.Queue) -> None:
+        self.stop()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._detach()
+
+    def set_target_frequency(self, frequency_hz: int) -> None:
+        frequency_hz = int(frequency_hz)
+        with self.lock:
+            if self.frequency_hz == frequency_hz:
+                return
+            self.frequency_hz = frequency_hz
+            upstream = self.upstream if self.remote else None
+        if upstream is not None:
+            upstream.set_target_frequency(frequency_hz)
+
+    def subscriber_stats(self, subscriber: queue.Queue | None) -> dict[str, Any]:
+        with self.lock:
+            upstream = self.upstream
+            upstream_queue = self.upstream_queue
+            dropped = self.dropped_batches
+        stats: dict[str, Any] = {}
+        upstream_stats = getattr(upstream, "subscriber_stats", None)
+        if upstream_stats is not None and upstream_queue is not None:
+            stats.update(upstream_stats(upstream_queue))
+        stats.update(
+            {
+                "name": f"feed:{self.name}",
+                "queue_depth": subscriber.qsize() if subscriber is not None else 0,
+                "queue_capacity": subscriber.maxsize if subscriber is not None else 0,
+                "feed_dropped_batches": dropped,
+            }
+        )
+        return stats
+
+    def _run(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                self._follow_source()
+                with self.lock:
+                    upstream = self.upstream
+                    upstream_queue = self.upstream_queue
+                    remote = self.remote
+                if upstream_queue is None:
+                    self.stop_event.wait(0.1)
+                    continue
+                try:
+                    batch = upstream_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                incoming = batch_generation(batch)
+                if incoming < getattr(upstream, "generation", 0):
+                    continue  # from before the source restarted
+                with self.lock:
+                    if upstream is not self.upstream:
+                        continue
+                    if incoming != self.upstream_generation:
+                        self.upstream_generation = incoming
+                        self.generation += 1
+                    generation = self.generation
+                    subscriber = self.subscriber
+                if subscriber is None:
+                    continue
+                self._offer(
+                    subscriber,
+                    ChannelFeedBatch(
+                        data=batch.data,
+                        sample_rate=int(batch.sample_rate),
+                        center_frequency_hz=int(batch.center_frequency_hz),
+                        captured_at=float(getattr(batch, "captured_at", time.monotonic())),
+                        source_generation=generation,
+                        prechannelized=remote,
+                    ),
+                )
+        finally:
+            self._detach()
+
+    def _follow_source(self) -> None:
+        source = self.current_source()
+        with self.lock:
+            if source is self.source:
+                return
+        self._detach()
+        upstream = None
+        upstream_queue = None
+        remote = source is not None and hasattr(source, "channel_fanout")
+        with self.lock:
+            frequency_hz = self.frequency_hz
+            max_seconds = self.subscriber_max_seconds
+        if source is not None:
+            upstream = source.channel_fanout(frequency_hz, name=self.name) if remote else source
+            upstream_queue = subscribe_raw_fanout(upstream, max_seconds=max_seconds or LIVE_IQ_QUEUE_SECONDS, name=self.name)
+        with self.lock:
+            self.source = source
+            self.upstream = upstream
+            self.upstream_queue = upstream_queue
+            self.upstream_generation = None
+            self.remote = remote
+            self.generation += 1
+            subscriber = self.subscriber
+        if subscriber is not None:
+            clear_queue_items(subscriber)
+        if source is not None:
+            LOG.info("%s now reads from %s", self.name, "a remote SDR" if remote else "this machine's SDR")
+
+    def _detach(self) -> None:
+        with self.lock:
+            upstream = self.upstream
+            upstream_queue = self.upstream_queue
+            remote = self.remote
+            self.source = None
+            self.upstream = None
+            self.upstream_queue = None
+        if upstream is None:
+            return
+        try:
+            if remote:
+                upstream.stop()
+            elif upstream_queue is not None:
+                upstream.unsubscribe(upstream_queue)
+        except Exception as exc:
+            LOG.debug("releasing %s's SDR feed failed: %s", self.name, exc)
+
+    def _offer(self, subscriber: queue.Queue, batch: ChannelFeedBatch) -> None:
+        try:
+            subscriber.put_nowait(batch)
+        except queue.Full:
+            try:
+                subscriber.get_nowait()
+            except queue.Empty:
+                pass
+            with self.lock:
+                self.dropped_batches += 1
+            try:
+                subscriber.put_nowait(batch)
+            except queue.Full:
+                pass
+
+
 def fanout_channel_profile(fanout: RawRtlFanout | IntermediateIqFanout) -> tuple[int, int] | None:
+    if isinstance(fanout, SdrChannelFeed):
+        fanout = fanout.current_source()
     if not isinstance(fanout, IntermediateIqFanout):
         return None
     center_frequency_hz = NWR_CENTER_FREQUENCY_HZ
@@ -3655,6 +3868,7 @@ class IcecastStreamWorker:
             retune_remote_feed = getattr(self.fanout, "set_target_frequency", None)
             if retune_remote_feed is not None:
                 retune_remote_feed(target_frequency_hz)
+            target_frequency_hz = channel_frequency_for_batch(batch, target_frequency_hz)
             alias_filter_strength = self.alias_filter_strength_provider()
             channel_transition_hz = alias_filter_transition_hz(
                 CHANNEL_IQ_ALIAS_TRANSITION_HZ,
@@ -3906,6 +4120,7 @@ class IcecastStreamWorker:
             retune_remote_feed = getattr(self.fanout, "set_target_frequency", None)
             if retune_remote_feed is not None:
                 retune_remote_feed(target_frequency_hz)
+            target_frequency_hz = channel_frequency_for_batch(batch, target_frequency_hz)
             alias_filter_strength = self.alias_filter_strength_provider()
             channel_transition_hz = alias_filter_transition_hz(
                 CHANNEL_IQ_ALIAS_TRANSITION_HZ,
@@ -3920,6 +4135,13 @@ class IcecastStreamWorker:
                 batch.center_frequency_hz,
             )
             if channelizer is None or channelizer_key != next_channelizer_key:
+                if getattr(batch, "prechannelized", False) and channelizer_key is not None:
+                    # The remote feed moved to a new channel: its signal
+                    # history no longer applies.
+                    self.signal_meter.reset()
+                    self.signal_presence.reset()
+                    fallback_state.reset()
+                    fallback_since = None
                 channelizer = IqChannelizer(
                     input_rate=batch.sample_rate,
                     center_frequency_hz=batch.center_frequency_hz,
@@ -4649,6 +4871,18 @@ class IcecastOutputWriter:
         self._set_status("disabled")
 
 
+def channel_frequency_for_batch(batch, wanted_hz: int) -> int:
+    """The frequency to channelize a batch at.
+
+    A remote feed arrives already channelized at the frequency it names. After
+    a retune it keeps delivering the old channel until the new one arrives, so
+    the batch, not the wanted frequency, says what to pass through.
+    """
+    if getattr(batch, "prechannelized", False):
+        return int(batch.center_frequency_hz)
+    return int(wanted_hz)
+
+
 class WeatherReceiverWorker:
     def __init__(
         self,
@@ -4771,6 +5005,7 @@ class WeatherReceiverWorker:
             retune_remote_feed = getattr(self.fanout, "set_target_frequency", None)
             if retune_remote_feed is not None:
                 retune_remote_feed(target_frequency_hz)
+            target_frequency_hz = channel_frequency_for_batch(batch, target_frequency_hz)
             alias_filter_strength = self.alias_filter_strength_provider()
             channel_transition_hz = alias_filter_transition_hz(
                 CHANNEL_IQ_ALIAS_TRANSITION_HZ,
@@ -4782,6 +5017,13 @@ class WeatherReceiverWorker:
             )
             next_channelizer_key = (batch.sample_rate, batch.center_frequency_hz)
             if channelizer is None or channelizer_key != next_channelizer_key:
+                # A remote retune only changes the batch's frequency; keep the
+                # partly built audio frame so the switch is seamless.
+                remote_retune = (
+                    getattr(batch, "prechannelized", False)
+                    and channelizer_key is not None
+                    and channelizer_key[0] == batch.sample_rate
+                )
                 channelizer = IqChannelizer(
                     input_rate=batch.sample_rate,
                     center_frequency_hz=batch.center_frequency_hz,
@@ -4793,8 +5035,11 @@ class WeatherReceiverWorker:
                 channelizer_key = next_channelizer_key
                 channelizer_alias_filter_strength = alias_filter_strength
                 channelizer_target_frequency_hz = target_frequency_hz
-                demodulator = ComplexNfmDemodulator()
-                frame_buffer.clear()
+                if remote_retune:
+                    demodulator.reset()
+                else:
+                    demodulator = ComplexNfmDemodulator()
+                    frame_buffer.clear()
             elif channelizer_alias_filter_strength != alias_filter_strength:
                 channelizer.update_alias_filter(
                     transition_hz=channel_transition_hz,
@@ -5217,11 +5462,12 @@ class RtlControlService:
                     "sample_rate": remote_sdr.get("sample_rate", settings.sample_rate),
                     "center_frequency_hz": remote_sdr.get("center_frequency_hz", NWR_CENTER_FREQUENCY_HZ),
                 }
-                capture_error = (
-                    remote_sdr.get("capture_error") or None
-                    if remote_status.get("reachable")
-                    else remote_status.get("error") or "The remote SDR is not reachable."
-                )
+                if remote_status.get("reachable"):
+                    capture_error = remote_sdr.get("capture_error") or None
+                elif self.remote_client is None or remote_status.get("connecting"):
+                    capture_error = None
+                else:
+                    capture_error = remote_status.get("error") or "The remote SDR is not reachable."
             return {
                 "settings": settings_payload,
                 "gain_values": gain_values,
@@ -6491,8 +6737,13 @@ class RtlControlService:
         if failure is None:
             # Not applicable cases (notifications off, I/Q file source, no SDR
             # selected) already cleared the states, so reaching here with a
-            # state means the SDR is working again.
+            # state means the SDR is working again. A problem nobody was told
+            # about is forgotten at once, so a later one gets its own grace
+            # period instead of inheriting this one's.
             for key, state in list(self.rtl_notification_states.items()):
+                if not state.get("notified_failure"):
+                    self.rtl_notification_states.pop(key, None)
+                    continue
                 last_seen = float(state.get("last_seen", 0.0))
                 if now - last_seen >= STREAM_NOTIFICATION_RECOVERY_SECONDS:
                     self.rtl_notification_states.pop(key, None)
@@ -6590,6 +6841,8 @@ class RtlControlService:
         status = client.status() if client is not None else {}
         record = self.remote_devices.get(host_id) or {}
         host_name = status.get("host_name") or record.get("name") or "the remote SDR host"
+        if client is None or status.get("connecting"):
+            return None  # just selected: not unreachable until a connection attempt fails
         if not status.get("reachable"):
             category = "unreachable"
             device_name = f"the remote SDR on {host_name}"
@@ -6993,9 +7246,9 @@ class RtlControlService:
         event_queue = SameEventQueue()
         with self.lock:
             self._ensure_webrtc_client_owner_locked(client_id, account_id)
-            fanout = self._channel_fanout_locked(frequency_hz, f"receiver:{client_id}")
-            if fanout is None:
+            if self._current_iq_source() is None:
                 raise ValueError("RTL-SDR capture is not active")
+            fanout = self._channel_feed(frequency_hz, f"receiver:{client_id}")
         worker = WeatherReceiverWorker(
             client_id=client_id,
             fanout=fanout,
@@ -7007,8 +7260,6 @@ class RtlControlService:
         try:
             with self.lock:
                 self._ensure_webrtc_client_owner_locked(client_id, account_id)
-                if self.intermediate_fanout is not fanout:
-                    raise ValueError("RTL-SDR capture changed while starting receiver")
                 replaced_worker = self.receiver_workers.pop(client_id, None)
                 self.receiver_accounts_by_client.pop(client_id, None)
                 self.receiver_workers[client_id] = worker
@@ -7420,8 +7671,12 @@ class RtlControlService:
                 settings.remote_host_id if settings.uses_remote_sdr else "",
             ) and (previous.uses_remote_sdr or settings.uses_remote_sdr)
             if source_changed:
-                # Everything reading the old SDR is rebuilt on the new one.
-                self._stop_sdr_consumers_locked()
+                # A recording belongs to one SDR. The receiver and streams
+                # read through channel feeds, which follow the new SDR.
+                self._stop_iq_recorder_locked()
+                # Problems with the old SDR no longer apply, and the new one
+                # gets a full grace period while it connects.
+                self.rtl_notification_states.clear()
             if settings.uses_remote_sdr:
                 if self.capture is not None:
                     self._detach_capture_locked()
@@ -7438,6 +7693,7 @@ class RtlControlService:
             else:
                 self._detach_capture_locked()
                 self._sync_remote_sdr_locked()
+                self._sync_stream_workers_locked()  # no SDR at all: streams stop
             client = self.remote_client
         if host_changes:
             if client is None:
@@ -7450,12 +7706,10 @@ class RtlControlService:
                 self._sync_stream_workers_locked()
         return self.status()
 
-    def _stop_sdr_consumers_locked(self) -> None:
+    def _stop_iq_recorder_locked(self) -> None:
         if self.iq_recorder is not None:
             self.iq_recorder.stop()
             self.iq_recorder = None
-        self._stop_receiver_workers_locked()
-        self._stop_stream_workers_locked()
 
     def _merged_settings(self, payload: dict[str, Any]) -> RtlControlSettings:
         settings = self.settings
@@ -7687,13 +7941,16 @@ class RtlControlService:
                 daemon=True,
             ).start()
 
-    def _channel_fanout_locked(self, frequency_hz: int, name: str):
-        """A fanout carrying the channel at frequency_hz, local or remote."""
+    def _current_iq_source(self):
+        """What channel feeds read from now: this machine's intermediate
+        fanout, the remote SDR client, or None. Read without the lock, so feed
+        threads never wait on a settings change in progress."""
         if self.settings.uses_remote_sdr:
-            if self.remote_client is None:
-                return None
-            return self.remote_client.channel_fanout(frequency_hz, name=name)
+            return self.remote_client
         return self.intermediate_fanout
+
+    def _channel_feed(self, frequency_hz: int, name: str) -> SdrChannelFeed:
+        return SdrChannelFeed(self._current_iq_source, frequency_hz, name)
 
     def _alias_filter_strength(self) -> int:
         with self.lock:
@@ -7900,12 +8157,10 @@ class RtlControlService:
             self.drain_thread.start()
 
     def _detach_capture_locked(self) -> None:
+        # The receiver and streams are left running: their channel feeds
+        # move to whatever SDR is used next.
         self.drain_stop.set()
-        if self.iq_recorder is not None:
-            self.iq_recorder.stop()
-            self.iq_recorder = None
-        self._stop_receiver_workers_locked()
-        self._stop_stream_workers_locked()
+        self._stop_iq_recorder_locked()
         intermediate = self.intermediate_fanout
         self.intermediate_fanout = None
         fanout = self.raw_fanout
@@ -8024,35 +8279,19 @@ class RtlControlService:
         if fanout is None and remote is None:
             return
 
-        def fanout_current(worker_fanout) -> bool:
-            if remote is not None:
-                return isinstance(worker_fanout, RemoteIqFanout) and worker_fanout.client is remote
-            return worker_fanout is fanout
-
         for key, stream in desired.items():
-            worker = self.stream_workers.get(key)
-            if worker is not None:
-                if not fanout_current(worker.fanout):
-                    self.stream_workers.pop(key, None)
-                    self._stop_stream_worker_async(worker, reason="fanout changed")
-                else:
-                    worker.sync_stream(stream)
-                    continue
             worker = self.stream_workers.get(key)
             if worker is not None:
                 worker.sync_stream(stream)
                 continue
-            worker_fanout = fanout
-            if remote is not None:
-                station = stream.get("station", {})
-                try:
-                    frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
-                except (KeyError, TypeError, ValueError):
-                    frequency_hz = NWR_CENTER_FREQUENCY_HZ
-                worker_fanout = remote.channel_fanout(frequency_hz, name=str(station.get("callsign") or stream.get("id", "stream")))
+            station = stream.get("station", {})
+            try:
+                frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
+            except (KeyError, TypeError, ValueError):
+                frequency_hz = NWR_CENTER_FREQUENCY_HZ
             worker = IcecastStreamWorker(
                 stream=stream,
-                fanout=worker_fanout,
+                fanout=self._channel_feed(frequency_hz, f"stream:{station.get('callsign') or stream.get('id', 'stream')}"),
                 fallback_settings_provider=self.fallback_settings_snapshot,
                 alias_filter_strength_provider=self._alias_filter_strength,
                 gain_provider=self._gain_signature,
@@ -8513,6 +8752,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         last_event_check = 0.0
         bitrate_controller = TcpOpusBitrateController() if codec == "opus" and encoder is not None else None
         next_frame_at = time.monotonic()
+        # Stalls in this machine's own audio (SDR lost, remote SDR link
+        # behind) are not the browser's connection; see TcpOpusBitrateController.
+        upstream_underruns = int(getattr(source.audio_source, "underrun_frames", 0))
+        upstream_hold_until = 0.0
         while True:
             if source.audio_source.closed.is_set():
                 return
@@ -8525,8 +8768,20 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                     except queue.Empty:
                         break
                     writer.send_json({"type": "same_event", "event": event})
+            read_started_at = time.monotonic()
             pcm = source.read_pcm_blocking(timeout=0.12)
+            read_finished_at = time.monotonic()
             source_paused = source.is_paused()
+            underruns = int(getattr(source.audio_source, "underrun_frames", 0))
+            if underruns != upstream_underruns or read_finished_at - read_started_at >= LIVE_AUDIO_UPSTREAM_STALL_SECONDS:
+                if read_finished_at >= upstream_hold_until:
+                    LOG.info(
+                        "live-audio WebSocket source for %s client %s stalled upstream; holding Opus bitrate",
+                        mode,
+                        client_id,
+                    )
+                upstream_underruns = underruns
+                upstream_hold_until = read_finished_at + LIVE_AUDIO_UPSTREAM_HOLD_SECONDS
             if codec == "opus" and encoder is not None:
                 packets = encoder.encode(pcm)
                 if not packets:
@@ -8540,6 +8795,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                         payload=packet,
                     )
                     if bitrate_controller is not None and encoder is not None and not source_paused:
+                        upstream_limited = time.monotonic() < upstream_hold_until
+                        # Consumed either way, so feedback from a stall is not
+                        # applied once the hold ends.
                         feedback = self.service.consume_live_audio_feedback(client_id, mode)
                         latency_drop_count = int(feedback.get("latency_drop_count", 0)) if feedback else 0
                         above_max_drop_count = int(feedback.get("above_max_drop_count", 0)) if feedback else 0
@@ -8551,6 +8809,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                             above_max_drop_count=above_max_drop_count,
                             network_receive_kbps=network_receive_kbps,
                             media_delivery_ratio=media_delivery_ratio,
+                            upstream_limited=upstream_limited,
                         )
                         next_bitrate = bitrate_decision.bitrate_kbps
                         if next_bitrate != encoder.bitrate_kbps:
@@ -20460,6 +20719,7 @@ function remoteSdrStatusText(remote, devices) {
   const status = remote.status || {};
   const device = devices.find(item => item.id === remote.device_id) || {};
   const name = status.host_name || remoteDeviceName(device);
+  if (!status.reachable && (status.connecting || !status.host_id)) return `Connecting to ${name}...`;
   if (!status.reachable) return `${name} is not reachable. Check that it is running and sharing its RTL-SDR.`;
   const sdr = status.sdr || {};
   if (sdr.problem === "disconnected") return `Connected to ${name}, but its RTL-SDR is not connected.`;

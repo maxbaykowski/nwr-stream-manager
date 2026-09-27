@@ -1476,6 +1476,9 @@ class RemoteSdrClient:
         self.connection: FrameConnection | None = None
         self.host_status: dict[str, Any] = {}
         self.reachable = False
+        # True until the first connection attempt settles either way, so a
+        # client that has only just started is not reported as unreachable.
+        self.connecting = True
         self.connected_address = ""
         self.last_status_at: float | None = None
         self.error = ""
@@ -1511,6 +1514,7 @@ class RemoteSdrClient:
                 "host_name": record.get("name", ""),
                 "address": record.get("address", ""),
                 "reachable": self.reachable,
+                "connecting": self.connecting and not self.reachable,
                 "connected_address": self.connected_address if self.reachable else "",
                 "last_status_at": self.last_status_at,
                 "error": self.error,
@@ -1632,6 +1636,7 @@ class RemoteSdrClient:
                         with self.lock:
                             self.host_status = status
                             self.reachable = True
+                            self.connecting = False
                             self.last_status_at = time.time()
                         if self.on_status is not None:
                             self.on_status(status)
@@ -1651,6 +1656,7 @@ class RemoteSdrClient:
     def _set_unreachable(self, error: str) -> None:
         with self.lock:
             self.reachable = False
+            self.connecting = False
             self.error = error
 
     def channel_fanout(self, frequency_hz: int, name: str = "channel", *, buffer_seconds: float | None = None) -> "RemoteIqFanout":
@@ -1796,8 +1802,12 @@ class RemoteIqFanout:
     Stream workers, the weather radio receiver and the I/Q recorder subscribe
     to it exactly as they would to a local fanout. Batches arrive already
     channelized or decimated by the host, so their local channelizers pass
-    them through. Reconnecting or retuning bumps `generation`, which makes a
-    consumer drop in-flight batches and reset its DSP state.
+    them through. Reconnecting bumps `generation`, which makes a consumer drop
+    in-flight batches and reset its DSP state. Retuning does not: the host
+    retunes its channelizer in place, so the new channel follows the old one
+    in the same sample stream, and the audio already buffered keeps playing
+    until the new channel reaches the front. Each batch carries the frequency
+    it was channelized at.
 
     Channel feeds play out through an IqJitterBuffer; wideband feeds, used for
     recordings, are delivered as they arrive through a deep queue instead.
@@ -1883,9 +1893,6 @@ class RemoteIqFanout:
             if self.params.get("frequency_hz") == frequency_hz:
                 return
             self.params["frequency_hz"] = frequency_hz
-            self.generation += 1
-            if self.jitter is not None:
-                self.jitter.flush()  # the old channel's audio is of no use now
             connection = self.connection
         if connection is not None:
             try:
@@ -1941,10 +1948,7 @@ class RemoteIqFanout:
                         continue
                     _sequence, sample_rate, center, _host_time, _host_generation, samples = decode_iq_frame(payload)
                     with self.lock:
-                        target = self.params.get("frequency_hz")
                         generation = self.generation
-                    if target is not None and center != target:
-                        continue  # still the old channel after a retune
                     batch = RemoteIqBatch(samples, sample_rate, center, time.monotonic(), generation)
                     if self.jitter is None:
                         self._offer(batch)
