@@ -6138,6 +6138,7 @@ class RtlControlService:
             return
         self._process_rtl_notifications_locked(now)
         failures: list[dict[str, Any]] = []
+        healthy_keys: set[str] = set()
         for snapshot in active_streams:
             stream_id = str(snapshot.get("id", ""))
             stream = configured_by_id.get(stream_id)
@@ -6145,13 +6146,17 @@ class RtlControlService:
                 continue
             settings = stream_notification_settings_from_stream(stream)
             failures.extend(stream_notification_failures(stream, snapshot, settings))
+            healthy_keys |= stream_notification_healthy_keys(stream, snapshot, settings)
         for stream_id, signal in self._stream_signals_locked().items():
             stream = configured_by_id.get(stream_id)
             if not stream or stream.get("enabled", True) is False:
                 continue
-            failure = stream_reception_failure(stream, signal, stream_notification_settings_from_stream(stream))
+            settings = stream_notification_settings_from_stream(stream)
+            failure = stream_reception_failure(stream, signal, settings)
             if failure is not None:
                 failures.append(failure)
+            elif stream_reception_healthy(stream, signal, settings):
+                healthy_keys.add(f"{stream_id}:reception")
         for failure in failures:
             key = str(failure["key"])
             active_failure_keys.add(key)
@@ -6165,6 +6170,7 @@ class RtlControlService:
                 },
             )
             state["last_seen"] = now
+            state["failure"] = failure
             if now - float(state.get("first_seen", now)) < STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS:
                 continue
             last_sent = float(state.get("last_sent", 0.0))
@@ -6178,20 +6184,32 @@ class RtlControlService:
             last_seen = float(state.get("last_seen", 0.0))
             if now - last_seen >= STREAM_NOTIFICATION_RECOVERY_SECONDS:
                 self.stream_notification_states.pop(key, None)
+                # Only announce a recovery the user was told about the failure
+                # for, and only when the output or signal is seen working.
+                if state.get("last_sent") and key in healthy_keys:
+                    self._send_stream_recovery_notification_async(state.get("failure") or {})
         self._process_recorded_eas_alert_notifications_locked()
 
     def _process_rtl_notifications_locked(self, now: float) -> None:
         failure = self._rtl_notification_failure_locked(now)
         if failure is None:
+            # Not applicable cases (notifications off, I/Q file source, no SDR
+            # selected) already cleared the states, so reaching here with a
+            # state means the SDR is working again.
             for key, state in list(self.rtl_notification_states.items()):
                 last_seen = float(state.get("last_seen", 0.0))
                 if now - last_seen >= STREAM_NOTIFICATION_RECOVERY_SECONDS:
                     self.rtl_notification_states.pop(key, None)
+                    notified = state.get("notified_failure")
+                    if notified:
+                        self._send_stream_recovery_notification_async(notified)
             return
         key = str(failure["key"])
+        notified_failure = None
         for stale_key in list(self.rtl_notification_states):
             if stale_key != key:
-                self.rtl_notification_states.pop(stale_key, None)
+                stale = self.rtl_notification_states.pop(stale_key, None) or {}
+                notified_failure = stale.get("notified_failure") or notified_failure
         state = self.rtl_notification_states.setdefault(
             key,
             {
@@ -6199,6 +6217,10 @@ class RtlControlService:
                 "last_seen": now,
                 "last_clear": 0.0,
                 "last_sent": 0.0,
+                # The failure the user was last told about, carried across a
+                # change of problem (not connected, then no data) so the
+                # eventual recovery notice matches what they were sent.
+                "notified_failure": notified_failure,
             },
         )
         state["last_seen"] = now
@@ -6209,6 +6231,7 @@ class RtlControlService:
             return
         self._send_stream_problem_notification_async(failure)
         state["last_sent"] = now
+        state["notified_failure"] = failure
 
     def _rtl_notification_failure_locked(self, now: float) -> dict[str, Any] | None:
         if not self.settings.notify_sdr_failures:
@@ -6230,35 +6253,42 @@ class RtlControlService:
                 "key": f"rtl:{serial}:disconnected",
                 "category": "disconnected",
                 "target_path": "/?view=rtl",
-                "message": f"{device_name} is not connected.",
+                "message": f"{sentence_case(device_name)} is not connected.",
+                "recovery_message": f"{sentence_case(device_name)} is now connected.",
             }
         error = str(self.capture_error or "").strip()
         if error:
             lower = error.lower()
             if "permission" in lower or "access denied" in lower or "udev" in lower:
                 message = f"Insufficient permissions to access {device_name}."
+                recovery_message = f"{sentence_case(device_name)} can now be accessed."
                 category = "permission"
             elif "claim" in lower or "busy" in lower or "resource busy" in lower:
                 message = f"Failed to claim {device_name}."
+                recovery_message = f"Successfully claimed {device_name}."
                 category = "claim"
             elif "not found" in lower or "disconnect" in lower or "no such device" in lower:
-                message = f"{device_name} is not connected."
+                message = f"{sentence_case(device_name)} is not connected."
+                recovery_message = f"{sentence_case(device_name)} is now connected."
                 category = "disconnected"
             else:
-                message = f"{device_name} has stopped outputting data."
+                message = f"{sentence_case(device_name)} has stopped outputting data."
+                recovery_message = f"{sentence_case(device_name)} is outputting data again."
                 category = "error"
             return {
                 "key": f"rtl:{serial}:{category}",
                 "category": category,
                 "target_path": "/?view=rtl",
                 "message": message,
+                "recovery_message": recovery_message,
             }
         if self.capture is None:
             return {
                 "key": f"rtl:{serial}:disconnected",
                 "category": "disconnected",
                 "target_path": "/?view=rtl",
-                "message": f"{device_name} is not connected.",
+                "message": f"{sentence_case(device_name)} is not connected.",
+                "recovery_message": f"{sentence_case(device_name)} is now connected.",
             }
         last_batch_at = self.last_batch_at
         if last_batch_at is None or now - float(last_batch_at) >= RTL_NOTIFICATION_NO_DATA_SECONDS:
@@ -6266,7 +6296,8 @@ class RtlControlService:
                 "key": f"rtl:{serial}:no-data",
                 "category": "no-data",
                 "target_path": "/?view=rtl",
-                "message": f"{device_name} has stopped outputting data.",
+                "message": f"{sentence_case(device_name)} has stopped outputting data.",
+                "recovery_message": f"{sentence_case(device_name)} is outputting data again.",
             }
         return None
 
@@ -6329,6 +6360,19 @@ class RtlControlService:
                         "force_auth": False,
                     }
                 )
+
+    def _send_stream_recovery_notification_async(self, failure: dict[str, Any]) -> None:
+        message = str(failure.get("recovery_message", "")).strip()
+        if not message:
+            return
+        self._send_stream_problem_notification_async(
+            {
+                "target_path": failure.get("target_path", "/"),
+                "force_auth": failure.get("force_auth", True),
+                "message": message,
+                "priority": 3,
+            }
+        )
 
     def _send_stream_problem_notification_async(self, failure: dict[str, Any]) -> None:
         settings = self.notification_settings
@@ -10371,6 +10415,11 @@ def friendly_soundcard_device_label(device: dict[str, Any]) -> str:
     return label or str(device.get("display_name") or device.get("device") or device.get("hw_device") or "Sound card").strip()
 
 
+def sentence_case(text: str) -> str:
+    """Capitalize the first letter, for names that can start a sentence."""
+    return text[:1].upper() + text[1:]
+
+
 def soundcard_notification_name(output: dict[str, Any]) -> str:
     soundcard = output.get("soundcard") if isinstance(output.get("soundcard"), dict) else {}
     for key in ("display_name", "card_long_name", "card_name", "device"):
@@ -10413,6 +10462,7 @@ def stream_notification_failures(
                     "category": "soundcard",
                     "target_path": stream_output_route_path(stream_id, output_id),
                     "message": f"{callsign}: sound card {name} is not connected.",
+                    "recovery_message": f"{callsign}: sound card {name} is now connected.",
                 }
             )
         else:
@@ -10426,9 +10476,52 @@ def stream_notification_failures(
                     "category": "icecast",
                     "target_path": stream_output_route_path(stream_id, output_id),
                     "message": f"{callsign}: failed to connect to the Icecast mountpoint at {destination}.",
+                    "recovery_message": f"{callsign}: successfully connected to the Icecast mountpoint at {destination}.",
                 }
             )
     return failures
+
+
+def stream_notification_healthy_keys(
+    stream: dict[str, Any],
+    snapshot: dict[str, Any],
+    settings: WebStreamNotificationSettings,
+) -> set[str]:
+    """Keys of watched outputs currently seen working.
+
+    A recovery notification needs this positive observation: an output that
+    was removed, disabled, or had its notification toggle turned off stops
+    reporting a failure too, and must not be announced as reconnected.
+    """
+    healthy: set[str] = set()
+    stream_id = str(stream.get("id", ""))
+    for output in snapshot.get("outputs", []):
+        if not isinstance(output, dict):
+            continue
+        status = str(output.get("status", snapshot.get("status", ""))).strip().lower()
+        if status != "enabled":
+            continue
+        output_type = str(output.get("type", "icecast") or "icecast")
+        output_id = str(output.get("id", ""))
+        if output_type == "soundcard":
+            if settings.soundcard_failures:
+                healthy.add(f"{stream_id}:soundcard:{output_id}")
+        elif settings.icecast_failures:
+            healthy.add(f"{stream_id}:icecast:{output_id}")
+    return healthy
+
+
+def stream_reception_healthy(
+    stream: dict[str, Any],
+    signal: dict[str, Any] | None,
+    settings: WebStreamNotificationSettings,
+) -> bool:
+    return (
+        settings.bad_reception
+        and isinstance(signal, dict)
+        and bool(signal.get("available"))
+        and signal.get("reception_problem") is None
+    )
 
 
 def stream_reception_failure(
@@ -10452,6 +10545,7 @@ def stream_reception_failure(
         "category": "reception",
         "target_path": stream_settings_route_path(stream_id),
         "message": message,
+        "recovery_message": f"{stream_callsign(stream)}: reception has improved.",
     }
 
 

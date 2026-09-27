@@ -273,16 +273,190 @@ class AuthTests(unittest.TestCase):
         service.last_batch_at = 1232.0
         service._process_rtl_notifications_locked(1232.0)
         self.assertEqual(service.rtl_notification_states, {})
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[-1]["message"], "RTLSDRBlog Blog V4 is now connected.")
+        self.assertEqual(sent[-1]["target_path"], "/?view=rtl")
         service.capture = None
         service.last_batch_at = None
         service._process_rtl_notifications_locked(1270.0)
-        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(sent), 2)
         service._process_rtl_notifications_locked(1301.0)
-        self.assertEqual(len(sent), 2)
-        service._process_rtl_notifications_locked(1400.0)
-        self.assertEqual(len(sent), 2)
-        service._process_rtl_notifications_locked(4902.0)
         self.assertEqual(len(sent), 3)
+        service._process_rtl_notifications_locked(1400.0)
+        self.assertEqual(len(sent), 3)
+        service._process_rtl_notifications_locked(4902.0)
+        self.assertEqual(len(sent), 4)
+
+    def _stream_notification_service(self, streams, signals=None):
+        wc = self.web_control
+        service = object.__new__(wc.RtlControlService)
+        service.streams = streams
+        service.stream_notification_states = {}
+        service.rtl_notification_states = {}
+        service.stream_eas_alert_notification_seen = set()
+        service.stream_workers = {}
+        service._notification_globally_ready_locked = lambda: True
+        service._process_rtl_notifications_locked = lambda now: None
+        service._process_recorded_eas_alert_notifications_locked = lambda: None
+        service._stream_signals_locked = lambda: dict(signals or {})
+        sent: list[dict[str, object]] = []
+        service._send_stream_problem_notification_async = sent.append
+        return service, sent
+
+    def _run_notifications(self, service, snapshots, at: float) -> None:
+        with patch.object(self.web_control.time, "monotonic", lambda: at):
+            service._process_stream_notifications_locked(snapshots)
+
+    @staticmethod
+    def _icecast_snapshot(status: str) -> list[dict[str, object]]:
+        return [{
+            "id": "stream-1",
+            "status": status,
+            "outputs": [{
+                "id": "out-1",
+                "type": "icecast",
+                "status": status,
+                "icecast": {"host": "radio.example.com", "port": 8000, "mount": "/kec49"},
+            }],
+        }]
+
+    def _icecast_stream(self, **notifications):
+        return {
+            "id": "stream-1",
+            "enabled": True,
+            "station": {"callsign": "KEC49"},
+            "notifications": {"icecast_failures": True, **notifications},
+        }
+
+    def test_icecast_recovery_is_announced_after_the_recovery_period(self) -> None:
+        stream = self._icecast_stream()
+        service, sent = self._stream_notification_service([stream])
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1000.0)
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1031.0)
+        self.assertEqual(len(sent), 1)
+
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1040.0)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1060.0)
+        self.assertEqual(len(sent), 1)  # still inside the 30 s recovery period
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1062.0)
+
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(
+            sent[-1]["message"],
+            "KEC49: successfully connected to the Icecast mountpoint at http://radio.example.com:8000/kec49.",
+        )
+        self.assertEqual(sent[-1]["priority"], 3)
+        self.assertEqual(service.stream_notification_states, {})
+
+    def test_no_recovery_notice_when_failure_was_never_announced(self) -> None:
+        service, sent = self._stream_notification_service([self._icecast_stream()])
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1000.0)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1010.0)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1100.0)
+
+        self.assertEqual(sent, [])
+
+    def test_disabling_a_failing_stream_or_its_toggle_is_not_a_recovery(self) -> None:
+        for change in ("disable_stream", "toggle_off", "output_removed"):
+            with self.subTest(change=change):
+                stream = self._icecast_stream()
+                service, sent = self._stream_notification_service([stream])
+                self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1000.0)
+                self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1031.0)
+                self.assertEqual(len(sent), 1)
+                snapshots = self._icecast_snapshot("disabled")
+                if change == "disable_stream":
+                    stream["enabled"] = False
+                elif change == "toggle_off":
+                    stream["notifications"]["icecast_failures"] = False
+                    snapshots = self._icecast_snapshot("enabled")
+                else:
+                    snapshots = []
+                self._run_notifications(service, snapshots, 1040.0)
+                self._run_notifications(service, snapshots, 1100.0)
+
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(service.stream_notification_states, {})
+
+    def test_soundcard_and_reception_recovery_messages(self) -> None:
+        stream = {
+            "id": "stream-1",
+            "enabled": True,
+            "station": {"callsign": "KEC49"},
+            "notifications": {"soundcard_failures": True, "bad_reception": True},
+        }
+        signals = {"stream-1": {"available": True, "reception_problem": "no_signal", "snr_db": -3.0}}
+        service, sent = self._stream_notification_service([stream], signals)
+
+        def snapshot(status):
+            return [{
+                "id": "stream-1",
+                "status": status,
+                "outputs": [{"id": "sc-1", "type": "soundcard", "status": status, "soundcard": {"display_name": "Yeti X"}}],
+            }]
+
+        self._run_notifications(service, snapshot("needs-attention"), 1000.0)
+        self._run_notifications(service, snapshot("needs-attention"), 1031.0)
+        self.assertEqual(
+            sorted(item["message"] for item in sent),
+            ["KEC49: no signal, only static is being received.", "KEC49: sound card Yeti X is not connected."],
+        )
+        signals["stream-1"] = {"available": True, "reception_problem": None, "snr_db": 18.0}
+        self._run_notifications(service, snapshot("enabled"), 1040.0)
+        self._run_notifications(service, snapshot("enabled"), 1062.0)
+
+        self.assertEqual(
+            sorted(item["message"] for item in sent[2:]),
+            ["KEC49: reception has improved.", "KEC49: sound card Yeti X is now connected."],
+        )
+
+    def test_rtl_recovery_matches_the_failure_that_was_announced(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.settings = self.web_control.RtlControlSettings(serial="00000001", notify_sdr_failures=True)
+        service.iq_file_source_config = None
+        service.capture = None
+        service.capture_error = ""
+        service.last_batch_at = None
+        service.rtl_notification_states = {}
+        service.rtl_device_name_cache = {}
+        service.devices = lambda: {"devices": []}
+        sent: list[dict[str, object]] = []
+        service._send_stream_problem_notification_async = sent.append
+
+        service._process_rtl_notifications_locked(1000.0)
+        service._process_rtl_notifications_locked(1031.0)
+        self.assertEqual(sent[-1]["message"], "The configured RTL-SDR is not connected.")
+        # Plugged back in but not streaming yet: a different problem, never announced.
+        service.devices = lambda: {"devices": [{"serial": "00000001", "name": "RTLSDRBlog Blog V4", "vendor": ""}]}
+        service.capture = object()
+        service._process_rtl_notifications_locked(1040.0)
+        service.last_batch_at = 1045.0
+        service._process_rtl_notifications_locked(1045.0)
+        service._process_rtl_notifications_locked(1071.0)
+
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[-1]["message"], "The configured RTL-SDR is now connected.")
+
+    def test_rtl_problem_that_clears_within_grace_sends_nothing(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.settings = self.web_control.RtlControlSettings(serial="00000001", notify_sdr_failures=True)
+        service.iq_file_source_config = None
+        service.capture = None
+        service.capture_error = ""
+        service.last_batch_at = None
+        service.rtl_notification_states = {}
+        service.rtl_device_name_cache = {}
+        service.devices = lambda: {"devices": [{"serial": "00000001", "name": "RTLSDRBlog Blog V4", "vendor": ""}]}
+        sent: list[dict[str, object]] = []
+        service._send_stream_problem_notification_async = sent.append
+
+        service._process_rtl_notifications_locked(1000.0)
+        service.capture = object()
+        service.last_batch_at = 1010.0
+        service._process_rtl_notifications_locked(1010.0)
+        service._process_rtl_notifications_locked(1100.0)
+
+        self.assertEqual(sent, [])
 
     def test_rtl_notification_classifies_permission_and_no_data_failures(self) -> None:
         service = object.__new__(self.web_control.RtlControlService)
