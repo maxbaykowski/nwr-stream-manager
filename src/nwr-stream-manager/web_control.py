@@ -11776,19 +11776,19 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div class="actions">
         <button id="open_iq_start" type="button">New recording</button>
       </div>
-      <table aria-label="I/Q recordings">
-        <thead>
-          <tr>
-            <th>Time of recording</th>
-            <th>Duration</th>
-            <th>Sample rate</th>
-            <th>Frequency</th>
-            <th>Actions</th>
+      <table class="responsive-table" role="table" aria-label="I/Q recordings">
+        <thead role="rowgroup">
+          <tr role="row">
+            <th role="columnheader">Time of recording</th>
+            <th role="columnheader">Duration</th>
+            <th role="columnheader">Sample rate</th>
+            <th role="columnheader">Frequency</th>
+            <th role="columnheader">Actions</th>
           </tr>
         </thead>
-        <tbody id="iq-recordings-body" aria-live="off">
-          <tr>
-            <td colspan="5" class="hint">No I/Q recordings.</td>
+        <tbody id="iq-recordings-body" role="rowgroup" aria-live="off">
+          <tr data-row-key="empty" role="row">
+            <td colspan="5" class="hint" role="cell">No I/Q recordings.</td>
           </tr>
         </tbody>
       </table>
@@ -11914,17 +11914,17 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div class="actions">
         <button id="open_create_account" type="button">Create account</button>
       </div>
-      <table aria-label="Accounts">
-        <thead>
-          <tr>
-            <th>Username</th>
-            <th>Account type</th>
-            <th>Last accessed</th>
-            <th>Actions</th>
+      <table class="responsive-table" role="table" aria-label="Accounts">
+        <thead role="rowgroup">
+          <tr role="row">
+            <th role="columnheader">Username</th>
+            <th role="columnheader">Account type</th>
+            <th role="columnheader">Last accessed</th>
+            <th role="columnheader">Actions</th>
           </tr>
         </thead>
-        <tbody id="accounts-body" aria-live="off">
-          <tr><td colspan="4" class="hint">No accounts.</td></tr>
+        <tbody id="accounts-body" role="rowgroup" aria-live="off">
+          <tr data-row-key="empty" role="row"><td colspan="4" class="hint" role="cell">No accounts.</td></tr>
         </tbody>
       </table>
     </section>
@@ -11983,7 +11983,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </tr>
         </thead>
         <tbody id="active-streams-body" role="rowgroup" aria-live="off">
-          <tr id="active-streams-empty" role="row">
+          <tr id="active-streams-empty" role="row" data-row-key="empty">
             <td colspan="6" class="hint" role="cell">No streams configured.</td>
           </tr>
         </tbody>
@@ -12172,38 +12172,38 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </label>
         <div id="icecast_outputs_panel">
         <h3>Icecast outputs</h3>
-        <table aria-label="Icecast outputs">
-          <thead>
-            <tr>
-              <th>Destination</th>
-              <th>Format</th>
-              <th>Sample rate</th>
-              <th>Bitrate</th>
-              <th>Status</th>
-              <th>Actions</th>
+        <table class="responsive-table" role="table" aria-label="Icecast outputs">
+          <thead role="rowgroup">
+            <tr role="row">
+              <th role="columnheader">Destination</th>
+              <th role="columnheader">Format</th>
+              <th role="columnheader">Sample rate</th>
+              <th role="columnheader">Bitrate</th>
+              <th role="columnheader">Status</th>
+              <th role="columnheader">Actions</th>
             </tr>
           </thead>
-          <tbody id="icecast-outputs-body" aria-live="off">
-            <tr>
-              <td colspan="6" class="hint">No outputs configured.</td>
+          <tbody id="icecast-outputs-body" role="rowgroup" aria-live="off">
+            <tr data-row-key="empty" role="row">
+              <td colspan="6" class="hint" role="cell">No Icecast outputs configured.</td>
             </tr>
           </tbody>
         </table>
         </div>
         <div id="soundcard_outputs_panel" hidden>
         <h3>Sound card outputs</h3>
-        <table aria-label="Sound card outputs">
-          <thead>
-            <tr>
-              <th>Sound card name</th>
-              <th>Channels</th>
-              <th>Status</th>
-              <th>Actions</th>
+        <table class="responsive-table" role="table" aria-label="Sound card outputs">
+          <thead role="rowgroup">
+            <tr role="row">
+              <th role="columnheader">Sound card name</th>
+              <th role="columnheader">Channels</th>
+              <th role="columnheader">Status</th>
+              <th role="columnheader">Actions</th>
             </tr>
           </thead>
-          <tbody id="soundcard-outputs-body" aria-live="off">
-            <tr>
-              <td colspan="4" class="hint">No sound card outputs configured.</td>
+          <tbody id="soundcard-outputs-body" role="rowgroup" aria-live="off">
+            <tr data-row-key="empty" role="row">
+              <td colspan="4" class="hint" role="cell">No sound card outputs configured.</td>
             </tr>
           </tbody>
         </table>
@@ -16846,9 +16846,7 @@ function renderIcecastOutputsTable(stream) {
   const rows = outputRowsByType(stream, "icecast");
   const nextSignature = outputTableNextSignature(rows);
   if (nextSignature === icecastOutputTableSignature) return;
-  if (containsFocusedElement(tbody)) return;
   icecastOutputTableSignature = nextSignature;
-  tbody.innerHTML = "";
   if (rows.length === 0) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
@@ -16856,12 +16854,10 @@ function renderIcecastOutputsTable(stream) {
     cell.className = "hint";
     cell.textContent = "No Icecast outputs configured.";
     row.appendChild(cell);
-    tbody.appendChild(row);
+    reconcileKeyedChildren(tbody, [keyedRow(labelResponsiveTableRow(row, tbody), "empty")]);
     return;
   }
-  for (const row of rows) {
-    tbody.appendChild(icecastOutputRow(row));
-  }
+  reconcileKeyedChildren(tbody, rows.map(row => keyedRow(labelResponsiveTableRow(icecastOutputRow(row), tbody), `output:${row.output.id || ""}`)));
 }
 
 function renderSoundcardOutputsTable(stream) {
@@ -16869,9 +16865,7 @@ function renderSoundcardOutputsTable(stream) {
   const rows = outputRowsByType(stream, "soundcard");
   const nextSignature = outputTableNextSignature(rows);
   if (nextSignature === soundcardOutputTableSignature) return;
-  if (containsFocusedElement(tbody)) return;
   soundcardOutputTableSignature = nextSignature;
-  tbody.innerHTML = "";
   if (rows.length === 0) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
@@ -16879,12 +16873,10 @@ function renderSoundcardOutputsTable(stream) {
     cell.className = "hint";
     cell.textContent = "No sound card outputs configured.";
     row.appendChild(cell);
-    tbody.appendChild(row);
+    reconcileKeyedChildren(tbody, [keyedRow(labelResponsiveTableRow(row, tbody), "empty")]);
     return;
   }
-  for (const row of rows) {
-    tbody.appendChild(soundcardOutputRow(row));
-  }
+  reconcileKeyedChildren(tbody, rows.map(row => keyedRow(labelResponsiveTableRow(soundcardOutputRow(row), tbody), `output:${row.output.id || ""}`)));
 }
 
 function icecastOutputRow(row) {
@@ -17046,26 +17038,19 @@ function renderActiveStreams(activeStreams, configured = configuredStreams, opti
   if (nextSignature === activeStreamsSignature) {
     return;
   }
-  if (!options.force && containsFocusedElement(tbody)) return;
   activeStreamsSignature = nextSignature;
-  tbody.innerHTML = "";
-
   if (rows.length === 0) {
     const row = document.createElement("tr");
     row.id = "active-streams-empty";
-    row.setAttribute("role", "row");
     const cell = document.createElement("td");
-    cell.setAttribute("role", "cell");
     cell.colSpan = 6;
     cell.className = "hint";
     cell.textContent = "No streams configured.";
     row.appendChild(cell);
-    tbody.appendChild(row);
+    reconcileKeyedChildren(tbody, [keyedRow(labelResponsiveTableRow(row, tbody), "empty")]);
     return;
   }
-  for (const stream of rows) {
-    tbody.appendChild(activeStreamRow(stream));
-  }
+  reconcileKeyedChildren(tbody, rows.map(stream => keyedRow(labelResponsiveTableRow(activeStreamRow(stream), tbody), `stream:${stream.id || ""}`)));
 }
 
 function dashboardAttentionSignatureFor(items, configured = configuredStreams) {
@@ -17191,21 +17176,21 @@ function renderDashboardStreamAttention(activeStreams, configured = configuredSt
   if (nextSignature === dashboardAttentionSignature) return;
   dashboardAttentionSignature = nextSignature;
   setText("dashboard-stream-summary", configuredStreamSummary(configured));
-  container.innerHTML = "";
   if (!items.length) {
     const healthy = document.createElement("div");
     healthy.className = "stream-item success";
     healthy.textContent = "All streams are healthy!";
-    container.appendChild(healthy);
+    reconcileKeyedChildren(container, [keyedRow(healthy, "healthy")]);
     return;
   }
+  const children = [];
   const alert = document.createElement("p");
   alert.className = "status-text status-needs-attention";
   const names = Array.from(new Set(items.map(item => item.callsign)));
   alert.textContent = names.length === 1
     ? `Stream ${names[0]} requires attention!`
     : `Streams ${sentenceList(names)} require attention.`;
-  container.appendChild(alert);
+  children.push(keyedRow(alert, "summary"));
   const readOnly = accountIsReadOnly();
   for (const item of items) {
     const row = document.createElement("div");
@@ -17224,8 +17209,9 @@ function renderDashboardStreamAttention(activeStreams, configured = configuredSt
       row.appendChild(link);
       row.append(`: ${item.detail}`);
     }
-    container.appendChild(row);
+    children.push(keyedRow(row, `stream:${item.id}`));
   }
+  reconcileKeyedChildren(container, children);
 }
 
 function sentenceCaseAlertName(name) {
@@ -17260,14 +17246,14 @@ function renderDashboardRecentAlerts(alerts) {
   const nextSignature = recentAlertsSignature(alerts);
   if (nextSignature === dashboardRecentAlertsSignature) return;
   dashboardRecentAlertsSignature = nextSignature;
-  container.innerHTML = "";
   if (!alerts || alerts.length === 0) {
     const empty = document.createElement("div");
     empty.className = "stream-item hint";
     empty.textContent = "No EAS alerts issued in the last 24 hours.";
-    container.appendChild(empty);
+    reconcileKeyedChildren(container, [keyedRow(empty, "empty")]);
     return;
   }
+  const children = [];
   for (const alert of alerts) {
     const item = document.createElement("div");
     item.className = "stream-item";
@@ -17293,11 +17279,10 @@ function renderDashboardRecentAlerts(alerts) {
     item.appendChild(alertLink);
     item.append(` issued ${relativeTimeAgo(alert.issued_at_epoch)} on ${alert.callsign || "Unknown"}. `);
     item.appendChild(allLink);
-    container.appendChild(item);
+    children.push(keyedRow(item, `alert:${alert.stream_id || ""}:${alert.id || ""}`));
   }
+  reconcileKeyedChildren(container, children);
 }
-
-const ACTIVE_STREAM_COLUMN_LABELS = ["Callsign", "Frequency", "Outputs", "Signal", "Status", "Actions"];
 
 function activeStreamRow(stream) {
   const station = stream.station || {};
@@ -17311,16 +17296,22 @@ function activeStreamRow(stream) {
   statusCell.className = `status-text status-${status}`;
   row.appendChild(statusCell);
   row.appendChild(streamActionsCell(stream));
-  labelResponsiveTableRow(row, ACTIVE_STREAM_COLUMN_LABELS);
   return row;
 }
 
-function labelResponsiveTableRow(row, labels) {
+function labelResponsiveTableRow(row, tbody) {
+  // Roles keep table semantics when phones restyle rows as cards; data-label
+  // is the visible card label, taken from the table's own column headers.
+  const table = tbody.closest("table");
+  const labels = table ? Array.from(table.querySelectorAll("thead th")).map(header => header.textContent.trim()) : [];
+  const cells = Array.from(row.children);
+  const placeholder = cells.length === 1 && cells[0].colSpan > 1;
   row.setAttribute("role", "row");
-  Array.from(row.children).forEach((cell, index) => {
+  cells.forEach((cell, index) => {
     cell.setAttribute("role", "cell");
-    if (labels[index]) cell.dataset.label = labels[index];
+    if (!placeholder && labels[index]) cell.dataset.label = labels[index];
   });
+  return row;
 }
 
 const SIGNAL_QUALITY_LABELS = {excellent: "Excellent", good: "Good", fair: "Fair", poor: "Poor", no_signal: "No signal"};
@@ -17624,6 +17615,122 @@ function syncSelectOptions(select, options) {
   if (active === select && document.activeElement !== select) select.focus();
 }
 
+// Screen readers keep their reading position on the DOM node they are on.
+// Replacing a list's rows on every status poll destroys that node and throws
+// the reader back to the top of the page, so polled lists are updated in
+// place: rows are matched by data-row-key and only changed attributes and
+// text are written.
+function keyedRow(element, key) {
+  element.dataset.rowKey = String(key);
+  return element;
+}
+
+function reconcileKeyedChildren(container, nextChildren) {
+  const seen = new Map();
+  for (const child of nextChildren) {
+    const key = child.dataset.rowKey || "";
+    const count = seen.get(key) || 0;
+    seen.set(key, count + 1);
+    if (count) child.dataset.rowKey = `${key}#${count}`;
+  }
+  const wanted = new Set(nextChildren.map(child => child.dataset.rowKey));
+  const existing = new Map();
+  for (const child of Array.from(container.children)) {
+    const key = child.dataset.rowKey;
+    if (key && wanted.has(key) && !existing.has(key)) {
+      existing.set(key, child);
+    } else {
+      child.remove();
+    }
+  }
+  const currentOrder = new Map(Array.from(container.children).map((child, index) => [child, index]));
+  const nodes = nextChildren.map(next => {
+    const current = existing.get(next.dataset.rowKey);
+    return current ? morphNode(current, next) : next;
+  });
+  // Moving a row detaches it, which loses a screen reader's place just like
+  // replacing it would, so only rows outside the longest already-ordered run
+  // are moved.
+  const stable = longestOrderedRun(nodes.map(node => currentOrder.has(node) ? currentOrder.get(node) : -1));
+  let anchor = null;
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const node = nodes[index];
+    if (!stable.has(index)) container.insertBefore(node, anchor);
+    anchor = node;
+  }
+}
+
+function longestOrderedRun(positions) {
+  // Indexes of the longest strictly increasing subsequence of existing
+  // positions (-1 marks new nodes, which are never part of it).
+  const tails = [];
+  const previous = new Array(positions.length).fill(-1);
+  positions.forEach((position, index) => {
+    if (position < 0) return;
+    let low = 0;
+    let high = tails.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (positions[tails[middle]] < position) low = middle + 1;
+      else high = middle;
+    }
+    if (low > 0) previous[index] = tails[low - 1];
+    tails[low] = index;
+  });
+  const stable = new Set();
+  let index = tails.length ? tails[tails.length - 1] : -1;
+  while (index >= 0) {
+    stable.add(index);
+    index = previous[index];
+  }
+  return stable;
+}
+
+function preservedAttributes(element) {
+  // Open menus and their buttons belong to the user, not to the poll.
+  if (element.classList && element.classList.contains("stream-actions-menu")) return ["hidden"];
+  if (element.hasAttribute && element.hasAttribute("aria-haspopup")) return ["aria-expanded"];
+  return [];
+}
+
+function morphAttributes(current, next) {
+  const preserved = preservedAttributes(current);
+  for (const attribute of Array.from(next.attributes)) {
+    if (preserved.includes(attribute.name)) continue;
+    if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+  }
+  for (const attribute of Array.from(current.attributes)) {
+    if (preserved.includes(attribute.name)) continue;
+    if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+  }
+}
+
+function morphNode(current, next) {
+  if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+    current.replaceWith(next);
+    return next;
+  }
+  if (current.nodeType === Node.TEXT_NODE) {
+    if (current.data !== next.data) current.data = next.data;
+    return current;
+  }
+  if (current.nodeType !== Node.ELEMENT_NODE) return current;
+  morphAttributes(current, next);
+  const currentChildren = Array.from(current.childNodes);
+  const nextChildren = Array.from(next.childNodes);
+  nextChildren.forEach((child, index) => {
+    if (currentChildren[index]) {
+      morphNode(currentChildren[index], child);
+    } else {
+      current.appendChild(child);
+    }
+  });
+  for (let index = nextChildren.length; index < currentChildren.length; index += 1) {
+    currentChildren[index].remove();
+  }
+  return current;
+}
+
 function containsFocusedElement(element) {
   const active = document.activeElement;
   return Boolean(active && element && element.contains(active));
@@ -17687,7 +17794,28 @@ function setAttributeIfChanged(element, name, value) {
 function setText(id, value) {
   const element = document.getElementById(id);
   const text = String(value);
-  if (element.textContent !== text) element.textContent = text;
+  if (element.textContent === text) return;
+  // Edit the existing text node rather than replacing it, so a screen reader
+  // reading a live value is not moved when it changes.
+  if (element.childNodes.length === 1 && element.firstChild.nodeType === Node.TEXT_NODE && text) {
+    element.firstChild.data = text;
+  } else {
+    element.textContent = text;
+  }
+}
+
+function renderLogs(lines) {
+  // One element per line, so a new line is appended and the oldest dropped
+  // without replacing the lines a screen reader may be reading.
+  const container = document.getElementById("logs");
+  const signature = (lines || []).join("\\n");
+  if (container.dataset.signature === signature) return;
+  container.dataset.signature = signature;
+  reconcileKeyedChildren(container, (lines || []).map(line => {
+    const row = document.createElement("span");
+    row.textContent = `${line}\\n`;
+    return keyedRow(row, line);
+  }));
 }
 
 function accountIsOwner() {
@@ -18221,9 +18349,7 @@ function renderAccounts(accounts) {
   if (!tbody) return;
   const signature = accountsTableSignature(accounts);
   if (signature === accountsSignature) return;
-  if (containsFocusedElement(tbody)) return;
   accountsSignature = signature;
-  tbody.innerHTML = "";
   if (!accounts || accounts.length === 0) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
@@ -18231,17 +18357,17 @@ function renderAccounts(accounts) {
     cell.className = "hint";
     cell.textContent = "No accounts.";
     row.appendChild(cell);
-    tbody.appendChild(row);
+    reconcileKeyedChildren(tbody, [keyedRow(labelResponsiveTableRow(row, tbody), "empty")]);
     return;
   }
-  for (const account of accounts) {
+  reconcileKeyedChildren(tbody, accounts.map(account => {
     const row = document.createElement("tr");
     row.appendChild(tableCell(account.username || ""));
     row.appendChild(tableCell(account.account_type || "Administrator"));
     row.appendChild(tableCell(formatAccountDate(account.last_accessed_at)));
     row.appendChild(accountActionsCell(account));
-    tbody.appendChild(row);
-  }
+    return keyedRow(labelResponsiveTableRow(row, tbody), `account:${account.id || ""}`);
+  }));
 }
 
 function accountActionsCell(account) {
@@ -18797,18 +18923,16 @@ function renderEasAlertList(data) {
   setDisabled(document.getElementById("eas_alert_prev"), easAlertPage <= 1);
   setDisabled(document.getElementById("eas_alert_next"), easAlertPage >= easAlertTotalPages);
   if (nextSignature === easAlertListSignature) return;
-  if (containsFocusedElement(list)) return;
   easAlertListSignature = nextSignature;
-  list.innerHTML = "";
   const alerts = data.alerts || [];
   if (alerts.length === 0) {
     const empty = document.createElement("div");
     empty.className = "hint";
     empty.textContent = "No EAS alerts recorded for this stream.";
-    list.appendChild(empty);
+    reconcileKeyedChildren(list, [keyedRow(empty, "empty")]);
     return;
   }
-  for (const alert of alerts) {
+  reconcileKeyedChildren(list, alerts.map(alert => {
     const item = document.createElement("a");
     item.href = routeForView("eas_alert_detail", {
       streamId: easAlertStreamId,
@@ -18818,8 +18942,8 @@ function renderEasAlertList(data) {
     item.className = "stream-item";
     item.textContent = alert.summary || "Unknown EAS alert";
     item.dataset.alertId = alert.id || "";
-    list.appendChild(item);
-  }
+    return keyedRow(item, `alert:${alert.id || ""}`);
+  }));
 }
 
 async function loadEasAlerts(options = {}) {
@@ -19819,9 +19943,7 @@ function renderIqRecordings(recordings) {
   if (!tbody) return;
   const signature = iqRecordingTableSignature(iqRecordings);
   if (signature === iqRecordingsSignature) return;
-  if (containsFocusedElement(tbody)) return;
   iqRecordingsSignature = signature;
-  tbody.innerHTML = "";
   if (!iqRecordings.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
@@ -19829,12 +19951,10 @@ function renderIqRecordings(recordings) {
     cell.className = "hint";
     cell.textContent = "No I/Q recordings.";
     row.appendChild(cell);
-    tbody.appendChild(row);
+    reconcileKeyedChildren(tbody, [keyedRow(labelResponsiveTableRow(row, tbody), "empty")]);
     return;
   }
-  for (const recording of iqRecordings) {
-    tbody.appendChild(iqRecordingRow(recording));
-  }
+  reconcileKeyedChildren(tbody, iqRecordings.map(recording => keyedRow(labelResponsiveTableRow(iqRecordingRow(recording), tbody), `recording:${recording.id || ""}`)));
 }
 
 function iqRecordingRow(recording) {
@@ -20040,7 +20160,7 @@ function applyStatus(data, options = {}) {
   setText("bytes", data.received_bytes);
   setText("last", data.last_batch_at ? `${data.last_batch_at.toFixed(3)}s` : "never");
   setText("capture-error", data.capture_error || "");
-  setText("logs", data.logs.join("\\n"));
+  renderLogs(data.logs || []);
   renderIqTestSourceStatus(data);
   setFallbackControls(data.fallback);
   setNotificationSettings(data.notifications || {});

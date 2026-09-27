@@ -286,13 +286,64 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
         self.assertIn("renderStreamSettingsSignal(stream);", source)
         self.assertIn('"Not measured while this stream is disabled."', source)
 
-    def test_manage_streams_phone_layout_keeps_table_semantics(self) -> None:
+    def test_served_page_scripts_parse(self) -> None:
+        # The page is a Python string, so a JS escape written with one
+        # backslash in web_control.py becomes a raw line break once served.
+        # Check the scripts exactly as the browser receives them.
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        for name in ("INDEX_HTML", "SETUP_HTML", "MUST_CHANGE_PASSWORD_HTML"):
+            for index, script in enumerate(re.findall(r"<script>(.*?)</script>", getattr(self.web_control, name), re.S)):
+                with self.subTest(page=name, script=index), tempfile.TemporaryDirectory() as tempdir:
+                    path = Path(tempdir) / "page.js"
+                    path.write_text(script, encoding="utf-8")
+                    result = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_polled_lists_update_in_place_for_screen_readers(self) -> None:
+        # Rebuilding a list on each poll destroys the node a screen reader is
+        # reading and throws it back to the top of the page.
+        source = (PACKAGE_PATH / "web_control.py").read_text(encoding="utf-8")
+        for container in (
+            "active-streams-body",
+            "icecast-outputs-body",
+            "soundcard-outputs-body",
+            "accounts-body",
+            "iq-recordings-body",
+            "dashboard-stream-attention",
+            "dashboard-recent-alerts",
+            "logs",
+        ):
+            with self.subTest(container=container):
+                start = source.index(f'document.getElementById("{container}")')
+                body = source[start : source.index("\n}\n", start)]
+                self.assertIn("reconcileKeyedChildren(", body)
+                self.assertNotIn('innerHTML = ""', body)
+                self.assertNotIn("containsFocusedElement(", body)
+
+    def test_tables_phone_layout_keeps_table_semantics(self) -> None:
         source = (PACKAGE_PATH / "web_control.py").read_text(encoding="utf-8")
 
-        self.assertIn('<table class="responsive-table" role="table" aria-label="Manage streams">', source)
         self.assertIn('<th role="columnheader">Signal</th>', source)
-        self.assertIn('<tbody id="active-streams-body" role="rowgroup" aria-live="off">', source)
-        self.assertIn("labelResponsiveTableRow(row, ACTIVE_STREAM_COLUMN_LABELS);", source)
+        for label, body_id in (
+            ("Manage streams", "active-streams-body"),
+            ("Icecast outputs", "icecast-outputs-body"),
+            ("Sound card outputs", "soundcard-outputs-body"),
+            ("Accounts", "accounts-body"),
+            ("I/Q recordings", "iq-recordings-body"),
+        ):
+            with self.subTest(table=label):
+                self.assertIn(f'<table class="responsive-table" role="table" aria-label="{label}">', source)
+                self.assertIn(f'<tbody id="{body_id}" role="rowgroup" aria-live="off">', source)
+                start = source.index(f'document.getElementById("{body_id}")')
+                body = source[start : source.index("\n}\n", start)]
+                self.assertIn("labelResponsiveTableRow(", body)
+        self.assertNotIn("<table aria-label=", source)
         # Visible card labels carry empty alt text so screen readers do not hear them twice.
         self.assertIn('content: attr(data-label) / "";', source)
 
