@@ -112,7 +112,8 @@ TAILSCALE_SKIPPED_OS = {"ios", "android", "ipados", "tvos"}
 VIRTUAL_INTERFACE_PREFIXES = ("br-", "cali", "cni", "docker", "flannel", "kube", "lxc", "podman", "veth", "virbr", "vmnet", "vboxnet")
 
 PAIRING_CODE_DIGITS = 6
-PAIRING_CODE_TTL_SECONDS = 300.0
+# Pairing mode lasts until the user stops it; guessing is limited by closing it
+# after this many incorrect codes in total.
 PAIRING_MAX_ATTEMPTS = 5
 SRP_IDENTITY = b"nwr-stream-manager"
 
@@ -985,7 +986,6 @@ class RemoteSdrHostBackend(Protocol):
 @dataclass
 class _PairingWindow:
     code: str
-    expires_at: float
     attempts: int = 0
 
 
@@ -1013,6 +1013,7 @@ class RemoteSdrServer:
         self.discovery: DiscoveryResponder | None = None
         self.lock = threading.Lock()
         self.pairing: _PairingWindow | None = None
+        self.pairing_ended_reason = ""
         self.connections: dict[int, dict[str, Any]] = {}
         self._connection_ids = 0
 
@@ -1064,31 +1065,34 @@ class RemoteSdrServer:
     # -- pairing ----------------------------------------------------------
 
     def begin_pairing(self) -> dict[str, Any]:
-        code = "".join(secrets.choice("0123456789") for _ in range(PAIRING_CODE_DIGITS))
+        """Enter pairing mode. The code stays the same until pairing mode ends."""
         with self.lock:
-            self.pairing = _PairingWindow(code=code, expires_at=time.time() + PAIRING_CODE_TTL_SECONDS)
-        LOG.info("remote SDR pairing opened for %.0f seconds", PAIRING_CODE_TTL_SECONDS)
+            if self.pairing is None:
+                code = "".join(secrets.choice("0123456789") for _ in range(PAIRING_CODE_DIGITS))
+                self.pairing = _PairingWindow(code=code)
+                self.pairing_ended_reason = ""
+                LOG.info("remote SDR pairing mode started")
         return self.pairing_status()
 
     def cancel_pairing(self) -> None:
         with self.lock:
+            if self.pairing is not None:
+                LOG.info("remote SDR pairing mode stopped")
             self.pairing = None
+            self.pairing_ended_reason = ""
 
     def pairing_status(self) -> dict[str, Any]:
         with self.lock:
-            window = self._active_pairing_locked()
+            window = self.pairing
             if window is None:
-                return {"active": False}
+                return {"active": False, "ended_reason": self.pairing_ended_reason}
             return {
                 "active": True,
                 "code": window.code,
-                "expires_at": window.expires_at,
-                "expires_in_seconds": max(0, int(window.expires_at - time.time())),
+                "attempts_left": PAIRING_MAX_ATTEMPTS - window.attempts,
             }
 
     def _active_pairing_locked(self) -> _PairingWindow | None:
-        if self.pairing is not None and time.time() >= self.pairing.expires_at:
-            self.pairing = None
         return self.pairing
 
     def unpair(self, client_id: str) -> bool:
@@ -1247,12 +1251,12 @@ class RemoteSdrServer:
                     window.attempts += 1
                     if window.attempts >= PAIRING_MAX_ATTEMPTS:
                         self.pairing = None
+                        self.pairing_ended_reason = "too-many-attempts"
                         LOG.warning("remote SDR pairing closed after %s failed attempts", PAIRING_MAX_ATTEMPTS)
             LOG.warning("remote SDR pairing attempt from %s used the wrong code", address[0])
             connection.send_json({"type": "error", "code": "wrong-code", "error": "The pairing code is incorrect."})
             return
-        with self.lock:
-            self.pairing = None
+        # Pairing mode stays on after a success; the user ends it.
         host_token = secrets.token_urlsafe(32)
         connection.send_json(
             {

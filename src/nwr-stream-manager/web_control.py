@@ -12266,7 +12266,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <input id="remote_access_enabled" type="checkbox" aria-describedby="remote_access_hint">
           Share this RTL-SDR with paired devices
         </label>
-        <span id="remote_access_hint" class="hint">Paired NWR Stream Manager devices on your network can use this RTL-SDR for their streams, weather radio receiver and I/Q recordings. Sharing uses TCP port 47432 and UDP port 47433.</span>
+        <span id="remote_access_hint" class="hint">Paired NWR Stream Manager devices on your network can use this RTL-SDR for their streams, weather radio receiver and I/Q recordings. To pair a device, select Pair a device here and enter the code it shows on the other device. Sharing uses TCP port 47432 and UDP port 47433.</span>
         <div id="remote_pairing_controls" hidden>
           <div class="actions">
             <button id="start_remote_pairing" type="button">Pair a device</button>
@@ -20418,6 +20418,9 @@ function renderRemoteSdr(data) {
   }
   setHidden("remote_pairing_controls", !sharing.running);
   renderRemotePairing(sharing, devices);
+  // The sharing machine shows a pairing code; the machine that uses it enters
+  // the code. Entering a code here while sharing would be backwards.
+  setHidden("remote_pair_section", Boolean(sharing.enabled && available));
   if (sharing.error) setMessage("remote-sharing-result", sharing.error, "error");
   renderPairedDevices(devices, remote);
 }
@@ -20444,14 +20447,20 @@ function renderRemotePairing(sharing, devices) {
   const spaced = code.length === 6 ? `${code.slice(0, 3)} ${code.slice(3)}` : code;
   setText(
     "remote_pairing_code",
-    active ? `Pairing code: ${spaced}. Enter it on the other NWR Stream Manager before ${formatClockTime(pairing.expires_at)}.` : ""
+    active ? `Pairing code: ${spaced}. Enter it on the other NWR Stream Manager. This device stays in pairing mode until you select Stop pairing.` : ""
   );
-  if (remotePairingWasActive && !active) {
-    const added = devices.find(device => !remotePairingDeviceIds.includes(device.id));
-    if (added) setMessage("remote-sharing-result", `Paired with ${remoteDeviceName(added)}.`, "success");
-    else setMessage("remote-sharing-result", "The pairing code expired. Select Pair a device to get a new one.");
+  const deviceIds = devices.map(device => device.id);
+  if (active && remotePairingWasActive) {
+    // Pairing mode stays on after each success, so announce every new device.
+    const added = devices.filter(device => !remotePairingDeviceIds.includes(device.id));
+    if (added.length) {
+      setMessage("remote-sharing-result", `Paired with ${sentenceList(added.map(remoteDeviceName))}.`, "success");
+    }
   }
-  if (!remotePairingWasActive && active) remotePairingDeviceIds = devices.map(device => device.id);
+  if (remotePairingWasActive && !active && pairing.ended_reason === "too-many-attempts") {
+    setMessage("remote-sharing-result", "Pairing mode ended after too many incorrect pairing codes. Select Pair a device to start again.", "error");
+  }
+  remotePairingDeviceIds = deviceIds;
   remotePairingWasActive = active;
 }
 

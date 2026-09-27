@@ -426,7 +426,7 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         stored = self.server.devices.path.read_text()
         self.assertNotIn(record["token"], stored)  # each side keeps only a hash of what it accepts
         self.assertIn(record["peer_token"], stored)  # and the token it will present itself
-        self.assertFalse(self.server.pairing_status()["active"])  # one code, one pairing
+        self.assertTrue(self.server.pairing_status()["active"])  # pairing mode stays on until stopped
 
     def test_pairing_rejects_wrong_code_and_closes_after_repeated_failures(self) -> None:
         remote = self.remote
@@ -438,6 +438,20 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(remote.RemoteSdrAuthError, "not open"):
             remote.pair_with_host("127.0.0.1", self.server.port, code, client_id="c" * 64, client_name="x")
         self.assertEqual(self.server.devices.all(), {})
+        self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "too-many-attempts"})
+
+    def test_pairing_mode_keeps_its_code_and_accepts_several_devices(self) -> None:
+        remote = self.remote
+        code = self.server.begin_pairing()["code"]
+        self.assertEqual(self.server.begin_pairing()["code"], code)  # pressing again keeps the code
+        for client_id in ("a" * 64, "b" * 64):
+            remote.pair_with_host("127.0.0.1", self.server.port, code, client_id=client_id, client_name=client_id[0])
+
+        self.assertEqual(sorted(self.server.devices.all()), ["a" * 64, "b" * 64])
+        self.assertEqual(self.server.pairing_status()["code"], code)
+        self.server.cancel_pairing()
+        self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": ""})
+        self.assertNotEqual(self.server.begin_pairing()["code"], "") 
 
     def test_pairing_requires_an_open_window(self) -> None:
         with self.assertRaisesRegex(self.remote.RemoteSdrAuthError, "not open"):
