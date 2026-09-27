@@ -12052,12 +12052,14 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .responsive-table td:not([data-label]) { display: block; }
   .responsive-table td[data-label]::before { content: attr(data-label); content: attr(data-label) / ""; color: #526070; font-size: 12px; font-weight: 700; text-transform: uppercase; }
   .responsive-table .menu-cell .stream-actions-menu { right: 12px; }
+  #remote_pair_section #remote_pair_panel { display: none; }
 }
 @media (max-width: 680px) and (prefers-color-scheme: dark) {
   .responsive-table tr { border-color: #333b48; }
   .responsive-table td[data-label]::before { color: #9aa8ba; }
 }
 @media (max-width: 900px) and (orientation: landscape) {
+  #remote_pair_section #remote_pair_panel { display: none; }
   .topbar { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 14px; padding: 10px 16px; }
   .topbar h1 { font-size: 20px; max-width: 9rem; }
   nav { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; width: 100%; }
@@ -12125,6 +12127,12 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div class="actions">
     <button id="copy_account_secret" type="button">Copy to clipboard</button>
     <button id="dismiss_account_secret" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="remote_pairing_dialog" class="fullscreen-dialog" role="dialog" aria-modal="true" aria-labelledby="remote_pairing_dialog_title" hidden>
+  <div class="fullscreen-dialog-panel">
+    <h2 id="remote_pairing_dialog_title"></h2>
+    <div id="remote_pairing_dialog_body"></div>
   </div>
 </div>
 <div id="same_test_warning_dialog" class="fullscreen-dialog" role="dialog" aria-modal="true" aria-labelledby="same_test_warning_title" hidden>
@@ -12270,9 +12278,22 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <div id="remote_pairing_controls" hidden>
           <div class="actions">
             <button id="start_remote_pairing" type="button">Pair a device</button>
-            <button id="cancel_remote_pairing" type="button" hidden>Stop pairing</button>
           </div>
-          <p id="remote_pairing_code" aria-live="polite"></p>
+          <div id="remote_pairing_panel" hidden>
+            <div class="grid">
+              <label>Pairing code
+                <input id="remote_pairing_code" type="text" readonly autocomplete="off" spellcheck="false" aria-describedby="remote_pairing_code_hint">
+              </label>
+            </div>
+            <div class="actions">
+              <button id="copy_remote_pairing_code" type="button">Copy pairing code</button>
+            </div>
+            <span id="remote_pairing_code_hint" class="hint"></span>
+            <div id="remote-pairing-copy-result" class="message" aria-live="polite"></div>
+            <div class="actions">
+              <button id="cancel_remote_pairing" type="button">Stop pairing</button>
+            </div>
+          </div>
         </div>
       </div>
       <div id="remote-sharing-result" class="message" aria-live="polite"></div>
@@ -12283,6 +12304,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div class="actions">
         <button id="find_remote_devices" type="button">Find devices</button>
       </div>
+      <div id="remote-pair-outcome" class="message" aria-live="polite"></div>
+      <div id="remote_pair_panel">
       <div class="grid">
         <label>Device
           <select id="remote_pair_device"></select>
@@ -12298,8 +12321,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       </div>
       <div class="actions">
         <button id="pair_remote_device" type="button">Pair</button>
+        <button id="close_remote_pair_dialog" type="button" hidden>Close</button>
       </div>
       <div id="remote-pair-result" class="message" aria-live="polite"></div>
+      </div>
     </section>
     <section id="paired_devices_section">
       <h3>Paired devices</h3>
@@ -20420,7 +20445,11 @@ function renderRemoteSdr(data) {
   renderRemotePairing(sharing, devices);
   // The sharing machine shows a pairing code; the machine that uses it enters
   // the code. Entering a code here while sharing would be backwards.
-  setHidden("remote_pair_section", Boolean(sharing.enabled && available));
+  const sharingThisSdr = Boolean(sharing.enabled && available);
+  setHidden("remote_pair_section", sharingThisSdr);
+  if (sharingThisSdr && remotePairingDialogState && remotePairingDialogState.kind === "client") {
+    closeRemotePairingDialog({restoreFocus: false});
+  }
   if (sharing.error) setMessage("remote-sharing-result", sharing.error, "error");
   renderPairedDevices(devices, remote);
 }
@@ -20440,28 +20469,107 @@ function remoteSdrStatusText(remote, devices) {
 
 function renderRemotePairing(sharing, devices) {
   const pairing = sharing.pairing || {};
-  const active = Boolean(pairing.active);
+  const active = Boolean(pairing.active && sharing.running);
+  const panel = document.getElementById("remote_pairing_panel");
+  const panelHadFocus = containsFocusedElement(panel);
   setHidden("start_remote_pairing", active);
-  setHidden("cancel_remote_pairing", !active);
-  const code = String(pairing.code || "");
-  const spaced = code.length === 6 ? `${code.slice(0, 3)} ${code.slice(3)}` : code;
+  setValue("remote_pairing_code", active ? String(pairing.code || "") : "");
   setText(
-    "remote_pairing_code",
-    active ? `Pairing code: ${spaced}. Enter it on the other NWR Stream Manager. This device stays in pairing mode until you select Stop pairing.` : ""
+    "remote_pairing_code_hint",
+    active ? `Enter this code on the other NWR Stream Manager before ${formatClockTime(pairing.expires_at)}. Pairing mode ends when a device pairs.` : ""
   );
-  const deviceIds = devices.map(device => device.id);
-  if (active && remotePairingWasActive) {
-    // Pairing mode stays on after each success, so announce every new device.
+  if (!active && remotePairingDialogState && remotePairingDialogState.kind === "host") {
+    closeRemotePairingDialog();
+  }
+  setHidden("remote_pairing_panel", !active);
+  if (!active) setMessage("remote-pairing-copy-result", "");
+  if (panelHadFocus && !active && !remotePairingDialogState) {
+    document.getElementById("start_remote_pairing").focus();
+  }
+  if (remotePairingWasActive && !active) {
     const added = devices.filter(device => !remotePairingDeviceIds.includes(device.id));
-    if (added.length) {
-      setMessage("remote-sharing-result", `Paired with ${sentenceList(added.map(remoteDeviceName))}.`, "success");
+    if (pairing.ended_reason === "paired" && added.length) {
+      setMessage("remote-sharing-result", `Paired with ${sentenceList(added.map(remoteDeviceName))}. Pairing mode has ended.`, "success");
+    } else if (pairing.ended_reason === "expired") {
+      setMessage("remote-sharing-result", "The pairing code expired. Select Pair a device to get a new one.");
+    } else if (pairing.ended_reason === "too-many-attempts") {
+      setMessage("remote-sharing-result", "Pairing mode ended after too many incorrect pairing codes. Select Pair a device to start again.", "error");
     }
   }
-  if (remotePairingWasActive && !active && pairing.ended_reason === "too-many-attempts") {
-    setMessage("remote-sharing-result", "Pairing mode ended after too many incorrect pairing codes. Select Pair a device to start again.", "error");
-  }
-  remotePairingDeviceIds = deviceIds;
+  if (!remotePairingWasActive && active) remotePairingDeviceIds = devices.map(device => device.id);
   remotePairingWasActive = active;
+}
+
+const PHONE_LAYOUT_QUERY = "(max-width: 680px), (max-width: 900px) and (orientation: landscape)";
+let remotePairingDialogState = null;
+
+function isPhoneLayout() {
+  return window.matchMedia(PHONE_LAYOUT_QUERY).matches;
+}
+
+function setRemotePairingModalOpen(open) {
+  for (const element of sameTestWarningModalTargets()) {
+    if ("inert" in element) element.inert = open;
+    if (open) element.setAttribute("aria-hidden", "true");
+    else element.removeAttribute("aria-hidden");
+  }
+}
+
+function openRemotePairingDialog(kind, title, panelId, opener, focusId) {
+  // On phones the pairing controls get the whole screen. The panel itself is
+  // moved into the dialog (and back afterwards), so there is one set of
+  // controls and the rest of the page can be made inert.
+  if (remotePairingDialogState) closeRemotePairingDialog({restoreFocus: false});
+  const panel = document.getElementById(panelId);
+  const placeholder = document.createComment(`${panelId} home`);
+  panel.parentNode.insertBefore(placeholder, panel);
+  document.getElementById("remote_pairing_dialog_body").appendChild(panel);
+  setText("remote_pairing_dialog_title", title);
+  setHidden("close_remote_pair_dialog", kind !== "client");
+  remotePairingDialogState = {kind, panel, placeholder, opener};
+  setRemotePairingModalOpen(true);
+  document.getElementById("remote_pairing_dialog").hidden = false;
+  const target = document.getElementById(focusId);
+  if (target) target.focus();
+}
+
+function closeRemotePairingDialog(options = {}) {
+  const state = remotePairingDialogState;
+  if (!state) return;
+  remotePairingDialogState = null;
+  state.placeholder.parentNode.insertBefore(state.panel, state.placeholder);
+  state.placeholder.remove();
+  document.getElementById("remote_pairing_dialog").hidden = true;
+  setHidden("close_remote_pair_dialog", true);
+  setRemotePairingModalOpen(false);
+  const opener = state.opener;
+  if (options.restoreFocus !== false && opener && !opener.hidden && !opener.disabled && opener.getClientRects().length) {
+    opener.focus();
+  }
+}
+
+function remotePairingDialogFocusable() {
+  const dialog = document.getElementById("remote_pairing_dialog");
+  if (!dialog || dialog.hidden) return [];
+  return Array.from(dialog.querySelectorAll("a[href], button, input, select, textarea, [tabindex]:not([tabindex='-1'])"))
+    .filter(element => !element.disabled && !element.hidden && element.getClientRects().length > 0);
+}
+
+async function copyRemotePairingCode() {
+  const input = document.getElementById("remote_pairing_code");
+  const button = document.getElementById("copy_remote_pairing_code");
+  if (!input.value) return;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(input.value);
+    } else if (!copyTextWithSelectionFallback(input)) {
+      throw new Error("clipboard is unavailable");
+    }
+    setMessage("remote-pairing-copy-result", "Pairing code copied.", "success");
+  } catch (error) {
+    setMessage("remote-pairing-copy-result", "Copy failed. Select the pairing code and copy it manually.", "error");
+  }
+  if (document.activeElement !== button) button.focus();
 }
 
 function pairedDeviceStatus(device, remote) {
@@ -20600,8 +20708,23 @@ function updateRemotePairAddressVisibility() {
   setHidden("remote_pair_address_hint", !manual);
 }
 
+async function openRemotePairFlow() {
+  setMessage("remote-pair-outcome", "");
+  if (isPhoneLayout()) {
+    openRemotePairingDialog(
+      "client",
+      "Pair with another NWR Stream Manager",
+      "remote_pair_panel",
+      document.getElementById("find_remote_devices"),
+      "remote_pair_device"
+    );
+  }
+  await findRemoteDevices();
+}
+
 async function findRemoteDevices() {
   const button = document.getElementById("find_remote_devices");
+  const hadFocus = document.activeElement === button;
   setDisabled(button, true);
   setMessage("remote-pair-result", "Searching the network...");
   try {
@@ -20620,6 +20743,8 @@ async function findRemoteDevices() {
     setMessage("remote-pair-result", error.message, "error");
   } finally {
     setDisabled(button, false);
+    // Disabling the button drops keyboard focus to the page; put it back.
+    if (hadFocus && (document.activeElement === document.body || !document.activeElement)) button.focus();
   }
 }
 
@@ -20657,11 +20782,14 @@ async function pairRemoteDevice() {
     setValue("remote_pair_code", "");
     remoteDiscoveredDevices = remoteDiscoveredDevices.map(device => added && device.id === added.id ? {...device, paired: true} : device);
     renderRemotePairDeviceOptions();
-    setMessage(
-      "remote-pair-result",
-      `Paired with ${remoteDeviceName(added)}. Either device can now use the other's shared RTL-SDR.`,
-      "success"
-    );
+    const success = `Paired with ${remoteDeviceName(added)}. Either device can now use the other's shared RTL-SDR.`;
+    if (remotePairingDialogState && remotePairingDialogState.kind === "client") {
+      setMessage("remote-pair-result", "");
+      closeRemotePairingDialog();
+      setMessage("remote-pair-outcome", success, "success");
+    } else {
+      setMessage("remote-pair-result", success, "success");
+    }
   } catch (error) {
     setMessage("remote-pair-result", error.message, "error");
   } finally {
@@ -21090,24 +21218,63 @@ document.getElementById("remote_access_enabled").addEventListener("change", even
   setRemoteAccessEnabled(event.target.checked);
 });
 document.getElementById("start_remote_pairing").addEventListener("click", async () => {
+  const opener = document.getElementById("start_remote_pairing");
   try {
     setMessage("remote-sharing-result", "");
     await remoteSdrAction("/api/remote-sdr/pairing/start");
-    document.getElementById("cancel_remote_pairing").focus();
+    if (isPhoneLayout()) {
+      openRemotePairingDialog("host", "Pair a device", "remote_pairing_panel", opener, "remote_pairing_code");
+    } else {
+      document.getElementById("remote_pairing_code").focus();
+    }
   } catch (error) {
     setMessage("remote-sharing-result", error.message, "error");
   }
 });
-document.getElementById("cancel_remote_pairing").addEventListener("click", async () => {
+async function stopRemotePairing() {
   try {
     await remoteSdrAction("/api/remote-sdr/pairing/cancel");
     setMessage("remote-sharing-result", "Pairing stopped.");
-    document.getElementById("start_remote_pairing").focus();
+    closeRemotePairingDialog();
+    const start = document.getElementById("start_remote_pairing");
+    if (!start.hidden) start.focus();
   } catch (error) {
     setMessage("remote-sharing-result", error.message, "error");
   }
+}
+document.getElementById("cancel_remote_pairing").addEventListener("click", stopRemotePairing);
+document.getElementById("copy_remote_pairing_code").addEventListener("click", copyRemotePairingCode);
+document.getElementById("close_remote_pair_dialog").addEventListener("click", () => closeRemotePairingDialog());
+document.getElementById("remote_pairing_dialog").addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    if (remotePairingDialogState && remotePairingDialogState.kind === "host") stopRemotePairing();
+    else closeRemotePairingDialog();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = remotePairingDialogFocusable();
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 });
-document.getElementById("find_remote_devices").addEventListener("click", findRemoteDevices);
+document.addEventListener("focusin", event => {
+  const dialog = document.getElementById("remote_pairing_dialog");
+  if (!remotePairingDialogState || dialog.hidden || dialog.contains(event.target)) return;
+  const focusable = remotePairingDialogFocusable();
+  if (focusable.length) focusable[0].focus();
+});
+document.getElementById("find_remote_devices").addEventListener("click", openRemotePairFlow);
 document.getElementById("remote_pair_device").addEventListener("change", updateRemotePairAddressVisibility);
 document.getElementById("pair_remote_device").addEventListener("click", pairRemoteDevice);
 document.getElementById("remote_pair_code").addEventListener("keydown", event => {

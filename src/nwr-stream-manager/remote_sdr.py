@@ -112,8 +112,9 @@ TAILSCALE_SKIPPED_OS = {"ios", "android", "ipados", "tvos"}
 VIRTUAL_INTERFACE_PREFIXES = ("br-", "cali", "cni", "docker", "flannel", "kube", "lxc", "podman", "veth", "virbr", "vmnet", "vboxnet")
 
 PAIRING_CODE_DIGITS = 6
-# Pairing mode lasts until the user stops it; guessing is limited by closing it
-# after this many incorrect codes in total.
+# Pairing mode ends when a device pairs, after this long, or after this many
+# incorrect codes, whichever comes first.
+PAIRING_CODE_TTL_SECONDS = 300.0
 PAIRING_MAX_ATTEMPTS = 5
 SRP_IDENTITY = b"nwr-stream-manager"
 
@@ -316,8 +317,13 @@ class PairedDeviceStore(_JsonRecordStore):
             },
         )
 
-    def note_address(self, peer_id: str, address: str, port: int | None = None) -> None:
-        """Remember an address the peer was reached at (or connected from)."""
+    def note_address(self, peer_id: str, address: str, port: int | None = None, *, reached: bool = False) -> None:
+        """Remember an address the peer was reached at (or connected from).
+
+        `reached` marks the address this instance last connected to
+        successfully, which is tried first next time so a dead Tailscale
+        address does not cost a timeout on every connection.
+        """
         with self.lock:
             records = self._load_locked()
             record = records.get(str(peer_id))
@@ -325,6 +331,8 @@ class PairedDeviceStore(_JsonRecordStore):
                 return
             addresses = ordered_addresses([address] + list(record.get("addresses") or []) + [record.get("address", "")])
             changes = {"addresses": addresses, "address": addresses[0]}
+            if reached:
+                changes["last_reached_address"] = address
             if port is not None:
                 changes["port"] = int(port)
             if all(record.get(key) == value for key, value in changes.items()):
@@ -986,6 +994,7 @@ class RemoteSdrHostBackend(Protocol):
 @dataclass
 class _PairingWindow:
     code: str
+    expires_at: float
     attempts: int = 0
 
 
@@ -1065,34 +1074,38 @@ class RemoteSdrServer:
     # -- pairing ----------------------------------------------------------
 
     def begin_pairing(self) -> dict[str, Any]:
-        """Enter pairing mode. The code stays the same until pairing mode ends."""
+        """Enter pairing mode, keeping the current code if it is already on."""
         with self.lock:
-            if self.pairing is None:
+            if self._active_pairing_locked() is None:
                 code = "".join(secrets.choice("0123456789") for _ in range(PAIRING_CODE_DIGITS))
-                self.pairing = _PairingWindow(code=code)
+                self.pairing = _PairingWindow(code=code, expires_at=time.time() + PAIRING_CODE_TTL_SECONDS)
                 self.pairing_ended_reason = ""
-                LOG.info("remote SDR pairing mode started")
+                LOG.info("remote SDR pairing mode started for %.0f seconds", PAIRING_CODE_TTL_SECONDS)
         return self.pairing_status()
 
     def cancel_pairing(self) -> None:
         with self.lock:
-            if self.pairing is not None:
+            if self._active_pairing_locked() is not None:
                 LOG.info("remote SDR pairing mode stopped")
+                self.pairing_ended_reason = "stopped"
             self.pairing = None
-            self.pairing_ended_reason = ""
 
     def pairing_status(self) -> dict[str, Any]:
         with self.lock:
-            window = self.pairing
+            window = self._active_pairing_locked()
             if window is None:
                 return {"active": False, "ended_reason": self.pairing_ended_reason}
             return {
                 "active": True,
                 "code": window.code,
+                "expires_at": window.expires_at,
                 "attempts_left": PAIRING_MAX_ATTEMPTS - window.attempts,
             }
 
     def _active_pairing_locked(self) -> _PairingWindow | None:
+        if self.pairing is not None and time.time() >= self.pairing.expires_at:
+            self.pairing = None
+            self.pairing_ended_reason = "expired"
         return self.pairing
 
     def unpair(self, client_id: str) -> bool:
@@ -1256,7 +1269,10 @@ class RemoteSdrServer:
             LOG.warning("remote SDR pairing attempt from %s used the wrong code", address[0])
             connection.send_json({"type": "error", "code": "wrong-code", "error": "The pairing code is incorrect."})
             return
-        # Pairing mode stays on after a success; the user ends it.
+        with self.lock:
+            # One pairing per code: pairing mode ends as soon as a device pairs.
+            self.pairing = None
+            self.pairing_ended_reason = "paired"
         host_token = secrets.token_urlsafe(32)
         connection.send_json(
             {
@@ -1514,7 +1530,11 @@ class RemoteSdrClient:
         def usable(addresses: list[str]) -> list[str]:
             return [address for address in ordered_addresses(addresses) if tailscale or not is_tailscale_address(address)]
 
-        attempts = [(address, port) for address in usable(list(record.get("addresses") or []) + [record.get("address", "")])]
+        last_reached = str(record.get("last_reached_address") or "")
+        remembered = usable(list(record.get("addresses") or []) + [record.get("address", "")])
+        if last_reached in remembered:
+            remembered = [last_reached] + [address for address in remembered if address != last_reached]
+        attempts = [(address, port) for address in remembered]
         last_error: Exception | None = None
         for index in range(2):
             for address, attempt_port in attempts:
@@ -1545,7 +1565,7 @@ class RemoteSdrClient:
                     if welcome.get("code") == "unauthorized":
                         raise RemoteSdrAuthError("The remote SDR no longer recognises this device. Pair it again.")
                     raise RemoteSdrError(str(welcome.get("error", "The remote SDR refused the connection.")))
-                self.hosts.note_address(self.host_id, address, attempt_port)
+                self.hosts.note_address(self.host_id, address, attempt_port, reached=True)
                 return connection
             if index == 0:
                 # The host may have a new address; find it by identity.

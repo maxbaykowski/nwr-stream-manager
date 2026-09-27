@@ -426,7 +426,7 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         stored = self.server.devices.path.read_text()
         self.assertNotIn(record["token"], stored)  # each side keeps only a hash of what it accepts
         self.assertIn(record["peer_token"], stored)  # and the token it will present itself
-        self.assertTrue(self.server.pairing_status()["active"])  # pairing mode stays on until stopped
+        self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "paired"})
 
     def test_pairing_rejects_wrong_code_and_closes_after_repeated_failures(self) -> None:
         remote = self.remote
@@ -440,18 +440,34 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         self.assertEqual(self.server.devices.all(), {})
         self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "too-many-attempts"})
 
-    def test_pairing_mode_keeps_its_code_and_accepts_several_devices(self) -> None:
+    def test_pairing_mode_ends_after_one_device_pairs(self) -> None:
         remote = self.remote
         code = self.server.begin_pairing()["code"]
         self.assertEqual(self.server.begin_pairing()["code"], code)  # pressing again keeps the code
-        for client_id in ("a" * 64, "b" * 64):
-            remote.pair_with_host("127.0.0.1", self.server.port, code, client_id=client_id, client_name=client_id[0])
+        remote.pair_with_host("127.0.0.1", self.server.port, code, client_id="a" * 64, client_name="a")
+        with self.assertRaisesRegex(remote.RemoteSdrAuthError, "not open"):
+            remote.pair_with_host("127.0.0.1", self.server.port, code, client_id="b" * 64, client_name="b")
 
-        self.assertEqual(sorted(self.server.devices.all()), ["a" * 64, "b" * 64])
-        self.assertEqual(self.server.pairing_status()["code"], code)
+        self.assertEqual(sorted(self.server.devices.all()), ["a" * 64])
+        self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "paired"})
+
+    def test_pairing_code_expires_after_five_minutes(self) -> None:
+        from unittest.mock import patch
+
+        remote = self.remote
+        started = time.time()
+        with patch.object(remote.time, "time", return_value=started):
+            code = self.server.begin_pairing()["code"]
+            self.assertEqual(self.server.pairing_status()["expires_at"], started + remote.PAIRING_CODE_TTL_SECONDS)
+        with patch.object(remote.time, "time", return_value=started + remote.PAIRING_CODE_TTL_SECONDS + 1):
+            self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "expired"})
+        with self.assertRaisesRegex(remote.RemoteSdrAuthError, "not open"):
+            remote.pair_with_host("127.0.0.1", self.server.port, code, client_id="a" * 64, client_name="a")
+
+    def test_stopping_pairing_mode(self) -> None:
+        self.server.begin_pairing()
         self.server.cancel_pairing()
-        self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": ""})
-        self.assertNotEqual(self.server.begin_pairing()["code"], "") 
+        self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "stopped"})
 
     def test_pairing_requires_an_open_window(self) -> None:
         with self.assertRaisesRegex(self.remote.RemoteSdrAuthError, "not open"):
@@ -581,6 +597,33 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         connection.close()
 
         self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_after_falling_back_the_working_address_is_tried_first(self) -> None:
+        from unittest.mock import patch
+
+        record = self.pair()
+        # A Tailscale address that times out (a blackholed TEST-NET address stands in).
+        self.hosts.update(record["id"], addresses=["100.64.0.1", "127.0.0.1"], address="100.64.0.1")
+        client = self.remote.RemoteSdrClient(
+            self.host_identity.fingerprint, self.hosts, client_id=self.client_identity.fingerprint, discovery_targets=["127.0.0.1"]
+        )
+        attempts: list[str] = []
+        original = self.remote.open_host_connection
+
+        def recording_open(address, port, **kwargs):
+            attempts.append(address)
+            if address == "100.64.0.1":
+                raise TimeoutError("timed out")
+            return original(address, port, **kwargs)
+
+        with patch.object(self.remote, "tailscale_is_up", return_value=True), patch.object(self.remote, "open_host_connection", recording_open):
+            client.connect(self.remote.REMOTE_SDR_ROLE_CONTROL).close()
+            first = list(attempts)
+            attempts.clear()
+            client.connect(self.remote.REMOTE_SDR_ROLE_CONTROL).close()
+
+        self.assertEqual(first, ["100.64.0.1", "127.0.0.1"])
+        self.assertEqual(attempts, ["127.0.0.1"])  # no second timeout on the dead address
 
     def test_pairing_shares_both_machines_addresses(self) -> None:
         from unittest.mock import patch
