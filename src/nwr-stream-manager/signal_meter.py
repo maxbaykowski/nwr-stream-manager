@@ -58,7 +58,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -92,6 +92,8 @@ RECEPTION_PROBLEM_NO_SIGNAL = "no_signal"
 BAD_RECEPTION_SNR_DB = 6.0
 BAD_RECEPTION_RECOVERY_SNR_DB = 9.0
 BAD_RECEPTION_SUSTAIN_SECONDS = 20.0
+SIGNAL_RESTORED_SNR_DB = 2.0
+SIGNAL_RESTORED_SECONDS = 3.0
 
 
 def signal_quality(snr_db: float | None) -> str:
@@ -164,6 +166,7 @@ class ChannelSignalMeter:
         block_seconds: float = SIGNAL_METER_BLOCK_SECONDS,
         noise_window_seconds: float = SIGNAL_METER_NOISE_WINDOW_SECONDS,
         smoothing_seconds: float = SIGNAL_METER_SMOOTHING_SECONDS,
+        on_measurement: Callable[[SignalMeasurement, float], None] | None = None,
     ) -> None:
         if sample_rate <= 0:
             raise ValueError("sample_rate must be greater than 0")
@@ -171,6 +174,7 @@ class ChannelSignalMeter:
         if not 0.0 < channel_half_bandwidth_hz < noise_low_hz < noise_high_hz <= nyquist:
             raise ValueError("signal band and noise reference band must be ordered inside Nyquist")
         self.sample_rate = int(sample_rate)
+        self.on_measurement = on_measurement
         self.fft_size = int(fft_size)
         self.block_samples = max(self.fft_size, int(round(block_seconds * self.sample_rate)))
         self.channel_half_bandwidth_hz = float(channel_half_bandwidth_hz)
@@ -316,6 +320,8 @@ class ChannelSignalMeter:
         )
         with self._lock:
             self._measurement = measurement
+        if self.on_measurement is not None:
+            self.on_measurement(measurement, block.size / self.sample_rate)
 
     def _update_bad_reception(self, snr_db: float | None) -> bool:
         # Timed on processed IQ rather than wall clock so gaps in the source
@@ -334,6 +340,58 @@ class ChannelSignalMeter:
         if self._stream_seconds - self._bad_since >= BAD_RECEPTION_SUSTAIN_SECONDS:
             self._bad_reception = True
         return self._bad_reception
+
+
+class SignalPresenceTracker:
+    """Whether a stream's station is currently unusable ("no signal").
+
+    Lost as soon as a measurement reads no signal; restored only once the SNR
+    has stayed at or above SIGNAL_RESTORED_SNR_DB for SIGNAL_RESTORED_SECONDS
+    of received IQ, so a signal hovering around the FM threshold does not
+    flip fallback audio on and off. Time is counted in measured IQ rather
+    than wall clock, so an SDR dropout neither restores nor extends it; the
+    state survives meter resets (gain, filter, SDR source changes) because
+    those do not change what the station is doing.
+    """
+
+    def __init__(
+        self,
+        *,
+        restored_snr_db: float = SIGNAL_RESTORED_SNR_DB,
+        restored_seconds: float = SIGNAL_RESTORED_SECONDS,
+    ) -> None:
+        self.restored_snr_db = float(restored_snr_db)
+        self.restored_seconds = float(restored_seconds)
+        self._lock = threading.Lock()
+        self._lost = False
+        self._restoring_seconds = 0.0
+
+    @property
+    def lost(self) -> bool:
+        with self._lock:
+            return self._lost
+
+    def reset(self) -> None:
+        with self._lock:
+            self._lost = False
+            self._restoring_seconds = 0.0
+
+    def update(self, measurement: SignalMeasurement, block_seconds: float) -> None:
+        with self._lock:
+            if measurement.quality == SIGNAL_QUALITY_NO_SIGNAL:
+                self._lost = True
+                self._restoring_seconds = 0.0
+                return
+            if not self._lost:
+                return
+            snr_db = measurement.snr_db
+            if snr_db is not None and snr_db >= self.restored_snr_db:
+                self._restoring_seconds += float(block_seconds)
+                if self._restoring_seconds >= self.restored_seconds:
+                    self._lost = False
+                    self._restoring_seconds = 0.0
+            else:
+                self._restoring_seconds = 0.0
 
 
 def _rounded(value: float | None) -> float | None:

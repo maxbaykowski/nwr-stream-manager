@@ -98,7 +98,7 @@ if __package__:
     )
     from .same_data import lookup_event, lookup_location
     from .same_live import SameEventQueue, SameSuppressionProcessor, generate_same_message
-    from .signal_meter import ChannelSignalMeter, noise_reference_band_for_transition
+    from .signal_meter import ChannelSignalMeter, SignalPresenceTracker, noise_reference_band_for_transition
     from .webrtc import (
         AiortcSessionManager,
         OpusEncoder,
@@ -192,6 +192,7 @@ else:
     SameSuppressionProcessor = same_live.SameSuppressionProcessor
     generate_same_message = same_live.generate_same_message
     ChannelSignalMeter = signal_meter.ChannelSignalMeter
+    SignalPresenceTracker = signal_meter.SignalPresenceTracker
     noise_reference_band_for_transition = signal_meter.noise_reference_band_for_transition
     AiortcSessionManager = webrtc.AiortcSessionManager
     OpusEncoder = webrtc.OpusEncoder
@@ -3068,7 +3069,8 @@ class IcecastStreamWorker:
         self.eas_error: str | None = None
         self.last_audio_at: float | None = None
         self.test_mode_source: SyntheticNwrTestModeSource | None = None
-        self.signal_meter = ChannelSignalMeter(IQ_SAMPLE_RATE)
+        self.signal_presence = SignalPresenceTracker()
+        self.signal_meter = ChannelSignalMeter(IQ_SAMPLE_RATE, on_measurement=self.signal_presence.update)
         self._configure_signal_meter(
             alias_filter_transition_hz(CHANNEL_IQ_ALIAS_TRANSITION_HZ, self.alias_filter_strength_provider())
         )
@@ -3368,6 +3370,11 @@ class IcecastStreamWorker:
         fallback = load_web_fallback_audio()
         fallback_state = WebFallbackPlaybackState()
         last_real_audio = time.monotonic()
+        # When the current fallback condition began: the SDR delivering no IQ,
+        # the station having no signal, or one handing over to the other. It is
+        # only cleared once IQ is flowing and the signal is not lost, so a
+        # dropout during a no-signal period does not restart the delay.
+        fallback_since: float | None = None
         idle_output_active = False
         idle_next_frame_at: float | None = None
         source_generation = getattr(self.fanout, "generation", 0)
@@ -3503,6 +3510,7 @@ class IcecastStreamWorker:
                 except queue.Empty:
                     pass
                 fallback_state.reset()
+                fallback_since = None
                 frame_buffer.clear()
                 idle_next_frame_at = None
                 test_mode_next_frame_at = None
@@ -3514,10 +3522,12 @@ class IcecastStreamWorker:
                 if not test_mode_was_active:
                     test_demodulator.reset()
                     self.signal_meter.reset()
+                    self.signal_presence.reset()
                     test_frame_buffer.clear()
                     real_test_iq_frame_buffer.clear()
                     real_test_iq_frames.clear()
                     fallback_state.reset()
+                    fallback_since = None
                     idle_next_frame_at = None
                     test_mode_next_frame_at = time.monotonic()
                     test_crossfade_state = "enter"
@@ -3572,6 +3582,8 @@ class IcecastStreamWorker:
                 self._configure_signal_meter(
                     alias_filter_transition_hz(CHANNEL_IQ_ALIAS_TRANSITION_HZ, self.alias_filter_strength_provider())
                 )
+                self.signal_presence.reset()
+                fallback_since = None
                 test_frame_buffer.clear()
                 real_test_iq_frame_buffer.clear()
                 real_test_iq_frames.clear()
@@ -3596,7 +3608,9 @@ class IcecastStreamWorker:
                 frames_due = max(1, int((now - idle_next_frame_at) / STREAM_FRAME_SECONDS) + 1)
                 frames_due = min(frames_due, 8)
                 fallback_settings = self.fallback_settings_provider()
-                idle_seconds = time.monotonic() - last_real_audio
+                if fallback_since is None:
+                    fallback_since = last_real_audio
+                idle_seconds = time.monotonic() - fallback_since
                 if not fallback_settings.enabled:
                     fallback_state.reset()
                     idle_next_frame_at = None
@@ -3611,7 +3625,7 @@ class IcecastStreamWorker:
                             with self.lock:
                                 fallback_station = self.stream.get("station", {})
                             LOG.info(
-                                "starting fallback audio for %s after %.1f seconds without IQ",
+                                "starting fallback audio for %s after %.1f seconds without IQ or a usable signal",
                                 fallback_station.get("callsign"),
                                 idle_seconds,
                             )
@@ -3637,7 +3651,6 @@ class IcecastStreamWorker:
                 demodulator = ComplexNfmDemodulator()
                 self.signal_meter.reset()
                 frame_buffer.clear()
-                fallback_state.reset()
                 idle_next_frame_at = None
                 LOG.info(
                     "stream DSP source generation changed for %s; reset channel state",
@@ -3689,6 +3702,9 @@ class IcecastStreamWorker:
                     channelizer_target_frequency_hz = target_frequency_hz
                     demodulator.reset()
                     self.signal_meter.reset()
+                    self.signal_presence.reset()
+                    fallback_state.reset()
+                    fallback_since = None
             current_gain = self.gain_provider()
             if current_gain != signal_meter_gain:
                 # RTL-SDR gain scales signal and noise together, so a step
@@ -3714,10 +3730,26 @@ class IcecastStreamWorker:
                 )
             if len(audio) == 0:
                 continue
-            last_real_audio = time.monotonic()
-            if fallback_state.active:
-                LOG.info("stopping fallback audio for %s", station.get("callsign"))
-            fallback_state.reset()
+            now = time.monotonic()
+            last_real_audio = now
+            fallback_settings = self.fallback_settings_provider()
+            if fallback_settings.enabled and self.signal_presence.lost:
+                # Keep demodulating so the meter sees the signal return, but
+                # after the fallback delay play fallback audio instead of static.
+                if fallback_since is None:
+                    fallback_since = now
+                if not fallback_state.active and now - fallback_since >= fallback_settings.silence_timeout_seconds:
+                    fallback_state.active = True
+                    LOG.info(
+                        "starting fallback audio for %s after %.1f seconds without a usable signal",
+                        station.get("callsign"),
+                        now - fallback_since,
+                    )
+            else:
+                if fallback_state.active:
+                    LOG.info("stopping fallback audio for %s", station.get("callsign"))
+                fallback_state.reset()
+                fallback_since = None
             with self.lock:
                 self.last_audio_at = time.time()
             for frame in frame_buffer.push(audio):
@@ -3731,7 +3763,11 @@ class IcecastStreamWorker:
                         ", ".join(changed_effects) or "none",
                     )
                 processed_frame = effects.process(frame)
-                self._write_pcm(float_to_s16(processed_frame), processed_frame)
+                if fallback_state.active:
+                    fallback_pcm = next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds)
+                    self._write_pcm(fallback_pcm, pcm_s16le_to_float32(fallback_pcm))
+                else:
+                    self._write_pcm(float_to_s16(processed_frame), processed_frame)
 
     def encoder_group_for(self, config: IcecastConfig) -> "IcecastEncoderGroup":
         key = icecast_encoder_key(config)

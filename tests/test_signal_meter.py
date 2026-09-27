@@ -443,5 +443,198 @@ class StreamGainChangeSignalMeterTests(unittest.TestCase):
         raise AssertionError("condition was not met before timeout")
 
 
+
+class SignalPresenceTrackerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.signal_meter = load_package_module("signal_meter")
+
+    def measurement(self, snr_db):
+        sm = self.signal_meter
+        return sm.SignalMeasurement(
+            channel_power_dbfs=None,
+            noise_floor_dbfs=None,
+            noise_density_dbfs_per_hz=None,
+            signal_dbfs=None,
+            snr_db=snr_db,
+            cn0_db_hz=None,
+            carrier_detected=False,
+            channel_bandwidth_hz=16_000.0,
+            measured_at=0.0,
+            quality=sm.signal_quality(snr_db),
+        )
+
+    def feed(self, tracker, snr_db, seconds, block=0.25):
+        for _ in range(int(round(seconds / block))):
+            tracker.update(self.measurement(snr_db), block)
+
+    def test_lost_immediately_and_restored_only_after_sustained_snr(self) -> None:
+        tracker = self.signal_meter.SignalPresenceTracker()
+        self.feed(tracker, 10.0, 1.0)
+        self.assertFalse(tracker.lost)
+        self.feed(tracker, -1.0, 0.25)
+        self.assertTrue(tracker.lost)
+        self.feed(tracker, 1.5, 5.0)  # above 0 dB but under the 2 dB restore level
+        self.assertTrue(tracker.lost)
+        self.feed(tracker, 2.5, 2.75)
+        self.assertTrue(tracker.lost)
+        self.feed(tracker, 1.0, 0.25)  # a dip restarts the count
+        self.feed(tracker, 2.5, 2.75)
+        self.assertTrue(tracker.lost)
+        self.feed(tracker, 2.5, 0.25)  # 3 s at or above 2 dB
+        self.assertFalse(tracker.lost)
+
+    def test_meter_reports_every_block_to_callback(self) -> None:
+        received = []
+        meter = self.signal_meter.ChannelSignalMeter(SAMPLE_RATE, on_measurement=lambda m, seconds: received.append(seconds))
+        rng = np.random.default_rng(12)
+        meter.process(complex_noise(rng, SAMPLE_RATE, 1e-6))  # one call, four blocks
+
+        self.assertEqual(received, [0.25] * 4)
+
+
+class StreamNoSignalFallbackTests(unittest.TestCase):
+    """Fallback audio also covers a station with no usable signal."""
+
+    FALLBACK_SAMPLE = 1234
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        self.rng = np.random.default_rng(21)
+        self.original_fallback_loader = wc.load_web_fallback_audio
+        sample = self.FALLBACK_SAMPLE
+        wc.load_web_fallback_audio = lambda sample_rate=wc.IQ_SAMPLE_RATE: types.SimpleNamespace(
+            pcm=np.full(sample_rate, sample, dtype="<i2").tobytes(),
+            sample_rate=sample_rate,
+        )
+        self.addCleanup(setattr, wc, "load_web_fallback_audio", self.original_fallback_loader)
+
+    def start_worker(self, delay_seconds: float):
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+
+        class Fanout:
+            def __init__(self) -> None:
+                self.queue = wc.queue.Queue(maxsize=4096)
+
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return self.queue
+
+            def unsubscribe(self, subscriber) -> None:
+                pass
+
+        fanout = Fanout()
+        worker = wc.IcecastStreamWorker(
+            stream={
+                "id": "stream-1",
+                "station": {"callsign": "WXN99", "frequency": "162.475"},
+                "outputs": [],
+                "eas_recording": {"enabled": True},
+            },
+            fanout=fanout,
+            fallback_settings_provider=lambda: wc.WebFallbackSettings(
+                enabled=True, silence_timeout_seconds=delay_seconds, loop_delay_seconds=0.0
+            ),
+            alias_filter_strength_provider=lambda: wc.ALIAS_FILTER_STRENGTH_DEFAULT,
+            state_directory=Path(tempdir.name),
+        )
+        self.frames = []
+        self.frames_lock = wc.threading.Lock()
+
+        def capture(pcm, float_samples=None):
+            kind = "fallback" if pcm[:2] == np.int16(self.FALLBACK_SAMPLE).tobytes() else (
+                "silence" if not any(pcm) else "nwr"
+            )
+            with self.frames_lock:
+                self.frames.append((time.monotonic(), kind))
+
+        worker._write_pcm = capture
+        worker.start()
+        self.addCleanup(worker.stop)
+        return worker, fanout
+
+    def push(self, fanout, snr_db, seconds, *, pace: bool = False) -> None:
+        wc = self.web_control
+        count = int(SAMPLE_RATE * seconds)
+        noise_density = 10.0 ** (-100.0 / 10.0)
+        iq = complex_noise(self.rng, count, noise_density * SAMPLE_RATE)
+        if snr_db is not None:
+            t = np.arange(count) / SAMPLE_RATE
+            power = noise_density * 16_000.0 * 10.0 ** (snr_db / 10.0)
+            iq += fm_carrier(np.sin(2.0 * np.pi * 1_050.0 * t), SAMPLE_RATE, 5_000.0, power)
+        chunk = SAMPLE_RATE // 20
+        for start in range(0, count, chunk):
+            fanout.queue.put(
+                wc.IqSampleBatch(data=iq[start : start + chunk].astype(np.complex64), sample_rate=SAMPLE_RATE, center_frequency_hz=162_475_000)
+            )
+            if pace:
+                time.sleep(chunk / SAMPLE_RATE)
+        StreamGainChangeSignalMeterTests._wait_for(lambda: fanout.queue.empty(), timeout=10.0)
+        time.sleep(0.1)
+
+    def lose_signal(self, worker, fanout) -> None:
+        # The meter smooths power over about a second, so a carrier dropping
+        # from a strong signal takes several seconds of IQ to read as no signal.
+        self.push(fanout, None, 8.0)
+        self.assertTrue(worker.signal_presence.lost)
+
+    def kinds_since(self, index: int) -> list[str]:
+        with self.frames_lock:
+            return [kind for _, kind in self.frames[index:]]
+
+    def mark(self) -> int:
+        with self.frames_lock:
+            return len(self.frames)
+
+    def test_no_signal_plays_fallback_after_delay_and_returns_after_sustained_signal(self) -> None:
+        worker, fanout = self.start_worker(delay_seconds=0.5)
+        self.push(fanout, 25.0, 2.0)
+        self.assertNotIn("fallback", self.kinds_since(0))
+
+        start = self.mark()
+        self.lose_signal(worker, fanout)
+        self.push(fanout, None, 1.0, pace=True)  # keep it lost for longer than the delay
+        kinds = self.kinds_since(start)
+        self.assertEqual(kinds[0], "nwr")  # static until the delay passes
+        self.assertEqual(kinds[-1], "fallback")
+
+        start = self.mark()
+        self.push(fanout, 20.0, 2.0)  # back, but not yet for the 3 s restore period
+        self.assertEqual(set(self.kinds_since(start)), {"fallback"})
+        start = self.mark()
+        self.push(fanout, 20.0, 2.0)
+        kinds = self.kinds_since(start)
+        self.assertEqual(kinds[0], "fallback")
+        self.assertEqual(kinds[-1], "nwr")
+
+    def test_sdr_dropout_during_no_signal_does_not_restart_the_delay(self) -> None:
+        worker, fanout = self.start_worker(delay_seconds=2.2)
+        self.push(fanout, 25.0, 1.0)
+        self.lose_signal(worker, fanout)  # the delay starts here
+        self.push(fanout, None, 1.5, pace=True)
+        start = self.mark()
+        StreamGainChangeSignalMeterTests._wait_for(lambda: len(self.kinds_since(start)) >= 5, timeout=5.0)
+        # IQ stopped after 1.5 s of no signal. With the timer carried over,
+        # fallback is due as soon as the idle output starts; a restarted
+        # timer would send about a second of silence first.
+        self.assertEqual(self.kinds_since(start)[0], "fallback")
+
+    def test_sdr_dropout_with_good_signal_still_resumes_immediately(self) -> None:
+        worker, fanout = self.start_worker(delay_seconds=0.3)
+        self.push(fanout, 25.0, 1.0)
+        start = self.mark()
+        StreamGainChangeSignalMeterTests._wait_for(lambda: "fallback" in self.kinds_since(start), timeout=5.0)
+        start = self.mark()
+        self.push(fanout, 25.0, 0.5)
+        kinds = [kind for kind in self.kinds_since(start) if kind != "silence"]
+        self.assertEqual(kinds[-1], "nwr")
+        self.assertLessEqual(kinds.count("fallback"), 2)  # at most a frame already in flight
+
+
 if __name__ == "__main__":
     unittest.main()
