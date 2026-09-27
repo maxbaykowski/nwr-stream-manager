@@ -49,7 +49,6 @@ PYTHON_DEPENDENCIES = (
     ),
     PythonDependency("soxr", "soxr"),
     PythonDependency("lameenc", "lameenc"),
-    PythonDependency("aiortc", "aiortc"),
     PythonDependency("easrecorder", "easrecorder"),
 )
 
@@ -135,7 +134,7 @@ NATIVE_DEPENDENCIES = (
     ),
 )
 
-EXECUTABLE_DEPENDENCIES = ("multimon-ng",)
+EXECUTABLE_DEPENDENCIES = ("multimon-ng", "openssl")
 
 
 def check_startup_dependencies() -> list[DependencyCheckResult]:

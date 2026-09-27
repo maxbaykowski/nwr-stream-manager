@@ -2,17 +2,12 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
-import asyncio
-import importlib.util
-import json
 import logging
-import queue
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from fractions import Fraction
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -29,8 +24,6 @@ WEBRTC_OPUS_FRAME_SAMPLES = round(WEBRTC_OPUS_SAMPLE_RATE * WEBRTC_FRAME_SECONDS
 WEBRTC_MAX_OPUS_PACKET_BYTES = 4_000
 WEBRTC_TARGET_BITRATE_KBPS = 128
 WEBRTC_MIN_BITRATE_KBPS = 32
-WEBRTC_BITRATE_STEP_KBPS = 8
-WEBRTC_RECOVERY_STABLE_FEEDBACKS = 12
 LIVE_AUDIO_TCP_BITRATE_LADDER_KBPS = (6, 8, 12, 16, 32, 64, 96, 128)
 LIVE_AUDIO_TCP_TARGET_BITRATE_KBPS = 128
 LIVE_AUDIO_TCP_SEND_SLOW_SECONDS = 0.06
@@ -91,110 +84,6 @@ class _CtypesOpusModule:
 
 
 _OPUS_MODULE: Any | None = None
-
-
-@dataclass(frozen=True)
-class WebRtcCapabilityReport:
-    transport_available: bool
-    opus_available: bool
-    target_bitrate_kbps: int = WEBRTC_TARGET_BITRATE_KBPS
-    minimum_bitrate_kbps: int = WEBRTC_MIN_BITRATE_KBPS
-    bitrate_step_kbps: int = WEBRTC_BITRATE_STEP_KBPS
-    transport_error: str = ""
-    opus_error: str = ""
-
-    @property
-    def available(self) -> bool:
-        return self.transport_available and self.opus_available
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "available": self.available,
-            "transport_available": self.transport_available,
-            "opus_available": self.opus_available,
-            "target_bitrate_kbps": self.target_bitrate_kbps,
-            "minimum_bitrate_kbps": self.minimum_bitrate_kbps,
-            "bitrate_step_kbps": self.bitrate_step_kbps,
-            "transport_error": self.transport_error,
-            "opus_error": self.opus_error,
-        }
-
-
-def server_webrtc_capabilities() -> WebRtcCapabilityReport:
-    transport_error = ""
-    opus_error = ""
-    transport_available = importlib.util.find_spec("aiortc") is not None
-    if not transport_available:
-        transport_error = "The 'aiortc' package is not installed."
-    try:
-        _load_opus_module()
-        opus_available = True
-    except Exception as exc:
-        opus_available = False
-        opus_error = str(exc)
-    return WebRtcCapabilityReport(
-        transport_available=transport_available,
-        opus_available=opus_available,
-        transport_error=transport_error,
-        opus_error=opus_error,
-    )
-
-
-class OpusBitrateController:
-    def __init__(
-        self,
-        *,
-        target_kbps: int = WEBRTC_TARGET_BITRATE_KBPS,
-        minimum_kbps: int = WEBRTC_MIN_BITRATE_KBPS,
-        step_kbps: int = WEBRTC_BITRATE_STEP_KBPS,
-        recovery_stable_feedbacks: int = WEBRTC_RECOVERY_STABLE_FEEDBACKS,
-    ) -> None:
-        if minimum_kbps <= 0:
-            raise ValueError("minimum bitrate must be positive")
-        if target_kbps < minimum_kbps:
-            raise ValueError("target bitrate must be greater than or equal to minimum")
-        if step_kbps <= 0:
-            raise ValueError("bitrate step must be positive")
-        self.target_kbps = target_kbps
-        self.minimum_kbps = minimum_kbps
-        self.step_kbps = step_kbps
-        self.recovery_stable_feedbacks = max(1, recovery_stable_feedbacks)
-        self.current_kbps = target_kbps
-        self._stable_feedbacks = 0
-
-    def update(
-        self,
-        *,
-        available_bitrate_bps: int | None = None,
-        packet_loss_fraction: float = 0.0,
-        rtt_ms: float | None = None,
-    ) -> int:
-        slow = False
-        if available_bitrate_bps is not None:
-            slow = available_bitrate_bps < self.current_kbps * 1000
-        if packet_loss_fraction >= 0.03:
-            slow = True
-        if rtt_ms is not None and rtt_ms >= 500:
-            slow = True
-
-        if slow:
-            self._stable_feedbacks = 0
-            self.current_kbps = max(
-                self.minimum_kbps, self.current_kbps - self.step_kbps
-            )
-            return self.current_kbps
-
-        if self.current_kbps >= self.target_kbps:
-            self._stable_feedbacks = 0
-            return self.current_kbps
-
-        self._stable_feedbacks += 1
-        if self._stable_feedbacks >= self.recovery_stable_feedbacks:
-            self.current_kbps = min(
-                self.target_kbps, self.current_kbps + self.step_kbps
-            )
-            self._stable_feedbacks = 0
-        return self.current_kbps
 
 
 class TcpOpusBitrateController:
@@ -472,9 +361,6 @@ class WebRtcAudioSource:
         self.max_buffered_frames = 0
         self.last_frame_at = 0.0
         self.last_underrun_log_at = 0.0
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._event: asyncio.Event | None = None
-        self._notify_sequence = 0
         self._prebuffered = False
 
     def push_pcm(self, pcm_s16le: bytes) -> None:
@@ -493,37 +379,10 @@ class WebRtcAudioSource:
                 self.pushed_frames += 1
                 self.max_buffered_frames = max(self.max_buffered_frames, len(self.buffer))
                 self.last_frame_at = now
-            self._notify_sequence += 1
             if len(self.buffer) > self.latency_high_water_frames:
                 while len(self.buffer) > self.latency_trim_to_frames:
                     self.buffer.popleft()
                     self.stale_frames += 1
-        self._notify_loop()
-
-    async def read_pcm(self, timeout: float = 0.25) -> bytes:
-        self._bind_loop(asyncio.get_running_loop())
-        if not self._prebuffered and self.prebuffer_frames:
-            await self._wait_for_buffer(
-                self.prebuffer_frames,
-                max(timeout, self.prebuffer_timeout_seconds),
-            )
-            self._prebuffered = True
-        elif self.low_water_frames:
-            with self.lock:
-                buffered = len(self.buffer)
-            if 0 < buffered < self.low_water_frames:
-                await self._wait_for_buffer(
-                    self.low_water_frames,
-                    max(WEBRTC_FRAME_SECONDS, self.refill_timeout_seconds),
-                )
-        frame = await self._pop_frame(timeout)
-        if frame is None:
-            self.underrun_frames += 1
-            self._log_underrun()
-            self._prebuffered = False
-            return b"\x00" * self.frame_bytes
-        self.read_frames += 1
-        return frame
 
     def get_latest_pcm(self, timeout: float = WEBRTC_FRAME_SECONDS) -> bytes:
         deadline = time.monotonic() + max(0.0, timeout)
@@ -569,8 +428,6 @@ class WebRtcAudioSource:
             self.buffer.clear()
             self.stale_frames += dropped
             self._prebuffered = True
-            self._notify_sequence += 1
-        self._notify_loop()
 
     def stats(self) -> dict[str, Any]:
         with self.lock:
@@ -600,7 +457,6 @@ class WebRtcAudioSource:
 
     def close(self) -> None:
         self.closed.set()
-        self._notify_loop()
 
     def _split_frames(self, pcm_s16le: bytes) -> list[bytes]:
         frames = []
@@ -611,37 +467,6 @@ class WebRtcAudioSource:
             if frame:
                 frames.append(frame)
         return frames
-
-    def _bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        if self._loop is loop and self._event is not None:
-            return
-        self._loop = loop
-        self._event = asyncio.Event()
-
-    async def _wait_for_buffer(self, frame_count: int, timeout: float) -> None:
-        deadline = time.monotonic() + max(0.0, timeout)
-        while not self.closed.is_set():
-            with self.lock:
-                if len(self.buffer) >= frame_count:
-                    return
-                notify_sequence = self._notify_sequence
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            await self._wait_for_push(min(remaining, WEBRTC_FRAME_SECONDS), notify_sequence)
-
-    async def _pop_frame(self, timeout: float) -> bytes | None:
-        deadline = time.monotonic() + max(0.0, timeout)
-        while not self.closed.is_set():
-            with self.lock:
-                if self.buffer:
-                    return self.buffer.popleft()
-                notify_sequence = self._notify_sequence
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            await self._wait_for_push(min(remaining, WEBRTC_FRAME_SECONDS), notify_sequence)
-        return None
 
     def _wait_for_buffer_blocking(self, frame_count: int, timeout: float) -> None:
         deadline = time.monotonic() + max(0.0, timeout)
@@ -666,33 +491,6 @@ class WebRtcAudioSource:
             time.sleep(min(0.005, remaining))
         return None
 
-    async def _wait_for_push(self, timeout: float, notify_sequence: int | None = None) -> None:
-        event = self._event
-        if event is None:
-            await asyncio.sleep(timeout)
-            return
-        if notify_sequence is not None:
-            with self.lock:
-                if self._notify_sequence != notify_sequence:
-                    return
-        event.clear()
-        if notify_sequence is not None:
-            with self.lock:
-                if self._notify_sequence != notify_sequence:
-                    return
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-        except TimeoutError:
-            pass
-
-    def _notify_loop(self) -> None:
-        if self._loop is None or self._event is None:
-            return
-        try:
-            self._loop.call_soon_threadsafe(self._event.set)
-        except RuntimeError:
-            pass
-
     def _log_underrun(self) -> None:
         now = time.monotonic()
         if now - self.last_underrun_log_at < 10.0:
@@ -707,7 +505,7 @@ class WebRtcAudioSource:
             underruns = self.underrun_frames
             last_frame_at = self.last_frame_at
         LOG.warning(
-            "WebRTC PCM source underrun: buffered=%s pushed=%s read=%s dropped=%s stale=%s underruns=%s last_frame_age=%.3fs",
+            "live audio PCM source underrun: buffered=%s pushed=%s read=%s dropped=%s stale=%s underruns=%s last_frame_age=%.3fs",
             buffered,
             pushed,
             read,
@@ -716,310 +514,6 @@ class WebRtcAudioSource:
             underruns,
             (now - last_frame_at) if last_frame_at else -1.0,
         )
-
-
-def create_webrtc_pcm_audio_track(source: WebRtcAudioSource):
-    aiortc = _load_aiortc()
-    av = _load_av()
-
-    class WebRtcPcmAudioTrack(aiortc.MediaStreamTrack):
-        kind = "audio"
-
-        def __init__(self, audio_source: WebRtcAudioSource) -> None:
-            super().__init__()
-            self._source = audio_source
-            self._resampler = PcmResampler(
-                getattr(audio_source, "sample_rate", IQ_SAMPLE_RATE),
-                WEBRTC_OPUS_SAMPLE_RATE,
-            )
-            self._pending = bytearray()
-            self._pts = 0
-            self._started_at: float | None = None
-            self._source_paused = _source_is_paused(audio_source)
-
-        async def recv(self):
-            needed_bytes = WEBRTC_OPUS_FRAME_SAMPLES * WEBRTC_OPUS_CHANNELS * 2
-            paused = _source_is_paused(self._source)
-            if paused != self._source_paused:
-                self._pending.clear()
-                self._started_at = None
-                self._source_paused = paused
-            attempts = 0
-            read_started_at = time.monotonic()
-            deadline = time.monotonic() + WEBRTC_FRAME_SECONDS
-            while len(self._pending) < needed_bytes and attempts < 4:
-                timeout = max(0.0, deadline - time.monotonic())
-                self._pending.extend(self._resampler.process(await _read_source_pcm(self._source, timeout)))
-                attempts += 1
-                if time.monotonic() >= deadline:
-                    break
-            paused = _source_is_paused(self._source)
-            if paused != self._source_paused:
-                self._pending.clear()
-                self._started_at = None
-                self._source_paused = paused
-            if paused:
-                self._pending.clear()
-                pcm = b"\x00" * needed_bytes
-            elif len(self._pending) < needed_bytes:
-                pcm = bytes(self._pending) + b"\x00" * (needed_bytes - len(self._pending))
-                self._pending.clear()
-            else:
-                pcm = bytes(self._pending[:needed_bytes])
-                del self._pending[:needed_bytes]
-            frame = av.AudioFrame(
-                format="s16",
-                layout="mono",
-                samples=WEBRTC_OPUS_FRAME_SAMPLES,
-            )
-            frame.planes[0].update(pcm)
-            frame.sample_rate = WEBRTC_OPUS_SAMPLE_RATE
-            frame.pts = self._pts
-            frame.time_base = Fraction(1, WEBRTC_OPUS_SAMPLE_RATE)
-            read_seconds = time.monotonic() - read_started_at
-            if self._started_at is None or read_seconds > (WEBRTC_FRAME_SECONDS * 1.5):
-                self._started_at = time.monotonic() - (
-                    (self._pts + WEBRTC_OPUS_FRAME_SAMPLES) / WEBRTC_OPUS_SAMPLE_RATE
-                )
-            self._pts += WEBRTC_OPUS_FRAME_SAMPLES
-            target_time = self._started_at + self._pts / WEBRTC_OPUS_SAMPLE_RATE
-            delay = target_time - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            return frame
-
-    return WebRtcPcmAudioTrack(source)
-
-
-async def _read_source_pcm(source: WebRtcAudioSource, timeout: float) -> bytes:
-    try:
-        return await source.read_pcm(timeout=timeout)
-    except TypeError:
-        return await source.read_pcm()
-
-
-def _source_is_paused(source: WebRtcAudioSource) -> bool:
-    is_paused = getattr(source, "is_paused", None)
-    if not callable(is_paused):
-        return False
-    try:
-        return bool(is_paused())
-    except Exception:
-        return False
-
-
-class AiortcSessionManager:
-    def __init__(self) -> None:
-        self.sessions: dict[str, Any] = {}
-        self.lock = threading.Lock()
-
-    async def accept_offer(
-        self,
-        *,
-        session_id: str,
-        sdp: str,
-        type: str = "offer",
-        tracks: tuple[Any, ...] = (),
-        event_queue: queue.Queue[dict[str, Any]] | None = None,
-        on_peer_closed: Callable[[str, str], None] | None = None,
-    ) -> dict[str, str]:
-        aiortc = _load_aiortc()
-        configuration = aiortc.RTCConfiguration(iceServers=[])
-        peer = aiortc.RTCPeerConnection(configuration=configuration)
-        stale_close_task: asyncio.Task[Any] | None = None
-        stale_close_delay: float | None = None
-        event_task: asyncio.Task[Any] | None = None
-        event_channel = None
-
-        async def drain_event_queue() -> None:
-            if event_queue is None or event_channel is None:
-                return
-            while True:
-                if peer_is_unhealthy():
-                    return
-                if getattr(event_channel, "readyState", "") != "open":
-                    await asyncio.sleep(0.05)
-                    continue
-                try:
-                    event = await asyncio.to_thread(event_queue.get, True, 0.25)
-                except queue.Empty:
-                    continue
-                if event is None:
-                    return
-                try:
-                    event_channel.send(json.dumps(event, separators=(",", ":")))
-                except Exception as exc:
-                    LOG.debug("WebRTC event channel send failed for %s: %s", session_id, exc)
-
-        if event_queue is not None:
-            @peer.on("datachannel")
-            def on_datachannel(channel: Any) -> None:
-                nonlocal event_channel, event_task
-                if getattr(channel, "label", "") != "nwr-events":
-                    return
-                event_channel = channel
-                LOG.debug("WebRTC event data channel opened by client for %s", session_id)
-
-                @channel.on("open")
-                def on_event_channel_open() -> None:
-                    nonlocal event_task
-                    if event_task is None or event_task.done():
-                        event_task = asyncio.create_task(drain_event_queue())
-
-                if getattr(channel, "readyState", "") == "open" and (event_task is None or event_task.done()):
-                    event_task = asyncio.create_task(drain_event_queue())
-
-        def peer_is_unhealthy() -> bool:
-            return getattr(peer, "connectionState", "") in {"failed", "closed", "disconnected"} or getattr(
-                peer,
-                "iceConnectionState",
-                "",
-            ) in {"failed", "closed", "disconnected"}
-
-        def cancel_stale_close() -> None:
-            nonlocal stale_close_task, stale_close_delay
-            if stale_close_task is not None and not stale_close_task.done():
-                stale_close_task.cancel()
-            stale_close_task = None
-            stale_close_delay = None
-
-        async def close_if_current(reason: str, delay: float = 0.0) -> None:
-            nonlocal event_task
-            if delay > 0:
-                try:
-                    await asyncio.sleep(delay)
-                except asyncio.CancelledError:
-                    return
-                if not peer_is_unhealthy():
-                    return
-            with self.lock:
-                if self.sessions.get(session_id) is not peer:
-                    return
-                self.sessions.pop(session_id, None)
-            if on_peer_closed is not None:
-                on_peer_closed(session_id, reason)
-            if event_task is not None:
-                event_task.cancel()
-                event_task = None
-            await peer.close()
-
-        def schedule_stale_close(reason: str, delay: float) -> None:
-            nonlocal stale_close_task, stale_close_delay
-            if (
-                stale_close_task is not None
-                and not stale_close_task.done()
-                and stale_close_delay == 0.0
-                and delay > 0
-            ):
-                return
-            cancel_stale_close()
-            stale_close_delay = delay
-            stale_close_task = asyncio.create_task(close_if_current(reason, delay))
-
-        @peer.on("connectionstatechange")
-        async def on_connectionstatechange() -> None:
-            state = getattr(peer, "connectionState", "")
-            if state == "connected":
-                if not peer_is_unhealthy():
-                    cancel_stale_close()
-            elif state in {"failed", "closed"}:
-                schedule_stale_close(f"connectionState={state}", 0.0)
-            elif state == "disconnected":
-                schedule_stale_close(f"connectionState={state}", 30.0)
-
-        @peer.on("iceconnectionstatechange")
-        async def on_iceconnectionstatechange() -> None:
-            state = getattr(peer, "iceConnectionState", "")
-            if state in {"connected", "completed"}:
-                if not peer_is_unhealthy():
-                    cancel_stale_close()
-            elif state in {"failed", "closed"}:
-                schedule_stale_close(f"iceConnectionState={state}", 0.0)
-            elif state == "disconnected":
-                schedule_stale_close(f"iceConnectionState={state}", 30.0)
-
-        senders = []
-        for track in tracks:
-            senders.append(peer.addTrack(track))
-        _prefer_opus(peer)
-        await peer.setRemoteDescription(aiortc.RTCSessionDescription(sdp=sdp, type=type))
-        answer = await peer.createAnswer()
-        await peer.setLocalDescription(answer)
-        for sender in senders:
-            try:
-                result = _configure_sender_bitrate(sender, WEBRTC_TARGET_BITRATE_KBPS)
-                if hasattr(result, "__await__"):
-                    await result
-            except Exception as exc:
-                LOG.debug("could not set WebRTC sender bitrate to %s Kbps: %s", WEBRTC_TARGET_BITRATE_KBPS, exc)
-        with self.lock:
-            old_peer = self.sessions.pop(session_id, None)
-            self.sessions[session_id] = peer
-        if old_peer is not None:
-            await old_peer.close()
-        if event_queue is not None and event_channel is not None and event_task is None:
-            event_task = asyncio.create_task(drain_event_queue())
-        return {
-            "sdp": peer.localDescription.sdp,
-            "type": peer.localDescription.type,
-        }
-
-    async def close(self, session_id: str) -> None:
-        with self.lock:
-            peer = self.sessions.pop(session_id, None)
-        if peer is not None:
-            await peer.close()
-
-    async def close_all(self) -> None:
-        with self.lock:
-            peers = list(self.sessions.values())
-            self.sessions.clear()
-        for peer in peers:
-            await peer.close()
-
-
-class WebRtcAsyncRunner:
-    def __init__(self) -> None:
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(
-            target=self._run,
-            name="webrtc-async-loop",
-            daemon=True,
-        )
-        self.thread.start()
-
-    def run(self, coroutine, timeout: float = 15.0):
-        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
-        return future.result(timeout=timeout)
-
-    def stop(self) -> None:
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.thread.join(timeout=2.0)
-
-    def _run(self) -> None:
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
-        pending = asyncio.all_tasks(self.loop)
-        for task in pending:
-            task.cancel()
-        if pending:
-            self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        self.loop.close()
-
-
-def bitrate_feedback_from_stats(stats: Any) -> dict[str, float | int | None]:
-    available_bitrate_bps = getattr(stats, "availableOutgoingBitrate", None)
-    rtt_seconds = getattr(stats, "roundTripTime", None)
-    packets_lost = getattr(stats, "packetsLost", None)
-    packets_sent = getattr(stats, "packetsSent", None)
-    packet_loss_fraction = 0.0
-    if packets_lost is not None and packets_sent:
-        packet_loss_fraction = max(0.0, float(packets_lost)) / max(1.0, float(packets_sent))
-    return {
-        "available_bitrate_bps": int(available_bitrate_bps) if available_bitrate_bps is not None else None,
-        "packet_loss_fraction": packet_loss_fraction,
-        "rtt_ms": float(rtt_seconds) * 1000.0 if rtt_seconds is not None else None,
-    }
 
 
 def _load_opus_module():
@@ -1060,50 +554,3 @@ def _load_system_opus_module():
     detail = "; ".join(errors) if errors else "ctypes could not locate libopus"
     raise OpusSupportError(f"system libopus could not be loaded: {detail}")
 
-
-def _load_aiortc():
-    try:
-        import aiortc
-    except ImportError as exc:
-        raise WebRtcError("The 'aiortc' package is required for WebRTC transport") from exc
-    return aiortc
-
-
-def _load_av():
-    try:
-        import av
-    except ImportError as exc:
-        raise WebRtcError("The 'av' package is required for WebRTC audio frames") from exc
-    return av
-
-
-def _prefer_opus(peer: Any) -> None:
-    try:
-        from aiortc import RTCRtpSender
-    except ImportError:
-        return
-    try:
-        capabilities = RTCRtpSender.getCapabilities("audio")
-        opus_codecs = [
-            codec for codec in capabilities.codecs
-            if str(getattr(codec, "mimeType", "")).lower() == "audio/opus"
-        ]
-        if not opus_codecs:
-            return
-        for transceiver in peer.getTransceivers():
-            if transceiver.kind == "audio":
-                transceiver.setCodecPreferences(opus_codecs)
-    except Exception as exc:
-        LOG.debug("could not force WebRTC Opus codec preference: %s", exc)
-
-
-def _configure_sender_bitrate(sender: Any, bitrate_kbps: int):
-    try:
-        parameters = sender.getParameters()
-        if not parameters.encodings:
-            return
-        parameters.encodings[0].maxBitrate = int(bitrate_kbps) * 1000
-        return sender.setParameters(parameters)
-    except Exception as exc:
-        LOG.debug("could not set WebRTC sender bitrate to %s Kbps: %s", bitrate_kbps, exc)
-    return None

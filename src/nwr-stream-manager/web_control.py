@@ -99,15 +99,27 @@ if __package__:
     from .same_data import lookup_event, lookup_location
     from .same_live import SameEventQueue, SameSuppressionProcessor, generate_same_message
     from .signal_meter import ChannelSignalMeter, SignalPresenceTracker, noise_reference_band_for_transition
+    from .remote_sdr import (
+        REMOTE_IQ_BUFFER_SECONDS,
+        REMOTE_IQ_MAX_SETTING_SECONDS,
+        REMOTE_IQ_MIN_BUFFER_SECONDS,
+        REMOTE_SDR_DISCOVERY_PORT,
+        REMOTE_SDR_TCP_PORT,
+        PairedDeviceStore,
+        is_tailscale_address,
+        RemoteIqFanout,
+        RemoteSdrAuthError,
+        RemoteSdrClient,
+        RemoteSdrError,
+        RemoteSdrServer,
+        discover_hosts,
+        load_or_create_identity,
+        pair_with_host,
+    )
     from .webrtc import (
-        AiortcSessionManager,
         OpusEncoder,
         TcpOpusBitrateController,
-        WebRtcAsyncRunner,
         WebRtcAudioSource,
-        WebRtcError,
-        create_webrtc_pcm_audio_track,
-        server_webrtc_capabilities,
     )
 else:
     import importlib
@@ -134,6 +146,7 @@ else:
     same_data = importlib.import_module(f"{package_name}.same_data")
     same_live = importlib.import_module(f"{package_name}.same_live")
     signal_meter = importlib.import_module(f"{package_name}.signal_meter")
+    remote_sdr = importlib.import_module(f"{package_name}.remote_sdr")
     webrtc = importlib.import_module(f"{package_name}.webrtc")
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
     deemphasis_makeup_gain = audio_effects.deemphasis_makeup_gain
@@ -193,15 +206,25 @@ else:
     generate_same_message = same_live.generate_same_message
     ChannelSignalMeter = signal_meter.ChannelSignalMeter
     SignalPresenceTracker = signal_meter.SignalPresenceTracker
+    REMOTE_IQ_BUFFER_SECONDS = remote_sdr.REMOTE_IQ_BUFFER_SECONDS
+    REMOTE_IQ_MAX_SETTING_SECONDS = remote_sdr.REMOTE_IQ_MAX_SETTING_SECONDS
+    REMOTE_IQ_MIN_BUFFER_SECONDS = remote_sdr.REMOTE_IQ_MIN_BUFFER_SECONDS
+    REMOTE_SDR_DISCOVERY_PORT = remote_sdr.REMOTE_SDR_DISCOVERY_PORT
+    REMOTE_SDR_TCP_PORT = remote_sdr.REMOTE_SDR_TCP_PORT
+    PairedDeviceStore = remote_sdr.PairedDeviceStore
+    is_tailscale_address = remote_sdr.is_tailscale_address
+    RemoteIqFanout = remote_sdr.RemoteIqFanout
+    RemoteSdrAuthError = remote_sdr.RemoteSdrAuthError
+    RemoteSdrClient = remote_sdr.RemoteSdrClient
+    RemoteSdrError = remote_sdr.RemoteSdrError
+    RemoteSdrServer = remote_sdr.RemoteSdrServer
+    discover_hosts = remote_sdr.discover_hosts
+    load_or_create_identity = remote_sdr.load_or_create_identity
+    pair_with_host = remote_sdr.pair_with_host
     noise_reference_band_for_transition = signal_meter.noise_reference_band_for_transition
-    AiortcSessionManager = webrtc.AiortcSessionManager
     OpusEncoder = webrtc.OpusEncoder
     TcpOpusBitrateController = webrtc.TcpOpusBitrateController
-    WebRtcAsyncRunner = webrtc.WebRtcAsyncRunner
     WebRtcAudioSource = webrtc.WebRtcAudioSource
-    WebRtcError = webrtc.WebRtcError
-    create_webrtc_pcm_audio_track = webrtc.create_webrtc_pcm_audio_track
-    server_webrtc_capabilities = webrtc.server_webrtc_capabilities
 
 import numpy as np
 
@@ -391,6 +414,17 @@ STREAM_TEST_MODE_TRANSMIT_EQ_POINTS: tuple[tuple[float, float], ...] = (
 )
 
 
+SDR_SOURCE_LOCAL = "local"
+SDR_SOURCE_REMOTE = "remote"
+REMOTE_SDR_DIRECTORY_NAME = "remote-sdr"
+# While a congested network stops the host sending, IQ for a remote feed waits
+# here rather than being dropped at the source.
+REMOTE_HOST_CHANNEL_QUEUE_SECONDS = 5.0
+REMOTE_HOST_WIDEBAND_QUEUE_SECONDS = 10.0
+# Settings a remote client may change on the host's SDR.
+REMOTE_SDR_HOST_SETTINGS = ("gain", "ppm_correction", "bias_tee", "alias_filter_strength")
+
+
 @dataclass(frozen=True)
 class RtlControlSettings:
     serial: str = ""
@@ -400,6 +434,18 @@ class RtlControlSettings:
     bias_tee: bool = False
     alias_filter_strength: int = ALIAS_FILTER_STRENGTH_DEFAULT
     notify_sdr_failures: bool = False
+    # Share this machine's SDR with paired NWR Stream Manager instances.
+    remote_access_enabled: bool = False
+    # "local" uses the SDR plugged into this machine; "remote" uses the SDR
+    # shared by the paired instance remote_host_id.
+    source_mode: str = SDR_SOURCE_LOCAL
+    remote_host_id: str = ""
+    # Seconds of remote IQ held back to ride out network hiccups (client side).
+    remote_buffer_seconds: float = REMOTE_IQ_BUFFER_SECONDS
+
+    @property
+    def uses_remote_sdr(self) -> bool:
+        return self.source_mode == SDR_SOURCE_REMOTE and bool(self.remote_host_id)
 
     def to_rtl_config(self) -> RtlConfig:
         if not self.serial:
@@ -1689,6 +1735,202 @@ def make_live_channelizer(
     )
 
 
+class HostChannelSource:
+    """Host side of a remote channel feed: one 24 kS/s NWR channel.
+
+    Channelizes this machine's intermediate IQ exactly as a local stream does
+    and follows the capture if it restarts. Retuning happens in place.
+    """
+
+    def __init__(self, fanout_provider, frequency_hz: int, alias_filter_strength_provider, name: str) -> None:
+        self.fanout_provider = fanout_provider
+        self.frequency_hz = validate_receiver_frequency(frequency_hz)
+        self.alias_filter_strength_provider = alias_filter_strength_provider
+        self.name = name
+        self.lock = threading.Lock()
+        self.fanout = None
+        self.queue: queue.Queue | None = None
+        self.channelizer: IqChannelizer | None = None
+        self.channelizer_key: tuple[int, int] | None = None
+        self.channelizer_strength: int | None = None
+        self.generation = 0
+
+    def set_frequency(self, frequency_hz: int) -> None:
+        frequency_hz = validate_receiver_frequency(frequency_hz)
+        with self.lock:
+            self.frequency_hz = frequency_hz
+
+    def read(self, timeout: float):
+        subscriber = self._subscription()
+        if subscriber is None:
+            time.sleep(timeout)
+            return None
+        try:
+            batch = subscriber.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        fanout_generation = getattr(self.fanout, "generation", 0)
+        incoming = batch_generation(batch)
+        if incoming < fanout_generation:
+            return None
+        if incoming != self.generation:
+            self.generation = incoming
+            self.channelizer = None
+        with self.lock:
+            target = self.frequency_hz
+        strength = self.alias_filter_strength_provider()
+        transition_hz = alias_filter_transition_hz(CHANNEL_IQ_ALIAS_TRANSITION_HZ, strength)
+        attenuation_db = alias_filter_attenuation_db(DEFAULT_ALIAS_ATTENUATION_DB, strength)
+        key = (batch.sample_rate, batch.center_frequency_hz)
+        if self.channelizer is None or self.channelizer_key != key:
+            self.channelizer = IqChannelizer(
+                input_rate=batch.sample_rate,
+                center_frequency_hz=batch.center_frequency_hz,
+                target_frequency_hz=target,
+                output_rate=IQ_SAMPLE_RATE,
+                transition_hz=transition_hz,
+                alias_attenuation_db=attenuation_db,
+            )
+            self.channelizer_key = key
+            self.channelizer_strength = strength
+        elif self.channelizer_strength != strength:
+            self.channelizer.update_alias_filter(transition_hz=transition_hz, attenuation_db=attenuation_db)
+            self.channelizer_strength = strength
+        if self.channelizer.target_frequency_hz != target:
+            self.channelizer.set_target_frequency(target)
+        channel_iq = self.channelizer.process_complex(iq_batch_complex(batch))
+        return set_batch_generation(
+            IqSampleBatch(data=channel_iq, sample_rate=IQ_SAMPLE_RATE, center_frequency_hz=target, captured_at=batch.captured_at),
+            self.generation,
+        )
+
+    def _subscription(self) -> queue.Queue | None:
+        fanout = self.fanout_provider()
+        if fanout is not self.fanout:
+            self._unsubscribe()
+            self.fanout = fanout
+            self.channelizer = None
+            if fanout is not None:
+                self.queue = subscribe_raw_fanout(fanout, max_seconds=REMOTE_HOST_CHANNEL_QUEUE_SECONDS, name=self.name)
+                self.generation = getattr(fanout, "generation", 0)
+        return self.queue
+
+    def _unsubscribe(self) -> None:
+        if self.fanout is not None and self.queue is not None:
+            self.fanout.unsubscribe(self.queue)
+        self.queue = None
+
+    def close(self) -> None:
+        self._unsubscribe()
+        self.fanout = None
+
+
+class HostWidebandSource:
+    """Host side of a remote wideband feed, decimated like a local recording."""
+
+    def __init__(self, fanout_provider, sample_rate: int, alias_filter_strength_provider, name: str) -> None:
+        self.fanout_provider = fanout_provider
+        self.sample_rate = validate_iq_recording_sample_rate(sample_rate)
+        self.alias_filter_strength_provider = alias_filter_strength_provider
+        self.name = name
+        self.fanout = None
+        self.queue: queue.Queue | None = None
+        self.decimator = None
+        self.decimator_key: tuple[int, int] | None = None
+        self.decimator_strength: int | None = None
+        self.generation = 0
+
+    def set_frequency(self, frequency_hz: int) -> None:
+        raise ValueError("wideband feeds cannot be retuned")
+
+    def read(self, timeout: float):
+        fanout = self.fanout_provider(self.sample_rate)
+        if fanout is not self.fanout:
+            self.close()
+            self.fanout = fanout
+            self.decimator = None
+            if fanout is not None:
+                self.queue = subscribe_raw_fanout(fanout, max_seconds=REMOTE_HOST_WIDEBAND_QUEUE_SECONDS, name=self.name)
+                self.generation = getattr(fanout, "generation", 0)
+        if self.queue is None:
+            time.sleep(timeout)
+            return None
+        try:
+            batch = self.queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        incoming = batch_generation(batch)
+        if incoming < getattr(self.fanout, "generation", 0):
+            return None
+        if incoming != self.generation:
+            self.generation = incoming
+            self.decimator = None
+        iq = iq_batch_complex(batch)
+        if self.sample_rate > batch.sample_rate:
+            raise ValueError("recording sample rate is higher than the RTL-SDR sample rate")
+        if self.sample_rate == batch.sample_rate:
+            output = iq
+        else:
+            strength = self.alias_filter_strength_provider()
+            transition_hz = alias_filter_transition_hz(INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ, strength)
+            attenuation_db = alias_filter_attenuation_db(INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB, strength)
+            key = (batch.sample_rate, self.sample_rate)
+            if self.decimator is None or self.decimator_key != key:
+                self.decimator = create_decimator(
+                    batch.sample_rate, self.sample_rate, transition_hz=transition_hz, attenuation_db=attenuation_db
+                )
+                self.decimator_key = key
+                self.decimator_strength = strength
+            elif self.decimator_strength != strength:
+                update_decimator_alias_filter(
+                    self.decimator, batch.sample_rate, self.sample_rate, transition_hz=transition_hz, attenuation_db=attenuation_db
+                )
+                self.decimator_strength = strength
+            output = self.decimator.process(iq)
+        return set_batch_generation(
+            IqSampleBatch(data=output, sample_rate=self.sample_rate, center_frequency_hz=batch.center_frequency_hz, captured_at=batch.captured_at),
+            self.generation,
+        )
+
+    def close(self) -> None:
+        if self.fanout is not None and self.queue is not None:
+            self.fanout.unsubscribe(self.queue)
+        self.queue = None
+        self.fanout = None
+
+
+class LocalSdrRemoteBackend:
+    """What the remote SDR server needs from this machine's SDR."""
+
+    def __init__(self, service: "RtlControlService") -> None:
+        self.service = service
+
+    def status(self) -> dict[str, Any]:
+        return self.service.remote_host_status()
+
+    def update_settings(self, changes: dict[str, Any]) -> dict[str, Any]:
+        allowed = {key: changes[key] for key in REMOTE_SDR_HOST_SETTINGS if key in changes}
+        if allowed:
+            self.service.update(allowed)
+        return self.service.remote_host_status()
+
+    def open_channel(self, frequency_hz: int, name: str) -> HostChannelSource:
+        return HostChannelSource(
+            lambda: self.service.intermediate_fanout,
+            frequency_hz,
+            self.service._alias_filter_strength,
+            name,
+        )
+
+    def open_wideband(self, sample_rate: int, name: str) -> HostWidebandSource:
+        def fanout_for(rate: int):
+            if rate == INTERMEDIATE_IQ_SAMPLE_RATE:
+                return self.service.intermediate_fanout
+            return self.service.raw_fanout
+
+        return HostWidebandSource(fanout_for, sample_rate, self.service._alias_filter_strength, name)
+
+
 def drain_queue_to_latest(source: queue.Queue, first_item: Any) -> Any:
     latest = first_item
     while True:
@@ -2798,9 +3040,6 @@ class SameAwareWebRtcAudioSource:
         for frame in self.suppressor.process_pcm(pcm):
             self.audio_source.push_pcm(self._pause_frame(frame))
 
-    async def read_pcm(self, timeout: float = 0.25) -> bytes:
-        return self._pause_frame(await self.audio_source.read_pcm(timeout=timeout))
-
     def read_pcm_blocking(self, timeout: float = 0.25) -> bytes:
         return self._pause_frame(self.audio_source.read_pcm_blocking(timeout=timeout))
 
@@ -3413,6 +3652,9 @@ class IcecastStreamWorker:
             with self.lock:
                 station = self.stream["station"]
             target_frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
+            retune_remote_feed = getattr(self.fanout, "set_target_frequency", None)
+            if retune_remote_feed is not None:
+                retune_remote_feed(target_frequency_hz)
             alias_filter_strength = self.alias_filter_strength_provider()
             channel_transition_hz = alias_filter_transition_hz(
                 CHANNEL_IQ_ALIAS_TRANSITION_HZ,
@@ -3661,6 +3903,9 @@ class IcecastStreamWorker:
             with self.lock:
                 station = self.stream["station"]
             target_frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
+            retune_remote_feed = getattr(self.fanout, "set_target_frequency", None)
+            if retune_remote_feed is not None:
+                retune_remote_feed(target_frequency_hz)
             alias_filter_strength = self.alias_filter_strength_provider()
             channel_transition_hz = alias_filter_transition_hz(
                 CHANNEL_IQ_ALIAS_TRANSITION_HZ,
@@ -4523,6 +4768,9 @@ class WeatherReceiverWorker:
                 frame_buffer.clear()
                 LOG.info("weather receiver source generation changed for client %s; reset channel state", self.client_id)
             target_frequency_hz = self._frequency_hz()
+            retune_remote_feed = getattr(self.fanout, "set_target_frequency", None)
+            if retune_remote_feed is not None:
+                retune_remote_feed(target_frequency_hz)
             alias_filter_strength = self.alias_filter_strength_provider()
             channel_transition_hz = alias_filter_transition_hz(
                 CHANNEL_IQ_ALIAS_TRANSITION_HZ,
@@ -4661,8 +4909,6 @@ class RtlControlService:
         self.iq_recording_download_accounts: dict[str, int] = {}
         self.iq_recording_download_recordings: dict[str, str] = {}
         self.aborted_iq_recording_downloads: set[str] = set()
-        self.webrtc_runner = WebRtcAsyncRunner()
-        self.webrtc_sessions = AiortcSessionManager()
         self.soundcard_manager = SharedSoundcardOutputManager(devices_provider=self._cached_soundcards)
         self.icecast_auth_cache: dict[str, float] = {}
         self.reset_lock = threading.Lock()
@@ -4670,12 +4916,25 @@ class RtlControlService:
         self.last_batch_at: float | None = None
         self.received_chunks = 0
         self.received_bytes = 0
+        remote_directory = state_path.parent / REMOTE_SDR_DIRECTORY_NAME
+        self.remote_identity = load_or_create_identity(remote_directory)
+        self.remote_devices = PairedDeviceStore(remote_directory / "paired-devices.json")
+        self.remote_backend = LocalSdrRemoteBackend(self)
+        self.remote_server: RemoteSdrServer | None = None
+        self.remote_sdr_port = REMOTE_SDR_TCP_PORT
+        self.remote_sdr_discovery_port = REMOTE_SDR_DISCOVERY_PORT
+        self.remote_server_error = ""
+        self.remote_client: RemoteSdrClient | None = None
         self.storage_monitor.add_path(self.iq_recordings_directory)
         self.storage_monitor.start()
         self.preview_cleanup_thread.start()
         self.stream_notification_thread.start()
-        if self.settings.serial:
+        if self.settings.uses_remote_sdr:
+            self._sync_remote_sdr_locked()
+            self._sync_stream_workers_locked()
+        elif self.settings.serial:
             self._start_or_update_capture_locked()
+            self._sync_remote_sdr_locked()
         else:
             self._select_only_connected_device()
 
@@ -4757,11 +5016,6 @@ class RtlControlService:
                 self.live_audio_feedback_by_client.pop(("receiver", client_id), None)
 
     def close(self) -> None:
-        try:
-            self.webrtc_runner.run(self.webrtc_sessions.close_all(), timeout=3.0)
-        except Exception as exc:
-            LOG.debug("WebRTC monitor cleanup failed: %s", exc)
-        self.webrtc_runner.stop()
         self.preview_cleanup_stop.set()
         self.stream_notification_stop.set()
         self.preview_cleanup_thread.join(timeout=2.0)
@@ -4771,6 +5025,13 @@ class RtlControlService:
             self.iq_recorder = None
         if recorder is not None:
             recorder.stop()
+        with self.lock:
+            server, client = self.remote_server, self.remote_client
+            self.remote_server = None
+            self.remote_client = None
+        for remote in (server, client):
+            if remote is not None:
+                remote.stop()
         self.stop_capture()
         self.soundcard_manager.stop()
         self.storage_monitor.stop()
@@ -4927,21 +5188,47 @@ class RtlControlService:
             notifications = {} if read_only or notification_settings is None else notification_settings.public_dict()
             if notifications:
                 notifications["effective_access_url"] = self.notification_effective_access_url()
+            settings_payload = asdict(settings)
+            source_payload = {
+                "kind": source_kind,
+                "name": source_name,
+                "sample_rate": (
+                    self.iq_file_source_config.sample_rate
+                    if self.iq_file_source_config is not None
+                    else settings.sample_rate
+                ),
+                "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
+            }
+            capture_error = self.capture_error
+            if settings.uses_remote_sdr:
+                # Report the remote host's SDR as this machine's SDR.
+                remote_status = self.remote_client.status() if self.remote_client is not None else {}
+                remote_sdr = remote_status.get("sdr") if isinstance(remote_status.get("sdr"), dict) else {}
+                host_settings = remote_sdr.get("settings") if isinstance(remote_sdr.get("settings"), dict) else {}
+                settings_payload.update({key: host_settings[key] for key in REMOTE_SDR_HOST_SETTINGS if key in host_settings})
+                gain_values = list(remote_sdr.get("gain_values") or [])
+                active = bool(remote_status.get("reachable") and remote_sdr.get("capture_active"))
+                source_payload = {
+                    "kind": "remote",
+                    "name": remote_status.get("host_name", ""),
+                    "host_id": settings.remote_host_id,
+                    "device_name": remote_sdr.get("device_name", ""),
+                    "reachable": bool(remote_status.get("reachable")),
+                    "sample_rate": remote_sdr.get("sample_rate", settings.sample_rate),
+                    "center_frequency_hz": remote_sdr.get("center_frequency_hz", NWR_CENTER_FREQUENCY_HZ),
+                }
+                capture_error = (
+                    remote_sdr.get("capture_error") or None
+                    if remote_status.get("reachable")
+                    else remote_status.get("error") or "The remote SDR is not reachable."
+                )
             return {
-                "settings": asdict(settings),
+                "settings": settings_payload,
                 "gain_values": gain_values,
                 "active": active,
-                "source": {
-                    "kind": source_kind,
-                    "name": source_name,
-                    "sample_rate": (
-                        self.iq_file_source_config.sample_rate
-                        if self.iq_file_source_config is not None
-                        else settings.sample_rate
-                    ),
-                    "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
-                },
-                "capture_error": self.capture_error,
+                "source": source_payload,
+                "remote_sdr": {} if read_only else self._remote_sdr_status_locked(),
+                "capture_error": capture_error,
                 "capture_stats": capture_stats,
                 "raw_fanout_stats": fanout_stats,
                 "intermediate_fanout_stats": intermediate_stats,
@@ -5486,7 +5773,16 @@ class RtlControlService:
             raw_fanout = self.raw_fanout
             intermediate_fanout = self.intermediate_fanout
             config = self._iq_recorder_config_from_payload_locked(payload)
-            if config.mode == IQ_RECORDER_MODE_STREAM:
+            if self.settings.uses_remote_sdr:
+                # The host channelizes or decimates; the recorder passes it through.
+                client = self.remote_client
+                if client is None:
+                    fanout = None
+                elif config.mode == IQ_RECORDER_MODE_STREAM:
+                    fanout = client.channel_fanout(int(config.target_frequency_hz or NWR_CENTER_FREQUENCY_HZ), name="iq-recorder")
+                else:
+                    fanout = client.wideband_fanout(config.sample_rate, name="iq-recorder")
+            elif config.mode == IQ_RECORDER_MODE_STREAM:
                 fanout = intermediate_fanout
             elif config.sample_rate == INTERMEDIATE_IQ_SAMPLE_RATE:
                 fanout = intermediate_fanout
@@ -6237,6 +6533,8 @@ class RtlControlService:
         if not self.settings.notify_sdr_failures:
             self.rtl_notification_states.clear()
             return None
+        if self.settings.uses_remote_sdr:
+            return self._remote_rtl_notification_failure_locked()
         if self.iq_file_source_config is not None:
             self.rtl_notification_states.clear()
             return None
@@ -6244,62 +6542,99 @@ class RtlControlService:
         if not serial:
             self.rtl_notification_states.clear()
             return None
+        problem = self._local_rtl_problem_locked(now)
+        if problem is None:
+            return None
+        message, recovery_message = rtl_problem_messages(problem["category"], problem["device_name"])
+        return {
+            "key": f"rtl:{serial}:{problem['category']}",
+            "category": problem["category"],
+            "target_path": "/?view=rtl",
+            "message": message,
+            "recovery_message": recovery_message,
+        }
+
+    def _local_rtl_problem_locked(self, now: float) -> dict[str, str] | None:
+        """What is wrong with this machine's RTL-SDR, if anything."""
+        serial = str(self.settings.serial or "").strip()
+        if not serial:
+            return None
         devices_payload = self.devices()
         rtl_devices = list(devices_payload.get("devices", []))
         device_name = self._rtl_notification_device_name_locked(serial, rtl_devices)
         serial_connected = any(str(device.get("serial", "")).strip() == serial for device in rtl_devices)
         if not serial_connected:
-            return {
-                "key": f"rtl:{serial}:disconnected",
-                "category": "disconnected",
-                "target_path": "/?view=rtl",
-                "message": f"{sentence_case(device_name)} is not connected.",
-                "recovery_message": f"{sentence_case(device_name)} is now connected.",
-            }
+            return {"category": "disconnected", "device_name": device_name}
         error = str(self.capture_error or "").strip()
         if error:
             lower = error.lower()
             if "permission" in lower or "access denied" in lower or "udev" in lower:
-                message = f"Insufficient permissions to access {device_name}."
-                recovery_message = f"{sentence_case(device_name)} can now be accessed."
                 category = "permission"
             elif "claim" in lower or "busy" in lower or "resource busy" in lower:
-                message = f"Failed to claim {device_name}."
-                recovery_message = f"Successfully claimed {device_name}."
                 category = "claim"
             elif "not found" in lower or "disconnect" in lower or "no such device" in lower:
-                message = f"{sentence_case(device_name)} is not connected."
-                recovery_message = f"{sentence_case(device_name)} is now connected."
                 category = "disconnected"
             else:
-                message = f"{sentence_case(device_name)} has stopped outputting data."
-                recovery_message = f"{sentence_case(device_name)} is outputting data again."
                 category = "error"
-            return {
-                "key": f"rtl:{serial}:{category}",
-                "category": category,
-                "target_path": "/?view=rtl",
-                "message": message,
-                "recovery_message": recovery_message,
-            }
+            return {"category": category, "device_name": device_name}
         if self.capture is None:
-            return {
-                "key": f"rtl:{serial}:disconnected",
-                "category": "disconnected",
-                "target_path": "/?view=rtl",
-                "message": f"{sentence_case(device_name)} is not connected.",
-                "recovery_message": f"{sentence_case(device_name)} is now connected.",
-            }
+            return {"category": "disconnected", "device_name": device_name}
         last_batch_at = self.last_batch_at
         if last_batch_at is None or now - float(last_batch_at) >= RTL_NOTIFICATION_NO_DATA_SECONDS:
-            return {
-                "key": f"rtl:{serial}:no-data",
-                "category": "no-data",
-                "target_path": "/?view=rtl",
-                "message": f"{sentence_case(device_name)} has stopped outputting data.",
-                "recovery_message": f"{sentence_case(device_name)} is outputting data again.",
-            }
+            return {"category": "no-data", "device_name": device_name}
         return None
+
+    def _remote_rtl_notification_failure_locked(self) -> dict[str, Any] | None:
+        host_id = self.settings.remote_host_id
+        client = self.remote_client
+        status = client.status() if client is not None else {}
+        record = self.remote_devices.get(host_id) or {}
+        host_name = status.get("host_name") or record.get("name") or "the remote SDR host"
+        if not status.get("reachable"):
+            category = "unreachable"
+            device_name = f"the remote SDR on {host_name}"
+        else:
+            sdr = status.get("sdr") if isinstance(status.get("sdr"), dict) else {}
+            category = str(sdr.get("problem") or "")
+            if not category:
+                return None
+            device_name = f"{sdr.get('device_name') or 'the RTL-SDR'} on {host_name}"
+        message, recovery_message = rtl_problem_messages(category, device_name)
+        return {
+            "key": f"remote:{host_id}:{category}",
+            "category": category,
+            "target_path": "/?view=rtl",
+            "message": message,
+            "recovery_message": recovery_message,
+        }
+
+    def remote_host_status(self) -> dict[str, Any]:
+        """This machine's SDR as reported to paired remote clients."""
+        now = time.monotonic()
+        with self.lock:
+            settings = self._effective_settings_locked()
+            capture = self.capture
+            gain_values = capture.get_gain_values() if isinstance(capture, RtlCaptureSource) else []
+            problem = self._local_rtl_problem_locked(now)
+            serial = str(settings.serial or "")
+            device_name = self._rtl_notification_device_name_locked(serial) if serial else ""
+            if device_name == "the configured RTL-SDR":
+                device_name = f"RTL-SDR serial {serial}"
+            last_batch_at = self.last_batch_at
+            capture_error = self.capture_error or ""
+        return {
+            "device_name": device_name,
+            "serial": serial,
+            "connected": problem is None or problem["category"] != "disconnected",
+            "capture_active": capture is not None,
+            "capture_error": capture_error,
+            "last_batch_age_seconds": round(now - float(last_batch_at), 3) if last_batch_at is not None else None,
+            "sample_rate": settings.sample_rate,
+            "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
+            "gain_values": gain_values,
+            "settings": {key: getattr(settings, key) for key in REMOTE_SDR_HOST_SETTINGS},
+            "problem": problem["category"] if problem is not None else None,
+        }
 
     def _rtl_notification_device_name_locked(
         self,
@@ -6517,84 +6852,6 @@ class RtlControlService:
         self._sync_stream_workers_locked()
         LOG.info("stopped stream test mode for %s: %s", stream_id or "unknown", reason)
 
-    def start_monitor(self, payload: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
-        client_id = str(payload.get("client_id", "")).strip()
-        stream_id = str(payload.get("stream_id", "")).strip()
-        sdp = str(payload.get("sdp", "")).strip()
-        offer_type = str(payload.get("type", "offer")).strip() or "offer"
-        LOG.info("WebRTC monitor start requested: client=%s stream=%s", client_id or "<missing>", stream_id or "<missing>")
-        if not client_id:
-            raise ValueError("monitor client id is required")
-        if not stream_id:
-            raise ValueError("stream id is required")
-        if not sdp:
-            raise ValueError("WebRTC offer SDP is required")
-        with self.lock:
-            self._ensure_webrtc_client_owner_locked(client_id, account_id)
-        capabilities = server_webrtc_capabilities()
-        if not capabilities.available:
-            LOG.warning(
-                "WebRTC monitor unavailable for client %s: transport=%s opus=%s",
-                client_id,
-                capabilities.transport_error or "ok",
-                capabilities.opus_error or "ok",
-            )
-            raise ValueError(
-                "WebRTC monitoring is unavailable: "
-                + (capabilities.transport_error or capabilities.opus_error or "server WebRTC support is incomplete")
-            )
-
-        event_queue = SameEventQueue()
-        self.stop_receiver({"client_id": client_id})
-        self.stop_monitor({"client_id": client_id})
-        with self.lock:
-            stream = self._stream_locked(stream_id)
-            if stream.get("enabled", True) is False:
-                LOG.warning("WebRTC monitor rejected for client %s: stream %s is disabled", client_id, stream_id)
-                raise ValueError("start the stream before monitoring it")
-            self.monitor_streams_by_client[client_id] = stream_id
-            self.monitor_accounts_by_client[client_id] = int(account_id or 0) if account_id is not None else 0
-            self._sync_stream_workers_locked()
-            worker = self.stream_workers.get(stream_worker_key(stream))
-            if worker is None:
-                self.monitor_streams_by_client.pop(client_id, None)
-                self.monitor_accounts_by_client.pop(client_id, None)
-                LOG.warning("WebRTC monitor rejected for client %s: worker unavailable for stream %s", client_id, stream_id)
-                raise ValueError("stream worker could not be started for monitoring")
-            source = worker.add_monitor_source(client_id, event_queue)
-            station = stream.get("station", {})
-
-        try:
-            track = create_webrtc_pcm_audio_track(source)
-            answer = self.webrtc_runner.run(
-                self.webrtc_sessions.accept_offer(
-                    session_id=client_id,
-                    sdp=sdp,
-                    type=offer_type,
-                    tracks=(track,),
-                    event_queue=event_queue.queue,
-                    on_peer_closed=self._handle_webrtc_session_closed,
-                )
-            )
-        except Exception as exc:
-            detached_source = None
-            with self.lock:
-                detached_source = self._remove_monitor_source_locked(client_id)
-            self._close_detached_monitor_sources([detached_source])
-            LOG.exception("WebRTC monitor negotiation failed for client %s stream %s: %s", client_id, stream_id, exc)
-            raise
-        LOG.info(
-            "started WebRTC monitor for %s on client %s",
-            station.get("callsign", stream_id),
-            client_id,
-        )
-        return {
-            "success": True,
-            "stream_id": stream_id,
-            "answer": answer,
-            "monitoring": self.monitor_status(client_id),
-        }
-
     def open_monitor_audio_source(
         self,
         *,
@@ -6637,12 +6894,8 @@ class RtlControlService:
             stopped_stream_id = self.monitor_streams_by_client.get(client_id, "")
             detached_source = self._remove_monitor_source_locked(client_id)
         self._close_detached_monitor_sources([detached_source])
-        try:
-            self.webrtc_runner.run(self.webrtc_sessions.close(client_id), timeout=3.0)
-        except Exception as exc:
-            LOG.debug("WebRTC monitor close failed for client %s: %s", client_id, exc)
         if stopped_stream_id:
-            LOG.info("stopped WebRTC monitor for stream %s on client %s", stopped_stream_id, client_id)
+            LOG.info("stopped monitor for stream %s on client %s", stopped_stream_id, client_id)
         return {"success": True, "monitoring": self.monitor_status(client_id)}
 
     def pause_monitor(self, payload: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
@@ -6706,93 +6959,18 @@ class RtlControlService:
 
     def remove_stream(self, stream_id: str) -> dict[str, Any]:
         stream_id = stream_id.strip()
-        monitor_client_ids: list[str] = []
         detached_monitor_sources: list[SameAwareWebRtcAudioSource] = []
         with self.lock:
             removed = [stream for stream in self.streams if stream.get("id") == stream_id]
             self.streams = [stream for stream in self.streams if stream.get("id") != stream_id]
             if not removed:
                 raise ValueError("stream was not found")
-            monitor_client_ids = self._remove_monitor_sources_for_stream_locked(stream_id, detached_monitor_sources)
+            self._remove_monitor_sources_for_stream_locked(stream_id, detached_monitor_sources)
             remove_stream_configs(self.streams_directory, removed)
             self._sync_stream_workers_locked()
         self._close_detached_monitor_sources(detached_monitor_sources)
-        self._close_monitor_sessions(monitor_client_ids)
         LOG.info("removed stream %s", stream_id)
         return self.stream_status()
-
-    def start_receiver(self, payload: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
-        client_id = str(payload.get("client_id", "")).strip()
-        sdp = str(payload.get("sdp", "")).strip()
-        offer_type = str(payload.get("type", "offer")).strip() or "offer"
-        frequency_hz = validate_receiver_frequency(payload.get("frequency_hz", NWR_CENTER_FREQUENCY_HZ))
-        LOG.info(
-            "weather receiver start requested: client=%s frequency=%s MHz",
-            client_id or "<missing>",
-            receiver_frequency_mhz(frequency_hz),
-        )
-        if not client_id:
-            raise ValueError("receiver client id is required")
-        if not sdp:
-            raise ValueError("WebRTC offer SDP is required")
-        with self.lock:
-            self._ensure_webrtc_client_owner_locked(client_id, account_id)
-        capabilities = server_webrtc_capabilities()
-        if not capabilities.available:
-            LOG.warning(
-                "WebRTC receiver unavailable for client %s: transport=%s opus=%s",
-                client_id,
-                capabilities.transport_error or "ok",
-                capabilities.opus_error or "ok",
-            )
-            raise ValueError(
-                "WebRTC receiver is unavailable: "
-                + (capabilities.transport_error or capabilities.opus_error or "server WebRTC support is incomplete")
-            )
-        self.stop_monitor({"client_id": client_id})
-        self.stop_receiver({"client_id": client_id})
-        event_queue = SameEventQueue()
-        with self.lock:
-            fanout = self.intermediate_fanout
-            if fanout is None:
-                LOG.warning("weather receiver rejected for client %s: RTL-SDR capture is not active", client_id)
-                raise ValueError("RTL-SDR capture is not active")
-            worker = WeatherReceiverWorker(
-                client_id=client_id,
-                fanout=fanout,
-                frequency_hz=frequency_hz,
-                alias_filter_strength_provider=self._alias_filter_strength,
-                event_queue=event_queue,
-            )
-            self.receiver_workers[client_id] = worker
-            self.receiver_accounts_by_client[client_id] = int(account_id or 0) if account_id is not None else 0
-            worker.start()
-        try:
-            track = create_webrtc_pcm_audio_track(worker.source)
-            answer = self.webrtc_runner.run(
-                self.webrtc_sessions.accept_offer(
-                    session_id=client_id,
-                    sdp=sdp,
-                    type=offer_type,
-                    tracks=(track,),
-                    event_queue=event_queue.queue,
-                    on_peer_closed=self._handle_webrtc_session_closed,
-                )
-            )
-        except Exception as exc:
-            failed_worker = None
-            with self.lock:
-                failed_worker = self._detach_receiver_locked(client_id)
-            if failed_worker is not None:
-                failed_worker.stop()
-            LOG.exception("weather receiver negotiation failed for client %s: %s", client_id, exc)
-            raise
-        LOG.info("started weather receiver for %s MHz on client %s", receiver_frequency_mhz(frequency_hz), client_id)
-        return {
-            "success": True,
-            "answer": answer,
-            "receiver": self.receiver_status(client_id),
-        }
 
     def open_receiver_audio_source(
         self,
@@ -6815,7 +6993,7 @@ class RtlControlService:
         event_queue = SameEventQueue()
         with self.lock:
             self._ensure_webrtc_client_owner_locked(client_id, account_id)
-            fanout = self.intermediate_fanout
+            fanout = self._channel_fanout_locked(frequency_hz, f"receiver:{client_id}")
             if fanout is None:
                 raise ValueError("RTL-SDR capture is not active")
         worker = WeatherReceiverWorker(
@@ -6890,10 +7068,6 @@ class RtlControlService:
         with self.lock:
             self._ensure_webrtc_client_owner_locked(client_id, account_id, require_existing=False)
             worker = self._detach_receiver_locked(client_id)
-        try:
-            self.webrtc_runner.run(self.webrtc_sessions.close(client_id), timeout=3.0)
-        except Exception as exc:
-            LOG.debug("WebRTC receiver close failed for client %s: %s", client_id, exc)
         if worker is not None:
             worker.stop()
             LOG.info("stopped weather receiver for client %s", client_id)
@@ -6935,18 +7109,16 @@ class RtlControlService:
         if "enabled" not in payload:
             raise ValueError("stream enabled state is required")
         enabled = bool(payload.get("enabled"))
-        monitor_client_ids: list[str] = []
         detached_monitor_sources: list[SameAwareWebRtcAudioSource] = []
         with self.lock:
             stream = self._stream_locked(stream_id)
             stream["enabled"] = enabled
             stream["updated_at"] = time.time()
             if not enabled:
-                monitor_client_ids = self._remove_monitor_sources_for_stream_locked(stream_id, detached_monitor_sources)
+                self._remove_monitor_sources_for_stream_locked(stream_id, detached_monitor_sources)
             save_streams(self.streams_directory, self.streams)
             self._sync_stream_workers_locked()
         self._close_detached_monitor_sources(detached_monitor_sources)
-        self._close_monitor_sessions(monitor_client_ids)
         LOG.info("%s stream %s", "started" if enabled else "stopped", stream_id)
         return self.stream_status()
 
@@ -7209,12 +7381,30 @@ class RtlControlService:
             self._start_or_update_capture_locked()
 
     def update(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(payload)
+        host_changes: dict[str, Any] = {}
         with self.lock:
+            previous = self.settings
+            if previous.uses_remote_sdr or payload.get("source_mode") == SDR_SOURCE_REMOTE:
+                next_mode = validate_sdr_source_mode(payload.get("source_mode", previous.source_mode))
+                if next_mode == SDR_SOURCE_REMOTE:
+                    # These belong to the remote host's SDR, not this machine's.
+                    # Forward only real changes, so saving something local
+                    # (a notification toggle) never needs the host to answer.
+                    # When first switching to a remote SDR the form still holds
+                    # this machine's values, which must not overwrite the host's.
+                    requested = {key: payload.pop(key) for key in REMOTE_SDR_HOST_SETTINGS if key in payload}
+                    same_host = previous.uses_remote_sdr and payload.get("remote_host_id", previous.remote_host_id) == previous.remote_host_id
+                    current_host = self._remote_host_settings_locked() if same_host else None
+                    host_changes = {
+                        key: value for key, value in requested.items()
+                        if current_host is not None and (key not in current_host or current_host[key] != value)
+                    }
             settings = self._merged_settings(payload)
             self.settings = settings
             save_settings(self.state_path, settings)
             LOG.info(
-                "saved RTL settings: serial=%s sample_rate=%s gain=%s ppm=%s bias_tee=%s alias_filter_strength=%s notify_sdr_failures=%s",
+                "saved RTL settings: serial=%s sample_rate=%s gain=%s ppm=%s bias_tee=%s alias_filter_strength=%s notify_sdr_failures=%s source=%s remote_access=%s",
                 settings.serial or "<none>",
                 settings.sample_rate,
                 "auto" if settings.gain is None else f"{settings.gain:g} dB",
@@ -7222,16 +7412,50 @@ class RtlControlService:
                 settings.bias_tee,
                 settings.alias_filter_strength,
                 settings.notify_sdr_failures,
+                settings.remote_host_id if settings.uses_remote_sdr else "local",
+                settings.remote_access_enabled,
             )
-            if self.iq_file_source_config is not None:
+            source_changed = (previous.uses_remote_sdr, previous.remote_host_id) != (
+                settings.uses_remote_sdr,
+                settings.remote_host_id if settings.uses_remote_sdr else "",
+            ) and (previous.uses_remote_sdr or settings.uses_remote_sdr)
+            if source_changed:
+                # Everything reading the old SDR is rebuilt on the new one.
+                self._stop_sdr_consumers_locked()
+            if settings.uses_remote_sdr:
+                if self.capture is not None:
+                    self._detach_capture_locked()
+                self.iq_file_source_config = None
+                self._sync_remote_sdr_locked()
+                self._sync_stream_workers_locked()
+            elif self.iq_file_source_config is not None:
                 if self.intermediate_fanout is not None:
                     self.intermediate_fanout.set_alias_filter_strength(settings.alias_filter_strength)
-                return self.status()
-            if settings.serial:
+                self._sync_remote_sdr_locked()
+            elif settings.serial:
                 self._start_or_update_capture_locked()
+                self._sync_remote_sdr_locked()
             else:
                 self._detach_capture_locked()
-            return self.status()
+                self._sync_remote_sdr_locked()
+            client = self.remote_client
+        if host_changes:
+            if client is None:
+                raise ValueError("The remote SDR is not connected.")
+            try:
+                client.update_settings(host_changes)
+            except RemoteSdrError as exc:
+                raise ValueError(str(exc)) from exc
+            with self.lock:
+                self._sync_stream_workers_locked()
+        return self.status()
+
+    def _stop_sdr_consumers_locked(self) -> None:
+        if self.iq_recorder is not None:
+            self.iq_recorder.stop()
+            self.iq_recorder = None
+        self._stop_receiver_workers_locked()
+        self._stop_stream_workers_locked()
 
     def _merged_settings(self, payload: dict[str, Any]) -> RtlControlSettings:
         settings = self.settings
@@ -7251,7 +7475,25 @@ class RtlControlService:
             changes["alias_filter_strength"] = validate_alias_filter_strength(payload["alias_filter_strength"])
         if "notify_sdr_failures" in payload:
             changes["notify_sdr_failures"] = bool(payload["notify_sdr_failures"])
-        return replace(settings, **changes)
+        if "source_mode" in payload:
+            changes["source_mode"] = validate_sdr_source_mode(payload["source_mode"])
+        if "remote_host_id" in payload:
+            changes["remote_host_id"] = str(payload["remote_host_id"] or "").strip()
+        if "remote_access_enabled" in payload:
+            changes["remote_access_enabled"] = bool(payload["remote_access_enabled"])
+        if "remote_buffer_seconds" in payload:
+            changes["remote_buffer_seconds"] = validate_remote_buffer_seconds(payload["remote_buffer_seconds"])
+        merged = replace(settings, **changes)
+        if merged.source_mode == SDR_SOURCE_REMOTE and "remote_access_enabled" not in payload:
+            merged = replace(merged, remote_access_enabled=False)  # nothing local to share
+        if merged.source_mode == SDR_SOURCE_REMOTE:
+            if not merged.remote_host_id or self.remote_devices.get(merged.remote_host_id) is None:
+                raise ValueError("Pair with a remote SDR before selecting it.")
+            if merged.remote_access_enabled:
+                raise ValueError("Remote access can only be turned on for an RTL-SDR connected to this machine.")
+        elif merged.remote_access_enabled and not merged.serial:
+            raise ValueError("Select an RTL-SDR connected to this machine before turning on remote access.")
+        return merged
 
     def _start_or_update_capture_locked(self) -> None:
         config = self.settings.to_rtl_config()
@@ -7286,9 +7528,184 @@ class RtlControlService:
         save_settings(self.state_path, self.settings)
         self._sync_stream_workers_locked()
 
+    def _remote_sdr_status_locked(self) -> dict[str, Any]:
+        settings = self.settings
+        server = self.remote_server
+        client = self.remote_client
+        connected = {item["id"]: item for item in (server.connected_clients() if server is not None else [])}
+        in_use = settings.remote_host_id if settings.uses_remote_sdr else ""
+        devices = []
+        client_status = client.status() if client is not None else {}
+        for device in self.remote_devices.public_list():
+            device["in_use"] = device["id"] == in_use
+            device["using_this_sdr"] = device["id"] in connected
+            # The network actually carrying the connection, if there is one.
+            live_address = ""
+            if device["in_use"]:
+                live_address = client_status.get("connected_address", "")
+            elif device["using_this_sdr"]:
+                live_address = connected[device["id"]].get("address", "")
+            device["via"] = ("tailscale" if is_tailscale_address(live_address) else "lan") if live_address else ""
+            devices.append(device)
+        return {
+            "identity": {"id": self.remote_identity.fingerprint, "name": self.remote_identity.name},
+            "sharing": {
+                "enabled": settings.remote_access_enabled,
+                "available": bool(settings.serial) and not settings.uses_remote_sdr,
+                "running": server is not None,
+                "port": server.port if server is not None else None,
+                "error": self.remote_server_error,
+                "pairing": server.pairing_status() if server is not None else {"active": False},
+            },
+            "remote": {
+                "source_mode": settings.source_mode,
+                "device_id": in_use,
+                "status": client_status or None,
+            },
+            "devices": devices,
+        }
+
+    def remote_sdr_status(self) -> dict[str, Any]:
+        with self.lock:
+            return self._remote_sdr_status_locked()
+
+    def discover_remote_sdrs(self) -> dict[str, Any]:
+        hosts = discover_hosts(port=self.remote_sdr_discovery_port, exclude_id=self.remote_identity.fingerprint)
+        paired = {record["id"] for record in self.remote_devices.public_list()}
+        for host in hosts:
+            host["paired"] = host["id"] in paired
+        return {"hosts": hosts}
+
+    def start_remote_sdr_pairing(self) -> dict[str, Any]:
+        with self.lock:
+            server = self.remote_server
+        if server is None:
+            raise ValueError("Turn on sharing before pairing another NWR Stream Manager.")
+        server.begin_pairing()
+        return self.remote_sdr_status()
+
+    def cancel_remote_sdr_pairing(self) -> dict[str, Any]:
+        with self.lock:
+            server = self.remote_server
+        if server is not None:
+            server.cancel_pairing()
+        return self.remote_sdr_status()
+
+    def pair_remote_sdr(self, payload: dict[str, Any]) -> dict[str, Any]:
+        address = str(payload.get("address", "")).strip()
+        if not address:
+            raise ValueError("Select an NWR Stream Manager to pair with.")
+        try:
+            port = int(payload.get("port") or REMOTE_SDR_TCP_PORT)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("The port is invalid.") from exc
+        try:
+            record = pair_with_host(
+                address,
+                port,
+                str(payload.get("code", "")),
+                client_id=self.remote_identity.fingerprint,
+                client_name=self.remote_identity.name,
+                client_port=self.remote_sdr_port or REMOTE_SDR_TCP_PORT,
+                expected_host_id=str(payload.get("host_id", "")).strip(),
+            )
+        except (RemoteSdrError, OSError) as exc:
+            raise ValueError(str(exc) or "Could not reach that NWR Stream Manager.") from exc
+        if record["id"] == self.remote_identity.fingerprint:
+            raise ValueError("This is the same NWR Stream Manager.")
+        discovered = payload.get("addresses") if isinstance(payload.get("addresses"), list) else []
+        self.remote_devices.add(
+            record["id"],
+            record["name"],
+            token=record["token"],
+            peer_token=record["peer_token"],
+            address=record["address"],
+            port=record["port"],
+            addresses=[str(item) for item in discovered],
+        )
+        LOG.info("paired with %s (%s)", record.get("name", ""), address)
+        return self.remote_sdr_status()
+
+    def unpair_remote_sdr_device(self, payload: dict[str, Any]) -> dict[str, Any]:
+        device_id = str(payload.get("device_id", "")).strip()
+        with self.lock:
+            if self.settings.uses_remote_sdr and self.settings.remote_host_id == device_id:
+                raise ValueError("Switch to another SDR before unpairing the one in use.")
+            server = self.remote_server
+        if server is not None:
+            server.unpair(device_id)  # also disconnects it from this SDR
+        else:
+            self.remote_devices.remove(device_id)
+        return self.remote_sdr_status()
+
+    def _sync_remote_sdr_locked(self) -> None:
+        """Start or stop the remote SDR host server and client to match settings."""
+        settings = self.settings
+        stopping: list[Any] = []
+        want_server = settings.remote_access_enabled and not settings.uses_remote_sdr and bool(settings.serial)
+        if want_server and self.remote_server is None:
+            server = RemoteSdrServer(
+                self.remote_identity,
+                self.remote_devices,
+                self.remote_backend,
+                port=self.remote_sdr_port,
+                discovery_port=self.remote_sdr_discovery_port,
+            )
+            try:
+                server.start()
+                self.remote_server = server
+                self.remote_server_error = ""
+            except OSError as exc:
+                self.remote_server_error = f"Remote access could not start: {exc}"
+                LOG.warning("%s", self.remote_server_error)
+        elif not want_server and self.remote_server is not None:
+            stopping.append(self.remote_server)
+            self.remote_server = None
+        if not want_server:
+            self.remote_server_error = ""
+        want_host = settings.remote_host_id if settings.uses_remote_sdr else ""
+        if self.remote_client is not None and self.remote_client.host_id != want_host:
+            stopping.append(self.remote_client)
+            self.remote_client = None
+        if self.remote_client is not None and self.remote_client.buffer_seconds != settings.remote_buffer_seconds:
+            self.remote_client.set_buffer_seconds(settings.remote_buffer_seconds)
+        if want_host and self.remote_client is None:
+            self.remote_client = RemoteSdrClient(
+                want_host,
+                self.remote_devices,
+                client_id=self.remote_identity.fingerprint,
+                discovery_port=self.remote_sdr_discovery_port,
+                buffer_seconds=settings.remote_buffer_seconds,
+            )
+            self.remote_client.start()
+        # Stopping joins threads that may be waiting on this lock, so do it
+        # from another thread.
+        if stopping:
+            threading.Thread(
+                target=lambda: [item.stop() for item in stopping],
+                name="remote-sdr-stop",
+                daemon=True,
+            ).start()
+
+    def _channel_fanout_locked(self, frequency_hz: int, name: str):
+        """A fanout carrying the channel at frequency_hz, local or remote."""
+        if self.settings.uses_remote_sdr:
+            if self.remote_client is None:
+                return None
+            return self.remote_client.channel_fanout(frequency_hz, name=name)
+        return self.intermediate_fanout
+
     def _alias_filter_strength(self) -> int:
         with self.lock:
+            if self.settings.uses_remote_sdr:
+                return int(self._remote_host_settings_locked().get("alias_filter_strength", self.settings.alias_filter_strength))
             return self.settings.alias_filter_strength
+
+    def _remote_host_settings_locked(self) -> dict[str, Any]:
+        client = self.remote_client
+        sdr = client.status().get("sdr", {}) if client is not None else {}
+        settings = sdr.get("settings") if isinstance(sdr, dict) else None
+        return settings if isinstance(settings, dict) else {}
 
     def _gain_signature(self) -> float | None:
         # None means hardware/tuner AGC is enabled. A manual gain change (or
@@ -7299,6 +7716,8 @@ class RtlControlService:
         # own AGC while enabled is not tracked here; see the signal_meter
         # module docstring for why live gain readback is not used.
         with self.lock:
+            if self.settings.uses_remote_sdr:
+                return self._remote_host_settings_locked().get("gain")
             return self.settings.gain
 
     def _effective_settings_locked(self) -> RtlControlSettings:
@@ -7578,10 +7997,13 @@ class RtlControlService:
             LOG.info("stopped stream test mode for %s: stream is no longer enabled", active_test_stream_id)
             self.stream_test_mode = None
             active_test_stream_id = ""
-        fanout = self.intermediate_fanout or (self.test_mode_fanout if active_test_stream_id else None)
+        remote = self.remote_client if self.settings.uses_remote_sdr else None
+        fanout = None if remote is not None else (
+            self.intermediate_fanout or (self.test_mode_fanout if active_test_stream_id else None)
+        )
         desired: dict[str, dict[str, Any]] = {}
         monitored_stream_ids = set(self.monitor_streams_by_client.values())
-        if fanout is not None:
+        if fanout is not None or remote is not None:
             for stream in list(self.streams) + list(getattr(self, "preview_streams", {}).values()):
                 if not stream.get("enabled", True):
                     continue
@@ -7599,13 +8021,18 @@ class RtlControlService:
                 worker = self.stream_workers.pop(key)
                 self._stop_stream_worker_async(worker, reason="retired")
 
-        if fanout is None:
+        if fanout is None and remote is None:
             return
+
+        def fanout_current(worker_fanout) -> bool:
+            if remote is not None:
+                return isinstance(worker_fanout, RemoteIqFanout) and worker_fanout.client is remote
+            return worker_fanout is fanout
 
         for key, stream in desired.items():
             worker = self.stream_workers.get(key)
             if worker is not None:
-                if worker.fanout is not fanout:
+                if not fanout_current(worker.fanout):
                     self.stream_workers.pop(key, None)
                     self._stop_stream_worker_async(worker, reason="fanout changed")
                 else:
@@ -7615,9 +8042,17 @@ class RtlControlService:
             if worker is not None:
                 worker.sync_stream(stream)
                 continue
+            worker_fanout = fanout
+            if remote is not None:
+                station = stream.get("station", {})
+                try:
+                    frequency_hz = int(round(float(station["frequency"]) * 1_000_000))
+                except (KeyError, TypeError, ValueError):
+                    frequency_hz = NWR_CENTER_FREQUENCY_HZ
+                worker_fanout = remote.channel_fanout(frequency_hz, name=str(station.get("callsign") or stream.get("id", "stream")))
             worker = IcecastStreamWorker(
                 stream=stream,
-                fanout=fanout,
+                fanout=worker_fanout,
                 fallback_settings_provider=self.fallback_settings_snapshot,
                 alias_filter_strength_provider=self._alias_filter_strength,
                 gain_provider=self._gain_signature,
@@ -7696,13 +8131,6 @@ class RtlControlService:
                 source.close()
         return client_ids
 
-    def _close_monitor_sessions(self, client_ids: list[str]) -> None:
-        for client_id in client_ids:
-            try:
-                self.webrtc_runner.run(self.webrtc_sessions.close(client_id), timeout=3.0)
-            except Exception as exc:
-                LOG.debug("WebRTC monitor close failed for client %s: %s", client_id, exc)
-
     def _detach_receiver_locked(self, client_id: str) -> WeatherReceiverWorker | None:
         worker = self.receiver_workers.pop(client_id, None)
         self.receiver_accounts_by_client.pop(client_id, None)
@@ -7723,37 +8151,6 @@ class RtlControlService:
         threading.Thread(
             target=cleanup,
             name=f"receiver-stop-{getattr(worker, 'client_id', 'unknown')}",
-            daemon=True,
-        ).start()
-
-    def _handle_webrtc_session_closed(self, client_id: str, reason: str) -> None:
-        def cleanup() -> None:
-            detached_monitor_source = None
-            with self.lock:
-                stopped_stream_id = self.monitor_streams_by_client.get(client_id, "")
-                if stopped_stream_id:
-                    detached_monitor_source = self._remove_monitor_source_locked(client_id)
-                stopped_receiver = self._detach_receiver_locked(client_id)
-            self._close_detached_monitor_sources([detached_monitor_source])
-            if stopped_receiver is not None:
-                stopped_receiver.stop()
-            if stopped_stream_id:
-                LOG.info(
-                    "cleaned up stale WebRTC monitor for stream %s on client %s after %s",
-                    stopped_stream_id,
-                    client_id,
-                    reason,
-                )
-            if stopped_receiver is not None:
-                LOG.info(
-                    "cleaned up stale weather receiver for client %s after %s",
-                    client_id,
-                    reason,
-                )
-
-        threading.Thread(
-            target=cleanup,
-            name=f"webrtc-cleanup-{client_id}",
             daemon=True,
         ).start()
 
@@ -7959,7 +8356,6 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 "/api/eas-alert-export",
                 "/api/eas-alert",
                 "/api/eas-alert-audio",
-                "/api/webrtc-capabilities",
                 "/api/live-audio",
                 "/api/monitor/status",
                 "/api/receiver/status",
@@ -7972,11 +8368,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if method == "POST":
             return path in {
                 "/api/client-log",
-                "/api/monitor/start",
                 "/api/monitor/pause",
                 "/api/monitor/resume",
                 "/api/monitor/stop",
-                "/api/receiver/start",
                 "/api/receiver/tune",
                 "/api/receiver/pause",
                 "/api/receiver/resume",
@@ -8242,6 +8636,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_json(self.service.devices())
         elif path == "/api/notification-settings":
             self._send_json({"notifications": self.service.notification_settings_snapshot().public_dict()})
+        elif path == "/api/remote-sdr":
+            self._send_json(self.service.remote_sdr_status())
         elif path == "/api/notification-access-urls":
             self._send_json(self.service.notification_access_url_options())
         elif path == "/api/iq-test-sources":
@@ -8268,8 +8664,6 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             )
         elif path == "/api/eas-alert-streams":
             self._send_json(self.service.eas_alert_streams())
-        elif path == "/api/webrtc-capabilities":
-            self._send_json(server_webrtc_capabilities().to_dict())
         elif path == "/api/eas-alerts":
             query = parse_qs(parsed.query)
             try:
@@ -8386,6 +8780,21 @@ class RtlControlHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         if not self._auth_ok_or_setup_response(path, "POST"):
+            return
+        remote_sdr_actions = {
+            "/api/remote-sdr/discover": lambda payload: self.service.discover_remote_sdrs(),
+            "/api/remote-sdr/pairing/start": lambda payload: self.service.start_remote_sdr_pairing(),
+            "/api/remote-sdr/pairing/cancel": lambda payload: self.service.cancel_remote_sdr_pairing(),
+            "/api/remote-sdr/pair": self.service.pair_remote_sdr,
+            "/api/remote-sdr/unpair": self.service.unpair_remote_sdr_device,
+        }
+        if path in remote_sdr_actions:
+            try:
+                response = remote_sdr_actions[path](self._read_json())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
             return
         if path == "/api/setup-account":
             try:
@@ -8521,20 +8930,6 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json({"success": True})
             return
-        if path == "/api/monitor/start":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.start_monitor(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API monitor start failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
         if path == "/api/monitor/stop":
             try:
                 payload = self._read_json()
@@ -8573,20 +8968,6 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 )
             except Exception as exc:
                 LOG.warning("API monitor resume failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/receiver/start":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.start_receiver(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API receiver start failed for %s: %s", self._client_address(), exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
@@ -9130,6 +9511,25 @@ def systemd_directory_path(variable: str) -> Path | None:
     return Path(value.split(":", 1)[0]).expanduser()
 
 
+def validate_remote_buffer_seconds(value: Any) -> float:
+    try:
+        seconds = round(float(value), 2)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The network buffer must be a number of seconds.") from exc
+    if not REMOTE_IQ_MIN_BUFFER_SECONDS <= seconds <= REMOTE_IQ_MAX_SETTING_SECONDS:
+        raise ValueError(
+            f"The network buffer must be between {REMOTE_IQ_MIN_BUFFER_SECONDS:g} and {REMOTE_IQ_MAX_SETTING_SECONDS:g} seconds."
+        )
+    return seconds
+
+
+def validate_sdr_source_mode(value: Any) -> str:
+    mode = str(value or SDR_SOURCE_LOCAL).strip().lower()
+    if mode not in {SDR_SOURCE_LOCAL, SDR_SOURCE_REMOTE}:
+        raise ValueError("SDR source must be local or remote")
+    return mode
+
+
 def load_settings(path: Path) -> RtlControlSettings:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -9151,6 +9551,10 @@ def load_settings(path: Path) -> RtlControlSettings:
                 raw.get("alias_filter_strength", ALIAS_FILTER_STRENGTH_DEFAULT)
             ),
             notify_sdr_failures=bool(raw.get("notify_sdr_failures", False)),
+            remote_access_enabled=bool(raw.get("remote_access_enabled", False)),
+            source_mode=validate_sdr_source_mode(raw.get("source_mode", SDR_SOURCE_LOCAL)),
+            remote_host_id=str(raw.get("remote_host_id", "")).strip(),
+            remote_buffer_seconds=validate_remote_buffer_seconds(raw.get("remote_buffer_seconds", REMOTE_IQ_BUFFER_SECONDS)),
         )
     except Exception as exc:
         LOG.warning("RTL control settings in %s are invalid: %s", path, exc)
@@ -10415,6 +10819,20 @@ def friendly_soundcard_device_label(device: dict[str, Any]) -> str:
     return label or str(device.get("display_name") or device.get("device") or device.get("hw_device") or "Sound card").strip()
 
 
+def rtl_problem_messages(category: str, device_name: str) -> tuple[str, str]:
+    """Failure and recovery notification text for an SDR problem."""
+    device = sentence_case(device_name)
+    if category == "permission":
+        return f"Insufficient permissions to access {device_name}.", f"{device} can now be accessed."
+    if category == "claim":
+        return f"Failed to claim {device_name}.", f"Successfully claimed {device_name}."
+    if category in {"error", "no-data"}:
+        return f"{device} has stopped outputting data.", f"{device} is outputting data again."
+    if category == "unreachable":
+        return f"{device} is not reachable.", f"{device} is reachable again."
+    return f"{device} is not connected.", f"{device} is now connected."
+
+
 def sentence_case(text: str) -> str:
     """Capitalize the first letter, for names that can start a sentence."""
     return text[:1].upper() + text[1:]
@@ -11101,11 +11519,6 @@ def access_urls(host: str, port: int) -> list[str]:
     return [f"http://{address}:{port}" for address in ordered_hosts]
 
 
-def configure_dependency_logging() -> None:
-    for name in ("aioice", "aiortc"):
-        logging.getLogger(name).setLevel(logging.WARNING)
-
-
 def default_log_path(state_path: Path) -> Path:
     logs_directory = systemd_directory_path("LOGS_DIRECTORY")
     if logs_directory is not None:
@@ -11177,7 +11590,6 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    configure_dependency_logging()
     log_path = log_file or default_log_path(state_path)
     configure_file_logging(log_path)
     try:
@@ -11785,13 +12197,38 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div id="view_rtl" class="view" hidden>
     <section>
       <h2>Configure RTL-SDR</h2>
-      <label>Active SDR
-        <select id="serial" aria-describedby="serial_hint"></select>
-      </label>
-      <span id="serial_hint" class="hint">Select the SDR dongle by serial number.</span>
-      <button id="rescan_devices" type="button">Rescan</button>
-      <button id="reset_rtl_device" type="button">Reset SDR</button>
-      <div id="device-errors" class="error"></div>
+      <fieldset id="sdr_source_fieldset">
+        <legend>SDR source</legend>
+        <label class="checkbox-row">
+          <input id="sdr_source_local" name="sdr_source" type="radio" value="local">
+          RTL-SDR connected to this machine
+        </label>
+        <label class="checkbox-row">
+          <input id="sdr_source_remote" name="sdr_source" type="radio" value="remote">
+          RTL-SDR shared by another NWR Stream Manager
+        </label>
+      </fieldset>
+      <div id="local_sdr_controls">
+        <label>Active SDR
+          <select id="serial" aria-describedby="serial_hint"></select>
+        </label>
+        <span id="serial_hint" class="hint">Select the SDR dongle by serial number.</span>
+        <button id="rescan_devices" type="button">Rescan</button>
+        <button id="reset_rtl_device" type="button">Reset SDR</button>
+        <div id="device-errors" class="error"></div>
+      </div>
+      <div id="remote_sdr_controls" hidden>
+        <label>Shared SDR
+          <select id="remote_sdr_device" aria-describedby="remote_sdr_device_hint"></select>
+        </label>
+        <span id="remote_sdr_device_hint" class="hint">Choose a paired NWR Stream Manager whose RTL-SDR this machine should use.</span>
+        <p id="remote_sdr_status"></p>
+        <label>Network buffer in seconds
+          <input id="remote_buffer_seconds" type="number" min="0.1" max="10" step="0.1" aria-describedby="remote_buffer_seconds_hint">
+        </label>
+        <span id="remote_buffer_seconds_hint" class="hint">How much radio data to hold back to ride out Wi-Fi congestion and network dropouts. Higher values are more reliable on weak connections but put audio further behind real time; raising it pauses audio while the buffer fills, and lowering it skips ahead. Valid range is 0.1 through 10 seconds. This delay applies to everything using the shared RTL-SDR, including stream monitoring and the weather radio receiver, whose own playback buffering in the browser adds to it.</span>
+      </div>
+      <div id="sdr-source-result" class="message" aria-live="polite"></div>
     </section>
     <section>
       <div class="grid">
@@ -11820,6 +12257,67 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div id="alias_filter_strength_hint" class="hint">
         Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.
       </div>
+    </section>
+    <section id="sdr_sharing_section">
+      <h3>Sharing</h3>
+      <p id="remote_access_unavailable" class="hint" hidden>Sharing is available while an RTL-SDR connected to this machine is selected.</p>
+      <div id="remote_access_controls">
+        <label class="checkbox-row">
+          <input id="remote_access_enabled" type="checkbox" aria-describedby="remote_access_hint">
+          Share this RTL-SDR with paired devices
+        </label>
+        <span id="remote_access_hint" class="hint">Paired NWR Stream Manager devices on your network can use this RTL-SDR for their streams, weather radio receiver and I/Q recordings. Sharing uses TCP port 47432 and UDP port 47433.</span>
+        <div id="remote_pairing_controls" hidden>
+          <div class="actions">
+            <button id="start_remote_pairing" type="button">Pair a device</button>
+            <button id="cancel_remote_pairing" type="button" hidden>Stop pairing</button>
+          </div>
+          <p id="remote_pairing_code" aria-live="polite"></p>
+        </div>
+      </div>
+      <div id="remote-sharing-result" class="message" aria-live="polite"></div>
+    </section>
+    <section id="remote_pair_section">
+      <h3>Pair with another NWR Stream Manager</h3>
+      <p class="hint">Pair once and either device can use the other's RTL-SDR. On the device you are pairing with, turn on sharing and select Pair a device to show a pairing code.</p>
+      <div class="actions">
+        <button id="find_remote_devices" type="button">Find devices</button>
+      </div>
+      <div class="grid">
+        <label>Device
+          <select id="remote_pair_device"></select>
+        </label>
+        <label id="remote_pair_address_label" hidden>Address
+          <input id="remote_pair_address" type="text" autocomplete="off" spellcheck="false" aria-describedby="remote_pair_address_hint">
+        </label>
+        <span id="remote_pair_address_hint" class="hint" hidden>The IP address or host name of the other NWR Stream Manager.</span>
+        <label>Pairing code
+          <input id="remote_pair_code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" aria-describedby="remote_pair_code_hint">
+        </label>
+        <span id="remote_pair_code_hint" class="hint">The 6-digit code shown on the other device.</span>
+      </div>
+      <div class="actions">
+        <button id="pair_remote_device" type="button">Pair</button>
+      </div>
+      <div id="remote-pair-result" class="message" aria-live="polite"></div>
+    </section>
+    <section id="paired_devices_section">
+      <h3>Paired devices</h3>
+      <table class="responsive-table" role="table" aria-label="Paired devices">
+        <thead role="rowgroup">
+          <tr role="row">
+            <th role="columnheader">Name</th>
+            <th role="columnheader">Status</th>
+            <th role="columnheader">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="paired-devices-body" role="rowgroup" aria-live="off">
+          <tr data-row-key="empty" role="row">
+            <td colspan="3" class="hint" role="cell">No paired devices.</td>
+          </tr>
+        </tbody>
+      </table>
+      <div id="paired-devices-result" class="message" aria-live="polite"></div>
     </section>
     <section id="rtl_notifications_section" hidden>
       <h3>Notifications</h3>
@@ -12025,7 +12523,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div id="view_logs" class="view" hidden>
     <section>
       <h2>Logs</h2>
-      <div id="webrtc_support_status" class="hint" hidden></div>
       <div class="status" aria-live="off">
         <div class="metric"><b>Capture</b><span id="active">inactive</span></div>
         <div class="metric"><b>Chunks</b><span id="chunks">0</span></div>
@@ -12846,10 +13343,6 @@ let iqRecordingsSignature = "";
 let selectedIqRecordingId = "";
 let lastIqRecordingsRefreshAt = 0;
 let iqTestSourcesSignature = "";
-let webRtcSupport = {
-  browser: {webrtc: false, opus: false},
-  server: {available: false}
-};
 let monitorClientId = "";
 let monitorStreamId = "";
 let monitorPeerConnection = null;
@@ -12892,7 +13385,6 @@ let accountsSignature = "";
 let notificationSettingsSignature = "";
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
-const WEBRTC_JITTER_BUFFER_TARGET_SECONDS = 0.06;
 const LIVE_AUDIO_TARGET_LATENCY_SECONDS = 0.26;
 const LIVE_AUDIO_MAX_LATENCY_SECONDS = 0.55;
 const LIVE_AUDIO_HARD_RESET_LATENCY_SECONDS = 1.2;
@@ -13246,30 +13738,6 @@ function handleLiveSameEvent(event) {
   }
 }
 
-function attachLiveEventChannel(channel) {
-  if (!channel) return null;
-  channel.addEventListener("open", () => {
-    logClientEvent("info", "same", "live SAME event channel opened");
-  });
-  channel.addEventListener("close", () => {
-    logClientEvent("info", "same", "live SAME event channel closed");
-  });
-  channel.addEventListener("message", message => {
-    try {
-      handleLiveSameEvent(JSON.parse(message.data));
-    } catch (error) {
-      logClientEvent("warning", "same", "invalid live SAME event", {error: error.message});
-      console.debug("invalid live SAME event", error);
-    }
-  });
-  return channel;
-}
-
-function createLiveEventChannel(peer) {
-  if (!peer || typeof peer.createDataChannel !== "function") return null;
-  return attachLiveEventChannel(peer.createDataChannel("nwr-events", {ordered: true}));
-}
-
 async function request(path, options = {}) {
   const response = await fetch(path, options);
   const data = await response.json();
@@ -13303,28 +13771,6 @@ function logClientEvent(level, area, message, details = {}) {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({level, area, message, details})
   }).catch(() => {});
-}
-
-function mediaSessionDiagnostics(audio) {
-  const session = "mediaSession" in navigator ? navigator.mediaSession : null;
-  return {
-    media_session_supported: Boolean(session),
-    media_metadata_supported: "MediaMetadata" in window,
-    media_session_playback_state: session ? session.playbackState : "",
-    audio_present: Boolean(audio),
-    audio_hidden: Boolean(audio && audio.hidden),
-    audio_paused: Boolean(audio && audio.paused),
-    audio_muted: Boolean(audio && audio.muted),
-    audio_volume: audio ? audio.volume : null,
-    audio_ready_state: audio ? audio.readyState : null,
-    audio_network_state: audio ? audio.networkState : null,
-    audio_has_src_object: Boolean(audio && audio.srcObject),
-    audio_track_count: audio && audio.srcObject && typeof audio.srcObject.getAudioTracks === "function"
-      ? audio.srcObject.getAudioTracks().length
-      : 0,
-    visibility_state: document.visibilityState,
-    user_agent: navigator.userAgent
-  };
 }
 
 function mediaSessionAnchorDiagnostics() {
@@ -13516,24 +13962,6 @@ function formatDuration(seconds) {
   const remaining = seconds % 60;
   if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
   return `${minutes}:${String(remaining).padStart(2, "0")}`;
-}
-
-function detectBrowserWebRtcSupport() {
-  const peerConnectionClass = window.RTCPeerConnection || window.webkitRTCPeerConnection;
-  const receiverClass = window.RTCRtpReceiver;
-  let opus = false;
-  if (receiverClass && typeof receiverClass.getCapabilities === "function") {
-    const capabilities = receiverClass.getCapabilities("audio");
-    opus = Boolean(
-      capabilities &&
-      Array.isArray(capabilities.codecs) &&
-      capabilities.codecs.some(codec => String(codec.mimeType || "").toLowerCase() === "audio/opus")
-    );
-  }
-  return {
-    webrtc: Boolean(peerConnectionClass),
-    opus
-  };
 }
 
 function supportsWebSocketLiveAudio() {
@@ -13935,26 +14363,6 @@ async function startLiveAudioSocket(params) {
   });
 }
 
-async function loadWebRtcSupport() {
-  const browser = detectBrowserWebRtcSupport();
-  let server = {available: false, transport_available: false, opus_available: false};
-  try {
-    server = await request("/api/webrtc-capabilities");
-  } catch (error) {
-    server = {available: false, error: error.message};
-  }
-  webRtcSupport = {browser, server};
-  window.nwrWebRtcSupport = webRtcSupport;
-  const element = document.getElementById("webrtc_support_status");
-  if (element) {
-    element.dataset.browserWebrtc = browser.webrtc ? "true" : "false";
-    element.dataset.browserOpus = browser.opus ? "true" : "false";
-    element.dataset.serverWebrtc = server.available ? "true" : "false";
-    element.textContent = `WebRTC browser=${browser.webrtc && browser.opus ? "available" : "unavailable"}, server=${server.available ? "available" : "unavailable"}`;
-  }
-  return webRtcSupport;
-}
-
 function pageMonitorClientId() {
   if (!monitorClientId) {
     monitorClientId = window.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
@@ -13985,22 +14393,6 @@ function resetLiveAudioElement() {
   } catch (error) {
     console.debug("live audio element reset failed", error);
   }
-}
-
-function restoreReceiverRemoteAudioElement() {
-  const audio = document.getElementById("stream_monitor_audio");
-  if (!audio || !receiverRemoteStream) return null;
-  if (audio.srcObject !== receiverRemoteStream) audio.srcObject = receiverRemoteStream;
-  prepareLiveAudioElement(audio);
-  applyReceiverPlaybackVolume();
-  return audio;
-}
-
-function pauseReceiverAudioElement() {
-  const audio = document.getElementById("stream_monitor_audio");
-  if (!audio) return;
-  prepareLiveAudioElement(audio);
-  audio.pause();
 }
 
 function clearLocalStreamMonitor() {
@@ -14055,19 +14447,10 @@ function clearMonitorWatchdogs() {
   clearMonitorStatsTimer();
 }
 
-function resumeMonitorPlayback() {
-  const audio = document.getElementById("stream_monitor_audio");
-  if (!audio || !audio.srcObject || !monitorStreamId) return;
-  if (audio.paused || audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-    audio.play().catch(error => console.debug("monitor playback resume failed", error));
-  }
-}
-
 function markMonitorPacketProgress(packetCount) {
   monitorLastPacketCount = packetCount;
   monitorLastPacketAt = Date.now();
   clearMonitorUnstableTimer();
-  resumeMonitorPlayback();
 }
 
 async function stopMonitorForUnstableConnection(reason = "") {
@@ -14123,10 +14506,9 @@ async function startStreamMonitor(streamId) {
         await resumeStreamMonitor();
         return;
       }
-      resumeMonitorPlayback();
       return;
     }
-    logClientEvent("info", "monitor", "restarting stale monitor WebRTC session", {stream_id: streamId});
+    logClientEvent("info", "monitor", "restarting stale monitor live-audio session", {stream_id: streamId});
     await stopStreamMonitor({notifyServer: true});
   }
   logClientEvent("info", "monitor", "monitor start requested", {stream_id: streamId});
@@ -14149,132 +14531,8 @@ async function startStreamMonitor(streamId) {
     if (settingsStreamId) renderStreamSettings();
     return;
   }
-  if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
-    logClientEvent("warning", "monitor", "browser does not support WebRTC Opus monitoring", webRtcSupport.browser);
-    throw new Error("This browser does not support WebRTC Opus audio monitoring.");
-  }
-  if (!webRtcSupport.server.available) {
-    const error = webRtcSupport.server.transport_error || webRtcSupport.server.opus_error || "Server WebRTC support is unavailable.";
-    logClientEvent("warning", "monitor", "server WebRTC support unavailable", webRtcSupport.server);
-    throw new Error(error);
-  }
-  const peer = new RTCPeerConnection({iceServers: []});
-  createLiveEventChannel(peer);
-  monitorPeerConnection = peer;
-  monitorStreamId = streamId;
-  monitorPaused = false;
-  await startMediaSessionAnchor("monitor-start");
-  updateMonitorMediaSession();
-  const audio = document.getElementById("stream_monitor_audio");
-  const transceiver = peer.addTransceiver("audio", {direction: "recvonly"});
-  if (transceiver.receiver && "jitterBufferTarget" in transceiver.receiver) {
-    try {
-      transceiver.receiver.jitterBufferTarget = WEBRTC_JITTER_BUFFER_TARGET_SECONDS;
-    } catch (error) {
-      console.debug("WebRTC receiver jitterBufferTarget is not writable", error);
-    }
-  }
-  peer.addEventListener("track", event => {
-    if (event.receiver && "jitterBufferTarget" in event.receiver) {
-      try {
-        event.receiver.jitterBufferTarget = WEBRTC_JITTER_BUFFER_TARGET_SECONDS;
-      } catch (error) {
-        console.debug("WebRTC track jitterBufferTarget is not writable", error);
-      }
-    }
-    audio.srcObject = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
-    prepareLiveAudioElement(audio);
-    audio.play()
-      .then(() => logClientEvent("info", "monitor", "monitor audio element playback started", mediaSessionDiagnostics(audio)))
-      .catch(error => {
-        logClientEvent("warning", "monitor", "monitor audio element playback failed", {...mediaSessionDiagnostics(audio), error: error.message});
-        setStreamResult(`Monitoring audio could not start: ${error.message}`, "error");
-      });
-    for (const eventName of ["waiting", "stalled", "suspend"]) {
-      audio.addEventListener(eventName, () => {
-        if (monitorPeerConnection === peer) scheduleMonitorUnstableStop(`audio ${eventName}`);
-      });
-    }
-    audio.addEventListener("playing", () => {
-      if (monitorPeerConnection === peer) clearMonitorUnstableTimer();
-    });
-    event.track.addEventListener("mute", () => {
-      if (monitorPeerConnection === peer) scheduleMonitorUnstableStop("audio track muted");
-    });
-    event.track.addEventListener("unmute", () => {
-      if (monitorPeerConnection === peer) {
-        clearMonitorUnstableTimer();
-        resumeMonitorPlayback();
-      }
-    });
-  });
-  peer.addEventListener("connectionstatechange", () => {
-    if (monitorPeerConnection !== peer) return;
-    if (["connected"].includes(peer.connectionState)) {
-      clearMonitorUnstableTimer();
-      return;
-    }
-    if (["failed", "closed", "disconnected"].includes(peer.connectionState)) {
-      scheduleMonitorUnstableStop(`connectionState=${peer.connectionState}`);
-    }
-  });
-  peer.addEventListener("iceconnectionstatechange", () => {
-    if (monitorPeerConnection !== peer) return;
-    if (["connected", "completed"].includes(peer.iceConnectionState)) {
-      clearMonitorUnstableTimer();
-      return;
-    }
-    if (["failed", "closed", "disconnected"].includes(peer.iceConnectionState)) {
-      scheduleMonitorUnstableStop(`iceConnectionState=${peer.iceConnectionState}`);
-    }
-  });
-  try {
-    const offer = await peer.createOffer();
-    await peer.setLocalDescription(offer);
-    const data = await request("/api/monitor/start", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        client_id: pageMonitorClientId(),
-        stream_id: streamId,
-        sdp: peer.localDescription.sdp,
-        type: peer.localDescription.type
-      })
-    });
-    await peer.setRemoteDescription(data.answer);
-    logClientEvent("info", "monitor", "monitor WebRTC answer accepted", {stream_id: streamId});
-    startMonitorPacketStats();
-    updateMonitorMediaSession();
-    renderStreams(configuredStreams);
-    if (settingsStreamId) renderStreamSettings();
-  } catch (error) {
-    if (monitorPeerConnection === peer) {
-      monitorPeerConnection = null;
-      monitorStreamId = "";
-      monitorPaused = false;
-      clearMonitorWatchdogs();
-      resetLiveAudioElement();
-      stopMediaSessionAnchor("monitor-start-failed");
-      clearLiveMediaSession();
-    }
-    try {
-      peer.close();
-    } catch (closeError) {
-      console.debug("failed to close failed monitor peer", closeError);
-    }
-    try {
-      await request("/api/monitor/stop", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({client_id: pageMonitorClientId()})
-      });
-    } catch (stopError) {
-      console.debug("monitor cleanup after failed start failed", stopError);
-    }
-    renderStreams(configuredStreams);
-    if (settingsStreamId) renderStreamSettings();
-    throw error;
-  }
+  logClientEvent("warning", "monitor", "browser does not support live audio", {});
+  throw new Error("This browser does not support live audio playback.");
 }
 
 async function stopStreamMonitor(options = {}) {
@@ -14309,12 +14567,7 @@ async function pauseStreamMonitor() {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({client_id: pageMonitorClientId()})
   });
-  const audio = document.getElementById("stream_monitor_audio");
-  if (liveAudioPeerUsesWebSocket(monitorPeerConnection)) {
-    stopScheduledLiveAudioSources();
-  } else if (audio) {
-    audio.pause();
-  }
+  stopScheduledLiveAudioSources();
   pauseMediaSessionAnchor("monitor-pause");
   updateMonitorMediaSession();
   logClientEvent("info", "monitor", "monitor paused", {stream_id: streamId});
@@ -14341,12 +14594,8 @@ async function resumeStreamMonitor() {
   monitorPaused = false;
   clearMonitorUnstableTimer();
   await startMediaSessionAnchor("monitor-resume");
-  if (liveAudioPeerUsesWebSocket(monitorPeerConnection)) {
-    await ensureLiveAudioContext();
-    liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
-  } else {
-    resumeMonitorPlayback();
-  }
+  await ensureLiveAudioContext();
+  liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
   updateMonitorMediaSession();
   startMonitorPacketStats();
   logClientEvent("info", "monitor", "monitor resumed", {stream_id: streamId});
@@ -14437,19 +14686,10 @@ function clearReceiverWatchdogs() {
   clearReceiverStatsTimer();
 }
 
-function resumeReceiverPlayback() {
-  const audio = document.getElementById("stream_monitor_audio");
-  if (!audio || !audio.srcObject || !receiverPlaying) return;
-  if (audio.paused || audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-    audio.play().catch(error => console.debug("receiver playback resume failed", error));
-  }
-}
-
 function markReceiverPacketProgress(packetCount) {
   receiverLastPacketCount = packetCount;
   receiverLastPacketAt = Date.now();
   clearReceiverUnstableTimer();
-  resumeReceiverPlayback();
 }
 
 async function stopReceiverForUnstableConnection(reason = "") {
@@ -14558,21 +14798,13 @@ function clearReceiverMediaSession() {
   clearLiveMediaSession();
 }
 
-function setReceiverAudioTracksEnabled(enabled) {
-  const audio = document.getElementById("stream_monitor_audio");
-  if (!audio || !audio.srcObject || typeof audio.srcObject.getAudioTracks !== "function") return;
-  for (const track of audio.srcObject.getAudioTracks()) {
-    track.enabled = enabled;
-  }
-}
-
 async function startWeatherReceiver() {
   pauseCurrentEasAlert();
   if (receiverPeerConnection) {
     if (liveAudioPeerIsUnusable(receiverPeerConnection) || !receiverRemoteStream) {
       logClientEvent("info", "receiver", "restarting stale receiver live-audio session", {frequency: currentReceiverChannel().label});
       await stopWeatherReceiver({notifyServer: true});
-    } else if (liveAudioPeerUsesWebSocket(receiverPeerConnection)) {
+    } else {
       logClientEvent("info", "receiver", "receiver WebSocket resume requested", {frequency: currentReceiverChannel().label});
       try {
         await request("/api/receiver/resume", {
@@ -14592,30 +14824,6 @@ async function startWeatherReceiver() {
       await ensureLiveAudioContext();
       liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
       await startMediaSessionAnchor("receiver-resume");
-      startReceiverPacketStats();
-      updateReceiverMediaSession();
-      renderReceiverControls();
-      setReceiverResult(`Listening to ${currentReceiverChannel().label}.`, "success");
-      return;
-    } else {
-      logClientEvent("info", "receiver", "receiver resume requested", {frequency: currentReceiverChannel().label});
-      await request("/api/receiver/resume", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({client_id: pageReceiverClientId()})
-      });
-      receiverPlaying = true;
-      receiverPaused = false;
-      clearReceiverUnstableTimer();
-      await startMediaSessionAnchor("receiver-resume");
-      const audio = restoreReceiverRemoteAudioElement();
-      setReceiverAudioTracksEnabled(true);
-      if (audio && audio.srcObject) {
-        prepareLiveAudioElement(audio);
-        applyReceiverPlaybackVolume();
-        await audio.play();
-        logClientEvent("info", "receiver", "receiver audio element playback resumed", mediaSessionDiagnostics(audio));
-      }
       startReceiverPacketStats();
       updateReceiverMediaSession();
       renderReceiverControls();
@@ -14644,119 +14852,8 @@ async function startWeatherReceiver() {
     setReceiverResult(`Listening to ${channel.label}.`, "success");
     return;
   }
-  if (!webRtcSupport.browser.webrtc || !webRtcSupport.browser.opus) {
-    logClientEvent("warning", "receiver", "browser does not support WebRTC Opus receiver", webRtcSupport.browser);
-    throw new Error("This browser does not support WebRTC Opus audio.");
-  }
-  if (!webRtcSupport.server.available) {
-    const error = webRtcSupport.server.transport_error || webRtcSupport.server.opus_error || "Server WebRTC support is unavailable.";
-    logClientEvent("warning", "receiver", "server WebRTC support unavailable", webRtcSupport.server);
-    throw new Error(error);
-  }
-  const peer = new RTCPeerConnection({iceServers: []});
-  createLiveEventChannel(peer);
-  receiverPeerConnection = peer;
-  receiverPlaying = true;
-  receiverPaused = false;
-  await startMediaSessionAnchor("receiver-start");
-  updateReceiverMediaSession();
-  renderReceiverControls();
-  const audio = document.getElementById("stream_monitor_audio");
-  const transceiver = peer.addTransceiver("audio", {direction: "recvonly"});
-  if (transceiver.receiver && "jitterBufferTarget" in transceiver.receiver) {
-    try {
-      transceiver.receiver.jitterBufferTarget = WEBRTC_JITTER_BUFFER_TARGET_SECONDS;
-    } catch (error) {
-      console.debug("WebRTC receiver jitterBufferTarget is not writable", error);
-    }
-  }
-  peer.addEventListener("track", event => {
-    event.track.enabled = true;
-    if (event.receiver && "jitterBufferTarget" in event.receiver) {
-      try {
-        event.receiver.jitterBufferTarget = WEBRTC_JITTER_BUFFER_TARGET_SECONDS;
-      } catch (error) {
-        console.debug("WebRTC track jitterBufferTarget is not writable", error);
-      }
-    }
-    receiverRemoteStream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
-    audio.srcObject = receiverRemoteStream;
-    prepareLiveAudioElement(audio);
-    applyReceiverPlaybackVolume();
-    setReceiverAudioTracksEnabled(true);
-    audio.play()
-      .then(() => logClientEvent("info", "receiver", "receiver audio element playback started", mediaSessionDiagnostics(audio)))
-      .catch(error => {
-        logClientEvent("warning", "receiver", "receiver audio element playback failed", {...mediaSessionDiagnostics(audio), error: error.message});
-        setReceiverResult(`Receiver audio could not start: ${error.message}`, "error");
-      });
-    for (const eventName of ["waiting", "stalled", "suspend"]) {
-      audio.addEventListener(eventName, () => {
-        if (receiverPeerConnection === peer) scheduleReceiverUnstableStop(`audio ${eventName}`);
-      });
-    }
-    audio.addEventListener("playing", () => {
-      if (receiverPeerConnection !== peer) return;
-      if (receiverPaused) {
-        scheduleReceiverMediaSessionRefresh();
-        return;
-      }
-      clearReceiverUnstableTimer();
-    });
-    event.track.addEventListener("mute", () => {
-      if (receiverPeerConnection === peer) scheduleReceiverUnstableStop("audio track muted");
-    });
-    event.track.addEventListener("unmute", () => {
-      if (receiverPeerConnection === peer) {
-        clearReceiverUnstableTimer();
-        resumeReceiverPlayback();
-      }
-    });
-  });
-  peer.addEventListener("connectionstatechange", () => {
-    if (receiverPeerConnection !== peer) return;
-    if (peer.connectionState === "connected") {
-      clearReceiverUnstableTimer();
-      return;
-    }
-    if (["failed", "closed", "disconnected"].includes(peer.connectionState)) {
-      scheduleReceiverUnstableStop(`connectionState=${peer.connectionState}`);
-    }
-  });
-  peer.addEventListener("iceconnectionstatechange", () => {
-    if (receiverPeerConnection !== peer) return;
-    if (["connected", "completed"].includes(peer.iceConnectionState)) {
-      clearReceiverUnstableTimer();
-      return;
-    }
-    if (["failed", "closed", "disconnected"].includes(peer.iceConnectionState)) {
-      scheduleReceiverUnstableStop(`iceConnectionState=${peer.iceConnectionState}`);
-    }
-  });
-  try {
-    const offer = await peer.createOffer();
-    await peer.setLocalDescription(offer);
-    const channel = currentReceiverChannel();
-    const data = await request("/api/receiver/start", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        client_id: pageReceiverClientId(),
-        frequency_hz: channel.frequency_hz,
-        sdp: peer.localDescription.sdp,
-        type: peer.localDescription.type
-      })
-    });
-    await peer.setRemoteDescription(data.answer);
-    logClientEvent("info", "receiver", "receiver WebRTC answer accepted", {frequency: channel.label});
-    startReceiverPacketStats();
-    updateReceiverMediaSession();
-    setReceiverResult(`Listening to ${channel.label}.`, "success");
-  } catch (error) {
-    logClientEvent("warning", "receiver", "receiver start failed in browser", {frequency: currentReceiverChannel().label, error: error.message});
-    await stopWeatherReceiver({notifyServer: true});
-    throw error;
-  }
+  logClientEvent("warning", "receiver", "browser does not support live audio", {});
+  throw new Error("This browser does not support live audio playback.");
 }
 
 async function stopWeatherReceiver(options = {}) {
@@ -14770,15 +14867,13 @@ async function stopWeatherReceiver(options = {}) {
   clearReceiverWatchdogs();
   if (preserveMediaSession && peer) {
     stopLiveSamePlayback();
-    if (liveAudioPeerUsesWebSocket(peer)) stopScheduledLiveAudioSources();
-    else setReceiverAudioTracksEnabled(true);
+    stopScheduledLiveAudioSources();
     logClientEvent("info", "receiver", "receiver pause requested", {frequency: currentReceiverChannel().label});
     await request("/api/receiver/pause", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({client_id: clientId})
     });
-    if (!liveAudioPeerUsesWebSocket(peer)) pauseReceiverAudioElement();
     pauseMediaSessionAnchor("receiver-pause");
     scheduleReceiverMediaSessionRefresh();
     renderReceiverControls();
@@ -15084,7 +15179,7 @@ async function loadIqTestSources(options = {}) {
 
 function renderIqTestSourceStatus(data) {
   developmentIqSourcesEnabled = Boolean(data && data.capabilities && data.capabilities.development_iq_sources);
-  setHidden("iq_test_source_section", !developmentIqSourcesEnabled);
+  setHidden("iq_test_source_section", !developmentIqSourcesEnabled || remoteSdrUsesRemote());
   if (!developmentIqSourcesEnabled) {
     setText("iq-test-source-result", "");
     setText("iq_test_source_directory", "");
@@ -19839,8 +19934,13 @@ function renderDashboardSdr(data) {
     return;
   }
 
-  setText("summary_source", "RTL-SDR");
-  setText("summary_sdr", activeSdrLabel(settings));
+  if (source.kind === "remote") {
+    setText("summary_source", `Shared by ${source.name || "another NWR Stream Manager"}`);
+    setText("summary_sdr", source.device_name || "unknown");
+  } else {
+    setText("summary_source", "RTL-SDR");
+    setText("summary_sdr", activeSdrLabel(settings));
+  }
   setText("summary_ppm", `${settings.ppm_correction || 0} PPM`);
   setText("summary_gain", settings.gain === null ? "automatic" : `${settings.gain} dB`);
   setText("summary_bias_tee", settings.bias_tee ? "enabled" : "disabled");
@@ -20250,6 +20350,326 @@ function updateDashboard(data) {
   if (settingsStreamId) renderStreamSettings();
 }
 
+let remoteSdr = {};
+let remoteDiscoveredDevices = [];
+let remoteSdrRequestPending = false;
+let remotePairingWasActive = false;
+let remotePairingDeviceIds = [];
+
+function setMessage(id, message, kind = "") {
+  const element = document.getElementById(id);
+  if (!element) return;
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function remoteDeviceName(device) {
+  return (device && device.name) || "Unnamed NWR Stream Manager";
+}
+
+function formatClockTime(epochSeconds) {
+  return new Date(Number(epochSeconds || 0) * 1000).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+}
+
+function remoteSdrUsesRemote() {
+  const remote = remoteSdr.remote || {};
+  return remote.source_mode === "remote" && Boolean(remote.device_id);
+}
+
+function renderRemoteSdr(data) {
+  remoteSdr = data.remote_sdr || {};
+  const devices = remoteSdr.devices || [];
+  const sharing = remoteSdr.sharing || {};
+  const remote = remoteSdr.remote || {};
+  const usesRemote = remoteSdrUsesRemote();
+  const sourceFocused = containsFocusedElement(document.getElementById("sdr_source_fieldset"))
+    || document.activeElement === document.getElementById("remote_sdr_device");
+  if (!sourceFocused && !remoteSdrRequestPending) {
+    setChecked("sdr_source_local", !usesRemote);
+    setChecked("sdr_source_remote", usesRemote);
+  }
+  const showRemote = document.getElementById("sdr_source_remote").checked;
+  setHidden("local_sdr_controls", showRemote);
+  setHidden("remote_sdr_controls", !showRemote);
+
+  const select = document.getElementById("remote_sdr_device");
+  const options = devices.map(device => ({value: device.id, label: remoteDeviceName(device)}));
+  if (!options.length) options.push({value: "", label: "No paired devices"});
+  if (select.dataset.signature !== JSON.stringify(options)) {
+    syncSelectOptions(select, options);
+    select.dataset.signature = JSON.stringify(options);
+  }
+  if (!sourceFocused && !remoteSdrRequestPending && remote.device_id) setValue("remote_sdr_device", remote.device_id);
+  setDisabled(select, !devices.length);
+  setText("remote_sdr_status", remoteSdrStatusText(remote, devices));
+  const buffer = document.getElementById("remote_buffer_seconds");
+  const savedBuffer = data.settings && data.settings.remote_buffer_seconds;
+  if (savedBuffer !== undefined && document.activeElement !== buffer && !remoteSdrRequestPending) {
+    setValue("remote_buffer_seconds", savedBuffer);
+  }
+
+  const available = Boolean(sharing.available);
+  setHidden("remote_access_unavailable", available);
+  setHidden("remote_access_controls", !available);
+  if (document.activeElement !== document.getElementById("remote_access_enabled") && !remoteSdrRequestPending) {
+    setChecked("remote_access_enabled", Boolean(sharing.enabled));
+  }
+  setHidden("remote_pairing_controls", !sharing.running);
+  renderRemotePairing(sharing, devices);
+  if (sharing.error) setMessage("remote-sharing-result", sharing.error, "error");
+  renderPairedDevices(devices, remote);
+}
+
+function remoteSdrStatusText(remote, devices) {
+  if (!devices.length) return "Pair with another NWR Stream Manager below to use its RTL-SDR.";
+  if (!remoteSdrUsesRemote()) return "";
+  const status = remote.status || {};
+  const device = devices.find(item => item.id === remote.device_id) || {};
+  const name = status.host_name || remoteDeviceName(device);
+  if (!status.reachable) return `${name} is not reachable. Check that it is running and sharing its RTL-SDR.`;
+  const sdr = status.sdr || {};
+  if (sdr.problem === "disconnected") return `Connected to ${name}, but its RTL-SDR is not connected.`;
+  if (sdr.problem) return `Connected to ${name}, but its RTL-SDR needs attention.`;
+  return `Connected to ${name}. Using ${sdr.device_name || "its RTL-SDR"}.`;
+}
+
+function renderRemotePairing(sharing, devices) {
+  const pairing = sharing.pairing || {};
+  const active = Boolean(pairing.active);
+  setHidden("start_remote_pairing", active);
+  setHidden("cancel_remote_pairing", !active);
+  const code = String(pairing.code || "");
+  const spaced = code.length === 6 ? `${code.slice(0, 3)} ${code.slice(3)}` : code;
+  setText(
+    "remote_pairing_code",
+    active ? `Pairing code: ${spaced}. Enter it on the other NWR Stream Manager before ${formatClockTime(pairing.expires_at)}.` : ""
+  );
+  if (remotePairingWasActive && !active) {
+    const added = devices.find(device => !remotePairingDeviceIds.includes(device.id));
+    if (added) setMessage("remote-sharing-result", `Paired with ${remoteDeviceName(added)}.`, "success");
+    else setMessage("remote-sharing-result", "The pairing code expired. Select Pair a device to get a new one.");
+  }
+  if (!remotePairingWasActive && active) remotePairingDeviceIds = devices.map(device => device.id);
+  remotePairingWasActive = active;
+}
+
+function pairedDeviceStatus(device, remote) {
+  const network = device.via === "tailscale" ? " over Tailscale" : "";
+  if (device.in_use) {
+    const status = remote.status || {};
+    return status.reachable ? `This machine is using its RTL-SDR${network}` : "This machine is using its RTL-SDR (not reachable)";
+  }
+  if (device.using_this_sdr) return `Using this machine's RTL-SDR${network}`;
+  return "Paired";
+}
+
+function renderPairedDevices(devices, remote) {
+  const tbody = document.getElementById("paired-devices-body");
+  if (!devices.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 3;
+    cell.className = "hint";
+    cell.textContent = "No paired devices.";
+    row.appendChild(cell);
+    reconcileKeyedChildren(tbody, [keyedRow(labelResponsiveTableRow(row, tbody), "empty")]);
+    return;
+  }
+  reconcileKeyedChildren(tbody, devices.map(device => {
+    const row = document.createElement("tr");
+    row.appendChild(tableCell(remoteDeviceName(device)));
+    row.appendChild(tableCell(pairedDeviceStatus(device, remote)));
+    const actions = document.createElement("td");
+    const unpair = document.createElement("button");
+    unpair.type = "button";
+    unpair.textContent = "Unpair";
+    unpair.setAttribute("aria-label", `Unpair ${remoteDeviceName(device)}`);
+    unpair.dataset.action = "unpair-remote-device";
+    unpair.dataset.deviceId = device.id;
+    unpair.dataset.deviceName = remoteDeviceName(device);
+    actions.appendChild(unpair);
+    row.appendChild(actions);
+    return keyedRow(labelResponsiveTableRow(row, tbody), `device:${device.id}`);
+  }));
+}
+
+async function saveSdrSource(payload, successMessage) {
+  remoteSdrRequestPending = true;
+  setMessage("sdr-source-result", "Saving...");
+  try {
+    const data = await request("/api/settings", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    remoteSdrRequestPending = false;
+    applyStatus(data, {syncControls: true});
+    setMessage("sdr-source-result", successMessage, "success");
+  } catch (error) {
+    remoteSdrRequestPending = false;
+    setMessage("sdr-source-result", error.message, "error");
+    await refresh().catch(() => {});
+  }
+}
+
+async function selectSdrSource(mode) {
+  if (mode === "local") {
+    await saveSdrSource({source_mode: "local"}, "Using the RTL-SDR connected to this machine.");
+    return;
+  }
+  const devices = remoteSdr.devices || [];
+  if (!devices.length) {
+    setHidden("local_sdr_controls", true);
+    setHidden("remote_sdr_controls", false);
+    setMessage("sdr-source-result", "Pair with another NWR Stream Manager first, then choose it as the shared SDR.", "error");
+    return;
+  }
+  const deviceId = document.getElementById("remote_sdr_device").value || devices[0].id;
+  const device = devices.find(item => item.id === deviceId) || devices[0];
+  await saveSdrSource(
+    {source_mode: "remote", remote_host_id: device.id},
+    `Using the RTL-SDR shared by ${remoteDeviceName(device)}.`
+  );
+}
+
+async function saveRemoteBufferSeconds() {
+  const input = document.getElementById("remote_buffer_seconds");
+  const seconds = Number(input.value);
+  if (!Number.isFinite(seconds) || seconds < 0.1 || seconds > 10) {
+    setMessage("sdr-source-result", "The network buffer must be between 0.1 and 10 seconds.", "error");
+    return;
+  }
+  await saveSdrSource({remote_buffer_seconds: seconds}, `Network buffer set to ${seconds} seconds.`);
+}
+
+async function setRemoteAccessEnabled(enabled) {
+  remoteSdrRequestPending = true;
+  try {
+    const data = await request("/api/settings", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({remote_access_enabled: enabled})
+    });
+    remoteSdrRequestPending = false;
+    applyStatus(data, {syncControls: true});
+    setMessage("remote-sharing-result", enabled ? "This RTL-SDR is now shared with paired devices." : "Sharing is turned off.", "success");
+  } catch (error) {
+    remoteSdrRequestPending = false;
+    setChecked("remote_access_enabled", !enabled);
+    setMessage("remote-sharing-result", error.message, "error");
+  }
+}
+
+async function remoteSdrAction(path, payload = {}) {
+  const data = await request(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  renderRemoteSdr({remote_sdr: data});
+  return data;
+}
+
+function renderRemotePairDeviceOptions() {
+  const select = document.getElementById("remote_pair_device");
+  const options = remoteDiscoveredDevices.map(device => ({
+    value: device.id,
+    label: `${remoteDeviceName(device)} (${device.via === "tailscale" ? "Tailscale" : "local network"})${device.paired ? ", already paired" : ""}`
+  }));
+  options.push({value: "manual", label: "Enter an address"});
+  syncSelectOptions(select, options);
+  const firstUnpaired = remoteDiscoveredDevices.find(device => !device.paired);
+  setValue("remote_pair_device", firstUnpaired ? firstUnpaired.id : options[0].value);
+  updateRemotePairAddressVisibility();
+}
+
+function updateRemotePairAddressVisibility() {
+  const manual = document.getElementById("remote_pair_device").value === "manual";
+  setHidden("remote_pair_address_label", !manual);
+  setHidden("remote_pair_address_hint", !manual);
+}
+
+async function findRemoteDevices() {
+  const button = document.getElementById("find_remote_devices");
+  setDisabled(button, true);
+  setMessage("remote-pair-result", "Searching the network...");
+  try {
+    const data = await request("/api/remote-sdr/discover", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    remoteDiscoveredDevices = data.hosts || [];
+    renderRemotePairDeviceOptions();
+    const count = remoteDiscoveredDevices.length;
+    setMessage(
+      "remote-pair-result",
+      count
+        ? `Found ${pluralize(count, "device")} sharing an RTL-SDR.`
+        : "No devices sharing an RTL-SDR were found. Turn on sharing on the other device, or enter its address.",
+      count ? "success" : ""
+    );
+  } catch (error) {
+    setMessage("remote-pair-result", error.message, "error");
+  } finally {
+    setDisabled(button, false);
+  }
+}
+
+function remotePairTarget() {
+  const choice = document.getElementById("remote_pair_device").value;
+  if (choice && choice !== "manual") {
+    const device = remoteDiscoveredDevices.find(item => item.id === choice);
+    if (device) return {address: device.address, addresses: device.addresses || [], port: device.port, host_id: device.id};
+  }
+  const raw = document.getElementById("remote_pair_address").value.trim();
+  const match = raw.match(/^\\[?([^\\]]+?)\\]?(?::(\\d+))?$/);
+  if (!raw || !match) return null;
+  return {address: match[1], port: match[2] ? Number(match[2]) : undefined};
+}
+
+async function pairRemoteDevice() {
+  const target = remotePairTarget();
+  if (!target) {
+    setMessage("remote-pair-result", "Find a device or enter its address first.", "error");
+    return;
+  }
+  const code = document.getElementById("remote_pair_code").value.replace(/\\D/g, "");
+  if (code.length !== 6) {
+    setMessage("remote-pair-result", "Enter the 6-digit pairing code shown on the other device.", "error");
+    document.getElementById("remote_pair_code").focus();
+    return;
+  }
+  const button = document.getElementById("pair_remote_device");
+  setDisabled(button, true);
+  setMessage("remote-pair-result", "Pairing...");
+  try {
+    const before = (remoteSdr.devices || []).map(device => device.id);
+    const data = await remoteSdrAction("/api/remote-sdr/pair", {...target, code});
+    const added = (data.devices || []).find(device => !before.includes(device.id));
+    setValue("remote_pair_code", "");
+    remoteDiscoveredDevices = remoteDiscoveredDevices.map(device => added && device.id === added.id ? {...device, paired: true} : device);
+    renderRemotePairDeviceOptions();
+    setMessage(
+      "remote-pair-result",
+      `Paired with ${remoteDeviceName(added)}. Either device can now use the other's shared RTL-SDR.`,
+      "success"
+    );
+  } catch (error) {
+    setMessage("remote-pair-result", error.message, "error");
+  } finally {
+    setDisabled(button, false);
+  }
+}
+
+async function unpairRemoteDevice(deviceId, name) {
+  if (!window.confirm(`Unpair ${name}? Neither device will be able to use the other's RTL-SDR until you pair them again.`)) return;
+  try {
+    await remoteSdrAction("/api/remote-sdr/unpair", {device_id: deviceId});
+    setMessage("paired-devices-result", `Unpaired ${name}.`, "success");
+  } catch (error) {
+    setMessage("paired-devices-result", error.message, "error");
+  }
+}
+
 function syncControls(data) {
   const s = data.settings;
   gainValues = data.gain_values || [];
@@ -20290,6 +20710,7 @@ function applyStatus(data, options = {}) {
   setText("bytes", data.received_bytes);
   setText("last", data.last_batch_at ? `${data.last_batch_at.toFixed(3)}s` : "never");
   setText("capture-error", data.capture_error || "");
+  if (data.remote_sdr && data.remote_sdr.identity) renderRemoteSdr(data);
   renderLogs(data.logs || []);
   renderIqTestSourceStatus(data);
   setFallbackControls(data.fallback);
@@ -20640,6 +21061,57 @@ function scheduleStreamTestModeSignalUpdate() {
     }
   }, 150);
 }
+
+for (const radio of document.querySelectorAll("input[name='sdr_source']")) {
+  radio.addEventListener("change", event => {
+    if (event.target.checked) selectSdrSource(event.target.value);
+  });
+}
+document.getElementById("remote_sdr_device").addEventListener("change", () => {
+  if (document.getElementById("sdr_source_remote").checked) selectSdrSource("remote");
+});
+document.getElementById("remote_buffer_seconds").addEventListener("change", saveRemoteBufferSeconds);
+document.getElementById("remote_buffer_seconds").addEventListener("keydown", event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    saveRemoteBufferSeconds();
+  }
+});
+document.getElementById("remote_access_enabled").addEventListener("change", event => {
+  setRemoteAccessEnabled(event.target.checked);
+});
+document.getElementById("start_remote_pairing").addEventListener("click", async () => {
+  try {
+    setMessage("remote-sharing-result", "");
+    await remoteSdrAction("/api/remote-sdr/pairing/start");
+    document.getElementById("cancel_remote_pairing").focus();
+  } catch (error) {
+    setMessage("remote-sharing-result", error.message, "error");
+  }
+});
+document.getElementById("cancel_remote_pairing").addEventListener("click", async () => {
+  try {
+    await remoteSdrAction("/api/remote-sdr/pairing/cancel");
+    setMessage("remote-sharing-result", "Pairing stopped.");
+    document.getElementById("start_remote_pairing").focus();
+  } catch (error) {
+    setMessage("remote-sharing-result", error.message, "error");
+  }
+});
+document.getElementById("find_remote_devices").addEventListener("click", findRemoteDevices);
+document.getElementById("remote_pair_device").addEventListener("change", updateRemotePairAddressVisibility);
+document.getElementById("pair_remote_device").addEventListener("click", pairRemoteDevice);
+document.getElementById("remote_pair_code").addEventListener("keydown", event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    pairRemoteDevice();
+  }
+});
+document.getElementById("paired-devices-body").addEventListener("click", event => {
+  const button = event.target.closest("button[data-action='unpair-remote-device']");
+  if (button) unpairRemoteDevice(button.dataset.deviceId, button.dataset.deviceName);
+});
+renderRemotePairDeviceOptions();
 
 for (const id of controls) {
   document.addEventListener("input", event => {
@@ -22355,7 +22827,6 @@ async function refresh() {
   populateIqSampleRates();
   selectAudioEffect("volume", false);
   renderReceiverControls();
-  loadWebRtcSupport();
   const data = await request("/api/status");
   if (!data.account || !data.account.read_only) {
     await loadDevices(data.settings.serial);

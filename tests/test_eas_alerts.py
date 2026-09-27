@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import io
 import importlib.util
 import importlib
@@ -1028,17 +1027,9 @@ class EasAlertTests(unittest.TestCase):
             def remove_monitor_source(self, client_id):
                 self.removed.append(client_id)
 
-        class Sessions:
-            def __init__(self):
-                self.closed = []
-
-            async def close(self, client_id):
-                self.closed.append(client_id)
-
         with tempfile.TemporaryDirectory() as temp_dir:
             stream = {"id": "stream-1", "enabled": True, "station": {"callsign": "WXN99"}}
             worker = Worker()
-            sessions = Sessions()
             service = object.__new__(web_control.RtlControlService)
             service.lock = web_control.threading.RLock()
             service.streams_directory = Path(temp_dir) / "streams"
@@ -1047,15 +1038,12 @@ class EasAlertTests(unittest.TestCase):
             service.monitor_accounts_by_client = {"client-1": 1, "client-2": 1}
             service.stream_workers = {"stream-1": worker}
             service._sync_stream_workers_locked = lambda: None
-            service.webrtc_runner = types.SimpleNamespace(run=lambda coro, timeout=None: asyncio.run(coro))
-            service.webrtc_sessions = sessions
 
             response = service.update_stream({"stream_id": "stream-1", "enabled": False})
 
             self.assertFalse(stream["enabled"])
             self.assertEqual(response["monitoring"], {"client-2": "other-stream"})
             self.assertEqual(worker.removed, ["client-1"])
-            self.assertEqual(sessions.closed, ["client-1"])
 
     def test_removing_stream_stops_active_monitors(self) -> None:
         web_control = self.web_control
@@ -1069,17 +1057,9 @@ class EasAlertTests(unittest.TestCase):
             def remove_monitor_source(self, client_id):
                 self.removed.append(client_id)
 
-        class Sessions:
-            def __init__(self):
-                self.closed = []
-
-            async def close(self, client_id):
-                self.closed.append(client_id)
-
         with tempfile.TemporaryDirectory() as temp_dir:
             stream = {"id": "stream-1", "enabled": True, "station": {"callsign": "WXN99"}}
             worker = Worker()
-            sessions = Sessions()
             service = object.__new__(web_control.RtlControlService)
             service.lock = web_control.threading.RLock()
             service.streams_directory = Path(temp_dir) / "streams"
@@ -1088,15 +1068,12 @@ class EasAlertTests(unittest.TestCase):
             service.monitor_accounts_by_client = {"client-1": 1}
             service.stream_workers = {"stream-1": worker}
             service._sync_stream_workers_locked = lambda: None
-            service.webrtc_runner = types.SimpleNamespace(run=lambda coro, timeout=None: asyncio.run(coro))
-            service.webrtc_sessions = sessions
 
             response = service.remove_stream("stream-1")
 
             self.assertEqual(response["streams"], [])
             self.assertEqual(response["monitoring"], {})
             self.assertEqual(worker.removed, ["client-1"])
-            self.assertEqual(sessions.closed, ["client-1"])
 
     def test_stream_worker_monitor_source_receives_processed_pcm_frame(self) -> None:
         worker = object.__new__(self.web_control.IcecastStreamWorker)
@@ -1485,7 +1462,7 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(channelizer.shifter.offset_hz, 50000.0)
         self.assertEqual(channelizer.shifter._phase, 1.25)
 
-    def test_webrtc_audio_source_outputs_silence_while_paused(self) -> None:
+    def test_live_audio_source_outputs_silence_while_paused(self) -> None:
         source = self.web_control.SameAwareWebRtcAudioSource(sample_rate=24_000, event_queue=None)
         try:
             frame = b"\x01\x02" * (source.frame_bytes // 2)
@@ -1493,10 +1470,7 @@ class EasAlertTests(unittest.TestCase):
             source.set_paused(True)
 
             self.assertEqual(source.get_latest_pcm(), b"\x00" * source.frame_bytes)
-            self.assertEqual(
-                asyncio.run(source.read_pcm(timeout=0)),
-                b"\x00" * source.frame_bytes,
-            )
+            self.assertEqual(source.read_pcm_blocking(timeout=0), b"\x00" * source.frame_bytes)
             self.assertTrue(source.stats()["paused"])
 
             source.set_paused(False)

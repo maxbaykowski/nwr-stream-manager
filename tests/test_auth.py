@@ -1197,7 +1197,7 @@ class AuthTests(unittest.TestCase):
         allowed = [
             ("GET", "/notification"),
             ("GET", "/api/streams"),
-            ("POST", "/api/monitor/start"),
+            ("POST", "/api/monitor/pause"),
             ("POST", "/api/monitor/stop"),
             ("GET", "/api/iq-recordings"),
             ("GET", "/api/iq-recording-download"),

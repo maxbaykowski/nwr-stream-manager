@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import asyncio
 import sys
 import types
 import unittest
@@ -26,30 +25,6 @@ class WebRtcTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.webrtc = load_webrtc_module()
-
-    def test_bitrate_controller_steps_down_to_floor(self) -> None:
-        controller = self.webrtc.OpusBitrateController()
-        values = [
-            controller.update(available_bitrate_bps=40_000)
-            for _ in range(20)
-        ]
-        self.assertEqual(values[:3], [120, 112, 104])
-        self.assertEqual(values[-1], 40)
-        floor_values = [
-            controller.update(available_bitrate_bps=1_000)
-            for _ in range(4)
-        ]
-        self.assertEqual(floor_values[-1], 32)
-        self.assertEqual(controller.update(available_bitrate_bps=1_000), 32)
-
-    def test_bitrate_controller_recovers_toward_target_after_stable_feedback(self) -> None:
-        controller = self.webrtc.OpusBitrateController(recovery_stable_feedbacks=2)
-        controller.update(available_bitrate_bps=20_000)
-        self.assertEqual(controller.current_kbps, 120)
-        controller.update(available_bitrate_bps=200_000)
-        self.assertEqual(controller.current_kbps, 120)
-        controller.update(available_bitrate_bps=200_000)
-        self.assertEqual(controller.current_kbps, 128)
 
     def test_tcp_opus_bitrate_controller_uses_coarse_ladder_without_jumping(self) -> None:
         controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=2, recovery_hold_feedbacks=0)
@@ -152,31 +127,31 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(source.dropped_frames, 1)
         self.assertEqual(source.get_latest_pcm(), b"new" + b"\x00" * (source.frame_bytes - 3))
 
-    def test_audio_source_async_callback_buffer_preserves_frame_order(self) -> None:
-        async def run_test():
+    def test_audio_source_buffer_preserves_frame_order(self) -> None:
+        def run_test():
             source = self.webrtc.WebRtcAudioSource(max_frames=4, prebuffer_frames=2, low_water_frames=0)
             frame_a = b"a" * source.frame_bytes
             frame_b = b"b" * source.frame_bytes
             source.push_pcm(frame_a)
             source.push_pcm(frame_b)
-            first = await source.read_pcm()
-            second = await source.read_pcm()
+            first = source.read_pcm_blocking()
+            second = source.read_pcm_blocking()
             return first, second, source.underrun_frames
 
-        first, second, underruns = asyncio.run(run_test())
+        first, second, underruns = run_test()
         self.assertEqual(first, b"a" * len(first))
         self.assertEqual(second, b"b" * len(second))
         self.assertEqual(underruns, 0)
 
     def test_audio_source_reports_buffer_stats_and_underruns(self) -> None:
-        async def run_test():
+        def run_test():
             source = self.webrtc.WebRtcAudioSource(max_frames=2, prebuffer_frames=0, low_water_frames=0)
             source.push_pcm(b"a")
-            await source.read_pcm()
-            await source.read_pcm(timeout=0)
+            source.read_pcm_blocking()
+            source.read_pcm_blocking(timeout=0)
             return source.stats()
 
-        stats = asyncio.run(run_test())
+        stats = run_test()
         self.assertEqual(stats["pushed_frames"], 1)
         self.assertEqual(stats["read_frames"], 1)
         self.assertEqual(stats["underrun_frames"], 1)
@@ -203,58 +178,6 @@ class WebRtcTests(unittest.TestCase):
 
         self.assertEqual(source.frame_bytes, 1280)
         self.assertEqual(source.stats()["sample_rate"], 32_000)
-
-    def test_audio_source_startup_prebuffer_is_not_limited_by_track_frame_timeout(self) -> None:
-        async def run_test():
-            source = self.webrtc.WebRtcAudioSource(
-                max_frames=4,
-                prebuffer_frames=2,
-                target_latency_frames=4,
-                low_water_frames=0,
-                prebuffer_timeout_seconds=0.2,
-            )
-
-            async def delayed_push():
-                await asyncio.sleep(0.03)
-                source.push_pcm(b"a" * source.frame_bytes)
-                source.push_pcm(b"b" * source.frame_bytes)
-
-            task = asyncio.create_task(delayed_push())
-            first = await source.read_pcm(timeout=self_webrtc.WEBRTC_FRAME_SECONDS)
-            await task
-            return first, source.stats()
-
-        self_webrtc = self.webrtc
-        first, stats = asyncio.run(run_test())
-        self.assertEqual(first, b"a" * len(first))
-        self.assertEqual(stats["underrun_frames"], 0)
-
-    def test_audio_source_rebuffers_after_underrun(self) -> None:
-        async def run_test():
-            source = self.webrtc.WebRtcAudioSource(
-                max_frames=4,
-                prebuffer_frames=2,
-                target_latency_frames=4,
-                low_water_frames=0,
-                prebuffer_timeout_seconds=0.2,
-            )
-            first = await source.read_pcm(timeout=0.01)
-
-            async def delayed_push():
-                await asyncio.sleep(0.03)
-                source.push_pcm(b"a" * source.frame_bytes)
-                source.push_pcm(b"b" * source.frame_bytes)
-
-            task = asyncio.create_task(delayed_push())
-            second = await source.read_pcm(timeout=self_webrtc.WEBRTC_FRAME_SECONDS)
-            await task
-            return first, second, source.stats()
-
-        self_webrtc = self.webrtc
-        first, second, stats = asyncio.run(run_test())
-        self.assertEqual(first, b"\x00" * len(first))
-        self.assertEqual(second, b"a" * len(second))
-        self.assertEqual(stats["underrun_frames"], 1)
 
     def test_audio_source_blocking_reader_uses_startup_prebuffer(self) -> None:
         source = self.webrtc.WebRtcAudioSource(
@@ -306,23 +229,8 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(second, b"a" * len(second))
         self.assertEqual(source.stats()["underrun_frames"], 1)
 
-    def test_audio_source_does_not_miss_push_between_buffer_check_and_wait(self) -> None:
-        async def run_test():
-            source = self.webrtc.WebRtcAudioSource(prebuffer_frames=0, low_water_frames=0)
-            source._bind_loop(asyncio.get_running_loop())
-            with source.lock:
-                notify_sequence = source._notify_sequence
-            source.push_pcm(b"a" * source.frame_bytes)
-            started = asyncio.get_running_loop().time()
-            await source._wait_for_push(0.05, notify_sequence)
-            elapsed = asyncio.get_running_loop().time() - started
-            return elapsed
-
-        elapsed = asyncio.run(run_test())
-        self.assertLess(elapsed, 0.02)
-
     def test_audio_source_preserves_bursty_pcm_above_target_latency(self) -> None:
-        async def run_test():
+        def run_test():
             source = self.webrtc.WebRtcAudioSource(
                 max_frames=8,
                 prebuffer_frames=0,
@@ -333,17 +241,17 @@ class WebRtcTests(unittest.TestCase):
             )
             for value in (b"a", b"b", b"c", b"d", b"e"):
                 source.push_pcm(value)
-            first = await source.read_pcm()
+            first = source.read_pcm_blocking()
             stats = source.stats()
             return first, stats, source.frame_bytes
 
-        first, stats, frame_bytes = asyncio.run(run_test())
+        first, stats, frame_bytes = run_test()
         self.assertEqual(first, b"a" + b"\x00" * (frame_bytes - 1))
         self.assertEqual(stats["stale_frames"], 0)
         self.assertEqual(stats["buffered_frames"], 4)
 
     def test_audio_source_trims_only_after_latency_high_watermark(self) -> None:
-        async def run_test():
+        def run_test():
             source = self.webrtc.WebRtcAudioSource(
                 max_frames=8,
                 prebuffer_frames=0,
@@ -357,10 +265,10 @@ class WebRtcTests(unittest.TestCase):
             before = source.stats()
             source.push_pcm(b"f")
             after = source.stats()
-            first = await source.read_pcm()
+            first = source.read_pcm_blocking()
             return before, after, first, source.frame_bytes
 
-        before, after, first, frame_bytes = asyncio.run(run_test())
+        before, after, first, frame_bytes = run_test()
         self.assertEqual(before["stale_frames"], 0)
         self.assertEqual(before["buffered_frames"], 5)
         self.assertEqual(after["stale_frames"], 2)
@@ -379,290 +287,6 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(stats["stale_frames"], 2)
         self.assertEqual(source.get_latest_pcm(timeout=0), b"\x00" * source.frame_bytes)
 
-    def test_webrtc_track_waits_for_complete_resampled_frame_before_padding(self) -> None:
-        class Source:
-            def __init__(self) -> None:
-                self.reads = 0
-
-            async def read_pcm(self):
-                self.reads += 1
-                return b"x"
-
-        class ShortFirstResampler:
-            def __init__(self, _input_rate, _output_rate) -> None:
-                self.calls = 0
-
-            def process(self, _pcm: bytes) -> bytes:
-                self.calls += 1
-                if self.calls == 1:
-                    return b"\x01\x00" * 480
-                return b"\x02\x00" * 480
-
-        original_resampler = self.webrtc.PcmResampler
-        self.webrtc.PcmResampler = ShortFirstResampler
-        try:
-            try:
-                source = Source()
-                track = self.webrtc.create_webrtc_pcm_audio_track(source)
-            except self.webrtc.WebRtcError as exc:
-                self.skipTest(str(exc))
-            frame = asyncio.run(track.recv())
-        finally:
-            self.webrtc.PcmResampler = original_resampler
-
-        self.assertEqual(source.reads, 2)
-        self.assertEqual(frame.samples, self.webrtc.WEBRTC_OPUS_FRAME_SAMPLES)
-
-    def test_webrtc_track_uses_short_pcm_read_timeout_to_keep_sender_alive(self) -> None:
-        class Source:
-            def __init__(self) -> None:
-                self.timeouts = []
-
-            async def read_pcm(self, timeout=0.25):
-                self.timeouts.append(timeout)
-                return b"\x00" * 960
-
-        class FullFrameResampler:
-            def __init__(self, _input_rate, _output_rate) -> None:
-                pass
-
-            def process(self, _pcm: bytes) -> bytes:
-                return b"\x00" * (self_webrtc.WEBRTC_OPUS_FRAME_SAMPLES * 2)
-
-        self_webrtc = self.webrtc
-        original_resampler = self.webrtc.PcmResampler
-        self.webrtc.PcmResampler = FullFrameResampler
-        try:
-            try:
-                source = Source()
-                track = self.webrtc.create_webrtc_pcm_audio_track(source)
-            except self.webrtc.WebRtcError as exc:
-                self.skipTest(str(exc))
-            asyncio.run(track.recv())
-        finally:
-            self.webrtc.PcmResampler = original_resampler
-
-        self.assertEqual(len(source.timeouts), 1)
-        self.assertGreaterEqual(source.timeouts[0], 0)
-        self.assertLessEqual(source.timeouts[0], self.webrtc.WEBRTC_FRAME_SECONDS)
-
-    def test_webrtc_track_starts_media_clock_after_startup_read(self) -> None:
-        class Source:
-            def __init__(self) -> None:
-                self.reads = 0
-
-            async def read_pcm(self, timeout=0.25):
-                self.reads += 1
-                if self.reads == 1:
-                    await asyncio.sleep(0.03)
-                return b"\x00" * 960
-
-        class FullFrameResampler:
-            def __init__(self, _input_rate, _output_rate) -> None:
-                pass
-
-            def process(self, _pcm: bytes) -> bytes:
-                return b"\x00" * (self_webrtc.WEBRTC_OPUS_FRAME_SAMPLES * 2)
-
-        async def run_test():
-            track = self_webrtc.create_webrtc_pcm_audio_track(Source())
-            started = asyncio.get_running_loop().time()
-            await track.recv()
-            after_first = asyncio.get_running_loop().time()
-            await track.recv()
-            after_second = asyncio.get_running_loop().time()
-            return after_first - started, after_second - after_first
-
-        self_webrtc = self.webrtc
-        original_resampler = self.webrtc.PcmResampler
-        self.webrtc.PcmResampler = FullFrameResampler
-        try:
-            try:
-                first_elapsed, second_elapsed = asyncio.run(run_test())
-            except self.webrtc.WebRtcError as exc:
-                self.skipTest(str(exc))
-        finally:
-            self.webrtc.PcmResampler = original_resampler
-
-        self.assertGreaterEqual(first_elapsed, 0.025)
-        self.assertLess(second_elapsed, 0.03)
-
-    def test_webrtc_track_rebases_media_clock_after_rebuffer_wait(self) -> None:
-        class Source:
-            def __init__(self) -> None:
-                self.reads = 0
-
-            async def read_pcm(self, timeout=0.25):
-                self.reads += 1
-                if self.reads == 3:
-                    await asyncio.sleep(0.06)
-                return b"\x00" * 960
-
-        class FullFrameResampler:
-            def __init__(self, _input_rate, _output_rate) -> None:
-                pass
-
-            def process(self, _pcm: bytes) -> bytes:
-                return b"\x00" * (self_webrtc.WEBRTC_OPUS_FRAME_SAMPLES * 2)
-
-        async def run_test():
-            track = self_webrtc.create_webrtc_pcm_audio_track(Source())
-            await track.recv()
-            before_second = asyncio.get_running_loop().time()
-            await track.recv()
-            after_second = asyncio.get_running_loop().time()
-            await track.recv()
-            after_third = asyncio.get_running_loop().time()
-            await track.recv()
-            after_fourth = asyncio.get_running_loop().time()
-            return (
-                after_second - before_second,
-                after_third - after_second,
-                after_fourth - after_third,
-            )
-
-        self_webrtc = self.webrtc
-        original_resampler = self.webrtc.PcmResampler
-        self.webrtc.PcmResampler = FullFrameResampler
-        try:
-            try:
-                second_elapsed, third_elapsed, fourth_elapsed = asyncio.run(run_test())
-            except self.webrtc.WebRtcError as exc:
-                self.skipTest(str(exc))
-        finally:
-            self.webrtc.PcmResampler = original_resampler
-
-        self.assertGreaterEqual(second_elapsed, 0.015)
-        self.assertGreaterEqual(third_elapsed, 0.055)
-        self.assertGreaterEqual(fourth_elapsed, 0.015)
-
-    def test_webrtc_track_outputs_silence_when_source_is_paused(self) -> None:
-        class Source:
-            sample_rate = 48_000
-
-            def __init__(self) -> None:
-                self.paused = False
-
-            async def read_pcm(self, timeout=0.25):
-                return b"\x11\x22" * self_webrtc.WEBRTC_OPUS_FRAME_SAMPLES
-
-            def is_paused(self):
-                return self.paused
-
-        class PassthroughResampler:
-            def __init__(self, _input_rate, _output_rate) -> None:
-                pass
-
-            def process(self, pcm: bytes) -> bytes:
-                return pcm
-
-        async def run_test():
-            source = Source()
-            track = self_webrtc.create_webrtc_pcm_audio_track(source)
-            source.paused = True
-            frame = await track.recv()
-            return bytes(frame.planes[0])
-
-        self_webrtc = self.webrtc
-        original_resampler = self.webrtc.PcmResampler
-        self.webrtc.PcmResampler = PassthroughResampler
-        try:
-            try:
-                pcm = asyncio.run(run_test())
-            except self.webrtc.WebRtcError as exc:
-                self.skipTest(str(exc))
-        finally:
-            self.webrtc.PcmResampler = original_resampler
-
-        self.assertEqual(pcm, b"\x00" * (self.webrtc.WEBRTC_OPUS_FRAME_SAMPLES * 2))
-
-    def test_server_capability_report_has_expected_shape(self) -> None:
-        report = self.webrtc.server_webrtc_capabilities().to_dict()
-        self.assertIn("available", report)
-        self.assertIn("transport_available", report)
-        self.assertIn("opus_available", report)
-        self.assertEqual(report["target_bitrate_kbps"], 128)
-        self.assertEqual(report["minimum_bitrate_kbps"], 32)
-        self.assertEqual(report["bitrate_step_kbps"], 8)
-
-    def test_session_manager_cleans_up_failed_peer(self) -> None:
-        class Description:
-            def __init__(self, sdp: str, type: str) -> None:
-                self.sdp = sdp
-                self.type = type
-
-        class Peer:
-            def __init__(self, _configuration=None) -> None:
-                self.connectionState = "new"
-                self.iceConnectionState = "new"
-                self.localDescription = Description("answer", "answer")
-                self.handlers = {}
-                self.closed = False
-
-            def on(self, event_name):
-                def register(handler):
-                    self.handlers[event_name] = handler
-                    return handler
-
-                return register
-
-            def addTrack(self, track):
-                return object()
-
-            async def setRemoteDescription(self, description):
-                self.remoteDescription = description
-
-            async def createAnswer(self):
-                return self.localDescription
-
-            async def setLocalDescription(self, description):
-                self.localDescription = description
-
-            async def close(self):
-                self.closed = True
-
-        class FakeAiortc:
-            RTCConfiguration = lambda self, iceServers=None: {"iceServers": iceServers or []}
-            RTCSessionDescription = Description
-
-            def __init__(self) -> None:
-                self.peer = Peer()
-
-            def RTCPeerConnection(self, configuration=None):
-                return self.peer
-
-        fake_aiortc = FakeAiortc()
-        original_loader = self.webrtc._load_aiortc
-        original_prefer_opus = self.webrtc._prefer_opus
-        original_configure = self.webrtc._configure_sender_bitrate
-        self.webrtc._load_aiortc = lambda: fake_aiortc
-        self.webrtc._prefer_opus = lambda _peer: None
-        self.webrtc._configure_sender_bitrate = lambda _sender, _bitrate: None
-        cleanup_events = []
-        try:
-            manager = self.webrtc.AiortcSessionManager()
-
-            async def run_test():
-                await manager.accept_offer(
-                    session_id="client-1",
-                    sdp="offer",
-                    on_peer_closed=lambda session_id, reason: cleanup_events.append((session_id, reason)),
-                )
-                self.assertIn("client-1", manager.sessions)
-                fake_aiortc.peer.connectionState = "failed"
-                await fake_aiortc.peer.handlers["connectionstatechange"]()
-                await asyncio.sleep(0)
-
-            asyncio.run(run_test())
-        finally:
-            self.webrtc._load_aiortc = original_loader
-            self.webrtc._prefer_opus = original_prefer_opus
-            self.webrtc._configure_sender_bitrate = original_configure
-
-        self.assertEqual(cleanup_events, [("client-1", "connectionState=failed")])
-        self.assertNotIn("client-1", manager.sessions)
-        self.assertTrue(fake_aiortc.peer.closed)
-
     def test_opus_loader_uses_system_libopus(self) -> None:
         original_module = self.webrtc._OPUS_MODULE
         self.webrtc._OPUS_MODULE = None
@@ -675,50 +299,6 @@ class WebRtcTests(unittest.TestCase):
             self.assertEqual(opus.OPUS_APPLICATION_AUDIO, 2049)
         finally:
             self.webrtc._OPUS_MODULE = original_module
-
-    def test_bitrate_feedback_from_transport_stats(self) -> None:
-        class Stats:
-            availableOutgoingBitrate = 96_000
-            roundTripTime = 0.25
-            packetsLost = 2
-            packetsSent = 100
-
-        feedback = self.webrtc.bitrate_feedback_from_stats(Stats())
-        self.assertEqual(feedback["available_bitrate_bps"], 96_000)
-        self.assertEqual(feedback["packet_loss_fraction"], 0.02)
-        self.assertEqual(feedback["rtt_ms"], 250.0)
-
-    def test_sender_bitrate_configuration_awaits_async_set_parameters(self) -> None:
-        class Encoding:
-            maxBitrate = None
-
-        class Parameters:
-            def __init__(self) -> None:
-                self.encodings = [Encoding()]
-
-        class Sender:
-            def __init__(self) -> None:
-                self.parameters = Parameters()
-                self.awaited = False
-
-            def getParameters(self):
-                return self.parameters
-
-            async def setParameters(self, parameters):
-                self.awaited = True
-                self.parameters = parameters
-
-        async def run_test():
-            sender = Sender()
-            result = self_webrtc._configure_sender_bitrate(sender, 96)
-            if hasattr(result, "__await__"):
-                await result
-            return sender.awaited, sender.parameters.encodings[0].maxBitrate
-
-        self_webrtc = self.webrtc
-        awaited, max_bitrate = asyncio.run(run_test())
-        self.assertTrue(awaited)
-        self.assertEqual(max_bitrate, 96_000)
 
     def test_opus_encoder_encodes_20_ms_packet_when_available(self) -> None:
         try:
