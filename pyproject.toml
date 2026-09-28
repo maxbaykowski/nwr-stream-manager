@@ -59,4 +59,4 @@ nwr_stream_manager = "src/nwr-stream-manager"
 "nwr_stream_manager.assets" = "src/nwr-stream-manager/assets"
 
 [tool.setuptools.package-data]
-nwr_stream_manager = ["assets/*.json", "assets/*.wav"]
+nwr_stream_manager = ["assets/*.json", "assets/*.wav", "assets/*.html"]

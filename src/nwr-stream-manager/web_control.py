@@ -419,6 +419,8 @@ STREAM_TEST_MODE_CROSSFADE_SECONDS = 1.0
 STREAM_TEST_MODE_LOOP_PERIOD_SECONDS = 5.0
 STREAM_TEST_MODE_PRE_EOM_SILENCE_SECONDS = 2.0
 STREAM_TEST_MODE_AUDIO = "test_mode.wav"
+HELP_PATH = "/help"
+HELP_FILE_NAME = "help.html"
 STREAM_TEST_MODE_SAME_AUDIO = "same_test.wav"
 STREAM_TEST_MODE_SAME_LOCATION = "999000"
 STREAM_TEST_MODE_SAME_SENDER_ID = "NWRSTMGR"
@@ -8541,6 +8543,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def _auth_ok_or_setup_response(self, path: str, method: str) -> bool:
         self.current_account = None
+        if path == HELP_PATH and method == "GET":
+            # Help holds nothing private, and people need it before and during setup too.
+            self._send_help()
+            return False
         has_account = self.service.accounts.has_account()
         if path == "/api/setup-state":
             self._send_json({"setup_required": not has_account})
@@ -9676,6 +9682,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError, OSError):
             LOG.debug("client disconnected before JSON response could be written")
+
+    def _send_help(self) -> None:
+        # Read on each request so edits to the help file show up without a restart.
+        try:
+            content = asset_path(HELP_FILE_NAME).read_text(encoding="utf-8")
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._send_html(content)
 
     def _send_html(self, content: str) -> None:
         data = content.encode("utf-8")
@@ -12421,6 +12436,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <a id="nav_rtl" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
       <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
       <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" data-eas-entry="restore" hidden>EAS alerts</a>
+      <a id="nav_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
       <span class="nav-more">
         <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
         <span id="nav_more_menu" class="nav-more-menu" role="menu" hidden>

@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NWR Stream Manager Help</title>
+<style>
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: #f6f7f9; color: #14181f; line-height: 1.55; }
+header { background: #fff; border-bottom: 1px solid #d8dde6; }
+.topbar { max-width: 980px; margin: 0 auto; padding: 14px 24px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; }
+.topbar h1 { font-size: 22px; margin: 0; }
+.topbar a { padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; text-decoration: none; }
+main { max-width: 980px; margin: 0 auto; padding: 24px; }
+section, nav.contents { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 18px 22px; margin-bottom: 16px; }
+h2 { font-size: 20px; margin: 0 0 12px; }
+h3 { font-size: 17px; margin: 22px 0 8px; }
+h4 { font-size: 15px; margin: 18px 0 6px; }
+a { color: #174a98; }
+p, li { max-width: 72ch; }
+ul, ol { padding-left: 1.4em; }
+li { margin: 4px 0; }
+nav.contents ol { margin: 0; }
+nav.contents ol ol { margin: 4px 0 8px; }
+dl { margin: 0 0 12px; }
+dt { font-weight: 700; margin-top: 10px; }
+dd { margin: 2px 0 0 1.2em; }
+table { width: 100%; border-collapse: collapse; margin: 8px 0 14px; }
+th, td { border-bottom: 1px solid #d8dde6; padding: 8px 10px; text-align: left; vertical-align: top; }
+th { color: #526070; font-size: 12px; text-transform: uppercase; }
+.note { border-left: 4px solid #2557a7; background: #eaf1ff; padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 12px 0; }
+.warning { border-left: 4px solid #b00020; background: #fff4f4; padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 12px 0; }
+.note p, .warning p { margin: 0; }
+.command { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 8px 0 14px; }
+.command code { flex: 1 1 280px; display: block; padding: 10px 12px; background: #10151d; color: #d8f3dc; border-radius: 6px; font-size: 14px; overflow-x: auto; white-space: pre; }
+.command button { font: inherit; padding: 8px 12px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; cursor: pointer; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.signal-excellent { color: #0f7a34; font-weight: 700; }
+.signal-good { color: #5a7d00; font-weight: 700; }
+.signal-fair { color: #9a5b00; font-weight: 700; }
+.signal-poor { color: #b00020; font-weight: 700; }
+.screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+@media (prefers-color-scheme: dark) {
+  body { background: #101318; color: #eef2f7; }
+  header, section, nav.contents, .topbar a, .command button { background: #181d24; color: #eef2f7; border-color: #333b48; }
+  a { color: #9dc1ff; }
+  th, td { border-color: #333b48; }
+  th { color: #9aa8ba; }
+  .note { background: #16233a; }
+  .warning { background: #2a1518; border-color: #ff6b7a; }
+  .signal-excellent { color: #5fd27a; }
+  .signal-good { color: #b5d65a; }
+  .signal-fair { color: #f0b44c; }
+  .signal-poor { color: #ff6b7a; }
+}
+@media (max-width: 680px) {
+  .topbar { padding: 14px 16px; }
+  main { padding: 16px; }
+  section, nav.contents { padding: 16px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="topbar">
+    <h1>NWR Stream Manager Help</h1>
+    <a href="/">Back to NWR Stream Manager</a>
+  </div>
+</header>
+<main>
+
+<nav class="contents" aria-labelledby="contents-title">
+  <h2 id="contents-title">Contents</h2>
+  <ol>
+    <li><a href="#what-is-nwr-stream-manager">What is NWR Stream Manager?</a></li>
+    <li><a href="#why-nwr-stream-manager">Why NWR Stream Manager was made</a></li>
+    <li><a href="#what-is-an-sdr">What is an SDR?</a></li>
+    <li><a href="#what-you-need">What you need</a></li>
+    <li><a href="#first-run">First run and creating your account</a></li>
+    <li><a href="#dashboard">The dashboard</a></li>
+    <li><a href="#configure-rtl-sdr">Configuring the RTL-SDR</a>
+      <ol>
+        <li><a href="#gain">Gain</a></li>
+        <li><a href="#ppm-correction">PPM correction</a></li>
+        <li><a href="#bias-tee">Bias tee</a></li>
+        <li><a href="#alias-filter">Alias filter strength</a></li>
+        <li><a href="#sdr-troubleshooting">When the SDR stops working</a></li>
+      </ol>
+    </li>
+    <li><a href="#first-stream">Setting up your first stream</a></li>
+    <li><a href="#output-types">Output types: Icecast and sound cards</a></li>
+    <li><a href="#streaming-services">Streaming services</a>
+      <ol>
+        <li><a href="#gwes">GWES Weather Radio</a></li>
+        <li><a href="#weatherusa">WeatherUSA</a></li>
+        <li><a href="#noaa-weather-radio-org">NOAA Weather Radio Org</a></li>
+        <li><a href="#custom-icecast">Your own Icecast server</a></li>
+      </ol>
+    </li>
+    <li><a href="#sound-card-outputs">Sound card outputs</a></li>
+    <li><a href="#streams-table">The streams table</a></li>
+    <li><a href="#signal-strength">Signal strength levels</a></li>
+    <li><a href="#stream-settings">Stream settings</a>
+      <ol>
+        <li><a href="#stream-settings-top">Enabling, monitoring and signal</a></li>
+        <li><a href="#outputs-tab">Outputs</a></li>
+        <li><a href="#eas-recording">EAS recording</a></li>
+        <li><a href="#fallback-audio">Fallback audio</a></li>
+        <li><a href="#audio-effects">Audio effects</a></li>
+        <li><a href="#stream-notifications">Stream notifications</a></li>
+        <li><a href="#test-mode">Test mode</a></li>
+      </ol>
+    </li>
+    <li><a href="#monitoring">Listening to a stream in your browser</a></li>
+    <li><a href="#eas-alerts">EAS alerts</a></li>
+    <li><a href="#weather-radio-receiver">Weather Radio Receiver</a></li>
+    <li><a href="#notifications">Notifications</a></li>
+    <li><a href="#remote-sdr">Using an SDR from another NWR Stream Manager</a></li>
+    <li><a href="#tailscale">Setting up Tailscale</a></li>
+    <li><a href="#accounts">Accounts</a></li>
+    <li><a href="#iq-recorder">I/Q Recorder</a></li>
+    <li><a href="#logs">Logs</a></li>
+    <li><a href="#storage">Storage</a></li>
+  </ol>
+</nav>
+
+<section aria-labelledby="what-is-nwr-stream-manager">
+  <h2 id="what-is-nwr-stream-manager">What is NWR Stream Manager?</h2>
+  <p>NWR Stream Manager is an all-new solution to streaming your local NOAA Weather Radio stations to the internet, so anyone can listen to them online. It uses an inexpensive USB radio receiver called an RTL-SDR, plugged into a computer that stays on, such as a Raspberry Pi or a small home server.</p>
+  <p>One RTL-SDR hears the entire NOAA Weather Radio band at once. That means a single dongle can stream every weather radio station you can receive, all at the same time, without retuning anything.</p>
+  <p>You control everything from a web page that you open in any browser on your computer, phone or tablet. From there you can:</p>
+  <ul>
+    <li>Stream stations to online services such as GWES Weather Radio, WeatherUSA and NOAA Weather Radio Org, or to your own Icecast server.</li>
+    <li>Play a station through a sound card, for example to feed Emergency Alert System (EAS) equipment.</li>
+    <li>Record and save EAS alerts as they are broadcast.</li>
+    <li>Listen to your streams, or tune around the weather radio band, right in your browser.</li>
+    <li>Get notifications on your phone when something goes belly up.</li>
+    <li>Share an RTL-SDR with another NWR Stream Manager on your network.</li>
+  </ul>
+  <p>NWR Stream Manager runs on its own in the background. Once your streams are set up, they keep running without you. When it's installed to run as a service, it also starts again on its own whenever the computer restarts.</p>
+</section>
+
+<section aria-labelledby="why-nwr-stream-manager">
+  <h2 id="why-nwr-stream-manager">Why NWR Stream Manager was made</h2>
+  <p>For a long time, most weather radio streams were run with a physical weather radio connected to a computer. That works, but it gets costly, since each station needs its own radio, and it isn't very efficient.</p>
+  <p>People who did stream with SDR dongles usually put together a chain of separate programs to do it: an SDR program such as SDR++ or SDR#, a virtual audio cable on Windows to pass the sound along, and BUTT (Broadcast Using This Tool) to send it to the streaming service. That chain is more fragile than a stack of dominoes. These are all desktop programs that can crash or be closed by accident, and if any one of them stops, down goes your stream, potentially multiple of your streams, depending on how many streams you're running. Windows also isn't the most dependable choice for something that has to run unattended day and night.</p>
+  <p>I created NWR Stream Manager to streamline and standardize streaming NOAA Weather Radio. Everything happens in one program that is built to run unattended, and it's all set up from one web page.</p>
+</section>
+
+<section aria-labelledby="what-is-an-sdr">
+  <h2 id="what-is-an-sdr">What is an SDR?</h2>
+  <p>SDR stands for software-defined radio. A regular radio has parts inside that are built to pick up one kind of signal, and you turn a dial to choose a station. A software-defined radio does most of that work in software instead. The hardware simply listens to a range of radio frequencies and hands everything it hears to the computer, and from there it's the computer's problem. That's both good and bad; I know.</p>
+  <p>The SDR used with NWR Stream Manager is called an RTL-SDR. It is a small USB stick, often called a dongle, a bit larger than a thumb drive, with a connector for an antenna. They are inexpensive and easy to find.</p>
+  <p>Unlike most conventional radios, which can only pick up one station at a time, an SDR can pick up multiple stations at a time if they're near enough in frequency. As such, NWR Stream Manager can receive all 7 NWR channels at the same time, allowing users to stream multiple stations with a single SDR dongle.</p>
+  <p>If you have only ever streamed with a physical weather radio, the main difference is this: instead of connecting a radio's headphone jack to a computer, you plug the RTL-SDR into the computer and connect your antenna to the RTL-SDR. NWR Stream Manager takes care of the rest.</p>
+</section>
+
+<section aria-labelledby="what-you-need">
+  <h2 id="what-you-need">What you need</h2>
+  <ul>
+    <li><strong>An RTL-SDR dongle.</strong> One dongle can serve every station you stream.</li>
+    <li><strong>An antenna</strong> that picks up the NOAA Weather Radio band, around 162 MHz. A good antenna placed high up, or outdoors, makes a bigger difference to reception than anything else.</li>
+    <li><strong>A computer that stays on,</strong> running Linux, such as a Raspberry Pi or an old PC. This is the machine NWR Stream Manager runs on.</li>
+    <li><strong>An internet connection,</strong> if you stream to online services.</li>
+    <li><strong>A browser</strong> on any computer, phone or tablet on the same network, to set things up.</li>
+  </ul>
+  <p>Installation instructions are in the <a href="https://github.com/maxbaykowski/nwr-stream-manager">NWR Stream Manager project page</a>. Once it is installed and running, open its web address in your browser. When NWR Stream Manager starts, it shows the addresses it can be reached at, which usually end in <code>:8080</code>.</p>
+</section>
+
+<section aria-labelledby="first-run">
+  <h2 id="first-run">First run and creating your account</h2>
+  <p>The first time you open NWR Stream Manager, you'll see a welcome page asking you to create an account. This account keeps other people on your network from messing with your streams.</p>
+  <ol>
+    <li>On the welcome page, select <strong>Next</strong>.</li>
+    <li>Choose a username. It can use letters, numbers, dashes and underscores.</li>
+    <li>Choose a password of at least 8 characters, and type it again to confirm it.</li>
+    <li>Select <strong>Next</strong>, then <strong>Finish</strong>.</li>
+  </ol>
+  <p>This first account is the <strong>owner</strong> account. It can do everything, including creating accounts for other people. See <a href="#accounts">Accounts</a> for more information on this.</p>
+  <div class="warning">
+    <p><strong>Create your account right away.</strong> Until an account exists, anyone on your network who opens NWR Stream Manager sees the setup page. This means someone else in your house could create the owner account themselves, which wouldn't be good, would it? Open up your browser and complete the setup as soon as NWR Stream Manager is running for the first time.</p>
+  </div>
+  <h3 id="signing-in">Signing in</h3>
+  <p>After setup, your browser asks for your username and password whenever you open NWR Stream Manager. This is your browser's own sign-in box, not part of the page. Your browser remembers that you're signed in for a while, so you won't be nagged to sign in every time.</p>
+</section>
+
+<section aria-labelledby="dashboard">
+  <h2 id="dashboard">The dashboard</h2>
+  <p>After signing in, you'll see the dashboard. It gives you a quick overview of how your RTL-SDR and your streams are doing, so you can tell at a glance whether anything needs attention.</p>
+  <dl>
+    <dt>Configured SDR</dt>
+    <dd>Which RTL-SDR is in use and its main settings. If the RTL-SDR throws a hissy fit and decides to freeze up or randomly disconnect, a warning appears here stating the SDR requires attention. The <strong>Configure RTL-SDR</strong> link takes you to its settings, where you can reset it.</dd>
+    <dt>Configured streams</dt>
+    <dd>How many streams you have, and a short explanation of any stream that needs attention, for example because of bad reception or a streaming service it can't connect to.</dd>
+    <dt>Recently issued EAS alerts</dt>
+    <dd>The latest EAS alerts recorded by your streams, if you have <a href="#eas-recording">EAS recording</a> turned on.</dd>
+    <dt>Storage</dt>
+    <dd>How much disk space is left, and how much you've gobbled up with saved EAS alert recordings and I/Q recordings. A warning appears if space is running low.</dd>
+  </dl>
+  <p>The bar across the top of every page takes you to the main areas: <strong>Dashboard</strong>, <strong>Configure RTL-SDR</strong>, <strong>Manage Streams</strong>, <strong>EAS alerts</strong> (once alerts have been recorded), <strong>Help</strong>, and <strong>More</strong>, which holds everything else.</p>
+</section>
+
+<section aria-labelledby="configure-rtl-sdr">
+  <h2 id="configure-rtl-sdr">Configuring the RTL-SDR</h2>
+  <p>Plug your RTL-SDR into the computer running NWR Stream Manager and connect your antenna to it. Then open <strong>Configure RTL-SDR</strong> from the bar at the top.</p>
+  <p>Under <strong>SDR source</strong>, choose <strong>RTL-SDR connected to this machine</strong>. Then pick your dongle from <strong>Active SDR</strong>. Dongles are listed by serial number. If yours isn't listed, check that it's plugged in and select <strong>Rescan</strong>.</p>
+  <p>Changes on this page take effect right away. You don't have to remember to click the save button.</p>
+
+  <h3 id="gain">Gain</h3>
+  <p>Gain controls how strongly the RTL-SDR amplifies what it receives. Think of it like the volume on the antenna side, before any listening happens.</p>
+  <ul>
+    <li><strong>Keep gain between 30 and 35 dB</strong> for the best results in most places.</li>
+    <li>Gain that's too high overloads the dongle with other nearby signals, which causes interference and can make reception worse, not better.</li>
+    <li>Gain that's too low will weaken your signal and leave weak stations buried in static.</li>
+  </ul>
+  <p>Leave <strong>Automatic gain control</strong> turned off. It tends to raise the gain too high, which, as mentioned above, can cause issues.</p>
+
+  <h3 id="ppm-correction">PPM correction</h3>
+  <p>Some dongles, especially older ones, don't tune exactly to the frequency they're told to. They can end up a considerable amount off frequency, and if that isn't already bad enough, some dongles drift as they warm up. PPM correction compensates for this. You shouldn't have to play with it, but if you do, it's there. If you hear loud distortion when listening to your streams, that's probably frequency drift, and you can try tweaking the PPM until it sounds good as a troubleshooting step.</p>
+
+  <h3 id="bias-tee">Bias tee</h3>
+  <p>The bias tee sends a small amount of power up the antenna cable. It's only for equipment that needs that power to work, such as some antenna amplifiers (often called LNAs) or active antennas.</p>
+  <div class="warning">
+    <p><strong>Most people will never need to turn this on.</strong> Only enable the bias tee if a piece of hardware connected to your antenna cable actually requires DC power. If you have hardware that needs it, you'll know, but for the vast majority of people, keep this setting switched off.</p>
+  </div>
+
+  <h3 id="alias-filter">Alias filter strength</h3>
+  <p>This controls how well NWR Stream Manager keeps signals from outside a station's channel from leaking in. Leave it at 100%. Lowering it saves some processing power on weak computers, at the cost of letting some interference through. If you slide this all the way down to 0, you'll probably hear a high-pitched whine if you're trying to listen to a weaker weather radio station and have a strong station nearby on a different frequency.</p>
+
+  <h3 id="sdr-notifications">Notifications for the RTL-SDR</h3>
+  <p>Once you've set up <a href="#notifications">notifications</a>, a <strong>Notify when the RTL-SDR requires attention</strong> option appears on this page. Turn it on to get a notification if the RTL-SDR disconnects, can't be opened, or stops sending data.</p>
+
+  <h3 id="sdr-troubleshooting">When the SDR stops working</h3>
+  <p>RTL-SDR dongles occasionally lock up and stop sending data, it happens to everyone. When that happens, all of your streams lose audio, and the dashboard shows that the RTL-SDR requires attention. Try these steps in order:</p>
+  <ol>
+    <li><strong>Reset the SDR.</strong> On the dashboard, select <strong>Configure RTL-SDR</strong>, then select <strong>Reset SDR</strong>. This restarts the dongle without unplugging it, and usually does the trick.</li>
+    <li><strong>Unplug it and plug it back in.</strong> If a reset doesn't help, and you're near the machine running NWR Stream Manager, do the classic &quot;unplug it and plug it back in&quot; solution that the IT people at your job always tell you. It's more effective than one might think.</li>
+    <li><strong>Restart the computer.</strong> If you aren't near the computer running NWR Stream Manager but can reach it remotely with a command line (shell access), here's another classic from the IT playbook: &quot;turn it off and back on again&quot;, or in this case, restart the machine:
+      <div class="command"><code>sudo reboot</code><button type="button" class="copy-button" hidden>Copy</button></div>
+      NWR Stream Manager and your streams start again on their own once the computer is back up, if it was installed to run as a service.
+    </li>
+  </ol>
+  <p>If the problem keeps coming back, check the power supply to the computer and dongle, try a different USB port, and consider a powered USB hub. Weak power is a common cause of dongles locking up.</p>
+</section>
+
+<section aria-labelledby="first-stream">
+  <h2 id="first-stream">Setting up your first stream</h2>
+  <p>A stream is one weather radio station, sent to one or more places called <a href="#output-types">outputs</a>. To add one, open <strong>Manage Streams</strong> and select <strong>Add stream</strong>. A step-by-step guide walks you through the entire process.</p>
+  <ol>
+    <li><strong>Choose the station.</strong> Search by callsign, city, state or frequency, then select the station from the list of matches.</li>
+    <li><strong>Choose the output type:</strong> an Icecast mountpoint to stream online, or a sound card. See <a href="#output-types">Output types</a>.</li>
+    <li><strong>For Icecast, choose the streaming service:</strong> GWES Weather Radio, WeatherUSA, NOAA Weather Radio Org, or a custom Icecast server. Choosing a service fills in its settings for you. See <a href="#streaming-services">Streaming services</a> for how to get set up with each one.</li>
+    <li><strong>Choose the stream format</strong>, if the service lets you pick: MP3 works almost everywhere, while OGG can sound better while using less internet data, but isn't compatible with as many devices, though it should work on any modern computer or smartphone.</li>
+    <li><strong>Enter your Icecast details</strong> from the streaming service: usually the password and mountpoint, plus the server address and username for a custom server. NWR Stream Manager checks them by connecting to the server before it saves anything.</li>
+    <li><strong>Adjust audio quality</strong>, if offered. If you have no idea what these settings are, just select <strong>Finish</strong>. The defaults will work just fine in 90% of cases.</li>
+  </ol>
+  <p>For a sound card, you choose the sound card, which of its left and right channels to use, and the volume instead. See <a href="#sound-card-outputs">Sound card outputs</a>.</p>
+  <p>Once you finish, the stream starts right away. You can add more outputs to it later, so one station can go to several services and a sound card at once.</p>
+</section>
+
+<section aria-labelledby="output-types">
+  <h2 id="output-types">Output types: Icecast and sound cards</h2>
+  <p>An output is a place a stream's audio is sent. There are two kinds:</p>
+  <dl>
+    <dt>Icecast mountpoint</dt>
+    <dd>Sends the station over the internet to an Icecast server, which is the kind of server weather radio streaming services use. This is how you get your station onto GWES Weather Radio, WeatherUSA, NOAA Weather Radio Org, or your own server. A "mountpoint" is simply the name of your stream's spot on the server, a bit like a web address.</dd>
+    <dt>Sound card</dt>
+    <dd>Plays the station through a sound card connected to the computer running NWR Stream Manager. This gives you a 24/7 audio feed, for example to feed an EAS ENDEC (yes, some hobbyists actually do this). See <a href="#sound-card-outputs">Sound card outputs</a>.</dd>
+  </dl>
+</section>
+
+<section aria-labelledby="streaming-services">
+  <h2 id="streaming-services">Streaming services</h2>
+  <p>There are three online services you can share your stream with. Each one works a little differently. When you choose one in NWR Stream Manager, its server settings are filled in for you and its requirements, such as the stream format, are applied automatically.</p>
+
+  <h3 id="gwes">GWES Weather Radio</h3>
+  <p><a href="https://weatherradio.org/">GWES Weather Radio</a> is run by the Global Weather &amp; EAS Society. Each streamer gets their own login details.</p>
+  <ol>
+    <li><strong>Submit your stream to GWES.</strong> Go to <a href="https://weatherradio.org/">weatherradio.org</a> and select <strong>Submit a Stream</strong>, or use the link NWR Stream Manager shows when you choose GWES. Fill out the short form with details such as your name, your email address, the name GWES should use when crediting the stream, and the callsign of the station.</li>
+    <li><strong>Wait for your credentials.</strong> Within a few days, you should get an email from GWES with your Icecast credentials.</li>
+    <li><strong>Enter them in NWR Stream Manager.</strong> Add a stream (or an output), choose GWES Weather Radio, and enter the details from the email.</li>
+  </ol>
+  <p>GWES requires streams to be in MP3 at a bitrate of 64 Kbps or higher. If you have no idea what that means, that's okay; NWR Stream Manager sets this for you.</p>
+
+  <h3 id="weatherusa">WeatherUSA</h3>
+  <ol>
+    <li><strong>Create a WeatherUSA account</strong> at <a href="https://www.weatherusa.net/members/new">weatherusa.net</a> before streaming.</li>
+    <li><strong>Add your stream.</strong> Once you've created your account and signed in, select <strong>My Services</strong> in the menu, then select <strong>Add my NOAA Weather Radio stream</strong>.</li>
+    <li><strong>Fill in the station information</strong> in the form and submit it. WeatherUSA then gives you your Icecast credentials.</li>
+    <li><strong>Enter them in NWR Stream Manager.</strong> Choose WeatherUSA when adding a stream. The server and username are filled in for you, so all you need to enter is your password and mountpoint, and choose MP3 or OGG. NWR Stream Manager suggests a mountpoint based on the callsign; make sure it matches the one WeatherUSA gave you.</li>
+  </ol>
+  <div class="note">
+    <p>Officially, WeatherUSA allows each person to stream one station. If you'd like to stream more than one, you can email WeatherUSA and ask to stream additional stations.</p>
+  </div>
+
+  <h3 id="noaa-weather-radio-org">NOAA Weather Radio Org</h3>
+  <p><a href="https://noaaweatherradio.org/">NOAA Weather Radio Org</a> uses a shared server, so there are no credentials to wait for.</p>
+  <ol>
+    <li><strong>Set up the mountpoint.</strong> Add a stream (or an output) and choose NOAA Weather Radio Org. NWR Stream Manager does this for you: it fills in the server, the shared login, and the audio settings the site requires, and names the mountpoint for the station in the format the site uses (state, city and callsign).</li>
+    <li><strong>Submit your stream.</strong> Once the mountpoint is set up, a reminder appears in NWR Stream Manager with a link to the NOAA Weather Radio Org submission form. Your stream won't appear on the website until you fill it out and it gets approved.</li>
+  </ol>
+  <p>If someone else is already streaming the same station to NOAA Weather Radio Org, they accept multiple feeds of the same station. In NWR Stream Manager, simply turn on <strong>Alternate stream</strong> and choose a number. This adds "-alt1", "-alt2" and so on to the mountpoint name. NOAA Weather Radio Org's <a href="https://noaaweatherradio.org/N2radio-finder.php">Weather Radio Station Lookup Utility</a> shows which mountpoints are already taken.</p>
+
+  <h3 id="custom-icecast">Your own Icecast server</h3>
+  <p>Choose <strong>Custom Icecast server</strong> to stream anywhere else, such as a service not listed in NWR Stream Manager or an Icecast server you run yourself. If you select this option you have to do all the dirty work yourself and enter the server's address (host), port, username, password and mountpoint, and choose the format and audio quality.</p>
+</section>
+
+<section aria-labelledby="sound-card-outputs">
+  <h2 id="sound-card-outputs">Sound card outputs</h2>
+  <p>A sound card output plays a station through a sound card connected to the computer running NWR Stream Manager. This isn't the device you're using to view this page. The main use is giving equipment a 24/7 feed of the station. For example, you might feed an Emergency Alert System ENDEC, which listens to weather radio for alerts to relay.</p>
+  <p>When adding a sound card output, you choose:</p>
+  <ul>
+    <li><strong>The sound card.</strong> Small, inexpensive USB sound cards will do, if you were wondering.</li>
+    <li><strong>Channels:</strong> left, right, or both. Using one channel per station lets a single stereo sound card carry two stations.</li>
+    <li><strong>Volume</strong> for that sound card only. It doesn't change the volume of your online streams.</li>
+  </ul>
+  <div class="note">
+    <p>I designed NWR Stream Manager to request exclusive access to sound cards, meaning it won't cooperate with PulseAudio or PipeWire, which ship with all the popular Linux desktop environments. If a sound card doesn't show up, or shows up but won't play, PipeWire is probably hogging it. Use a sound card that nothing else is using, or even better, run NWR Stream Manager on a computer without a desktop, such as a Raspberry Pi set up as a server. This behavior is intentional, as PipeWire and PulseAudio give applications a way to all use the same sound card to play their audio, which is the exact opposite of what you want when feeding EAS equipment.</p>
+  </div>
+  <p>If a USB sound card stops responding, open the stream's <a href="#outputs-tab">Outputs</a> tab and choose <strong>Reset USB sound card</strong> from its <strong>More actions</strong> menu. Most sound cards aren't nearly as finicky as RTL-SDR dongles, but I have seen it on occasion where a sound card misbehaves, especially on PCs with weak USB power.</p>
+</section>
+
+<section aria-labelledby="streams-table">
+  <h2 id="streams-table">The streams table</h2>
+  <p><strong>Manage Streams</strong> lists every stream you've set up in a table, one stream per row:</p>
+  <dl>
+    <dt>Callsign</dt>
+    <dd>The station's callsign, such as WXN99.</dd>
+    <dt>Frequency</dt>
+    <dd>The station's frequency, one of the seven weather radio channels between 162.400 and 162.550 MHz.</dd>
+    <dt>Outputs</dt>
+    <dd>Number of outputs the stream is being sent to.</dd>
+    <dt>Signal</dt>
+    <dd>How well the station is being received, as a rating from Excellent to Poor. See <a href="#signal-strength">Signal strength levels</a>. This is the first thing to check if a stream sounds noisy.</dd>
+    <dt>Status</dt>
+    <dd>
+      <strong>Enabled</strong> means the stream is running and all of its outputs are working.
+      <strong>Needs attention</strong> means something is wrong: reception is bad, a failure occurred connecting to an Icecast mountpoint, or a sound card went belly up or was disconnected. The dashboard explains what the problem is.
+      <strong>Disabled</strong> means the stream is stopped by the user; that one is self-explanatory.
+    </dd>
+    <dt>Actions</dt>
+    <dd>The <strong>More actions</strong> menu lets you start or stop the stream, listen to it in your browser (Monitor), open its settings (Edit stream settings), or remove it.</dd>
+  </dl>
+</section>
+
+<section aria-labelledby="signal-strength">
+  <h2 id="signal-strength">Signal strength levels</h2>
+  <p>NWR Stream Manager rates how clearly each station is received, from best to worst:</p>
+  <table>
+    <thead>
+      <tr><th scope="col">Rating</th><th scope="col">What it means</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="signal-excellent">Excellent</td><td>A strong, clear signal. The station sounds clean.</td></tr>
+      <tr><td class="signal-good">Good</td><td>A solid signal with little noise.</td></tr>
+      <tr><td class="signal-fair">Fair</td><td>The stream is usable, but has some background hiss.</td></tr>
+      <tr><td class="signal-poor">Poor</td><td>This is the point where EAS decoding fails and listeners complain. When it gets bad enough to be unusable, the stream is marked as having bad reception.</td></tr>
+      <tr><td>No signal</td><td>Only static is being received. If it reaches this point, fallback audio will play if you have it enabled for the stream.</td></tr>
+    </tbody>
+  </table>
+  <p>The rating is followed by a number in dB SNR (signal-to-noise ratio). Higher numbers are better. Generally this number should stay above 8 dB; anywhere below that number is the point where EAS equipment starts to fail and the stream sounds deplorable. If a station's signal is poor, the best improvements usually come from a better antenna, placing it higher up or outdoors, and checking the <a href="#gain">gain</a>.</p>
+</section>
+
+<section aria-labelledby="stream-settings">
+  <h2 id="stream-settings">Stream settings</h2>
+  <p>To change a stream's settings, open <strong>Manage Streams</strong>, open the stream's <strong>More actions</strong> menu and select <strong>Edit stream settings</strong>. Changes take effect right away.</p>
+
+  <h3 id="stream-settings-top">Enabling, monitoring and signal</h3>
+  <p>Above the tabs are three controls that show up no matter where you are in the settings page:</p>
+  <ul>
+    <li><strong>Enable this stream</strong> starts or stops the stream.</li>
+    <li><strong>Monitor</strong> lets you listen to the stream in your browser. See <a href="#monitoring">Listening to a stream in your browser</a>.</li>
+    <li><strong>Signal</strong> shows the station's reception, just like the Signal column in the streams table, along with the signal and background noise levels in more detail.</li>
+  </ul>
+  <p>Below that are tabs for each group of settings. Each is described in turn below.</p>
+
+  <h3 id="outputs-tab">Outputs</h3>
+  <p>The Outputs tab lists every output the stream is sent to. Use the <strong>Show outputs</strong> selector to switch between <strong>Icecast outputs</strong> and <strong>Sound card outputs</strong>; you can only view one output type at a time.</p>
+  <p>Each output shows its status: <strong>Connected</strong> (or <strong>Enabled</strong> for sound cards) when it's working, <strong>Needs attention</strong> when it isn't, and <strong>Disabled</strong> when you've turned it off. Its <strong>More actions</strong> menu lets you disable or enable it, edit it, or remove it. For USB sound cards, the menu also has <strong>Reset USB sound card</strong>.</p>
+  <p>To add another output, select <strong>Add output</strong>, then choose Icecast mountpoint or Sound card. The steps are the same as when you <a href="#first-stream">set up your first stream</a>:</p>
+  <ul>
+    <li><strong>Icecast:</strong> choose the streaming service, then enter its details. See <a href="#streaming-services">Streaming services</a>.</li>
+    <li><strong>Sound card:</strong> choose the sound card, channels and volume. See <a href="#sound-card-outputs">Sound card outputs</a>.</li>
+  </ul>
+  <div class="note">
+    <p>Every stream needs at least one output working. This means if the stream only has one output, you can't disable it. EAS recording counts as an output, so it is possible to have a stream that gets sent nowhere and only records alerts.</p>
+  </div>
+
+  <h3 id="eas-recording">EAS recording</h3>
+  <p>EAS recording saves every EAS alert the station broadcasts as an audio file on the computer running NWR Stream Manager. You can then play, download and manage the recordings in <a href="#eas-alerts">EAS alerts</a>.</p>
+  <dl>
+    <dt>Enable EAS recording</dt>
+    <dd>Turns recording on for the station.</dd>
+    <dt>Pre-recording time</dt>
+    <dd>How many seconds of audio to keep from before the alert starts, from 0 to 10.</dd>
+    <dt>Post-recording time</dt>
+    <dd>How many seconds to keep recording after the alert ends, from 0 to 10.</dd>
+    <dt>Maximum recording time</dt>
+    <dd>The longest a single alert recording can be, in seconds.</dd>
+    <dt>Recording format</dt>
+    <dd>WAV for the best quality, or MP3 for smaller files.</dd>
+  </dl>
+  <p>If the computer runs low on storage, recording is paused automatically so the disk doesn't fill up completely.</p>
+
+  <h3 id="fallback-audio">Fallback audio</h3>
+  <p>If a stream stops getting audio from the radio, or if there's no signal from the station, you can optionally enable fallback audio. When fallback audio is on, a voice announcement will play instead of listeners hearing static or dead air. The voice announcement is a prerecorded audio file of the VoiceText Paul voice, and it says the following: &quot;This weather radio stream is currently experiencing technical difficulties. Please check back later.&quot;</p>
+  <dl>
+    <dt>Fallback delay</dt>
+    <dd>How long to wait after the station audio stops before fallback audio kicks in, from 30 to 120 seconds.</dd>
+    <dt>Seconds before restart</dt>
+    <dd>The fallback audio plays in a loop. This setting controls the pause before the audio repeats. Set it to 0 to repeat it without a gap.</dd>
+  </dl>
+  <p>As soon as radio audio comes back, the station plays again.</p>
+
+  <h3 id="audio-effects">Audio effects</h3>
+  <p>Audio effects shape how the stream sounds. Choose an effect from the list to see its settings.</p>
+  <dl>
+    <dt>NWR deemphasis</dt>
+    <dd>
+      <p><strong>This is the key to a good sounding stream. Leave it on.</strong> Weather radio stations boost the high-pitched parts of their audio before transmitting, and every weather radio turns them back down when it plays the sound. This is called deemphasis. It makes the audio sound natural and keeps hiss down. Without it, the stream sounds harsh, tinny and hissy, very different from a real weather radio. Deemphasis is on for new streams.</p>
+    </dd>
+    <dt>Volume multiplier</dt>
+    <dd>Adjusts the stream volume. The default volume level is 1. A volume of 2 is double, a volume level of 0.5 is half.</dd>
+    <dt>Comfort noise</dt>
+    <dd>Mixes in a very quiet background rumble, like the faint noise some weather radios make during silence. Some listeners prefer it instead of hearing the transmitter background noise. The level can be set from -60 dB (quietest) to -30 dB (loudest).</dd>
+    <dt>Highpass</dt>
+    <dd>Removes low sounds, such as a 60 Hz hum, below the frequency you choose. Sharpness sets how gradual the cut is: 0 is gentle and natural sounding, and 10 cuts off very sharply. The frequency can't go above 900 Hz, so the 1050 Hz tone is never affected.</dd>
+    <dt>Lowpass</dt>
+    <dd>Removes high sounds above the frequency you choose, with the same sharpness setting as the highpass. It can't go below 2200 Hz, so SAME tones remain intact. This is separate from deemphasis.</dd>
+    <dt>Notch filter</dt>
+    <dd>Removes a narrow band of sound around one frequency, which is useful for getting rid of transmitter buzz or high-pitched whines that you'll encounter sooner or later. Choose the frequency to filter out and how wide the notch should be. A narrow notch removes just the whine; a wider one also removes the surrounding frequencies. To protect the alert tones, the notch can't be placed on them, and how wide it can be depends on how close it is to them.</dd>
+  </dl>
+
+  <h3 id="stream-notifications">Stream notifications</h3>
+  <p>Once you've set up <a href="#notifications">notifications</a>, a <strong>Notifications</strong> tab appears in stream settings. Choose which problems with this stream should notify you:</p>
+  <ul>
+    <li><strong>Failed Icecast mountpoints:</strong> a streaming service can't be reached.</li>
+    <li><strong>Disconnected sound cards.</strong></li>
+    <li><strong>Bad reception or no signal.</strong></li>
+    <li><strong>Recorded EAS alerts:</strong> a new alert has been saved (when EAS recording is on).</li>
+  </ul>
+  <p>You'll also receive a notification when each of these problems clears up.</p>
+
+  <h3 id="test-mode">Test mode</h3>
+  <p>Test mode swaps the real station for a simulated weather radio station, so you can check that your outputs and any connected alert equipment, such as an ENDEC, work properly without waiting for a real alert. The simulated station plays a looping test announcement, and it goes through your stream's outputs and audio effects just like the real station would.</p>
+  <p>Turn on <strong>Enable test mode</strong> on the Test Mode tab. When you turn it off, the real station audio returns.</p>
+  <dl>
+    <dt>Signal strength</dt>
+    <dd>Makes the simulated station stronger or weaker, from -80 to 0 dBFS. Lowering it lets you hear how your stream and equipment behave with a weak, noisy signal.</dd>
+    <dt>Send SAME test</dt>
+    <dd>
+      <p>Sends a complete test alert: the alert header tones, the long 1050 Hz alert tone, a spoken test message, and the end-of-message tones. Connected alert equipment should react to it just like a real alert.</p>
+      <p><strong>Important</strong>: the test alert will be sent out to <strong>all</strong> enabled outputs, including streaming services, EAS recording and sound cards. It's sent as a practice/demo alert for a location code that doesn't exist (999000), which helps prevent anything from acting on it by mistake. Even so, disable any outputs you don't want it sent to first, especially public services such as GWES Weather Radio, NOAA Weather Radio Org or WeatherUSA. GWES Weather Radio, especially, is one you should disable, as they sometimes monitor users' streams for EAS alerts as part of their EAS Relay Network. Don't be an idiot with the SAME test feature.</p>
+    </dd>
+    <dt>Tone generators</dt>
+    <dd>
+      <p>While test mode is on, you can play tones along with the test announcement to simulate buzzes and whines, for example to try out the <a href="#audio-effects">audio effects</a> that remove them. There are four kinds: <strong>sine</strong> (a pure whine), <strong>square</strong> (a harsh, hollow buzz), <strong>triangle</strong> (a soft tone) and <strong>sawtooth</strong> (a bright, raspy buzz). Each can be turned on separately, with its own frequency (20 to 7000 Hz) and amplitude (loudness). Tones keep playing during a SAME test.</p>
+      <p>Checking the <strong>Mute tone generators</strong> checkbox silences all tone generators; unchecking it brings them back.</p>
+    </dd>
+  </dl>
+  <h4 id="test-mode-limit">Test mode time limit</h4>
+  <p>Test mode can do real harm if misused, since it can send alerts to equipment and to the public. To prevent abuse, there are limits on how long the test mode features can be used. Test mode can be used for <strong>up to 10 minutes in any hour</strong>. The time is shared by all streams: using test mode on one stream uses up time for all of them. Oh, and if you were getting any clever ideas, the limit does not reset if you restart NWR Stream Manager or reboot the computer.</p>
+  <p>The limit is "rolling": rather than resetting all at once on the hour, each minute of test mode you use comes back one hour after you used it. For example, if you used test mode from 2:00 to 2:03 and again from 2:30 to 2:37, you'd get 3 minutes back between 3:00 and 3:03, and the other 7 between 3:30 and 3:37. This means you can never use more than 10 minutes of test mode in any 60-minute stretch, no matter how you time it.</p>
+  <p>The Test Mode tab shows how much time you have left. When you've used it all, test mode turns off and the page tells you when more time will be available.</p>
+  <p>If time runs out, or you close the page, in the middle of a SAME test, the test is ended safely rather than cut off: the alert header tones and the 1050 Hz alert tone finish, then after 2 seconds of silence the end-of-message tones are sent, and the real station returns a second later. This makes sure connected equipment isn't left thinking an alert is still going on.</p>
+  <p>Only one person can use test mode at a time, and it turns off if you close the page. This means if you open NWR Stream Manager on your computer and enter test mode for a stream, then attempt to access test mode on your phone, you won't be able to.</p>
+</section>
+
+<section aria-labelledby="monitoring">
+  <h2 id="monitoring">Listening to a stream in your browser</h2>
+  <p>You can listen to any running stream right in your browser, exactly as your listeners hear it, including your audio effects. Choose <strong>Monitor</strong> from the stream's <strong>More actions</strong> menu in <strong>Manage Streams</strong>, or turn on <strong>Monitor</strong> in its settings.</p>
+  <ul>
+    <li>On Android, listening usually keeps going when you switch to another app or lock the screen.</li>
+    <li>On iPhone and iPad, listening stops when Safari goes into the background. This is a known limitation; there's nothing I can do about it, unfortunately.</li>
+    <li>If your internet connection is too unstable, listening stops and NWR Stream Manager tells you why.</li>
+  </ul>
+</section>
+
+<section aria-labelledby="eas-alerts">
+  <h2 id="eas-alerts">EAS alerts</h2>
+  <p>When <a href="#eas-recording">EAS recording</a> is on, every alert your streams record shows up under <strong>EAS alerts</strong> in the bar at the top. The link appears once the first alert has been recorded.</p>
+  <ul>
+    <li>Choose a stream to see its alerts, newest first.</li>
+    <li>Select an alert to see its details: the type of event, the counties it covers, and when it was issued and when it expires. You can play the recording, download it, or remove it. Turn on <strong>Autoplay</strong> to play alerts one after another.</li>
+    <li><strong>Export alerts</strong> downloads a group of recordings at once, and <strong>Delete alerts</strong> removes a group of them.</li>
+  </ul>
+  <p>The dashboard also shows the most recently issued alerts.</p>
+</section>
+
+<section aria-labelledby="weather-radio-receiver">
+  <h2 id="weather-radio-receiver">Weather Radio Receiver</h2>
+  <p>The Weather Radio Receiver is for when you just want to listen to NWR. After all, you have an RTL-SDR capable of capturing all 7 channels at once, so you should have a way to tune around the band. Open it from <strong>More</strong>, then <strong>Weather Radio Receiver</strong>.</p>
+  <ul>
+    <li>Use <strong>Previous channel</strong> and <strong>Next channel</strong> to change frequency, and <strong>Play</strong> to start listening.</li>
+    <li>If an alert is broadcast while you're listening, a banner appears and shows what the alert is and the areas it covers. On phones, the banner only shows the alert type due to the small screen size unless you put the phone in landscape mode.</li>
+  </ul>
+  <p>Listening in the background works the same way as <a href="#monitoring">monitoring a stream</a>.</p>
+</section>
+
+<section aria-labelledby="notifications">
+  <h2 id="notifications">Notifications</h2>
+  <p>NWR Stream Manager can send notifications to your phone or computer when something goes haywire: a stream goes down, a sound card stops working, reception gets bad, or the RTL-SDR gives up, and when said problems are resolved. You can also get notified when an alert gets recorded for streams with EAS recording enabled.</p>
+  <p>Notifications are sent through <a href="https://ntfy.sh/">ntfy</a>, a free notification service. You install the ntfy app and subscribe to a private "topic", which is like a private channel only you know the name of. NWR Stream Manager then sends its notifications to that topic.</p>
+  <h3 id="notifications-setup">Setting up notifications</h3>
+  <ol>
+    <li>Open <strong>More</strong>, then <strong>Notification settings</strong>, and select <strong>Set up</strong>.</li>
+    <li>Choose whether you have your own ntfy server. Most people should choose <strong>No, use ntfy.sh</strong>, the free public server, which doesn't need an account.</li>
+    <li>Install the ntfy app. There are links for the Apple App Store and Google Play, or you can use the ntfy web app in your browser.</li>
+    <li>Copy the <strong>topic secret</strong> that NWR Stream Manager shows. In the ntfy app, add a subscription and paste the topic secret as the topic name. You can subscribe on as many devices as you like.</li>
+    <li>Choose the address your devices should open when you select a notification. Pick one your devices can reach. If you use <a href="#tailscale">Tailscale</a>, choosing its address means notifications open NWR Stream Manager even when you're away from home.</li>
+    <li>Select <strong>Send test notification</strong> to make sure it arrives, then select <strong>Finish</strong>.</li>
+  </ol>
+  <div class="note">
+    <p>Keep your topic secret private. Anyone who knows it can see your notifications and send their own. If you ever get notifications that didn't come from NWR Stream Manager, select <strong>Regenerate topic secret</strong> in Notification settings, and subscribe to the new topic in the ntfy app.</p>
+  </div>
+  <h3 id="notifications-choose">Choosing what you're notified about</h3>
+  <p>After setup, choose what you want notifications for:</p>
+  <ul>
+    <li><strong>For each stream:</strong> open its settings and use the <a href="#stream-notifications">Notifications tab</a>.</li>
+    <li><strong>For the RTL-SDR:</strong> open <strong>Configure RTL-SDR</strong> and turn on <strong>Notify when the RTL-SDR requires attention</strong>.</li>
+  </ul>
+</section>
+
+<section aria-labelledby="remote-sdr">
+  <h2 id="remote-sdr">Using an SDR from another NWR Stream Manager</h2>
+  <p>Two computers running NWR Stream Manager can share an RTL-SDR with each other. One computer has the RTL-SDR plugged in, and the other uses it over the network as if it were plugged in there.</p>
+  <h3 id="remote-sdr-why">Why would I want this?</h3>
+  <p>The best place for your RTL-SDR is right next to your antenna, often in an attic, on a roof or at the top of a mast, with a short cable. The shorter the cable between antenna and dongle, the less signal is lost. But that spot often isn't a good place to stream from. For example, if you monitor with an ENDEC, the ENDEC and its sound card probably live somewhere else in the house.</p>
+  <p>With sharing, a small computer such as a Raspberry Pi sits by the antenna with the RTL-SDR, and your main NWR Stream Manager elsewhere does the streaming, recording and sound card output using that RTL-SDR.</p>
+  <h3 id="remote-sdr-pairing">Pairing two NWR Stream Managers</h3>
+  <p>Both computers need to be on the same network, or connected through <a href="#tailscale">Tailscale</a>. You only have to pair them once, and after that either one can use the other's RTL-SDR.</p>
+  <ol>
+    <li>On the computer <strong>with</strong> the RTL-SDR, open <strong>Configure RTL-SDR</strong>. Under <strong>Sharing</strong>, turn on <strong>Share this RTL-SDR with paired devices</strong>, then select <strong>Pair a device</strong>. A 6-digit pairing code appears. It lasts for 5 minutes, so make sure you pair the two devices before it expires.</li>
+    <li>On the <strong>other</strong> computer, open <strong>Configure RTL-SDR</strong>. Under <strong>Pair with another NWR Stream Manager</strong>, select <strong>Find devices</strong>, choose the other computer from the list, enter the pairing code, and select <strong>Pair</strong>. If it isn't in the list, you can enter its IP address instead if you know it.</li>
+    <li>Still on the second computer, under <strong>SDR source</strong>, choose <strong>RTL-SDR shared by another NWR Stream Manager</strong>, then choose the paired computer under <strong>Shared SDR</strong>.</li>
+  </ol>
+  <p>Paired computers are listed under <strong>Paired devices</strong>, where you can also remove them.</p>
+  <h3 id="remote-sdr-buffer">Network buffer</h3>
+  <p>When using a shared RTL-SDR, network inconsistencies and dropouts have to be taken into account. When using an RTL-SDR connected directly over USB, there isn't much latency. However, the same can't be said for transmitting SDR data over the network. The <strong>Network buffer</strong> setting holds back a little radio data to ride out Wi-Fi hiccups and brief network dropouts. A bigger buffer is more reliable on a weak connection, but puts your audio a bit further behind real time. The delay applies to everything using the shared RTL-SDR, including monitoring and the Weather Radio Receiver. The buffer can be set between 0 and 10 seconds. You'll probably notice the delay the most when using the weather radio receiver, as depending on what the buffer is set to there will be a noticeable delay before the weather radio receiver plays audio or switches channels.</p>
+  <div class="note">
+    <p>If a firewall runs on the computer with the RTL-SDR, you'll need to unblock TCP port 47432 and UDP port 47433.</p>
+  </div>
+</section>
+
+<section aria-labelledby="tailscale">
+  <h2 id="tailscale">Setting up Tailscale</h2>
+  <p>NWR Stream Manager runs on a computer on your local network, meaning you can only access it when you're at home connected to your Wi-Fi. However, you probably want to be able to access NWR Stream Manager when you're away from home as well. <a href="https://tailscale.com/">Tailscale</a> connects your devices together securely over the internet, as if they were all on the same home network. It has a free plan for personal use. With Tailscale you can:</p>
+  <ul>
+    <li>Open NWR Stream Manager from your phone or laptop when you're away from home.</li>
+    <li>Have notifications open NWR Stream Manager wherever you are.</li>
+    <li>Share an RTL-SDR between two NWR Stream Managers in different places, such as a friend's house or a second site.</li>
+  </ul>
+  <p>Tailscale needs to be installed on every device, including the devices with NWR Stream Manager installed and the computers, phones, and tablets you use to access NWR Stream Manager, and said devices all need to be on the same account and tailnet.</p>
+  <h3 id="tailscale-server">On the computer running NWR Stream Manager</h3>
+  <ol>
+    <li>Open a command line (terminal) on the computer running NWR Stream Manager, and install Tailscale with its install script:
+      <div class="command"><code>curl -fsSL https://tailscale.com/install.sh | sh</code><button type="button" class="copy-button" hidden>Copy</button></div>
+    </li>
+    <li>Start Tailscale:
+      <div class="command"><code>sudo tailscale up</code><button type="button" class="copy-button" hidden>Copy</button></div>
+      This shows a web link. Open it in a browser and sign in to your Tailscale account (or create one) to add this computer.
+    </li>
+    <li>Find this computer's Tailscale address:
+      <div class="command"><code>tailscale ip -4</code><button type="button" class="copy-button" hidden>Copy</button></div>
+      It's a number starting with 100, such as 100.101.102.103.
+    </li>
+  </ol>
+  <h3 id="tailscale-devices">On your phone, tablet or other computers</h3>
+  <p>Install the Tailscale app from <a href="https://tailscale.com/download">tailscale.com/download</a> or from the <a href="https://play.google.com/store/apps/details?id=com.tailscale.ipn&amp;hl=en_US">Google Play Store</a> or <a href="https://apps.apple.com/us/app/tailscale/id1470499037">Apple App Store</a>, and sign in with the same Tailscale account. For a second NWR Stream Manager, repeat the steps above on that computer.</p>
+  <h3 id="tailscale-using">Using it</h3>
+  <p>With Tailscale on, you can open NWR Stream Manager from anywhere using its Tailscale address and port, for example <code>http://100.101.102.103:8080</code>. Once Tailscale is running on the computer with NWR Stream Manager, it also appears as a choice for where <a href="#notifications">notifications</a> should open, and paired devices can be found over Tailscale when <a href="#remote-sdr">sharing an RTL-SDR</a>.</p>
+</section>
+
+<section aria-labelledby="accounts">
+  <h2 id="accounts">Accounts</h2>
+  <p>Everyone who uses NWR Stream Manager signs in with an account. There are three types of accounts:</p>
+  <dl>
+    <dt>Owner</dt>
+    <dd>The account created during <a href="#first-run">first-run setup</a>. It can do everything, and it's the only account that can manage other accounts.</dd>
+    <dt>Administrator</dt>
+    <dd>Can set up and change the RTL-SDR, streams, outputs, EAS recording, audio effects and everything else, but can't manage accounts.</dd>
+    <dt>Read-only</dt>
+    <dd>Can look but not change anything: view streams, listen to them, use the Weather Radio Receiver, play and export EAS alerts, download I/Q recordings and view logs.</dd>
+  </dl>
+  <h3 id="accounts-create">Creating accounts for other people</h3>
+  <ol>
+    <li>Signed in as the owner, open <strong>More</strong>, then <strong>Manage accounts</strong>, and select <strong>Create account</strong>.</li>
+    <li>Enter a username. Check <strong>Read-only account</strong> if the person should only be able to look and listen; otherwise they'll be an administrator.</li>
+    <li>Select <strong>Create account</strong>. A temporary password appears. Copy it and give it to the person. It's only shown once, so be sure to send it to the person right away.</li>
+  </ol>
+  <p>The first time they sign in, they'll be asked to choose their own password.</p>
+  <h3 id="accounts-passwords">Passwords</h3>
+  <ul>
+    <li>To change your own password, open <strong>More</strong>, then <strong>Change account password</strong>. The owner does this from <strong>Manage accounts</strong> instead, by choosing <strong>Change account password</strong> from their own account's <strong>More actions</strong> menu.</li>
+    <li>If someone forgets their password, the owner can open <strong>Manage accounts</strong> and choose <strong>Reset password</strong> from that account's <strong>More actions</strong> menu. This gives them a new temporary password.</li>
+    <li>If the owner password is lost, NWR Stream Manager has to be stopped and its account database (the <code>accounts.db</code> file in its settings folder) deleted. The setup page then appears again so a new owner account can be created. Your streams and settings are kept. Starting to get the memo yet?</li>
+  </ul>
+</section>
+
+<section aria-labelledby="iq-recorder">
+  <h2 id="iq-recorder">I/Q Recorder</h2>
+  <p>For those of you that are more familiar with how RTL-SDRs work, the I/Q recorder may be of use to you. The I/Q Recorder saves the raw radio data the RTL-SDR receives, rather than audio. You won't need it for everyday streaming. It's mainly useful for advanced users, who may want to record a chunk of spectrum and analyze it in external SDR software such as SDR++ or SDR#. Open it from <strong>More</strong>, then <strong>I/Q Recorder</strong>.</p>
+  <ul>
+    <li><strong>New recording</strong> records either one stream's station or the entire weather radio band. You can have it stop on its own after a number of minutes.</li>
+    <li>While a recording is running, a banner at the top of every page reminds you.</li>
+    <li>Recordings can be downloaded in a few formats. Choose whichever one you need.</li>
+  </ul>
+  <p><strong>Warning</strong>: Recording and saving I/Q data will absolutely <strong>chew</strong> through disk space like nobody's business if you aren't careful. Keep an eye on the storage space shown while recording.</p>
+</section>
+
+<section aria-labelledby="logs">
+  <h2 id="logs">Logs</h2>
+  <p>The Logs page, under <strong>More</strong>, shows a running record of what NWR Stream Manager is doing, along with whether the RTL-SDR is sending data. Most users won't need to touch or understand the logs, but if you report a bug, I may ask you to send me the log.</p>
+</section>
+
+<section aria-labelledby="storage">
+  <h2 id="storage">Storage</h2>
+  <p>EAS alert recordings and I/Q recordings are saved on the computer running NWR Stream Manager, and they take up disk space over time. I/Q recordings especially can eat your storage for breakfast if you let them. The <a href="#dashboard">dashboard</a> shows how much space is left and how much each kind of recording uses.</p>
+  <p>If the disk gets nearly full, NWR Stream Manager pauses EAS recording and stops any I/Q recording, so the computer doesn't run out of space completely. Delete old alerts in <a href="#eas-alerts">EAS alerts</a> or old I/Q recordings to free up space; recording resumes once there's room again.</p>
+</section>
+
+</main>
+<div id="copy-status" class="screen-reader-only" aria-live="polite"></div>
+<script>
+// Copy buttons for commands; they stay hidden if the page is viewed without scripts.
+for (const button of document.querySelectorAll(".copy-button")) {
+  const command = button.previousElementSibling.textContent;
+  button.hidden = false;
+  button.setAttribute("aria-label", `Copy command: ${command}`);
+  button.addEventListener("click", async () => {
+    const status = document.getElementById("copy-status");
+    try {
+      await navigator.clipboard.writeText(command);
+      button.textContent = "Copied";
+      status.textContent = "Command copied to the clipboard.";
+    } catch (error) {
+      button.textContent = "Copy failed";
+      status.textContent = "Couldn't copy the command. Select it and copy it instead.";
+    }
+    setTimeout(() => {
+      button.textContent = "Copy";
+      status.textContent = "";
+    }, 2000);
+  });
+}
+</script>
+</body>
+</html>

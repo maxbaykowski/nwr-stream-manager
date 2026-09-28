@@ -1161,6 +1161,37 @@ class AuthTests(unittest.TestCase):
         self.assertFalse(handler._auth_ok_or_setup_response("/api/setup-state", "GET"))
         self.assertEqual(sent["payload"], {"setup_required": False})
 
+    def test_help_is_readable_without_signing_in_before_and_after_setup(self) -> None:
+        for has_account in (False, True):
+            handler = object.__new__(self.web_control.RtlControlHandler)
+            handler.current_account = None
+            handler.headers = {}
+            handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(has_account=lambda: has_account))
+            sent = {}
+            handler._send_html = lambda content: sent.update(html=content)
+
+            self.assertFalse(handler._auth_ok_or_setup_response("/help", "GET"))
+            self.assertIn("<title>NWR Stream Manager Help</title>", sent["html"])
+
+    def test_help_link_sits_left_of_the_more_menu(self) -> None:
+        html = self.web_control.INDEX_HTML
+        help_link = html.index('<a id="nav_help" href="/help" target="_blank" rel="noopener">Help')
+        more_menu = html.index('<span class="nav-more">')
+
+        self.assertLess(help_link, more_menu)
+        self.assertLess(html.index('id="nav_eas_alerts"'), help_link)
+
+    def test_help_contents_links_all_lead_to_headings(self) -> None:
+        import re
+
+        html = self.web_control.asset_path(self.web_control.HELP_FILE_NAME).read_text(encoding="utf-8")
+        ids = re.findall(r'\bid="([^"]+)"', html)
+        links = re.findall(r'href="#([^"]+)"', html)
+
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(links)
+        self.assertEqual(sorted(set(links) - set(ids)), [])
+
     def test_password_hash_does_not_store_plaintext(self) -> None:
         encoded = self.web_control.hash_account_password("StrongPass!1")
 
