@@ -40,6 +40,13 @@ from urllib.request import Request, urlopen
 
 if __package__:
     from .audio_effects import AudioEffectsProcessor, deemphasis_makeup_gain
+    from .time_budget import TEST_MODE_TIME_FILE_NAME, TestModeTimeBudget, TestModeTimeUsedUp
+    from .tone_generators import (
+        TONE_MIN_FREQUENCY_HZ,
+        ToneGeneratorBank,
+        parse_tone_generator_settings,
+        tone_max_frequency_hz,
+    )
     from .alsa import (
         ALSA_CHANNEL_BOTH,
         ALSA_CHANNEL_LEFT,
@@ -150,6 +157,15 @@ else:
     signal_meter = importlib.import_module(f"{package_name}.signal_meter")
     remote_sdr = importlib.import_module(f"{package_name}.remote_sdr")
     webrtc = importlib.import_module(f"{package_name}.webrtc")
+    tone_generators = importlib.import_module(f"{package_name}.tone_generators")
+    time_budget = importlib.import_module(f"{package_name}.time_budget")
+    TEST_MODE_TIME_FILE_NAME = time_budget.TEST_MODE_TIME_FILE_NAME
+    TestModeTimeBudget = time_budget.TestModeTimeBudget
+    TestModeTimeUsedUp = time_budget.TestModeTimeUsedUp
+    TONE_MIN_FREQUENCY_HZ = tone_generators.TONE_MIN_FREQUENCY_HZ
+    ToneGeneratorBank = tone_generators.ToneGeneratorBank
+    parse_tone_generator_settings = tone_generators.parse_tone_generator_settings
+    tone_max_frequency_hz = tone_generators.tone_max_frequency_hz
     AudioEffectsProcessor = audio_effects.AudioEffectsProcessor
     deemphasis_makeup_gain = audio_effects.deemphasis_makeup_gain
     ALSA_CHANNEL_BOTH = alsa_module.ALSA_CHANNEL_BOTH
@@ -386,7 +402,7 @@ READ_ONLY_RESTRICTED_NOTIFICATION_VIEWS = {
     "notifications",
 }
 STREAM_TEST_MODE_HEARTBEAT_TIMEOUT_SECONDS = 12.0
-STREAM_TEST_MODE_IDLE_SECONDS = 300.0
+STREAM_TEST_MODE_TIME_LIMIT_REASON = "time limit reached"
 STREAM_TEST_MODE_DEVIATION_HZ = 5_000.0
 STREAM_TEST_MODE_NOISE_DBFS = -68.0
 STREAM_TEST_MODE_MIN_SIGNAL_DBFS = -80.0
@@ -395,6 +411,9 @@ STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS = -20.0
 STREAM_TEST_MODE_AUDIO_PEAK_LIMIT = 0.96
 STREAM_TEST_MODE_AUDIO_DRIVE = 5.0
 STREAM_TEST_MODE_TONE_PEAK = 0.90
+# Loudest the voice or SAME audio gets; tone generators share the remaining deviation.
+STREAM_TEST_MODE_PROGRAM_PEAK = max(STREAM_TEST_MODE_AUDIO_PEAK_LIMIT, STREAM_TEST_MODE_TONE_PEAK)
+STREAM_TEST_MODE_TONE_MAX_FREQUENCY_HZ = tone_max_frequency_hz(IQ_SAMPLE_RATE, STREAM_TEST_MODE_DEVIATION_HZ)
 STREAM_TEST_MODE_SIGNAL_FADE_SECONDS = 1.0
 STREAM_TEST_MODE_CROSSFADE_SECONDS = 1.0
 STREAM_TEST_MODE_LOOP_PERIOD_SECONDS = 5.0
@@ -2322,7 +2341,20 @@ class SyntheticNwrTestModeSource:
         self.alert_active = False
         self.stop_requested = False
         self.stop_ready = False
+        self.tones = ToneGeneratorBank(
+            sample_rate=self.sample_rate,
+            max_frequency_hz=STREAM_TEST_MODE_TONE_MAX_FREQUENCY_HZ,
+        )
         self.lock = threading.Lock()
+
+    def update_tones(self, raw: Any) -> None:
+        with self.lock:
+            settings = parse_tone_generator_settings(
+                raw,
+                self.tones.settings,
+                max_frequency_hz=STREAM_TEST_MODE_TONE_MAX_FREQUENCY_HZ,
+            )
+            self.tones.update(settings)
 
     def set_signal_dbfs(self, value: Any, *, immediate: bool = False) -> None:
         with self.lock:
@@ -2360,6 +2392,7 @@ class SyntheticNwrTestModeSource:
             "same_active": self.alert_active,
             "stop_requested": self.stop_requested,
             "stop_ready": self.stop_ready,
+            "tones": self.tones.settings.as_dict(),
         }
 
     def process(self, samples: int) -> np.ndarray:
@@ -2368,7 +2401,12 @@ class SyntheticNwrTestModeSource:
             return np.array([], dtype=np.complex64)
         with self.lock:
             audio = self._next_audio_locked(count)
+            tones, tone_levels = self.tones.process(count)
             signal_start_dbfs, signal_end_dbfs = self._signal_ramp_locked(count)
+        # Tone generators play on top of the voice and SAME audio. When together they would
+        # exceed full deviation, turn the whole mix down instead of over-deviating.
+        headroom = 1.0 / np.maximum(1.0, STREAM_TEST_MODE_PROGRAM_PEAK + tone_levels)
+        audio = ((audio + tones) * headroom).astype(np.float32)
         return self._fm_modulate(audio, signal_start_dbfs, signal_end_dbfs)
 
     def _build_loop_audio(self) -> np.ndarray:
@@ -3704,6 +3742,13 @@ class IcecastStreamWorker:
             self.test_mode_source.set_signal_dbfs(signal_dbfs)
             return self.test_mode_snapshot_locked()
 
+    def update_test_mode_tones(self, raw: Any) -> dict[str, Any]:
+        with self.lock:
+            if self.test_mode_source is None:
+                raise ValueError("test mode is not active for this stream")
+            self.test_mode_source.update_tones(raw)
+            return self.test_mode_snapshot_locked()
+
     def trigger_test_mode_same(self) -> dict[str, Any]:
         with self.lock:
             if self.test_mode_source is None:
@@ -3729,6 +3774,7 @@ class IcecastStreamWorker:
             "stop_ready": bool(snapshot.get("stop_ready", False)),
             "signal_dbfs": float(snapshot.get("signal_dbfs", STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS)),
             "current_signal_dbfs": float(snapshot.get("current_signal_dbfs", snapshot.get("signal_dbfs", STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS))),
+            "tones": snapshot.get("tones", {}),
         }
 
     def has_monitor_sources(self) -> bool:
@@ -5093,6 +5139,7 @@ class RtlControlService:
         self.web_port = 8080
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.notification_state_path = state_path.with_name(NOTIFICATION_STATE_FILE_NAME)
+        self.test_mode_time = TestModeTimeBudget(state_path.with_name(TEST_MODE_TIME_FILE_NAME))
         self.soundcard_names_path = state_path.with_name(SOUNDCARD_DEVICE_NAMES_FILE_NAME)
         self.accounts = AccountStore(state_path.parent / ACCOUNTS_DATABASE_FILE_NAME)
         self.auth_sessions = AuthSessionStore()
@@ -5389,13 +5436,14 @@ class RtlControlService:
         session = self.stream_test_mode
         if not session:
             return
+        if session.get("stopping"):
+            return
         heartbeat_at = float(session.get("heartbeat_at", session.get("started_at", now)))
-        last_same_at = float(session.get("last_same_at", session.get("started_at", now)))
         reason = ""
         if now - heartbeat_at > STREAM_TEST_MODE_HEARTBEAT_TIMEOUT_SECONDS:
             reason = "client heartbeat expired"
-        elif now - last_same_at > STREAM_TEST_MODE_IDLE_SECONDS:
-            reason = "SAME test idle timeout"
+        elif self.test_mode_time.remaining(now) <= 0.0:
+            reason = STREAM_TEST_MODE_TIME_LIMIT_REASON
         if reason:
             self._stop_stream_test_mode_locked(reason=reason)
 
@@ -7002,13 +7050,13 @@ class RtlControlService:
     def _stream_test_mode_status_locked(self) -> dict[str, Any]:
         session = self.stream_test_mode
         if not session:
-            return {"active": False}
+            return self._inactive_stream_test_mode_status_locked()
         stream_id = str(session.get("stream_id", ""))
         worker = self.stream_workers.get(stream_id)
         worker_status = worker.test_mode_snapshot() if worker is not None else {}
         if bool(session.get("stopping", False)) and not bool(worker_status.get("active", False)):
             self.stream_test_mode = None
-            return {"active": False}
+            return self._inactive_stream_test_mode_status_locked()
         return {
             "active": True,
             "stream_id": stream_id,
@@ -7019,14 +7067,19 @@ class RtlControlService:
             "started_at": float(session.get("started_at", 0.0) or 0.0),
             "heartbeat_at": float(session.get("heartbeat_at", 0.0) or 0.0),
             "last_same_at": float(session.get("last_same_at", 0.0) or 0.0),
+            "tones": worker_status.get("tones", {}),
+            "time": self.test_mode_time.snapshot(time.time()),
         }
+
+    def _inactive_stream_test_mode_status_locked(self) -> dict[str, Any]:
+        return {"active": False, "time": self.test_mode_time.snapshot(time.time())}
 
     def update_stream_test_mode(self, payload: dict[str, Any]) -> dict[str, Any]:
         action = str(payload.get("action", "")).strip().lower()
         stream_id = str(payload.get("stream_id", "")).strip()
         client_id = str(payload.get("client_id", "")).strip()
         now = time.time()
-        if action not in {"start", "stop", "heartbeat", "signal", "same"}:
+        if action not in {"start", "stop", "heartbeat", "signal", "same", "tones"}:
             raise ValueError("test mode action is required")
         if not client_id:
             raise ValueError("test mode client id is required")
@@ -7047,6 +7100,8 @@ class RtlControlService:
                     raise ValueError("test mode is owned by another browser")
                 if self.stream_test_mode and str(self.stream_test_mode.get("stream_id", "")) != stream_id:
                     self._stop_stream_test_mode_locked(reason="another stream entered test mode")
+                # All streams share one 10-minutes-per-hour allowance.
+                self.test_mode_time.start(now)
                 self.stream_test_mode = {
                     "stream_id": stream_id,
                     "client_id": client_id,
@@ -7059,6 +7114,7 @@ class RtlControlService:
                 worker = self.stream_workers.get(stream_worker_key(stream))
                 if worker is None:
                     self.stream_test_mode = None
+                    self.test_mode_time.stop(now)
                     raise ValueError("test mode stream worker could not be started")
                 worker.set_test_mode(True, signal_dbfs)
                 LOG.info("started test mode for %s", stream.get("station", {}).get("callsign", stream_id))
@@ -7080,6 +7136,9 @@ class RtlControlService:
                 session["signal_dbfs"] = signal_dbfs
                 worker.update_test_mode_signal(signal_dbfs)
                 return {"test_mode": self._stream_test_mode_status_locked(), "streams": list(self.streams)}
+            if action == "tones":
+                worker.update_test_mode_tones(payload.get("tones"))
+                return {"test_mode": self._stream_test_mode_status_locked(), "streams": list(self.streams)}
             if action == "same":
                 session["last_same_at"] = now
                 worker.trigger_test_mode_same()
@@ -7091,6 +7150,9 @@ class RtlControlService:
         session = self.stream_test_mode
         if not session:
             return
+        # Time stops counting as soon as test mode is asked to stop, even if a SAME test
+        # still has to finish with its EOMs.
+        self.test_mode_time.stop(time.time())
         stream_id = str(session.get("stream_id", ""))
         worker = self.stream_workers.get(stream_id)
         if worker is not None:
@@ -8253,6 +8315,7 @@ class RtlControlService:
         ):
             LOG.info("stopped stream test mode for %s: stream is no longer enabled", active_test_stream_id)
             self.stream_test_mode = None
+            self.test_mode_time.stop(time.time())
             active_test_stream_id = ""
         remote = self.remote_client if self.settings.uses_remote_sdr else None
         fanout = None if remote is not None else (
@@ -12260,6 +12323,8 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .effects-list button[aria-current="true"] { border-color: #2557a7; box-shadow: inset 3px 0 0 #2557a7; }
 .effects-detail { min-width: 0; }
 .audio-effect-panel[hidden] { display: none; }
+.test-tone-panel[hidden] { display: none; }
+.test-tones-mute { margin-bottom: 18px; }
 .audio-effects-back { display: none; }
 pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; background: #10151d; color: #d8f3dc; padding: 12px; border-radius: 6px; font-size: 13px; }
 .error { color: #a40000; font-weight: 600; }
@@ -13389,7 +13454,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       </div>
       <div id="panel_test_mode" class="tabpanel" role="tabpanel" aria-labelledby="tab_test_mode" hidden>
         <h3>Test mode</h3>
-        <p class="hint">Replace this stream's real radio channel with a simulated NOAA Weather Radio channel for testing outputs and SAME handling.</p>
+        <p class="hint">Replace this stream's real radio channel with a simulated NOAA Weather Radio channel for testing outputs and SAME handling. Test mode can be used for up to 10 minutes in any hour, shared by all streams.</p>
+        <p id="test_mode_time" class="hint">Time left: 10:00.</p>
         <div class="grid">
           <label class="checkbox-row">
             <input id="test_mode_enabled" type="checkbox">
@@ -13401,10 +13467,96 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <span id="test_mode_signal_hint" class="hint">Signal strength in dBFS.</span>
           <div id="test_mode_signal_value" class="hint">-20 dBFS</div>
         </div>
+        <div id="test_tones_mute" class="test-tones-mute" hidden>
+          <label class="checkbox-row">
+            <input id="test_tones_muted" type="checkbox" aria-describedby="test_tones_muted_hint">
+            Mute tone generators
+          </label>
+          <span id="test_tones_muted_hint" class="hint">Silences every tone generator. Unmuting brings back the ones that were on.</span>
+        </div>
         <div class="actions">
           <button id="test_mode_same" type="button">Send SAME test</button>
         </div>
         <div id="test-mode-result" class="message"></div>
+        <div id="test_tones_section" hidden>
+          <h3>Tone generators</h3>
+          <p class="hint">Play tones along with the test announcements and SAME tests, to simulate buzzes and whines. Tones are sent the same way as SAME tones, so NWR deemphasis affects them the same way.</p>
+          <div id="test_tones_layout" class="effects-layout">
+            <div id="test_tones_list" class="effects-list" aria-label="Tone generators">
+              <button type="button" data-test-tone="sine">Sine wave</button>
+              <button type="button" data-test-tone="square">Square wave</button>
+              <button type="button" data-test-tone="triangle">Triangle wave</button>
+              <button type="button" data-test-tone="sawtooth">Sawtooth wave</button>
+            </div>
+            <div class="effects-detail">
+              <button id="test_tones_back" class="audio-effects-back" type="button">Back to tone generators</button>
+              <div id="test_tone_sine" class="test-tone-panel">
+                <h4>Sine wave</h4>
+                <label class="checkbox-row">
+                  <input id="test_tone_sine_enabled" type="checkbox" aria-describedby="test_tone_sine_enabled_hint">
+                  Enable sine wave generator
+                </label>
+                <span id="test_tone_sine_enabled_hint" class="hint">A pure tone, like a whine.</span>
+                <label>Frequency
+                  <input id="test_tone_sine_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sine_frequency_hint">
+                </label>
+                <span id="test_tone_sine_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                <label>Amplitude
+                  <input id="test_tone_sine_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sine_amplitude_hint">
+                </label>
+                <span id="test_tone_sine_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+              </div>
+              <div id="test_tone_square" class="test-tone-panel" hidden>
+                <h4>Square wave</h4>
+                <label class="checkbox-row">
+                  <input id="test_tone_square_enabled" type="checkbox" aria-describedby="test_tone_square_enabled_hint">
+                  Enable square wave generator
+                </label>
+                <span id="test_tone_square_enabled_hint" class="hint">A harsh, hollow buzz, like electrical interference.</span>
+                <label>Frequency
+                  <input id="test_tone_square_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_square_frequency_hint">
+                </label>
+                <span id="test_tone_square_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                <label>Amplitude
+                  <input id="test_tone_square_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_square_amplitude_hint">
+                </label>
+                <span id="test_tone_square_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+              </div>
+              <div id="test_tone_triangle" class="test-tone-panel" hidden>
+                <h4>Triangle wave</h4>
+                <label class="checkbox-row">
+                  <input id="test_tone_triangle_enabled" type="checkbox" aria-describedby="test_tone_triangle_enabled_hint">
+                  Enable triangle wave generator
+                </label>
+                <span id="test_tone_triangle_enabled_hint" class="hint">A soft tone, a little brighter than a sine wave.</span>
+                <label>Frequency
+                  <input id="test_tone_triangle_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_triangle_frequency_hint">
+                </label>
+                <span id="test_tone_triangle_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                <label>Amplitude
+                  <input id="test_tone_triangle_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_triangle_amplitude_hint">
+                </label>
+                <span id="test_tone_triangle_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+              </div>
+              <div id="test_tone_sawtooth" class="test-tone-panel" hidden>
+                <h4>Sawtooth wave</h4>
+                <label class="checkbox-row">
+                  <input id="test_tone_sawtooth_enabled" type="checkbox" aria-describedby="test_tone_sawtooth_enabled_hint">
+                  Enable sawtooth wave generator
+                </label>
+                <span id="test_tone_sawtooth_enabled_hint" class="hint">A bright, raspy buzz, like a hum with strong harmonics.</span>
+                <label>Frequency
+                  <input id="test_tone_sawtooth_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sawtooth_frequency_hint">
+                </label>
+                <span id="test_tone_sawtooth_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                <label>Amplitude
+                  <input id="test_tone_sawtooth_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sawtooth_amplitude_hint">
+                </label>
+                <span id="test_tone_sawtooth_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
   </div>
@@ -13680,6 +13832,12 @@ let streamTestModeHeartbeatTimer = null;
 let streamTestModeSignalTimer = null;
 let sameTestWarningPreviousFocus = null;
 let selectedAudioEffect = "volume";
+const TEST_TONE_NAMES = ["sine", "square", "triangle", "sawtooth"];
+let selectedTestTone = "sine";
+let testTonesSignature = "";
+let testTonesUpdateTimer = null;
+let testModeClockOffset = 0;
+let testModeTimeUsedUpShown = false;
 let wizardStep = 0;
 let wizardMode = "add";
 let wizardDirty = false;
@@ -16500,6 +16658,7 @@ function numericSaveCallbackForElement(element) {
   if (["fallback_delay", "fallback_loop_delay"].includes(element.id)) return scheduleFallbackUpdate;
   if (["eas_pre_seconds", "eas_post_seconds", "eas_max_seconds"].includes(element.id)) return scheduleEasUpdate;
   if (element.id.startsWith("audio_")) return scheduleAudioEffectsUpdate;
+  if (element.id.startsWith("test_tone")) return scheduleTestTonesUpdate;
   return null;
 }
 
@@ -16585,6 +16744,9 @@ function updateTestModeSignalText() {
 
 function setStreamTestModeStatus(status) {
   streamTestMode = status || {active: false};
+  if (streamTestMode.time && Number.isFinite(streamTestMode.time.now)) {
+    testModeClockOffset = streamTestMode.time.now - Date.now() / 1000;
+  }
   if (settingsStreamId) setTestModeControls();
   updateStreamTestModeHeartbeat();
 }
@@ -16597,12 +16759,14 @@ function setTestModeControls() {
     setHidden("panel_test_mode", true);
     if (activeSettingsTab() === "test_mode") showSettingsTab("outputs");
     setTestModeResult("");
+    setTestToneControls(false);
     streamTestModeSignature = "";
     return;
   }
   const activeForStream = activeTestModeForCurrentStream();
   const sameActive = activeForStream && Boolean(streamTestMode.same_active);
   const stopping = activeForStream && Boolean(streamTestMode.stopping);
+  setTestToneControls(activeForStream && !stopping);
   const nextSignature = JSON.stringify({
     stream_id: settingsStreamId || "",
     enabled: streamIsEnabled(stream),
@@ -16611,12 +16775,20 @@ function setTestModeControls() {
     active_client_id: streamTestMode.client_id || "",
     signal_dbfs: streamTestMode.signal_dbfs,
     same_active: sameActive,
-    stopping
+    stopping,
+    time_used_up: testModeTimeUsedUp(),
+    available_at: Math.round(testModeAvailableAt() || 0)
   });
+  renderTestModeTime();
   if (nextSignature === streamTestModeSignature) return;
+  const timeUsedUp = testModeTimeUsedUp();
+  testModeTimeUsedUpShown = timeUsedUp;
   if (activeForStream) setValue("test_mode_signal", streamTestMode.signal_dbfs ?? -20);
   setChecked("test_mode_enabled", activeForStream);
-  setDisabled(document.getElementById("test_mode_enabled"), !stream || !streamIsEnabled(stream) || sameActive || stopping);
+  setDisabled(
+    document.getElementById("test_mode_enabled"),
+    !stream || !streamIsEnabled(stream) || sameActive || stopping || (!activeForStream && timeUsedUp)
+  );
   setDisabled(document.getElementById("test_mode_signal"), !activeForStream || stopping);
   setDisabled(document.getElementById("test_mode_same"), !activeForStream || sameActive || stopping);
   updateTestModeSignalText();
@@ -16624,10 +16796,143 @@ function setTestModeControls() {
     setTestModeResult(stopping ? "Test mode is stopping." : sameActive ? "SAME test is running." : "Test mode is active.", "success");
   } else if (streamTestMode.active) {
     setTestModeResult("Test mode is active for another stream.", "");
+  } else if (timeUsedUp) {
+    setTestModeResult(`You've hit your time limit for test mode.${testModeMoreTimeText()}`, "");
   } else {
     setTestModeResult("");
   }
   streamTestModeSignature = nextSignature;
+}
+
+function testModeTime() {
+  return (streamTestMode && streamTestMode.time) || {limit_seconds: 600, window_seconds: 3600, usage: []};
+}
+
+function testModeServerNow() {
+  return Date.now() / 1000 + testModeClockOffset;
+}
+
+function testModeUsage(now) {
+  return (testModeTime().usage || []).map(([start, end]) => [start, end === null ? now : end]);
+}
+
+function testModeSecondsLeft() {
+  const time = testModeTime();
+  const now = testModeServerNow();
+  const windowStart = now - time.window_seconds;
+  let used = 0;
+  for (const [start, end] of testModeUsage(now)) {
+    used += Math.max(0, Math.min(end, now) - Math.max(start, windowStart));
+  }
+  return Math.max(0, time.limit_seconds - used);
+}
+
+function testModeAvailableAt() {
+  if (testModeSecondsLeft() > 0) return null;
+  const time = testModeTime();
+  const now = testModeServerNow();
+  const starts = testModeUsage(now).filter(([, end]) => end > now - time.window_seconds).map(([start]) => start);
+  return starts.length ? Math.max(now, Math.min(...starts) + time.window_seconds) : now;
+}
+
+function testModeTimeUsedUp() {
+  return !activeTestModeForCurrentStream() && testModeSecondsLeft() <= 0;
+}
+
+function formatTestModeDuration(seconds) {
+  const whole = Math.ceil(seconds);
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
+}
+
+function testModeMoreTimeText() {
+  const availableAt = testModeAvailableAt();
+  if (!availableAt) return "";
+  // Shown in the browser's own clock.
+  const when = new Date((availableAt - testModeClockOffset) * 1000).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short"
+  });
+  return ` More time will be available at ${when}.`;
+}
+
+function renderTestModeTime() {
+  const time = testModeTime();
+  setText("test_mode_time", `Time left: ${formatTestModeDuration(testModeSecondsLeft())} of ${formatTestModeDuration(time.limit_seconds)}.`);
+}
+
+function tickTestModeTime() {
+  if (!settingsStreamId || document.getElementById("panel_test_mode").hidden) return;
+  renderTestModeTime();
+  if (testModeTimeUsedUp() !== testModeTimeUsedUpShown) {
+    streamTestModeSignature = "";
+    setTestModeControls();
+  }
+}
+
+function setTestToneControls(show) {
+  const section = document.getElementById("test_tones_section");
+  if (!show) {
+    // Test mode is off, so leave any open tone generator page and hide the generators.
+    const layout = document.getElementById("test_tones_layout");
+    const hadFocus = section.contains(document.activeElement) ||
+      document.getElementById("test_tones_mute").contains(document.activeElement);
+    layout.classList.remove("effect-detail-active");
+    setHidden("test_tones_section", true);
+    setHidden("test_tones_mute", true);
+    if (hadFocus) document.getElementById("test_mode_enabled").focus();
+    testTonesSignature = "";
+    return;
+  }
+  setHidden("test_tones_section", false);
+  setHidden("test_tones_mute", false);
+  const tones = streamTestMode.tones || {};
+  const nextSignature = JSON.stringify(tones);
+  if (nextSignature === testTonesSignature) return;
+  const generators = tones.generators || {};
+  setChecked("test_tones_muted", Boolean(tones.muted));
+  for (const name of TEST_TONE_NAMES) {
+    const settings = generators[name] || {enabled: false, frequency: 440, amplitude: 25};
+    setChecked(`test_tone_${name}_enabled`, Boolean(settings.enabled));
+    setValue(`test_tone_${name}_frequency`, settings.frequency);
+    setValue(`test_tone_${name}_amplitude`, settings.amplitude);
+  }
+  testTonesSignature = nextSignature;
+}
+
+function selectTestTone(name, showDetail = true) {
+  selectedTestTone = name;
+  for (const button of document.querySelectorAll("[data-test-tone]")) {
+    button.setAttribute("aria-current", button.dataset.testTone === name ? "true" : "false");
+  }
+  for (const panel of document.querySelectorAll(".test-tone-panel")) {
+    panel.hidden = panel.id !== `test_tone_${name}`;
+  }
+  document.getElementById("test_tones_layout").classList.toggle("effect-detail-active", showDetail);
+}
+
+function testTonesPayload() {
+  const generators = {};
+  for (const name of TEST_TONE_NAMES) {
+    generators[name] = {
+      enabled: document.getElementById(`test_tone_${name}_enabled`).checked,
+      frequency: numericControlValue(`test_tone_${name}_frequency`),
+      amplitude: numericControlValue(`test_tone_${name}_amplitude`)
+    };
+  }
+  return {muted: document.getElementById("test_tones_muted").checked, generators};
+}
+
+function scheduleTestTonesUpdate() {
+  if (!activeTestModeForCurrentStream()) return;
+  clearTimeout(testTonesUpdateTimer);
+  testTonesUpdateTimer = setTimeout(async () => {
+    try {
+      await sendStreamTestMode("tones", {tones: testTonesPayload()});
+    } catch (error) {
+      setTestModeResult(error.message, "error");
+    }
+  }, 150);
 }
 
 function easPayload() {
@@ -17350,6 +17655,8 @@ function showStreamSettings(streamId) {
   streamNotificationsSignature = "";
   streamTestModeSignature = "";
   selectAudioEffect(selectedAudioEffect, false);
+  selectTestTone(selectedTestTone, false);
+  testTonesSignature = "";
   closeOutputForm();
   const station = stream.station || {};
   setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
@@ -21613,7 +21920,13 @@ function updateStreamTestModeHeartbeat() {
     try {
       await sendStreamTestMode("heartbeat", {stream_id: streamTestMode.stream_id || settingsStreamId});
     } catch (error) {
-      setTestModeResult(error.message, "error");
+      // Test mode may have ended on the server (for example after 5 idle minutes).
+      try {
+        await refresh();
+      } catch (refreshError) {
+        console.debug("failed to refresh status after heartbeat error", refreshError);
+      }
+      if (activeTestModeBelongsToThisPage()) setTestModeResult(error.message, "error");
     }
   }, 5000);
 }
@@ -22280,6 +22593,7 @@ document.getElementById("test_mode_enabled").addEventListener("change", async ev
 });
 
 document.getElementById("test_mode_signal").addEventListener("input", scheduleStreamTestModeSignalUpdate);
+setInterval(tickTestModeTime, 1000);
 
 document.getElementById("test_mode_same").addEventListener("click", openSameTestWarning);
 document.getElementById("cancel_same_test_warning").addEventListener("click", closeSameTestWarning);
@@ -22317,6 +22631,54 @@ document.getElementById("audio_effects_list").addEventListener("keydown", event 
   buttons[nextIndex].focus();
   selectAudioEffect(buttons[nextIndex].dataset.audioEffect, false);
 });
+
+document.getElementById("test_tones_list").addEventListener("click", event => {
+  const button = event.target && event.target.closest ? event.target.closest("[data-test-tone]") : null;
+  if (!button) return;
+  selectTestTone(button.dataset.testTone, true);
+});
+
+document.getElementById("test_tones_list").addEventListener("keydown", event => {
+  const buttons = Array.from(document.querySelectorAll("[data-test-tone]"));
+  const index = buttons.indexOf(event.target);
+  if (index < 0) return;
+  let nextIndex = index;
+  if (event.key === "ArrowDown" || event.key === "ArrowRight") nextIndex = (index + 1) % buttons.length;
+  else if (event.key === "ArrowUp" || event.key === "ArrowLeft") nextIndex = (index - 1 + buttons.length) % buttons.length;
+  else if (event.key === "Home") nextIndex = 0;
+  else if (event.key === "End") nextIndex = buttons.length - 1;
+  else return;
+  event.preventDefault();
+  buttons[nextIndex].focus();
+  selectTestTone(buttons[nextIndex].dataset.testTone, false);
+});
+
+document.getElementById("test_tones_back").addEventListener("click", () => {
+  document.getElementById("test_tones_layout").classList.remove("effect-detail-active");
+  const selected = document.querySelector(`[data-test-tone='${selectedTestTone}']`);
+  if (selected) selected.focus();
+});
+
+document.getElementById("test_tones_muted").addEventListener("change", scheduleTestTonesUpdate);
+
+for (const name of TEST_TONE_NAMES) {
+  document.getElementById(`test_tone_${name}_enabled`).addEventListener("change", scheduleTestTonesUpdate);
+  for (const field of ["frequency", "amplitude"]) {
+    const element = document.getElementById(`test_tone_${name}_${field}`);
+    element.addEventListener("input", event => {
+      if (isTextEditingInputEvent(event) || element.dataset.userEditing === "1") {
+        beginNumericTextEdit(element);
+        return;
+      }
+      normalizeNumericControl(element);
+      scheduleTestTonesUpdate();
+    });
+    element.addEventListener("change", () => {
+      commitNumericControlElement(element, null);
+      scheduleTestTonesUpdate();
+    });
+  }
+}
 
 document.getElementById("audio_effects_back").addEventListener("click", () => {
   document.getElementById("audio_effects_layout").classList.remove("effect-detail-active");
@@ -23436,6 +23798,7 @@ async function refresh() {
   populateBitrates();
   populateIqSampleRates();
   selectAudioEffect("volume", false);
+  selectTestTone("sine", false);
   renderReceiverControls();
   const data = await request("/api/status");
   if (!data.account || !data.account.read_only) {

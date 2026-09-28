@@ -771,6 +771,7 @@ class AuthTests(unittest.TestCase):
         service.lock = threading.RLock()
         service.streams = [{"id": "stream-1", "enabled": True, "station": {"callsign": "WXN99"}}]
         service.stream_test_mode = None
+        service.test_mode_time = self.web_control.TestModeTimeBudget(None)
 
         class Worker:
             def __init__(self) -> None:
@@ -804,6 +805,246 @@ class AuthTests(unittest.TestCase):
                 {"action": "start", "stream_id": "stream-1", "client_id": "client-b"}
             )
         self.assertEqual(service.stream_test_mode["client_id"], "client-a")
+
+    def _tone_test_mode_service(self):
+        web_control = self.web_control
+        service = object.__new__(web_control.RtlControlService)
+        service.lock = threading.RLock()
+        service.streams = [
+            {"id": "stream-1", "enabled": True, "station": {"callsign": "WXN99"}},
+            {"id": "stream-2", "enabled": True, "station": {"callsign": "KEC49"}},
+        ]
+        service.stream_test_mode = None
+        service.test_mode_time = web_control.TestModeTimeBudget(None)
+
+        class Worker:
+            def __init__(self) -> None:
+                self.source = None
+
+            def set_test_mode(self, enabled, signal_dbfs=-20.0):
+                if enabled:
+                    self.source = web_control.SyntheticNwrTestModeSource(sample_rate=web_control.IQ_SAMPLE_RATE)
+                else:
+                    self.source = None
+                return self.test_mode_snapshot()
+
+            def update_test_mode_tones(self, raw):
+                self.source.update_tones(raw)
+                return self.test_mode_snapshot()
+
+            def test_mode_snapshot(self):
+                if self.source is None:
+                    return {"active": False}
+                return dict(self.source.snapshot(), active=True)
+
+        service.stream_workers = {"stream-1": Worker(), "stream-2": Worker()}
+        service._sync_stream_workers_locked = lambda: None
+        return service
+
+    def test_test_mode_tone_generators_update(self) -> None:
+        service = self._tone_test_mode_service()
+        service.update_stream_test_mode({"action": "start", "stream_id": "stream-1", "client_id": "client-a"})
+
+        response = service.update_stream_test_mode({
+            "action": "tones",
+            "stream_id": "stream-1",
+            "client_id": "client-a",
+            "tones": {"generators": {"square": {"enabled": True, "frequency": 120, "amplitude": 40}}},
+        })
+
+        tones = response["test_mode"]["tones"]
+        self.assertEqual(tones["generators"]["square"], {"enabled": True, "frequency": 120.0, "amplitude": 40.0})
+        self.assertFalse(tones["generators"]["sine"]["enabled"])
+        self.assertFalse(tones["muted"])
+
+        for bad in ({"frequency": 7001}, {"frequency": 19}, {"amplitude": 101}, {"amplitude": -1}):
+            with self.assertRaises(ValueError):
+                service.update_stream_test_mode({
+                    "action": "tones",
+                    "stream_id": "stream-1",
+                    "client_id": "client-a",
+                    "tones": {"generators": {"sine": bad}},
+                })
+
+    def test_test_mode_time_limit_ends_test_mode_and_is_shared_by_all_streams(self) -> None:
+        service = self._tone_test_mode_service()
+        service.update_stream_test_mode({"action": "start", "stream_id": "stream-1", "client_id": "client-a"})
+        # Pretend this session has been running for the whole 10 minutes.
+        service.test_mode_time.session_started_at = self.web_control.time.time() - 600.0
+
+        status = service.stream_test_mode_status()
+
+        self.assertFalse(status["active"])
+        self.assertEqual(status["time"]["remaining_seconds"], 0.0)
+        self.assertIsNotNone(status["time"]["available_at"])
+        for stream_id in ("stream-1", "stream-2"):
+            with self.assertRaisesRegex(ValueError, "10 minutes of test mode"):
+                service.update_stream_test_mode({"action": "start", "stream_id": stream_id, "client_id": "client-a"})
+
+    def test_test_mode_time_counts_only_while_on_and_comes_back_an_hour_later(self) -> None:
+        budget = self.web_control.TestModeTimeBudget(None)
+        budget.start(1000.0)
+        budget.stop(1090.0)
+
+        self.assertEqual(budget.remaining(1500.0), 510.0)
+        self.assertIsNone(budget.available_at(1500.0))
+        # Time used from 1000 to 1090 comes back as it becomes more than an hour old.
+        self.assertEqual(budget.remaining(4600.0 + 45.0), 555.0)
+        self.assertEqual(budget.remaining(4690.0), 600.0)
+        self.assertEqual(budget.usage, [])
+
+    def test_test_mode_time_left_over_cannot_run_into_a_fresh_hour(self) -> None:
+        budget = self.web_control.TestModeTimeBudget(None)
+        budget.start(0.0)
+        budget.stop(300.0)
+        # Five minutes are left. Turning test mode on 3 minutes before an hour has passed must
+        # not give 3 minutes plus a fresh 10: no hour may ever hold more than 10 minutes.
+        budget.start(3600.0 - 180.0)
+        self.assertEqual(budget.remaining(3600.0 - 1.0), 121.0)
+        self.assertEqual(budget.remaining(3900.0), 120.0)
+        self.assertEqual(budget.remaining(3600.0 - 180.0 + 600.0), 0.0)
+
+    def test_test_mode_time_is_not_refreshed_by_turning_it_off_and_on(self) -> None:
+        budget = self.web_control.TestModeTimeBudget(None)
+        budget.start(0.0)
+        budget.stop(300.0)
+        budget.start(3600.0 - 180.0)
+        budget.stop(3600.0)
+
+        budget.start(3601.0)
+        self.assertEqual(budget.remaining(3601.0), 121.0)
+
+    def test_test_mode_time_says_when_more_is_available(self) -> None:
+        budget = self.web_control.TestModeTimeBudget(None)
+        budget.start(100.0)
+        budget.stop(400.0)
+        budget.start(1000.0)
+        budget.stop(1300.0)
+
+        self.assertEqual(budget.remaining(2000.0), 0.0)
+        self.assertEqual(budget.available_at(2000.0), 3700.0)
+        with self.assertRaisesRegex(ValueError, "10 minutes of test mode"):
+            budget.start(2000.0)
+        self.assertEqual(budget.remaining(3760.0), 60.0)
+
+    def test_test_mode_time_survives_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test_mode_time.json"
+            now = self.web_control.time.time()
+            budget = self.web_control.TestModeTimeBudget(path)
+            budget.start(now - 120.0)
+            budget.update(now - 30.0)
+
+            # The server stops mid-session; the time already used stays used.
+            restarted = self.web_control.TestModeTimeBudget(path)
+            self.assertEqual(restarted.remaining(now), 510.0)
+            self.assertIsNone(restarted.available_at(now))
+
+            path.write_text("not json", encoding="utf-8")
+            unreadable = self.web_control.TestModeTimeBudget(path)
+            loaded_at = self.web_control.time.time()
+            self.assertLess(unreadable.remaining(loaded_at), 0.5)
+            self.assertAlmostEqual(unreadable.remaining(loaded_at + 3600.0), 600.0, delta=0.5)
+
+    def test_test_mode_time_running_out_during_same_finishes_like_a_closed_tab(self) -> None:
+        web_control = self.web_control
+        np = web_control.np
+        rate = web_control.IQ_SAMPLE_RATE
+        frame = web_control.STREAM_FRAME_SAMPLES
+        source = web_control.SyntheticNwrTestModeSource(sample_rate=rate)
+        self.assertTrue(source.queue_same_test())
+        source.process(frame)
+        self.assertEqual(source.alert_segment[0], "header")
+
+        # Time runs out part way through the ZCZC headers: they finish, then the 1050 Hz tone,
+        # then 2 seconds of silence, the EOMs and 1 second of silence before real audio returns.
+        source.request_stop()
+        played: list[list] = []
+        for _ in range(int(60.0 / web_control.STREAM_FRAME_SECONDS)):
+            if source.snapshot()["stop_ready"]:
+                break
+            current = source.alert_segment or (source.alert_segments[0] if source.alert_segments else None)
+            kind = current[0] if current else "done"
+            source.process(frame)
+            if played and played[-1][0] == kind:
+                played[-1][1] += frame
+            else:
+                played.append([kind, frame])
+        self.assertTrue(source.snapshot()["stop_ready"])
+
+        kinds = [kind for kind, _count in played]
+        self.assertEqual(kinds[:3], ["header", "header_silence", "attention"])
+        self.assertNotIn("message", kinds)
+        self.assertEqual(kinds[-3:], ["pre_eom_silence", "eom", "post_eom_silence"])
+        durations = dict((kind, count / rate) for kind, count in played)
+        self.assertAlmostEqual(durations["attention"], 8.0, delta=0.05)
+        self.assertAlmostEqual(durations["pre_eom_silence"], 2.0, delta=0.05)
+        self.assertAlmostEqual(durations["post_eom_silence"], 1.0, delta=0.05)
+
+    def test_test_mode_tones_play_with_same_test_without_over_deviating(self) -> None:
+        np = self.web_control.np
+        source = self.web_control.SyntheticNwrTestModeSource(sample_rate=self.web_control.IQ_SAMPLE_RATE)
+        source.update_tones({"generators": {
+            name: {"enabled": True, "frequency": frequency, "amplitude": 100}
+            for name, frequency in zip(("sine", "square", "triangle", "sawtooth"), (60, 400, 1200, 7000))
+        }})
+        self.assertTrue(source.queue_same_test())
+        modulated = []
+        original = source._fm_modulate
+
+        def capture(audio, start, end):
+            modulated.append(np.array(audio))
+            return original(audio, start, end)
+
+        source._fm_modulate = capture
+        for _ in range(int(3.0 / self.web_control.STREAM_FRAME_SECONDS)):
+            source.process(self.web_control.STREAM_FRAME_SAMPLES)
+        audio = np.concatenate(modulated)
+
+        self.assertLessEqual(float(np.max(np.abs(audio))), 1.0)
+        self.assertTrue(source.snapshot()["same_active"])
+
+        source.update_tones({"muted": True})
+        for _ in range(5):
+            source.process(self.web_control.STREAM_FRAME_SAMPLES)
+        modulated.clear()
+        source.process(self.web_control.STREAM_FRAME_SAMPLES)
+        self.assertTrue(source.snapshot()["tones"]["generators"]["sine"]["enabled"])
+        self.assertTrue(all(voice.level == 0.0 for voice in source.tones.voices.values()))
+
+    def test_tone_generator_waveforms_stay_inside_the_channel(self) -> None:
+        np = self.web_control.np
+        sample_rate = self.web_control.IQ_SAMPLE_RATE
+        maximum = self.web_control.STREAM_TEST_MODE_TONE_MAX_FREQUENCY_HZ
+        self.assertEqual(maximum, 7000.0)
+        for name in ("sine", "square", "triangle", "sawtooth"):
+            bank = self.web_control.ToneGeneratorBank(sample_rate=sample_rate, max_frequency_hz=maximum)
+            bank.update(self.web_control.parse_tone_generator_settings(
+                {"generators": {name: {"enabled": True, "frequency": 330, "amplitude": 100}}},
+                bank.settings,
+                max_frequency_hz=maximum,
+            ))
+            audio, _levels = bank.process(sample_rate * 2)
+            audio = audio[sample_rate:]
+            spectrum = np.abs(np.fft.rfft(audio * np.hanning(len(audio))))
+            frequencies = np.fft.rfftfreq(len(audio), 1.0 / sample_rate)
+
+            self.assertAlmostEqual(float(frequencies[np.argmax(spectrum)]), 330.0, delta=1.0)
+            self.assertLessEqual(float(np.max(np.abs(audio))), 1.0 + 1e-6)
+            self.assertLess(float(np.max(spectrum[frequencies > 7100.0]) / np.max(spectrum)), 1e-4)
+
+    def test_tone_generators_only_show_while_test_mode_is_on(self) -> None:
+        html = self.web_control.INDEX_HTML
+
+        self.assertIn('<div id="test_tones_section" hidden>', html)
+        self.assertIn('<div id="test_tones_mute" class="test-tones-mute" hidden>', html)
+        for name in ("sine", "square", "triangle", "sawtooth"):
+            self.assertIn(f'data-test-tone="{name}"', html)
+            self.assertIn(f'id="test_tone_{name}_frequency" type="number" min="20" max="7000"', html)
+        # Same list-and-detail layout as audio effects, with a back button on small screens.
+        self.assertIn('<div id="test_tones_layout" class="effects-layout">', html)
+        self.assertIn('<button id="test_tones_back" class="audio-effects-back" type="button">', html)
+        self.assertIn('layout.classList.remove("effect-detail-active");', html)
 
     def test_interface_is_up_accepts_unknown_operstate_with_up_flag(self) -> None:
         def fake_read_text(path, encoding=None):
@@ -1282,6 +1523,7 @@ class AuthTests(unittest.TestCase):
         service.development_iq_sources_enabled = False
         service.log_handler = type("LogHandler", (), {"snapshot": lambda self: []})()
         now = self.web_control.time.time()
+        service.test_mode_time = self.web_control.TestModeTimeBudget(None)
         service.stream_test_mode = {
             "stream_id": "stream-1",
             "client_id": "client-a",
