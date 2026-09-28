@@ -2042,7 +2042,7 @@ class EasAlertTests(unittest.TestCase):
         processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
             highpass=config.FilterConfig(enabled=True, frequency=300, sharpness=1),
             lowpass=config.FilterConfig(enabled=True, frequency=4000, sharpness=1),
-            notch=config.FilterConfig(enabled=True, frequency=3000, sharpness=1),
+            notch=config.NotchConfig(enabled=True, frequency=3000, width=100),
         ))
         highpass = processor.highpass
         lowpass = processor.lowpass
@@ -2054,7 +2054,7 @@ class EasAlertTests(unittest.TestCase):
         changed = processor.update_config(config.AudioConfig(
             highpass=config.FilterConfig(enabled=True, frequency=350, sharpness=1),
             lowpass=config.FilterConfig(enabled=True, frequency=4000, sharpness=1),
-            notch=config.FilterConfig(enabled=True, frequency=3000, sharpness=1),
+            notch=config.NotchConfig(enabled=True, frequency=3000, width=100),
         ))
 
         self.assertEqual(changed, ("highpass",))
@@ -2208,13 +2208,67 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertLess(float(np.max(np.abs(chunked_output - single_output))), 1e-5)
 
+    def _notch_audio_payload(self, notch: dict) -> dict:
+        return {
+            "deemphasis": {"enabled": True, "tau": 530},
+            "comfort_noise": {"enabled": False, "level_db": -40},
+            "volume": {"enabled": False, "multiplier": 1},
+            "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
+            "lowpass": {"enabled": False, "frequency": 4000, "sharpness": 0},
+            "notch": notch,
+        }
+
+    def test_notch_width_is_saved_and_limited_near_protected_tones(self) -> None:
+        audio = self.web_control.validate_audio_payload(
+            self._notch_audio_payload({"enabled": True, "frequency": 3000, "width": 250})
+        )
+        self.assertEqual(audio["notch"], {"enabled": True, "frequency": 3000.0, "width": 250.0})
+        self.assertNotIn("sharpness", audio["notch"])
+
+        widest = self.config.notch_max_width(1250)
+        self.assertLess(widest, 400)
+        with self.assertRaisesRegex(ValueError, "notch.width"):
+            self.web_control.validate_audio_payload(
+                self._notch_audio_payload({"enabled": True, "frequency": 1250, "width": widest + 1})
+            )
+        with self.assertRaisesRegex(ValueError, "notch.width"):
+            self.web_control.validate_audio_payload(
+                self._notch_audio_payload({"enabled": True, "frequency": 3000, "width": 30})
+            )
+
+    def test_notch_sharpness_from_older_settings_becomes_width(self) -> None:
+        notch = self.config.parse_notch_config({"enabled": True, "frequency": 3000, "sharpness": 10})
+        self.assertEqual(notch.width, 60.0)
+        near_tone = self.config.parse_notch_config({"enabled": True, "frequency": 1250, "sharpness": 0})
+        self.assertEqual(near_tone.width, self.config.notch_max_width(1250))
+
+        stream = {"id": "s", "audio": {"notch": {"enabled": False, "frequency": 3000, "sharpness": 5}}}
+        self.web_control.migrate_stream_notch_width(stream)
+        self.assertEqual(stream["audio"]["notch"], {"enabled": False, "frequency": 3000.0, "width": 230.0})
+
+    def test_notch_width_sets_heard_width_and_spares_protected_tones(self) -> None:
+        sample_rate = 24_000
+        frequencies = np.linspace(1.0, 11_999.0, 48_000)
+        for center, width in ((3000.0, 60.0), (3000.0, 500.0), (400.0, 200.0), (1250.0, 222.0)):
+            kernel = self.audio_effects._filter_kernel(
+                "notch", self.config.NotchConfig(enabled=True, frequency=center, width=width), sample_rate
+            ).astype(np.float64)
+            phases = np.exp(-2j * np.pi * np.outer(frequencies, np.arange(len(kernel))) / sample_rate)
+            response = 20 * np.log10(np.abs(phases @ kernel) + 1e-15)
+            attenuated = frequencies[response < -3.0]
+            self.assertAlmostEqual(attenuated[-1] - attenuated[0], width, delta=max(6.0, width * 0.05))
+            tones = np.array(self.config.PROTECTED_TONES_HZ)
+            tone_phases = np.exp(-2j * np.pi * np.outer(tones, np.arange(len(kernel))) / sample_rate)
+            tone_loss = 20 * np.log10(np.abs(tone_phases @ kernel))
+            self.assertGreater(float(np.min(tone_loss)), -1.05)
+
     def test_notch_filter_near_nyquist_does_not_raise_or_emit_nan(self) -> None:
         config = self.config
         processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
             deemphasis=config.DeemphasisConfig(enabled=False, tau=0),
             volume=config.VolumeConfig(enabled=False, multiplier=1.0),
             lowpass=config.FilterConfig(enabled=False, frequency=3400, sharpness=0),
-            notch=config.FilterConfig(enabled=True, frequency=12000, sharpness=10),
+            notch=config.NotchConfig(enabled=True, frequency=12000, width=60),
         ))
         samples = np.zeros(480, dtype=np.float32)
 

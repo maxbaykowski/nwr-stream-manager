@@ -45,6 +45,12 @@ PROTECTED_AUDIO_BANDS_HZ = (
     ("SAME space tone", SAME_SPACE_BAND_HZ),
     ("SAME mark tone", SAME_MARK_BAND_HZ),
 )
+# Attention tone, SAME space tone, SAME mark tone.
+PROTECTED_TONES_HZ = (1050.0, 1562.5, 2083.3)
+PROTECTED_TONE_MAX_LOSS_DB = 1.0
+NOTCH_MIN_WIDTH_HZ = 60.0
+NOTCH_MAX_WIDTH_HZ = 2000.0
+NOTCH_DEFAULT_WIDTH_HZ = 100.0
 AUDIO_NYQUIST_HZ = IQ_SAMPLE_RATE / 2
 STATE_DIRECTORY_NAME = "rtl_weatherband"
 ENV_VAR_PATTERN = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([^}]+)\})")
@@ -136,6 +142,13 @@ class FilterConfig:
 
 
 @dataclass(frozen=True)
+class NotchConfig:
+    enabled: bool = False
+    frequency: float = 0.0
+    width: float = NOTCH_DEFAULT_WIDTH_HZ
+
+
+@dataclass(frozen=True)
 class AudioConfig:
     deemphasis: DeemphasisConfig = field(default_factory=DeemphasisConfig)
     comfort_noise: ComfortNoiseConfig = field(default_factory=ComfortNoiseConfig)
@@ -144,7 +157,7 @@ class AudioConfig:
     lowpass: FilterConfig = field(
         default_factory=lambda: FilterConfig(enabled=False, frequency=3400.0, sharpness=2.0)
     )
-    notch: FilterConfig = field(default_factory=FilterConfig)
+    notch: NotchConfig = field(default_factory=NotchConfig)
 
     @property
     def deemphasis_tau(self) -> float:
@@ -360,7 +373,7 @@ def parse_audio_config(raw: dict[str, Any]) -> AudioConfig:
             volume=parse_volume_config(raw.get("volume")),
             highpass=parse_filter_config(raw.get("highpass")),
             lowpass=parse_filter_config(raw.get("lowpass")),
-            notch=parse_filter_config(raw.get("notch")),
+            notch=parse_notch_config(raw.get("notch")),
         )
     else:
         audio = AudioConfig(
@@ -369,7 +382,7 @@ def parse_audio_config(raw: dict[str, Any]) -> AudioConfig:
             volume=parse_volume_config(raw.get("volume")),
             highpass=parse_filter_config(raw.get("highpass")),
             lowpass=parse_filter_config(raw.get("lowpass")),
-            notch=parse_filter_config(raw.get("notch")),
+            notch=parse_notch_config(raw.get("notch")),
         )
     validate_audio_config(audio)
     return audio
@@ -426,8 +439,8 @@ def merge_valid_audio_config(
         lowpass = current.lowpass
 
     try:
-        notch = parse_filter_config(raw.get("notch"))
-        validate_filter_config("notch", notch)
+        notch = parse_notch_config(raw.get("notch"))
+        validate_notch_config(notch)
         if notch != current.notch:
             changed_filters.add("notch")
     except (ConfigError, KeyError, TypeError, ValueError) as exc:
@@ -490,6 +503,37 @@ def parse_filter_config(raw: Any) -> FilterConfig:
         frequency=_float(raw, "frequency", 0.0),
         sharpness=_float(raw, "sharpness", 0.0),
     )
+
+
+def parse_notch_config(raw: Any) -> NotchConfig:
+    if raw is None:
+        return NotchConfig()
+    raw = _object(raw, "audio.notch")
+    frequency = _float(raw, "frequency", 0.0)
+    if "width" in raw:
+        width = _float(raw, "width")
+    elif "sharpness" in raw:
+        # Settings saved before notch width existed; use the width that sharpness implied.
+        width = 400.0 - 34.0 * min(10.0, max(0.0, _float(raw, "sharpness")))
+        if _finite(frequency) and frequency > 0:
+            width = min(max(width, NOTCH_MIN_WIDTH_HZ), notch_max_width(frequency))
+    else:
+        width = NOTCH_DEFAULT_WIDTH_HZ
+    return NotchConfig(
+        enabled=_bool(raw, "enabled", False),
+        frequency=frequency,
+        width=width,
+    )
+
+
+def notch_max_width(frequency: float) -> float:
+    """Widest notch at this frequency that keeps the attention and SAME tones within
+    PROTECTED_TONE_MAX_LOSS_DB."""
+    allowed = math.sqrt(10 ** (PROTECTED_TONE_MAX_LOSS_DB / 10) - 1)
+    widest = min(NOTCH_MAX_WIDTH_HZ, 2 * frequency)
+    for tone in PROTECTED_TONES_HZ:
+        widest = min(widest, allowed * abs(tone**2 - frequency**2) / tone)
+    return max(NOTCH_MIN_WIDTH_HZ, math.floor(widest))
 
 
 def parse_fallback_config(raw: Any) -> FallbackConfig:
@@ -627,7 +671,7 @@ def validate_audio_config(config: AudioConfig) -> None:
     validate_volume_config(config.volume)
     validate_filter_config("highpass", config.highpass)
     validate_filter_config("lowpass", config.lowpass)
-    validate_filter_config("notch", config.notch)
+    validate_notch_config(config.notch)
     validate_audio_filter_relationships(config)
 
 
@@ -661,13 +705,25 @@ def validate_filter_config(name: str, config: FilterConfig) -> None:
         raise ConfigError(
             f"lowpass.frequency must be no lower than {SAME_MARK_BAND_HZ[1]} Hz"
         )
-    if name == "notch":
-        for label, (minimum, maximum) in PROTECTED_AUDIO_BANDS_HZ:
-            if minimum <= config.frequency <= maximum:
-                raise ConfigError(
-                    f"notch.frequency cannot be inside the protected {minimum}-{maximum} Hz "
-                    f"band for the {label}"
-                )
+
+
+def validate_notch_config(config: NotchConfig) -> None:
+    if not config.enabled:
+        return
+    if not _finite(config.frequency) or not 0 < config.frequency <= AUDIO_NYQUIST_HZ:
+        raise ConfigError(f"notch.frequency must be between 0 and {AUDIO_NYQUIST_HZ}")
+    for label, (minimum, maximum) in PROTECTED_AUDIO_BANDS_HZ:
+        if minimum <= config.frequency <= maximum:
+            raise ConfigError(
+                f"notch.frequency cannot be inside the protected {minimum}-{maximum} Hz "
+                f"band for the {label}"
+            )
+    widest = notch_max_width(config.frequency)
+    if not _finite(config.width) or not NOTCH_MIN_WIDTH_HZ <= config.width <= widest:
+        raise ConfigError(
+            f"notch.width must be between {NOTCH_MIN_WIDTH_HZ:g} and {widest:g} Hz "
+            f"at {config.frequency:g} Hz, to protect the attention and SAME tones"
+        )
 
 
 def validate_audio_filter_relationships(config: AudioConfig) -> None:

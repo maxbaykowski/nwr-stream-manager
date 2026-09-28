@@ -60,6 +60,7 @@ if __package__:
         IcecastConfig,
         IQ_SAMPLE_RATE,
         parse_audio_config,
+        parse_notch_config,
     )
     from .device_probe import SharedDeviceProbe
     from .dependency_check import (
@@ -172,6 +173,7 @@ else:
     IcecastConfig = config_module.IcecastConfig
     IQ_SAMPLE_RATE = config_module.IQ_SAMPLE_RATE
     parse_audio_config = config_module.parse_audio_config
+    parse_notch_config = config_module.parse_notch_config
     ComplexArray = dsp.ComplexArray
     DEFAULT_ALIAS_ATTENUATION_DB = dsp.DEFAULT_ALIAS_ATTENUATION_DB
     IqChannelizer = dsp.IqChannelizer
@@ -362,7 +364,7 @@ RECEIVER_AUDIO_CONFIG = parse_audio_config(
         "volume": {"enabled": False, "multiplier": 1.0},
         "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
         "lowpass": {"enabled": False, "frequency": 3400, "sharpness": 2},
-        "notch": {"enabled": False, "frequency": 3000, "sharpness": 0},
+        "notch": {"enabled": False, "frequency": 3000, "width": 100},
     }
 )
 FALLBACK_STATE_FILE_NAME = "fallback.json"
@@ -10816,14 +10818,30 @@ def load_station_database(path: Path = STATIONS_ASSET_PATH) -> list[dict[str, st
 def load_streams(streams_directory: Path, legacy_path: Path) -> list[dict[str, Any]]:
     streams = load_stream_configs(streams_directory)
     if streams:
+        for stream in streams:
+            migrate_stream_notch_width(stream)
         return streams
     if (streams_directory / STREAMS_DIRECTORY_MARKER_FILE_NAME).exists():
         return []
     streams = load_legacy_streams(legacy_path)
+    for stream in streams:
+        migrate_stream_notch_width(stream)
     if streams:
         LOG.info("migrating %s stream configuration(s) from %s to %s", len(streams), legacy_path, streams_directory)
         save_streams(streams_directory, streams)
     return streams
+
+
+def migrate_stream_notch_width(stream: dict[str, Any]) -> None:
+    # The notch used to be set by sharpness; convert it to the equivalent width.
+    audio = stream.get("audio")
+    notch = audio.get("notch") if isinstance(audio, dict) else None
+    if not isinstance(notch, dict) or "width" in notch:
+        return
+    try:
+        audio["notch"] = asdict(parse_notch_config(notch))
+    except Exception as exc:
+        LOG.warning("could not convert notch settings for stream %s: %s", stream.get("id"), exc)
 
 
 def load_stream_configs(streams_directory: Path) -> list[dict[str, Any]]:
@@ -12363,6 +12381,20 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <button id="dismiss_nwrorg_submission" type="button">Dismiss</button>
   </div>
 </div>
+<div id="notification_setup_dialog" class="notice-dialog" role="dialog" tabindex="-1" aria-labelledby="notification_setup_title" aria-describedby="notification_setup_streams notification_setup_rtl" hidden>
+  <h2 id="notification_setup_title">Notifications are set up</h2>
+  <p id="notification_setup_streams">
+    To get notifications for a stream, go to <a href="/?view=streams" data-view="streams">Manage Streams</a>,
+    select More actions for the stream, select Edit stream settings, and open the Notifications tab.
+  </p>
+  <p id="notification_setup_rtl">
+    To get notifications when the RTL-SDR needs attention, go to <a href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
+    and turn on Notify when the RTL-SDR requires attention.
+  </p>
+  <div class="actions">
+    <button id="dismiss_notification_setup" type="button">Dismiss</button>
+  </div>
+</div>
 <div id="monitor_unstable_dialog" class="notice-dialog" role="dialog" aria-labelledby="monitor_unstable_title" aria-live="assertive" hidden>
   <h2 id="monitor_unstable_title">Stream monitoring stopped</h2>
   <p>Your internet connection is too unstable for stream monitoring.</p>
@@ -12763,42 +12795,103 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div id="view_notifications" class="view" hidden>
     <section>
       <h2>Notification settings</h2>
-      <div id="notification-result" class="message"></div>
+      <div id="notification-result" class="message" aria-live="polite"></div>
       <div id="notification_intro">
-        <p>Get notifications on your computer or phone when a stream goes down, a sound card isn't working, or the SDR disconnects.</p>
+        <p>Get notifications on your computer or phone when a stream goes down, a sound card isn't working, or the RTL-SDR needs attention.</p>
         <div class="actions">
           <button id="start_notification_setup" type="button">Set up</button>
         </div>
       </div>
       <div id="notification_configured" hidden>
-        <p id="notification_configured_summary"></p>
+        <label>ntfy server
+          <select id="notification_server_mode" aria-describedby="notification_server_mode_hint">
+            <option value="ntfy.sh">ntfy.sh</option>
+            <option value="self-hosted">Self-hosted instance</option>
+          </select>
+        </label>
+        <span id="notification_server_mode_hint" class="hint">The ntfy server notifications are sent through. After changing it, subscribe to the topic on the new server in the ntfy app.</span>
+        <label id="notification_configured_server_url_label" hidden>Server URL
+          <input id="notification_configured_server_url" type="url" autocomplete="url" placeholder="https://ntfy.example.com" aria-describedby="notification_configured_server_url_hint">
+        </label>
+        <span id="notification_configured_server_url_hint" class="hint" hidden>The URL of your self-hosted ntfy server, starting with http:// or https://.</span>
         <label>Topic secret
           <input id="notification_configured_topic_secret" type="text" readonly aria-describedby="notification_configured_topic_hint">
         </label>
-        <div id="notification_configured_topic_hint" class="hint">Subscribe to this topic in the ntfy app to receive notifications.</div>
+        <span id="notification_configured_topic_hint" class="hint">Subscribe to this topic in the ntfy app to receive notifications.</span>
         <div class="actions">
           <button id="copy_configured_notification_topic" type="button">Copy to clipboard</button>
-          <button id="configured_test_notifications" type="button">Send test notification</button>
-          <button id="restart_notification_setup" type="button">Set up again</button>
-        </div>
-        <div class="control-block">
           <button id="regenerate_notification_topic" type="button" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</button>
-          <div id="regenerate_notification_topic_hint" class="hint">Regenerate the topic secret if someone has figured out the current one.</div>
         </div>
+        <span id="regenerate_notification_topic_hint" class="hint">Regenerate the topic secret if someone has figured out the current one.</span>
         <label>Open NWR Stream Manager from notifications
           <select id="notification_access_url_mode" aria-describedby="notification_access_url_hint"></select>
         </label>
-        <div id="notification_access_url_hint" class="hint">Choose the address devices should open when a notification links back to NWR Stream Manager.</div>
+        <span id="notification_access_url_hint" class="hint">The address your devices open when you select a notification. Choose one they can reach, such as a Tailscale address for devices away from home.</span>
         <label id="notification_custom_access_url_label" hidden>Custom URL
-          <input id="notification_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com">
+          <input id="notification_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_custom_access_url_hint">
         </label>
+        <span id="notification_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
+        <div class="actions">
+          <button id="configured_test_notifications" type="button">Send test notification</button>
+        </div>
       </div>
       <div id="notification_wizard" hidden>
-        <div id="notification_wizard_body"></div>
+        <div id="notification_step_server_choice" class="wizard-step">
+          <p>Let's get notifications set up! NWR Stream Manager sends notifications through ntfy, a free, open-source notification service. You install the ntfy app on your phone or computer and subscribe to a private topic, and NWR Stream Manager sends a notification to that topic when something needs your attention, such as a stream going down or the RTL-SDR disconnecting.</p>
+          <p>Most people use the public ntfy.sh server, which is free and doesn't need an account. If you run your own ntfy server, you can use it instead.</p>
+          <fieldset>
+            <legend>Do you have your own self-hosted ntfy server?</legend>
+            <label class="checkbox-row"><input id="notification_self_hosted_no" name="notification_self_hosted" type="radio" value="no" checked> No, use ntfy.sh</label>
+            <label class="checkbox-row"><input id="notification_self_hosted_yes" name="notification_self_hosted" type="radio" value="yes"> Yes</label>
+          </fieldset>
+        </div>
+        <div id="notification_step_server_url" class="wizard-step" hidden>
+          <p>Enter the URL of your self-hosted ntfy server.</p>
+          <label>ntfy server URL
+            <input id="notification_server_url" type="url" placeholder="https://ntfy.example.com" autocomplete="url" aria-describedby="notification_server_url_hint">
+          </label>
+          <span id="notification_server_url_hint" class="hint">Starts with http:// or https://.</span>
+        </div>
+        <div id="notification_step_app_install" class="wizard-step" hidden>
+          <p>Download the ntfy app on your device, or use the ntfy web app.</p>
+          <ul>
+            <li><a href="https://apps.apple.com/us/app/ntfy/id1625396347" target="_blank" rel="noopener noreferrer">Download ntfy from the Apple App Store</a></li>
+            <li><a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy" target="_blank" rel="noopener noreferrer">Download ntfy from Google Play</a></li>
+            <li><a id="notification_web_app_link" href="https://ntfy.sh/app" target="_blank" rel="noopener noreferrer">Open the ntfy web app</a></li>
+          </ul>
+        </div>
+        <div id="notification_step_topic" class="wizard-step" hidden>
+          <p>To receive notifications, subscribe to the NWR Stream Manager topic in the ntfy app. Copy the topic secret below, then paste it into the topic name field in the ntfy app. You can subscribe on as many devices as you want; notifications are sent to all of them.</p>
+          <label>Topic secret
+            <input id="notification_topic_secret" type="text" readonly aria-describedby="notification_topic_secret_hint">
+          </label>
+          <span id="notification_topic_secret_hint" class="hint">Anyone who knows the topic secret can see and send notifications on it. If you ever receive notifications that didn't come from NWR Stream Manager, regenerate the topic secret in the notification settings.</span>
+          <div class="actions">
+            <button id="copy_notification_topic" type="button">Copy to clipboard</button>
+          </div>
+        </div>
+        <div id="notification_step_access_url" class="wizard-step" hidden>
+          <p>Selecting a notification can open NWR Stream Manager. Choose the address your devices should use to reach it.</p>
+          <label>Open NWR Stream Manager from notifications
+            <select id="notification_wizard_access_url_mode" aria-describedby="notification_wizard_access_url_hint"></select>
+          </label>
+          <span id="notification_wizard_access_url_hint" class="hint">Choose an address your devices can reach, such as a Tailscale address for devices away from home.</span>
+          <label id="notification_wizard_custom_access_url_label" hidden>Custom URL
+            <input id="notification_wizard_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_wizard_custom_access_url_hint">
+          </label>
+          <span id="notification_wizard_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
+        </div>
+        <div id="notification_step_test" class="wizard-step" hidden>
+          <p>Send a test notification to make sure notifications from NWR Stream Manager reach your devices, then select Finish.</p>
+          <div class="actions">
+            <button id="wizard_test_notifications" type="button">Send test notification</button>
+          </div>
+        </div>
         <div class="actions">
           <button id="notification_cancel" type="button">Cancel</button>
-          <button id="notification_back" type="button">Back</button>
+          <button id="notification_back" type="button" hidden>Back</button>
           <button id="notification_next" type="button">Next</button>
+          <button id="notification_finish" type="button" hidden>Finish</button>
         </div>
       </div>
     </section>
@@ -13205,15 +13298,15 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 <input id="audio_notch_enabled" type="checkbox" aria-describedby="audio_notch_enabled_hint">
                 Enable notch filter
               </label>
-              <span id="audio_notch_enabled_hint" class="hint">Removes a narrow tone, useful for analog whines.</span>
+              <span id="audio_notch_enabled_hint" class="hint">Removes a narrow band of audio around one frequency, useful for analog whines.</span>
               <label>Frequency
                 <input id="audio_notch_frequency" type="number" min="1" max="12000" step="1" aria-describedby="audio_notch_frequency_hint">
               </label>
               <span id="audio_notch_frequency_hint" class="hint">Frequency in Hz. Frequencies of and near this value will be attenuated. To protect the 1050 Hz attention tone and SAME tones, this cannot be within 900-1100, 1400-1600, or 2000-2200 Hz.</span>
-              <label>Sharpness
-                <input id="audio_notch_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_notch_sharpness_hint">
+              <label>Width
+                <input id="audio_notch_width" type="number" min="60" max="2000" step="1" aria-describedby="audio_notch_width_hint">
               </label>
-              <span id="audio_notch_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
+              <span id="audio_notch_width_hint" class="hint">Width in Hz of the band that will be attenuated. Narrow widths remove just the tone; wider widths also remove the audio around it. To protect the 1050 Hz attention tone and SAME tones, the widest allowed depends on the frequency: <span id="audio_notch_width_max">2000</span> Hz at the current frequency.</span>
             </div>
           </div>
         </div>
@@ -13709,6 +13802,11 @@ const PROTECTED_AUDIO_BANDS = [
   {min: 1400, max: 1600},
   {min: 2000, max: 2200}
 ];
+// Attention tone, SAME space tone, SAME mark tone; matches config.PROTECTED_TONES_HZ.
+const PROTECTED_AUDIO_TONES = [1050, 1562.5, 2083.3];
+const PROTECTED_TONE_MAX_LOSS_DB = 1.0;
+const NOTCH_MIN_WIDTH_HZ = 60;
+const NOTCH_MAX_WIDTH_HZ = 2000;
 let sameAudioContext = null;
 let sameOutputGain = null;
 let sameLiveAudioMuteTimer = null;
@@ -16239,6 +16337,33 @@ function filterPayload(name) {
   };
 }
 
+function notchPayload() {
+  return {
+    enabled: document.getElementById("audio_notch_enabled").checked,
+    frequency: numericControlValue("audio_notch_frequency"),
+    width: numericControlValue("audio_notch_width")
+  };
+}
+
+function notchMaxWidth(frequency) {
+  const allowed = Math.sqrt(10 ** (PROTECTED_TONE_MAX_LOSS_DB / 10) - 1);
+  let widest = Math.min(NOTCH_MAX_WIDTH_HZ, 2 * frequency);
+  for (const tone of PROTECTED_AUDIO_TONES) {
+    widest = Math.min(widest, allowed * Math.abs(tone ** 2 - frequency ** 2) / tone);
+  }
+  return Math.max(NOTCH_MIN_WIDTH_HZ, Math.floor(widest));
+}
+
+function updateNotchWidthLimit(clamp) {
+  const frequency = Number(document.getElementById("audio_notch_frequency").value);
+  if (!Number.isFinite(frequency) || frequency <= 0) return;
+  const widest = notchMaxWidth(frequency);
+  const width = document.getElementById("audio_notch_width");
+  width.max = String(widest);
+  document.getElementById("audio_notch_width_max").textContent = String(widest);
+  if (clamp) normalizeNumericControl(width);
+}
+
 function clampNumber(value, minimum, maximum) {
   const number = Number(value);
   if (!Number.isFinite(number)) return minimum;
@@ -16303,6 +16428,7 @@ function normalizeAudioFrequencyControl(nameOrElement) {
   const normalized = String(Math.round(value));
   if (element.value !== normalized) element.value = normalized;
   element.dataset.previousValue = normalized;
+  if (name === "notch") updateNotchWidthLimit(true);
 }
 
 function skipProtectedAudioBands(value, previous) {
@@ -16402,7 +16528,7 @@ function audioEffectsPayload() {
     },
     highpass: filterPayload("highpass"),
     lowpass: filterPayload("lowpass"),
-    notch: filterPayload("notch")
+    notch: notchPayload()
   };
 }
 
@@ -16526,7 +16652,7 @@ function defaultAudioEffectsSettings() {
     deemphasis: {enabled: true, tau: 300.0},
     highpass: {enabled: false, frequency: 300.0, sharpness: 0.0},
     lowpass: {enabled: false, frequency: 3400.0, sharpness: 2.0},
-    notch: {enabled: false, frequency: 3000.0, sharpness: 0.0}
+    notch: {enabled: false, frequency: 3000.0, width: 100.0}
   };
 }
 
@@ -16565,7 +16691,7 @@ function setAudioEffectsControls(stream) {
   setValue("audio_deemphasis_tau", settings.deemphasis.tau);
   setAudioFilterControls("highpass", settings.highpass);
   setAudioFilterControls("lowpass", settings.lowpass);
-  setAudioFilterControls("notch", settings.notch);
+  setNotchControls(settings.notch);
   audioEffectsSignature = nextSignature;
 }
 
@@ -16575,6 +16701,14 @@ function setAudioFilterControls(name, settings) {
   setValue(`audio_${name}_sharpness`, settings.sharpness);
   const frequency = document.getElementById(`audio_${name}_frequency`);
   frequency.dataset.previousValue = String(settings.frequency);
+}
+
+function setNotchControls(settings) {
+  setChecked("audio_notch_enabled", settings.enabled);
+  setValue("audio_notch_frequency", settings.frequency);
+  setValue("audio_notch_width", settings.width);
+  document.getElementById("audio_notch_frequency").dataset.previousValue = String(settings.frequency);
+  updateNotchWidthLimit(false);
 }
 
 function selectAudioEffect(name, showDetail = true) {
@@ -18374,36 +18508,68 @@ function setNotificationResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+const NTFY_PUBLIC_SERVER_URL = "https://ntfy.sh";
 let notificationSettings = {};
 let notificationWizardActive = false;
 let notificationWizardStep = 0;
 let notificationWizardSelfHosted = false;
-let notificationWizardServerUrl = "https://ntfy.sh";
+let notificationWizardServerUrl = NTFY_PUBLIC_SERVER_URL;
 let notificationWizardTopic = "";
 let notificationAccessUrlOptions = [];
-let notificationAccessUrlOptionsSignature = "";
 let notificationAccessUrlSelectionSignature = "";
+let notificationServerSelectionSignature = "";
 let notificationAccessUrlsLoading = false;
 
 const NOTIFICATION_STEP_SERVER_CHOICE = 0;
 const NOTIFICATION_STEP_SERVER_URL = 1;
 const NOTIFICATION_STEP_APP_INSTALL = 2;
 const NOTIFICATION_STEP_TOPIC = 3;
-const NOTIFICATION_STEP_TEST = 4;
-const NOTIFICATION_STEP_DONE = 5;
+const NOTIFICATION_STEP_ACCESS_URL = 4;
+const NOTIFICATION_STEP_TEST = 5;
+const NOTIFICATION_WIZARD_STEPS = [
+  [NOTIFICATION_STEP_SERVER_CHOICE, "notification_step_server_choice"],
+  [NOTIFICATION_STEP_SERVER_URL, "notification_step_server_url"],
+  [NOTIFICATION_STEP_APP_INSTALL, "notification_step_app_install"],
+  [NOTIFICATION_STEP_TOPIC, "notification_step_topic"],
+  [NOTIFICATION_STEP_ACCESS_URL, "notification_step_access_url"],
+  [NOTIFICATION_STEP_TEST, "notification_step_test"]
+];
 
-function notificationPayload() {
-  return {
+function notificationSettingsPayload(overrides = {}) {
+  // Everything the server keeps, so saving one setting leaves the others as they are.
+  return Object.assign({
     enabled: true,
-    server_url: notificationWizardServerUrl || "https://ntfy.sh",
-    topic: notificationWizardTopic || notificationSettings.topic || "",
-    priority: 3,
+    server_url: notificationSettings.server_url || NTFY_PUBLIC_SERVER_URL,
+    topic: notificationSettings.topic || "",
+    priority: notificationSettings.priority || 3,
     access_url_mode: notificationSettings.access_url_mode || "auto",
     custom_access_url: notificationSettings.custom_access_url || "",
     access_token: "",
-    username: "",
-    password: ""
-  };
+    keep_access_token: Boolean(notificationSettings.access_token_set),
+    username: notificationSettings.username || "",
+    password: "",
+    keep_password: Boolean(notificationSettings.password_set)
+  }, overrides);
+}
+
+function notificationWizardAccessUrl() {
+  const mode = document.getElementById("notification_wizard_access_url_mode").value || "auto";
+  if (mode !== "custom") return {access_url_mode: mode, custom_access_url: notificationSettings.custom_access_url || ""};
+  const value = document.getElementById("notification_wizard_custom_access_url").value;
+  return {access_url_mode: mode, custom_access_url: normalizeNotificationAccessUrl(value)};
+}
+
+function notificationPayload() {
+  let access = {};
+  try {
+    access = notificationWizardAccessUrl();
+  } catch (error) {
+    access = {};
+  }
+  return notificationSettingsPayload(Object.assign({
+    server_url: notificationWizardServerUrl || NTFY_PUBLIC_SERVER_URL,
+    topic: notificationWizardTopic || notificationSettings.topic || ""
+  }, access));
 }
 
 function setNotificationSettings(settings = {}) {
@@ -18435,10 +18601,7 @@ function renderNotificationSettings() {
   configured.hidden = notificationWizardActive || !notificationIsConfigured();
   wizard.hidden = !notificationWizardActive;
   if (notificationIsConfigured()) {
-    setText(
-      "notification_configured_summary",
-      `Notifications are set up using ${notificationSettings.server_url || "https://ntfy.sh"}.`
-    );
+    renderNotificationServerControls();
     setValue("notification_configured_topic_secret", notificationSettings.topic || "");
     renderNotificationAccessUrlControls();
     loadNotificationAccessUrlOptions();
@@ -18446,32 +18609,62 @@ function renderNotificationSettings() {
   if (notificationWizardActive) renderNotificationWizard();
 }
 
+function notificationServerIsSelfHosted(url = notificationSettings.server_url) {
+  return Boolean(url) && url.replace(/[/]+$/, "") !== NTFY_PUBLIC_SERVER_URL;
+}
+
+function updateNotificationServerUrlVisibility(mode = document.getElementById("notification_server_mode").value) {
+  const selfHosted = mode === "self-hosted";
+  setHidden("notification_configured_server_url_label", !selfHosted);
+  setHidden("notification_configured_server_url_hint", !selfHosted);
+}
+
+function renderNotificationServerControls() {
+  const select = document.getElementById("notification_server_mode");
+  const input = document.getElementById("notification_configured_server_url");
+  const serverUrl = notificationSettings.server_url || NTFY_PUBLIC_SERVER_URL;
+  const signature = serverUrl;
+  if (notificationServerSelectionSignature !== signature) {
+    notificationServerSelectionSignature = signature;
+    // Leave the controls alone while they are being changed.
+    if (document.activeElement !== select) setValue("notification_server_mode", notificationServerIsSelfHosted(serverUrl) ? "self-hosted" : "ntfy.sh");
+    if (document.activeElement !== input) setValue("notification_configured_server_url", notificationServerIsSelfHosted(serverUrl) ? serverUrl : "");
+  }
+  updateNotificationServerUrlVisibility();
+}
+
+async function saveNotificationServerSettings() {
+  if (!notificationIsConfigured() || accountIsReadOnly()) return;
+  const mode = document.getElementById("notification_server_mode").value;
+  updateNotificationServerUrlVisibility(mode);
+  if (mode !== "self-hosted") {
+    if (notificationServerIsSelfHosted()) await saveNotificationSettings(notificationSettingsPayload({server_url: NTFY_PUBLIC_SERVER_URL}));
+    return;
+  }
+  const value = document.getElementById("notification_configured_server_url").value.trim();
+  if (!value) {
+    setNotificationResult("Enter the URL of your self-hosted ntfy server.");
+    return;
+  }
+  let serverUrl = "";
+  try {
+    serverUrl = normalizeNotificationAccessUrl(value);
+  } catch (error) {
+    setNotificationResult("Enter a valid ntfy server URL, such as ntfy.example.com or https://ntfy.example.com.", "error");
+    return;
+  }
+  if (serverUrl === (notificationSettings.server_url || "").replace(/[/]+$/, "")) return;
+  await saveNotificationSettings(notificationSettingsPayload({server_url: serverUrl}));
+}
+
 function notificationAccessUrlMode() {
   const select = document.getElementById("notification_access_url_mode");
   return select ? (select.value || "auto") : (notificationSettings.access_url_mode || "auto");
 }
 
-function notificationAccessPayload(overrides = {}) {
-  return {
-    enabled: true,
-    server_url: notificationSettings.server_url || "https://ntfy.sh",
-    topic: notificationSettings.topic || "",
-    priority: notificationSettings.priority || 3,
-    access_url_mode: overrides.access_url_mode || notificationAccessUrlMode(),
-    custom_access_url: overrides.custom_access_url !== undefined
-      ? overrides.custom_access_url
-      : (document.getElementById("notification_custom_access_url")?.value || notificationSettings.custom_access_url || ""),
-    access_token: "",
-    keep_access_token: Boolean(notificationSettings.access_token_set),
-    username: notificationSettings.username || "",
-    password: "",
-    keep_password: Boolean(notificationSettings.password_set)
-  };
-}
-
 function normalizeNotificationAccessUrl(value, defaultScheme = "https") {
   let text = String(value || "").trim().replace(/[/]+$/, "");
-  if (!text) return "";
+  if (!text) throw new Error("missing URL");
   if (!text.includes("://")) text = `${defaultScheme}://${text}`;
   const parsed = new URL(text);
   if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("invalid scheme");
@@ -18480,26 +18673,36 @@ function normalizeNotificationAccessUrl(value, defaultScheme = "https") {
 
 function updateNotificationCustomUrlVisibility(mode = notificationAccessUrlMode()) {
   setHidden("notification_custom_access_url_label", mode !== "custom");
+  setHidden("notification_custom_access_url_hint", mode !== "custom");
+}
+
+function updateNotificationWizardCustomUrlVisibility() {
+  const custom = document.getElementById("notification_wizard_access_url_mode").value === "custom";
+  setHidden("notification_wizard_custom_access_url_label", !custom);
+  setHidden("notification_wizard_custom_access_url_hint", !custom);
+}
+
+function notificationAccessUrlOptionSpecs() {
+  const saved = notificationSettings.access_url_mode || "auto";
+  const options = Array.isArray(notificationAccessUrlOptions) ? notificationAccessUrlOptions : [];
+  const specs = [{value: "auto", label: options.length ? `Automatic (${options[0].label})` : "Automatic"}];
+  for (const option of options) specs.push({value: option.id, label: option.label});
+  if (saved !== "auto" && saved !== "custom" && !options.some(option => option.id === saved)) {
+    specs.push({value: saved, label: "Previously selected address unavailable"});
+  }
+  specs.push({value: "custom", label: "Custom URL"});
+  return specs;
 }
 
 function renderNotificationAccessUrlOptions() {
-  const select = document.getElementById("notification_access_url_mode");
-  if (!select) return;
-  const savedSelected = notificationSettings.access_url_mode || "auto";
-  const options = Array.isArray(notificationAccessUrlOptions) ? notificationAccessUrlOptions : [];
-  const optionSpecs = [{value: "auto", label: options.length ? `Automatic (${options[0].label})` : "Automatic"}];
-  for (const option of options) {
-    optionSpecs.push({value: option.id, label: option.label});
-  }
-  if (savedSelected && savedSelected !== "auto" && savedSelected !== "custom" && !options.some(option => option.id === savedSelected)) {
-    optionSpecs.push({value: savedSelected, label: "Previously selected address unavailable"});
-  }
-  optionSpecs.push({value: "custom", label: "Custom URL"});
+  const optionSpecs = notificationAccessUrlOptionSpecs();
   const signature = JSON.stringify(optionSpecs);
-  const domSignature = JSON.stringify(Array.from(select.options).map(option => ({value: option.value, label: option.textContent || ""})));
-  if (notificationAccessUrlOptionsSignature === signature && domSignature === signature) return;
-  notificationAccessUrlOptionsSignature = signature;
-  syncSelectOptions(select, optionSpecs);
+  for (const id of ["notification_access_url_mode", "notification_wizard_access_url_mode"]) {
+    const select = document.getElementById(id);
+    if (!select) continue;
+    const domSignature = JSON.stringify(Array.from(select.options).map(option => ({value: option.value, label: option.textContent || ""})));
+    if (domSignature !== signature) syncSelectOptions(select, optionSpecs);
+  }
 }
 
 function syncNotificationAccessUrlSelection() {
@@ -18540,29 +18743,39 @@ async function loadNotificationAccessUrlOptions() {
 async function saveNotificationAccessUrlSettings() {
   if (!notificationIsConfigured() || accountIsReadOnly()) return;
   const mode = notificationAccessUrlMode();
-  const custom = document.getElementById("notification_custom_access_url");
-  if (mode === "custom") {
-    const value = custom ? custom.value.trim().replace(/[/]+$/, "") : "";
-    try {
-      const normalized = normalizeNotificationAccessUrl(value);
-      await saveNotificationSettings(notificationAccessPayload({access_url_mode: mode, custom_access_url: normalized}));
-    } catch (error) {
-      setNotificationResult("Enter a valid custom URL, such as nwr.example.com or https://nwr.example.com.", "error");
-      return;
-    }
+  if (mode !== "custom") {
+    await saveNotificationSettings(notificationSettingsPayload({access_url_mode: mode}));
     return;
   }
-  await saveNotificationSettings(notificationAccessPayload({access_url_mode: mode}));
+  const value = document.getElementById("notification_custom_access_url").value;
+  if (!value.trim()) return;  // wait for the address
+  let customUrl = "";
+  try {
+    customUrl = normalizeNotificationAccessUrl(value);
+  } catch (error) {
+    setNotificationResult("Enter a valid custom URL, such as nwr.example.com or https://nwr.example.com.", "error");
+    return;
+  }
+  await saveNotificationSettings(notificationSettingsPayload({access_url_mode: mode, custom_access_url: customUrl}));
 }
 
 function startNotificationWizard() {
   notificationWizardActive = true;
   notificationWizardStep = NOTIFICATION_STEP_SERVER_CHOICE;
   notificationWizardSelfHosted = false;
-  notificationWizardServerUrl = notificationSettings.server_url || "https://ntfy.sh";
+  notificationWizardServerUrl = NTFY_PUBLIC_SERVER_URL;
   notificationWizardTopic = "";
+  setChecked("notification_self_hosted_no", true);
+  setChecked("notification_self_hosted_yes", false);
+  setValue("notification_server_url", "");
+  renderNotificationAccessUrlOptions();
+  setValue("notification_wizard_access_url_mode", notificationSettings.access_url_mode || "auto");
+  setValue("notification_wizard_custom_access_url", notificationSettings.custom_access_url || "");
+  loadNotificationAccessUrlOptions();
   setNotificationResult("");
   renderNotificationSettings();
+  const first = document.getElementById("notification_self_hosted_no");
+  if (first) first.focus();
 }
 
 function cancelNotificationWizard() {
@@ -18570,6 +18783,8 @@ function cancelNotificationWizard() {
   notificationWizardTopic = "";
   setNotificationResult("");
   renderNotificationSettings();
+  const start = document.getElementById("start_notification_setup");
+  if (start && !start.hidden && start.getClientRects().length) start.focus();
 }
 
 function generateNotificationTopic() {
@@ -18586,89 +18801,29 @@ function generateNotificationTopic() {
 }
 
 function notificationWebAppUrl() {
-  return `${(notificationWizardServerUrl || "https://ntfy.sh").replace(/[/]+$/, "")}/app`;
-}
-
-function escapeHtmlAttribute(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return `${(notificationWizardServerUrl || NTFY_PUBLIC_SERVER_URL).replace(/[/]+$/, "")}/app`;
 }
 
 function renderNotificationWizard() {
-  const body = document.getElementById("notification_wizard_body");
-  const cancel = document.getElementById("notification_cancel");
   const back = document.getElementById("notification_back");
   const next = document.getElementById("notification_next");
-  if (!body || !cancel || !back || !next) return;
-  cancel.hidden = notificationWizardStep === NOTIFICATION_STEP_DONE;
-  setDisabled(back, notificationWizardStep === NOTIFICATION_STEP_SERVER_CHOICE);
-  next.textContent = notificationWizardStep === NOTIFICATION_STEP_DONE ? "Finish" : "Next";
-  setDisabled(next, false);
-  if (notificationWizardStep === NOTIFICATION_STEP_SERVER_CHOICE) {
-    body.innerHTML = `
-      <h3>Let's get notifications set up!</h3>
-      <fieldset>
-        <legend>Do you have your own self-hosted ntfy server?</legend>
-        <label><input id="notification_self_hosted_no" name="notification_self_hosted" type="radio" value="no"> No</label>
-        <label><input id="notification_self_hosted_yes" name="notification_self_hosted" type="radio" value="yes"> Yes</label>
-      </fieldset>
-    `;
-    setChecked("notification_self_hosted_yes", notificationWizardSelfHosted);
-    setChecked("notification_self_hosted_no", !notificationWizardSelfHosted);
-    return;
+  const finish = document.getElementById("notification_finish");
+  if (!back || !next || !finish) return;
+  const focused = document.activeElement;
+  for (const [step, id] of NOTIFICATION_WIZARD_STEPS) setHidden(id, notificationWizardStep !== step);
+  const last = notificationWizardStep === NOTIFICATION_STEP_TEST;
+  back.hidden = notificationWizardStep === NOTIFICATION_STEP_SERVER_CHOICE;
+  next.hidden = last;
+  finish.hidden = !last;
+  const webApp = document.getElementById("notification_web_app_link");
+  if (webApp && webApp.getAttribute("href") !== notificationWebAppUrl()) webApp.setAttribute("href", notificationWebAppUrl());
+  if (notificationWizardStep === NOTIFICATION_STEP_TOPIC) setValue("notification_topic_secret", notificationWizardTopic);
+  if (notificationWizardStep === NOTIFICATION_STEP_ACCESS_URL) updateNotificationWizardCustomUrlVisibility();
+  // A button that was just pressed may now be hidden; keep keyboard focus in the wizard.
+  if (focused && focused.hidden && document.getElementById("notification_wizard").contains(focused)) {
+    const target = last ? document.getElementById("wizard_test_notifications") : next;
+    target.focus();
   }
-  if (notificationWizardStep === NOTIFICATION_STEP_SERVER_URL) {
-    body.innerHTML = `
-      <p>Enter the URL of your self-hosted ntfy server.</p>
-      <label>ntfy server URL
-        <input id="notification_server_url" type="url" placeholder="https://ntfy.example.com" autocomplete="url">
-      </label>
-    `;
-    setValue("notification_server_url", notificationWizardServerUrl === "https://ntfy.sh" ? "" : notificationWizardServerUrl);
-    return;
-  }
-  if (notificationWizardStep === NOTIFICATION_STEP_APP_INSTALL) {
-    const webApp = notificationWebAppUrl();
-    body.innerHTML = `
-      <p>Download the ntfy app on your device, or use the ntfy web app.</p>
-      <ul>
-        <li><a href="https://apps.apple.com/us/app/ntfy/id1625396347" target="_blank" rel="noopener noreferrer">Download ntfy from the Apple App Store</a></li>
-        <li><a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy" target="_blank" rel="noopener noreferrer">Download ntfy from Google Play</a></li>
-        <li><a href="${escapeHtmlAttribute(webApp)}" target="_blank" rel="noopener noreferrer">Open the ntfy web app</a></li>
-      </ul>
-    `;
-    return;
-  }
-  if (notificationWizardStep === NOTIFICATION_STEP_TOPIC) {
-    if (!notificationWizardTopic) notificationWizardTopic = generateNotificationTopic();
-    body.innerHTML = `
-      <p>Almost done! To receive notifications, you'll need to subscribe to the NWR Stream Manager topic in the ntfy app. To do this, first copy the topic secret below, then go into the ntfy app and paste it into the topic name field. You can subscribe to the topic on as many devices as you want; notifications will be sent to all of them.</p>
-      <label>Topic secret
-        <input id="notification_topic_secret" readonly>
-      </label>
-      <div class="actions">
-        <button id="copy_notification_topic" type="button">Copy to clipboard</button>
-      </div>
-      <p>Topics are public, meaning anyone that knows the topic name can see notifications and send notifications themselves. The chance of a topic name being brute-forced is low, but if it does happen, or you start to receive notifications that do not originate from NWR Stream Manager, you can regenerate the topic name in the notification settings.</p>
-    `;
-    setValue("notification_topic_secret", notificationWizardTopic);
-    return;
-  }
-  if (notificationWizardStep === NOTIFICATION_STEP_TEST) {
-    body.innerHTML = `
-      <p>Send a test notification to make sure you can receive notifications from NWR Stream Manager on your other devices.</p>
-      <div class="actions">
-        <button id="wizard_test_notifications" type="button">Send test notification</button>
-      </div>
-    `;
-    return;
-  }
-  body.innerHTML = `
-    <p>Notification setup complete! To configure notifications for individual streams, click "Manage streams", click "More actions" on the stream you want to enable notifications for, click "Edit stream settings", and go to the notifications tab.</p>
-  `;
 }
 
 function notificationWizardServerChoice() {
@@ -18701,66 +18856,96 @@ async function testNotificationSettings(payload = notificationPayload()) {
 }
 
 function notificationWizardPreviousStep() {
-  if (notificationWizardStep === NOTIFICATION_STEP_APP_INSTALL && !notificationWizardSelfHosted) return NOTIFICATION_STEP_SERVER_CHOICE;
-  if (notificationWizardStep === NOTIFICATION_STEP_APP_INSTALL) return NOTIFICATION_STEP_SERVER_URL;
-  if (notificationWizardStep === NOTIFICATION_STEP_SERVER_URL) return NOTIFICATION_STEP_SERVER_CHOICE;
+  if (notificationWizardStep === NOTIFICATION_STEP_APP_INSTALL) {
+    return notificationWizardSelfHosted ? NOTIFICATION_STEP_SERVER_URL : NOTIFICATION_STEP_SERVER_CHOICE;
+  }
   return Math.max(NOTIFICATION_STEP_SERVER_CHOICE, notificationWizardStep - 1);
+}
+
+function showNotificationWizardStep(step) {
+  notificationWizardStep = step;
+  setNotificationResult("");
+  renderNotificationWizard();
 }
 
 async function notificationWizardNext() {
   if (notificationWizardStep === NOTIFICATION_STEP_SERVER_CHOICE) {
     notificationWizardSelfHosted = notificationWizardServerChoice() === "yes";
-    notificationWizardServerUrl = notificationWizardSelfHosted ? notificationWizardServerUrl : "https://ntfy.sh";
-    notificationWizardStep = notificationWizardSelfHosted ? NOTIFICATION_STEP_SERVER_URL : NOTIFICATION_STEP_APP_INSTALL;
-    renderNotificationWizard();
+    if (!notificationWizardSelfHosted) notificationWizardServerUrl = NTFY_PUBLIC_SERVER_URL;
+    showNotificationWizardStep(notificationWizardSelfHosted ? NOTIFICATION_STEP_SERVER_URL : NOTIFICATION_STEP_APP_INSTALL);
     return;
   }
   if (notificationWizardStep === NOTIFICATION_STEP_SERVER_URL) {
-    const input = document.getElementById("notification_server_url");
-    const value = input ? input.value.trim().replace(/[/]+$/, "") : "";
-    if (!value) {
+    const value = document.getElementById("notification_server_url").value;
+    if (!value.trim()) {
       setNotificationResult("Enter the URL of your self-hosted ntfy server.", "error");
       return;
     }
     try {
-      const parsed = new URL(value);
-      if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("invalid scheme");
-      notificationWizardServerUrl = value;
+      notificationWizardServerUrl = normalizeNotificationAccessUrl(value);
     } catch (error) {
-      setNotificationResult("Enter a valid ntfy server URL that starts with http:// or https://.", "error");
+      setNotificationResult("Enter a valid ntfy server URL, such as ntfy.example.com or https://ntfy.example.com.", "error");
       return;
     }
-    setNotificationResult("");
-    notificationWizardStep = NOTIFICATION_STEP_APP_INSTALL;
-    renderNotificationWizard();
+    showNotificationWizardStep(NOTIFICATION_STEP_APP_INSTALL);
     return;
   }
   if (notificationWizardStep === NOTIFICATION_STEP_APP_INSTALL) {
     if (!notificationWizardTopic) notificationWizardTopic = generateNotificationTopic();
-    notificationWizardStep = NOTIFICATION_STEP_TOPIC;
-    renderNotificationWizard();
+    showNotificationWizardStep(NOTIFICATION_STEP_TOPIC);
     return;
   }
   if (notificationWizardStep === NOTIFICATION_STEP_TOPIC) {
-    notificationWizardStep = NOTIFICATION_STEP_TEST;
-    renderNotificationWizard();
+    showNotificationWizardStep(NOTIFICATION_STEP_ACCESS_URL);
     return;
   }
-  if (notificationWizardStep === NOTIFICATION_STEP_TEST) {
-    notificationWizardStep = NOTIFICATION_STEP_DONE;
-    renderNotificationWizard();
-    return;
+  if (notificationWizardStep === NOTIFICATION_STEP_ACCESS_URL) {
+    try {
+      notificationWizardAccessUrl();
+    } catch (error) {
+      setNotificationResult("Enter a valid custom URL, such as nwr.example.com or https://nwr.example.com.", "error");
+      return;
+    }
+    showNotificationWizardStep(NOTIFICATION_STEP_TEST);
   }
-  await saveNotificationSettings(notificationPayload());
+}
+
+async function finishNotificationWizard() {
+  const button = document.getElementById("notification_finish");
+  setDisabled(button, true);
+  try {
+    await saveNotificationSettings(notificationPayload());
+  } catch (error) {
+    setNotificationResult(error.message, "error");
+    return;
+  } finally {
+    setDisabled(button, false);
+  }
   notificationWizardActive = false;
   notificationWizardTopic = "";
+  setNotificationResult("");
   renderNotificationSettings();
+  showNotificationSetupDialog();
+}
+
+function showNotificationSetupDialog() {
+  const dialog = document.getElementById("notification_setup_dialog");
+  if (!dialog) return;
+  dialog.hidden = false;
+  dialog.focus();
+}
+
+function dismissNotificationSetupDialog() {
+  const dialog = document.getElementById("notification_setup_dialog");
+  if (!dialog || dialog.hidden) return;
+  const hadFocus = containsFocusedElement(dialog);
+  dialog.hidden = true;
+  const next = document.getElementById("notification_server_mode");
+  if (hadFocus && next && next.getClientRects().length) next.focus();
 }
 
 function notificationWizardBack() {
-  notificationWizardStep = notificationWizardPreviousStep();
-  setNotificationResult("");
-  renderNotificationWizard();
+  showNotificationWizardStep(notificationWizardPreviousStep());
 }
 
 async function copyNotificationTopic(inputId = "notification_topic_secret") {
@@ -18784,20 +18969,7 @@ async function regenerateNotificationTopic() {
   if (!window.confirm("Regenerate the notification topic secret? You will need to unsubscribe from the old topic and subscribe to the new one on every device.")) {
     return;
   }
-  const nextTopic = generateNotificationTopic();
-  await saveNotificationSettings({
-    enabled: true,
-    server_url: notificationSettings.server_url || "https://ntfy.sh",
-    topic: nextTopic,
-    priority: notificationSettings.priority || 3,
-    access_url_mode: notificationSettings.access_url_mode || "auto",
-    custom_access_url: notificationSettings.custom_access_url || "",
-    access_token: "",
-    keep_access_token: Boolean(notificationSettings.access_token_set),
-    username: notificationSettings.username || "",
-    password: "",
-    keep_password: Boolean(notificationSettings.password_set)
-  });
+  await saveNotificationSettings(notificationSettingsPayload({topic: generateNotificationTopic()}));
   setNotificationResult("Topic regenerated. Subscribe your devices to the new topic.", "success");
 }
 
@@ -21592,7 +21764,6 @@ for (const id of ["fallback_enabled", "fallback_delay", "fallback_loop_delay"]) 
 }
 
 document.getElementById("start_notification_setup").addEventListener("click", startNotificationWizard);
-document.getElementById("restart_notification_setup").addEventListener("click", startNotificationWizard);
 document.getElementById("notification_cancel").addEventListener("click", cancelNotificationWizard);
 document.getElementById("notification_back").addEventListener("click", notificationWizardBack);
 document.getElementById("notification_next").addEventListener("click", async () => {
@@ -21600,6 +21771,19 @@ document.getElementById("notification_next").addEventListener("click", async () 
     await notificationWizardNext();
   } catch (error) {
     setNotificationResult(error.message, "error");
+  }
+});
+document.getElementById("notification_finish").addEventListener("click", finishNotificationWizard);
+document.getElementById("dismiss_notification_setup").addEventListener("click", dismissNotificationSetupDialog);
+for (const link of document.querySelectorAll("#notification_setup_dialog a")) {
+  link.addEventListener("click", () => {
+    document.getElementById("notification_setup_dialog").hidden = true;
+  });
+}
+document.getElementById("notification_setup_dialog").addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    dismissNotificationSetupDialog();
   }
 });
 document.getElementById("regenerate_notification_topic").addEventListener("click", async () => {
@@ -21612,6 +21796,15 @@ document.getElementById("regenerate_notification_topic").addEventListener("click
 document.getElementById("copy_configured_notification_topic").addEventListener("click", async () => {
   await copyNotificationTopic("notification_configured_topic_secret");
 });
+for (const id of ["notification_server_mode", "notification_configured_server_url"]) {
+  document.getElementById(id).addEventListener("change", async () => {
+    try {
+      await saveNotificationServerSettings();
+    } catch (error) {
+      setNotificationResult(error.message, "error");
+    }
+  });
+}
 document.getElementById("notification_access_url_mode").addEventListener("change", async () => {
   updateNotificationCustomUrlVisibility();
   try {
@@ -21627,49 +21820,30 @@ document.getElementById("notification_custom_access_url").addEventListener("chan
     setNotificationResult(error.message, "error");
   }
 });
+document.getElementById("notification_wizard_access_url_mode").addEventListener("change", updateNotificationWizardCustomUrlVisibility);
 document.getElementById("configured_test_notifications").addEventListener("click", async event => {
   const button = event.currentTarget;
   setDisabled(button, true);
   try {
-    await testNotificationSettings({
-      enabled: true,
-      server_url: notificationSettings.server_url || "https://ntfy.sh",
-      topic: notificationSettings.topic || "",
-      priority: notificationSettings.priority || 3,
-      access_url_mode: notificationSettings.access_url_mode || "auto",
-      custom_access_url: notificationSettings.custom_access_url || "",
-      access_token: "",
-      keep_access_token: Boolean(notificationSettings.access_token_set),
-      username: notificationSettings.username || "",
-      password: "",
-      keep_password: Boolean(notificationSettings.password_set)
-    });
+    await testNotificationSettings(notificationSettingsPayload());
   } catch (error) {
     setNotificationResult(error.message, "error");
   } finally {
     setDisabled(button, false);
   }
 });
-document.getElementById("notification_wizard").addEventListener("change", event => {
-  if (event.target && event.target.name === "notification_self_hosted") {
-    notificationWizardSelfHosted = event.target.value === "yes";
-  }
+document.getElementById("copy_notification_topic").addEventListener("click", async () => {
+  await copyNotificationTopic("notification_topic_secret");
 });
-document.getElementById("notification_wizard").addEventListener("click", async event => {
-  if (event.target && event.target.id === "copy_notification_topic") {
-    await copyNotificationTopic("notification_topic_secret");
-    return;
-  }
-  if (event.target && event.target.id === "wizard_test_notifications") {
-    const button = event.target;
-    setDisabled(button, true);
-    try {
-      await testNotificationSettings(notificationPayload());
-    } catch (error) {
-      setNotificationResult(error.message, "error");
-    } finally {
-      setDisabled(button, false);
-    }
+document.getElementById("wizard_test_notifications").addEventListener("click", async event => {
+  const button = event.currentTarget;
+  setDisabled(button, true);
+  try {
+    await testNotificationSettings(notificationPayload());
+  } catch (error) {
+    setNotificationResult(error.message, "error");
+  } finally {
+    setDisabled(button, false);
   }
 });
 
@@ -21710,7 +21884,7 @@ for (const id of [
   "audio_lowpass_sharpness",
   "audio_notch_enabled",
   "audio_notch_frequency",
-  "audio_notch_sharpness"
+  "audio_notch_width"
 ]) {
   document.addEventListener("input", event => {
     if (event.target && event.target.id === id) {

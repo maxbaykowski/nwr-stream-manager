@@ -81,6 +81,21 @@ class AuthTests(unittest.TestCase):
         self.assertIn("syncSelectOptions(select, optionSpecs)", html)
         self.assertNotIn("updateSelectOptions(", html)
 
+    def test_notification_setup_matches_the_other_setup_screens(self) -> None:
+        html = self.web_control.INDEX_HTML
+
+        # The wizard ends with Finish, like Add stream, and asks where notifications should open.
+        self.assertIn('<button id="notification_finish" type="button" hidden>Finish</button>', html)
+        self.assertIn('id="notification_step_access_url"', html)
+        self.assertIn("a free, open-source notification service", html)
+        # Finishing shows a notice that screen readers are moved to.
+        self.assertIn('id="notification_setup_dialog" class="notice-dialog" role="dialog" tabindex="-1"', html)
+        self.assertIn('aria-describedby="notification_setup_streams notification_setup_rtl"', html)
+        self.assertIn("dialog.focus();", html)
+        # The server can be changed after setup; setup itself is not repeated.
+        self.assertIn('<option value="self-hosted">Self-hosted instance</option>', html)
+        self.assertNotIn("restart_notification_setup", html)
+
     def test_notification_custom_access_url_accepts_missing_scheme(self) -> None:
         settings = self.web_control.validate_notification_settings_payload(
             {

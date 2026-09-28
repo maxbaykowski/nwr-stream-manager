@@ -5,13 +5,27 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 from numpy.typing import NDArray
 
-from .config import AudioConfig, ComfortNoiseConfig, FilterConfig, IQ_SAMPLE_RATE
+from .config import (
+    AudioConfig,
+    ComfortNoiseConfig,
+    FilterConfig,
+    IQ_SAMPLE_RATE,
+    NOTCH_MIN_WIDTH_HZ,
+    NotchConfig,
+    PROTECTED_TONES_HZ,
+    PROTECTED_TONE_MAX_LOSS_DB,
+    notch_max_width,
+)
 from .deemphasis import DeemphasisFilter
 
 
-MIN_FILTER_TAPS = 5
-MIN_HIGHPASS_FILTER_TAPS = 513
-MAX_FILTER_TAPS = 1025
+FILTER_TAPS = 1025
+FILTER_DESIGN_FFT_SIZE = 16384
+# Sharpness 0 is a gentle 6 dB/octave slope; 10 is as steep as the kernel allows.
+FILTER_MIN_ORDER = 1.0
+FILTER_MAX_ORDER = 40.0
+# The kernel's own resolution widens a notch by roughly this much (added in quadrature).
+NOTCH_WINDOW_WIDTH_HZ = 50.0
 DC_BLOCK_CUTOFF_HZ = 20.0
 DC_BLOCK_VECTOR_CHUNK_SAMPLES = 4096
 NWR_DEEMPHASIS_MAKEUP_GAIN = 2.0
@@ -236,10 +250,6 @@ class AudioEffectsProcessor:
         return tuple(changed)
 
 
-def tap_count_for_sharpness(sharpness: float) -> int:
-    return _tap_count_for_sharpness(sharpness, MIN_FILTER_TAPS)
-
-
 def comfort_noise_linear_level(level_db: float) -> float:
     return float(10 ** (level_db / 20.0))
 
@@ -248,30 +258,47 @@ def deemphasis_makeup_gain(tau: float) -> float:
     return NWR_DEEMPHASIS_MAKEUP_GAIN if tau > 0 else NWR_DEEMPHASIS_DISABLED_GAIN
 
 
-def highpass_tap_count_for_sharpness(sharpness: float) -> int:
-    normalized = max(0.0, min(1.0, sharpness / 10.0))
-    taps = round(
-        MIN_HIGHPASS_FILTER_TAPS
-        + (MAX_FILTER_TAPS - MIN_HIGHPASS_FILTER_TAPS) * normalized**2.2
+def highpass_order(cutoff_hz: float, sharpness: float) -> float:
+    """Butterworth-style order; each step of 1 adds 6 dB/octave of slope."""
+    ratios = [cutoff_hz / tone for tone in PROTECTED_TONES_HZ if tone > cutoff_hz]
+    return _order_for_sharpness(sharpness, ratios)
+
+
+def lowpass_order(cutoff_hz: float, sharpness: float) -> float:
+    """Butterworth-style order; each step of 1 adds 6 dB/octave of slope."""
+    ratios = [tone / cutoff_hz for tone in PROTECTED_TONES_HZ if tone < cutoff_hz]
+    return _order_for_sharpness(sharpness, ratios)
+
+
+def notch_design_width(frequency: float, width: float) -> float:
+    """Width to design for so the heard -3 dB width matches the requested one."""
+    width = min(max(width, NOTCH_MIN_WIDTH_HZ), notch_max_width(frequency))
+    return float(np.sqrt(max(width**2 - NOTCH_WINDOW_WIDTH_HZ**2, 1.0)))
+
+
+def _order_for_sharpness(sharpness: float, tone_ratios: list[float]) -> float:
+    # Lowest order that keeps every protected tone within PROTECTED_TONE_MAX_LOSS_DB.
+    allowed = _protected_tone_power_ratio()
+    gentlest = max(
+        [FILTER_MIN_ORDER]
+        + [np.log(allowed) / (2 * np.log(ratio)) for ratio in tone_ratios if ratio < 1]
     )
-    return taps if taps % 2 else taps + 1
+    sharpest = max(gentlest, FILTER_MAX_ORDER)
+    return _interpolate_for_sharpness(sharpness, gentlest, sharpest)
 
 
-def highpass_design_cutoff(cutoff_hz: float, sharpness: float) -> float:
+def _protected_tone_power_ratio() -> float:
+    return 10 ** (PROTECTED_TONE_MAX_LOSS_DB / 10) - 1
+
+
+def _interpolate_for_sharpness(sharpness: float, gentlest: float, sharpest: float) -> float:
     normalized = max(0.0, min(1.0, sharpness / 10.0))
-    cutoff_scale = 0.2 + 0.8 * normalized**1.7
-    return max(DC_BLOCK_CUTOFF_HZ, cutoff_hz * cutoff_scale)
-
-
-def _tap_count_for_sharpness(sharpness: float, minimum_taps: int) -> int:
-    normalized = max(0.0, min(1.0, sharpness / 10.0))
-    taps = round(minimum_taps + (MAX_FILTER_TAPS - minimum_taps) * normalized**4)
-    return taps if taps % 2 else taps + 1
+    return float(gentlest * (sharpest / gentlest) ** normalized)
 
 
 def _build_filter(
     kind: str,
-    config: FilterConfig,
+    config: FilterConfig | NotchConfig,
     sample_rate: int,
 ) -> FirFilter | None:
     kernel = _filter_kernel(kind, config, sample_rate)
@@ -281,7 +308,7 @@ def _build_filter(
 def _update_or_build_filter(
     current: FirFilter | None,
     kind: str,
-    config: FilterConfig,
+    config: FilterConfig | NotchConfig,
     sample_rate: int,
 ) -> FirFilter | None:
     kernel = _filter_kernel(kind, config, sample_rate)
@@ -295,68 +322,48 @@ def _update_or_build_filter(
 
 def _filter_kernel(
     kind: str,
-    config: FilterConfig,
+    config: FilterConfig | NotchConfig,
     sample_rate: int,
 ) -> NDArray[np.float32] | None:
     if not config.enabled:
         return None
+    frequencies = np.fft.rfftfreq(FILTER_DESIGN_FFT_SIZE, 1 / sample_rate)
     if kind == "highpass":
-        taps = highpass_tap_count_for_sharpness(config.sharpness)
-        cutoff = highpass_design_cutoff(config.frequency, config.sharpness)
-        return _highpass_kernel(cutoff, sample_rate, taps)
-    taps = tap_count_for_sharpness(config.sharpness)
+        order = highpass_order(config.frequency, config.sharpness)
+        with np.errstate(divide="ignore", over="ignore"):
+            magnitude = 1 / np.sqrt(1 + (config.frequency / frequencies) ** (2 * order))
+        return _kernel_from_magnitude(magnitude, FILTER_TAPS)
     if kind == "lowpass":
         if config.frequency >= sample_rate / 2:
             return None
-        return _lowpass_kernel(config.frequency, sample_rate, taps)
+        order = lowpass_order(config.frequency, config.sharpness)
+        with np.errstate(over="ignore"):
+            magnitude = 1 / np.sqrt(1 + (frequencies / config.frequency) ** (2 * order))
+        kernel = _kernel_from_magnitude(magnitude, FILTER_TAPS)
+        return (kernel / np.sum(kernel)).astype(np.float32)
     if kind == "notch":
-        width = _notch_width(config.sharpness)
-        low = max(1.0, config.frequency - width / 2)
-        high = min(sample_rate / 2 - 1.0, config.frequency + width / 2)
-        if high <= low:
+        if not 0 < config.frequency < sample_rate / 2:
             return None
-        return _notch_kernel(low, high, sample_rate, taps)
+        q = config.frequency / notch_design_width(config.frequency, config.width)
+        distance = frequencies**2 - config.frequency**2
+        magnitude = np.abs(distance) / np.sqrt(
+            distance**2 + (frequencies * config.frequency / q) ** 2
+        )
+        kernel = _kernel_from_magnitude(magnitude, FILTER_TAPS).astype(np.float64)
+        return _deepen_null(kernel, config.frequency / sample_rate).astype(np.float32)
     raise ValueError(f"unsupported filter kind: {kind}")
 
 
-def _notch_width(sharpness: float) -> float:
-    return 400.0 - 340.0 * (sharpness / 10.0)
-
-
-def _lowpass_kernel(
-    cutoff_hz: float,
-    sample_rate: int,
-    taps: int,
-) -> NDArray[np.float32]:
-    cutoff = cutoff_hz / sample_rate
-    center = (taps - 1) / 2
-    n = np.arange(taps, dtype=np.float64)
-    kernel = 2 * cutoff * np.sinc(2 * cutoff * (n - center))
-    kernel *= np.hamming(taps)
-    kernel /= np.sum(kernel)
+def _kernel_from_magnitude(magnitude: NDArray[np.float64], taps: int) -> NDArray[np.float32]:
+    """Linear-phase kernel that follows an analog-style magnitude curve."""
+    impulse = np.fft.irfft(magnitude, FILTER_DESIGN_FFT_SIZE)
+    kernel = np.roll(impulse, taps // 2)[:taps] * np.hamming(taps)
     return kernel.astype(np.float32)
 
 
-def _highpass_kernel(
-    cutoff_hz: float,
-    sample_rate: int,
-    taps: int,
-) -> NDArray[np.float32]:
-    lowpass = _lowpass_kernel(cutoff_hz, sample_rate, taps)
-    highpass = -lowpass
-    highpass[taps // 2] += 1.0
-    return highpass.astype(np.float32)
-
-
-def _notch_kernel(
-    low_hz: float,
-    high_hz: float,
-    sample_rate: int,
-    taps: int,
-) -> NDArray[np.float32]:
-    lowpass_low = _lowpass_kernel(low_hz, sample_rate, taps)
-    lowpass_high = _lowpass_kernel(high_hz, sample_rate, taps)
-    bandpass = lowpass_high - lowpass_low
-    notch = -bandpass
-    notch[taps // 2] += 1.0
-    return notch.astype(np.float32)
+def _deepen_null(kernel: NDArray[np.float64], center: float) -> NDArray[np.float64]:
+    # Windowing leaves a little of the notch frequency behind; remove exactly that much.
+    n = np.arange(len(kernel), dtype=np.float64) - len(kernel) // 2
+    carrier = np.cos(2 * np.pi * center * n)
+    correction = carrier * np.hamming(len(kernel))
+    return kernel - (kernel @ carrier) * correction / (correction @ carrier)
