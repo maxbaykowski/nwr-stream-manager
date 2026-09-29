@@ -8,6 +8,7 @@ import threading
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import numpy as np
@@ -179,6 +180,93 @@ class RemoteSdrNetworkTests(unittest.TestCase):
 
         self.assertEqual(targets, ["255.255.255.255", "192.168.1.255", "10.0.0.255", "100.105.221.80", "127.0.0.1"])
         self.assertEqual(addresses, {"tailscale": "100.113.206.20", "lan": ["192.168.1.79", "10.0.0.5"]})
+
+
+class SilentHostTests(unittest.TestCase):
+    """A host that loses power never closes its connections; the client must notice anyway."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.remote = load_remote_sdr()
+
+    def wait_until(self, condition, seconds=3.0) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if condition():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_client_gives_up_on_a_control_connection_that_goes_silent(self) -> None:
+        remote = self.remote
+
+        class SilentConnection:
+            sock = types.SimpleNamespace(getpeername=lambda: ("192.0.2.10", remote.REMOTE_SDR_TCP_PORT))
+
+            def recv_json(self, timeout=None):
+                # Nothing ever arrives and the connection never closes.
+                time.sleep(3600 if timeout is None else timeout)
+                raise TimeoutError("no remote SDR message arrived in time")
+
+            def close(self):
+                pass
+
+        dropped = []
+
+        class Feed:
+            def drop_connection(self):
+                dropped.append(True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            hosts = remote.PairedDeviceStore(Path(directory) / "hosts.json")
+            client = remote.RemoteSdrClient("host-id", hosts, client_id="client-id")
+            client.connect = lambda role, **params: SilentConnection()
+            client.fanouts.add(Feed())
+            with (
+                unittest.mock.patch.object(remote, "CONTROL_IDLE_TIMEOUT_SECONDS", 0.2),
+                self.assertLogs(remote.LOG, level="WARNING") as logs,
+            ):
+                client.start()
+                try:
+                    gave_up = self.wait_until(lambda: dropped and not client.status()["reachable"])
+                finally:
+                    client.stop()
+
+        # The fake reconnects at once, which clears the error, so check what was reported.
+        self.assertTrue(gave_up)
+        self.assertTrue(any("stopped responding" in line for line in logs.output), logs.output)
+
+    def test_iq_feed_reconnects_when_its_connection_goes_silent(self) -> None:
+        remote = self.remote
+        connects = []
+
+        class SilentConnection:
+            def recv_frame(self, timeout=None):
+                time.sleep(3600 if timeout is None else timeout)
+                raise TimeoutError("no remote SDR message arrived in time")
+
+            def send_json(self, message):
+                pass
+
+            def close(self):
+                pass
+
+        client = types.SimpleNamespace(
+            connect=lambda role, **params: connects.append(role) or SilentConnection(),
+            forget_fanout=lambda fanout: None,
+        )
+        fanout = remote.RemoteIqFanout(client, remote.REMOTE_SDR_ROLE_CHANNEL, {"frequency_hz": 162_475_000}, name="test")
+        with (
+            unittest.mock.patch.object(remote, "REMOTE_IQ_IDLE_TIMEOUT_SECONDS", 0.2),
+            unittest.mock.patch.object(remote, "RECONNECT_MIN_SECONDS", 0.05),
+        ):
+            fanout.subscribe()
+            try:
+                reconnected = self.wait_until(lambda: len(connects) >= 2)
+            finally:
+                fanout.stop()
+
+        self.assertTrue(reconnected)
 
 
 class IqJitterBufferTests(unittest.TestCase):

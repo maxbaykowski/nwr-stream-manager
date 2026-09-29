@@ -7,17 +7,33 @@ from numpy.typing import NDArray
 
 
 PCM_SCALE = 32768.0
-NWR_DEEMPHASIS_LOW_HZ = 300.0
-NWR_DEEMPHASIS_HIGH_HZ = 3000.0
-NWR_DEEMPHASIS_LOW_SHELF_END_HZ = 700.0
-NWR_DEEMPHASIS_LOW_SHELF_GAIN = 0.68
-NWR_DEEMPHASIS_POST_HIGH_ROLLOFF = 3.5
-NWR_DEEMPHASIS_MID_DIP_HZ = 1000.0
-NWR_DEEMPHASIS_MID_DIP_GAIN = 0.82
-NWR_DEEMPHASIS_MID_DIP_OCTAVES = 1.15
-NWR_DEEMPHASIS_PRESENCE_HZ = 2200.0
-NWR_DEEMPHASIS_PRESENCE_GAIN = 1.50
-NWR_DEEMPHASIS_PRESENCE_OCTAVES = 0.40
+# The receive curve as levels in dB relative to 1 kHz, joined smoothly on a log-frequency axis.
+# Tune by ear here: each row is a frequency in Hz and its level in dB.
+NWR_DEEMPHASIS_VOICING: tuple[tuple[float, float], ...] = (
+    (20.0, 8.5),
+    (100.0, 8.5),
+    (200.0, 9.2),
+    (250.0, 9.3),
+    (300.0, 9.0),
+    (400.0, 7.7),
+    (500.0, 6.0),
+    (600.0, 4.6),
+    (700.0, 3.2),
+    (850.0, 1.4),
+    (1000.0, 0.0),
+    (1250.0, -1.3),
+    (1600.0, -2.9),
+    (2000.0, -4.4),
+    (2500.0, -6.2),
+    (3000.0, -8.2),
+    (3500.0, -10.5),
+    (4000.0, -13.2),
+    (5000.0, -19.3),
+    (6000.0, -25.1),
+    (8000.0, -34.6),
+    (12000.0, -48.0),
+)
+NWR_DEEMPHASIS_1KHZ_DB = -12.1
 NWR_DEEMPHASIS_TAPS = 257
 
 
@@ -103,38 +119,16 @@ def generate_nwr_deemphasis_curve(
 ) -> NDArray[np.float32]:
     """Return the fixed NOAA Weather Radio receive de-emphasis FIR.
 
-    NWR transmit audio is pre-emphasized at +6 dB/octave from 300 Hz
-    through 3000 Hz. The receive side applies the inverse -6 dB/octave
-    curve across that full range, with additional receiver-like shaping
-    at the low and high ends.
+    NWR transmit audio is pre-emphasized at +6 dB/octave from 300 Hz through
+    3000 Hz, and a receiver applies the inverse. A plain inverse slope sounds
+    muffled, so the curve is voiced from NWR_DEEMPHASIS_VOICING instead.
 
-    A practical weather-radio receiver still needs to keep demodulated
-    wideband hiss from sitting on a flat shelf above 3000 Hz. Above the
-    specified pre-emphasis range, continue with a noise taper instead of
-    a sharp lowpass so upper speech detail remains audible while hiss is
-    still pushed down. A wider low shelf keeps the 250-350 Hz region from
-    sounding too forward without removing the low-frequency body entirely.
-
-    The inverse slope alone leaves the voice sounding muffled: the band
-    the slope favours most, roughly 500-1500 Hz, dominates while the
-    consonant range sits far too low. Two gentle log-symmetric bells
-    correct that balance. A shallow dip around 1 kHz pulls the midrange
-    back by about 1.5 dB, and a presence bell restores the upper speech
-    band so consonants come through.
-
-    Where that presence bell sits matters more than how tall it is. NWR
-    voice detail that actually carries intelligibility lives around
-    1800-2600 Hz; by 3-4 kHz the channel holds mostly demodulated hiss,
-    because the transmit pre-emphasis stops at 3000 Hz and the source
-    audio is band-limited not far above it. A bell centred near 3 kHz
-    therefore buys very little clarity while making the 3-4 kHz region
-    audibly hot. So the bell is centred at 2200 Hz and kept modest: it
-    adds a little over 2 dB through 1800-2600 Hz relative to a plain
-    inverse slope, holds the 3 kHz excess to under 4 dB, and lets the
-    post-3000 Hz taper dominate from there out. The result falls
-    monotonically from the bell peak to Nyquist rather than shelving off
-    and recovering higher up. Overall gain is normalized conservatively
-    to avoid introducing clipping.
+    Above 1 kHz the slope steepens steadily, from about -4 dB/octave through the
+    speech band to about -20 dB/octave well above 3 kHz, where the channel holds
+    mostly demodulated hiss. It must not flatten out and then drop away: a level
+    stretch ending in a steep roll-off is heard as a peak at its edge. Nor may it
+    fall and then shelve back up. The levels are joined with a monotone cubic on
+    a log-frequency axis, so the curve never overshoots between table rows.
     """
     if sample_rate <= 0:
         raise ValueError("sample_rate must be greater than 0")
@@ -143,50 +137,15 @@ def generate_nwr_deemphasis_curve(
     taps = int(taps)
     if taps % 2 == 0:
         taps += 1
-    nyquist = sample_rate / 2.0
-    if nyquist <= NWR_DEEMPHASIS_LOW_HZ:
-        return np.array([1.0], dtype=np.float32)
 
     nfft = 1
     while nfft < taps * 16:
         nfft *= 2
     frequencies = np.fft.rfftfreq(nfft, d=1.0 / float(sample_rate))
-    high_hz = min(NWR_DEEMPHASIS_HIGH_HZ, nyquist)
-    high_gain = NWR_DEEMPHASIS_LOW_HZ / high_hz
-    response = np.ones_like(frequencies, dtype=np.float64)
-    sloped = (frequencies > NWR_DEEMPHASIS_LOW_HZ) & (frequencies < high_hz)
-    response[sloped] = NWR_DEEMPHASIS_LOW_HZ / frequencies[sloped]
-    low_shelf = frequencies < NWR_DEEMPHASIS_LOW_SHELF_END_HZ
-    if np.any(low_shelf):
-        shelf_progress = np.clip(
-            frequencies[low_shelf] / NWR_DEEMPHASIS_LOW_SHELF_END_HZ,
-            0.0,
-            1.0,
-        )
-        smooth = shelf_progress * shelf_progress * (3.0 - 2.0 * shelf_progress)
-        response[low_shelf] *= (
-            NWR_DEEMPHASIS_LOW_SHELF_GAIN
-            + (1.0 - NWR_DEEMPHASIS_LOW_SHELF_GAIN) * smooth
-        )
-    above_high = frequencies >= high_hz
-    if np.any(above_high):
-        post_high_ratio = np.maximum(frequencies[above_high], high_hz) / high_hz
-        response[above_high] = high_gain / np.power(
-            post_high_ratio,
-            NWR_DEEMPHASIS_POST_HIGH_ROLLOFF,
-        )
-    response *= _log_bell(
-        frequencies,
-        NWR_DEEMPHASIS_MID_DIP_HZ,
-        NWR_DEEMPHASIS_MID_DIP_GAIN,
-        NWR_DEEMPHASIS_MID_DIP_OCTAVES,
-    )
-    response *= _log_bell(
-        frequencies,
-        NWR_DEEMPHASIS_PRESENCE_HZ,
-        NWR_DEEMPHASIS_PRESENCE_GAIN,
-        NWR_DEEMPHASIS_PRESENCE_OCTAVES,
-    )
+    table_hz = np.log2([hz for hz, _level in NWR_DEEMPHASIS_VOICING])
+    table_db = np.array([level for _hz, level in NWR_DEEMPHASIS_VOICING])
+    levels_db = _monotone_cubic(table_hz, table_db, np.log2(np.maximum(frequencies, 1.0)))
+    response = np.power(10.0, (levels_db + NWR_DEEMPHASIS_1KHZ_DB) / 20.0)
 
     impulse = np.fft.irfft(response, n=nfft)
     centered = np.fft.fftshift(impulse)
@@ -200,18 +159,33 @@ def generate_nwr_deemphasis_curve(
     return kernel.astype(np.float32)
 
 
-def _log_bell(
-    frequencies: NDArray[np.float64],
-    center_hz: float,
-    gain: float,
-    octaves: float,
+def _monotone_cubic(
+    x: NDArray[np.float64],
+    y: NDArray[np.float64],
+    points: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Return a peaking/dipping bell that is symmetric on a log-frequency axis.
-
-    ``gain`` is the multiplier at ``center_hz`` and ``octaves`` is the
-    Gaussian width, so the shape stays the same regardless of sample rate.
-    """
-    if gain == 1.0 or octaves <= 0.0 or center_hz <= 0.0:
-        return np.ones_like(frequencies, dtype=np.float64)
-    distance = np.log2(np.maximum(frequencies, 1e-6) / center_hz) / octaves
-    return 1.0 + (gain - 1.0) * np.exp(-0.5 * distance * distance)
+    """Fritsch-Carlson monotone cubic interpolation, held flat past either end."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    widths = np.diff(x)
+    slopes = np.diff(y) / widths
+    tangents = np.empty_like(y)
+    tangents[0] = slopes[0]
+    tangents[-1] = slopes[-1]
+    for i in range(1, len(x) - 1):
+        if slopes[i - 1] * slopes[i] <= 0.0:
+            tangents[i] = 0.0
+        else:
+            before = 2.0 * widths[i] + widths[i - 1]
+            after = widths[i] + 2.0 * widths[i - 1]
+            tangents[i] = (before + after) / (before / slopes[i - 1] + after / slopes[i])
+    points = np.clip(points, x[0], x[-1])
+    index = np.clip(np.searchsorted(x, points) - 1, 0, len(x) - 2)
+    width = widths[index]
+    t = (points - x[index]) / width
+    return (
+        (2 * t**3 - 3 * t**2 + 1) * y[index]
+        + (t**3 - 2 * t**2 + t) * width * tangents[index]
+        + (-2 * t**3 + 3 * t**2) * y[index + 1]
+        + (t**3 - t**2) * width * tangents[index + 1]
+    )

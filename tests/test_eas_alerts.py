@@ -6,6 +6,7 @@ import importlib
 import json
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -2099,13 +2100,7 @@ class EasAlertTests(unittest.TestCase):
         gain_100 = gain_at(100.0)
         gain_300 = gain_at(300.0)
         gain_1000 = gain_at(1000.0)
-        gain_1800 = gain_at(1800.0)
-        gain_2200 = gain_at(2200.0)
-        gain_2600 = gain_at(2600.0)
-        gain_3000 = gain_at(3000.0)
         gain_3500 = gain_at(3500.0)
-        gain_4000 = gain_at(4000.0)
-        gain_4500 = gain_at(4500.0)
         gain_6000 = gain_at(6000.0)
         gain_8000 = gain_at(8000.0)
 
@@ -2117,37 +2112,34 @@ class EasAlertTests(unittest.TestCase):
         self.assertLess(gain_300, 0.78)
         self.assertLess(gain_100, gain_300)
 
-        # The midrange dip keeps the 1 kHz region from dominating.
+        # The inverse pre-emphasis slope keeps 1 kHz well below the low end.
         self.assertLess(gain_1000, gain_300 * 0.40)
         self.assertGreater(gain_1000, gain_300 * 0.30)
 
-        # The presence bell holds up the 1800-2600 Hz band that actually
-        # carries intelligibility, so speech does not sound muffled.
-        self.assertGreater(gain_1800, gain_1000 * 0.72)
-        self.assertLess(gain_1800, gain_1000 * 0.90)
-        self.assertGreater(gain_2200, gain_1000 * 0.65)
+        def db_per_octave(low_hz: float, high_hz: float) -> float:
+            return 20.0 * np.log10(gain_at(high_hz) / gain_at(low_hz)) / np.log2(high_hz / low_hz)
 
-        # That lift has to be centred in the speech band, not up in the
-        # 3-4 kHz range where the channel carries mostly hiss.
-        self.assertGreater(gain_1800, gain_2600)
-        self.assertLess(gain_3000, gain_300 * 0.20)
-        self.assertGreater(gain_3000, gain_300 * 0.12)
+        # No level stretch through the speech band: a flat run that ends in a steep
+        # roll-off is heard as a peak around 2 kHz.
+        steps = [1200.0 * 2 ** (i / 6) for i in range(0, 19)]
+        slopes = [db_per_octave(low, high) for low, high in zip(steps, steps[1:])]
+        speech = [slope for low, slope in zip(steps, slopes) if low < 2500.0]
+        self.assertLess(max(speech), -3.0)
+        # Past it, the slope steepens gradually rather than falling off a cliff.
+        self.assertGreater(min(slopes), -24.0)
+        self.assertLess(max(abs(b - a) for a, b in zip(slopes, slopes[1:])), 5.0)
+        self.assertLess(gain_2000 := gain_at(2000.0), gain_1000 * 10 ** (-3.5 / 20))
+        self.assertGreater(gain_2000, gain_1000 * 10 ** (-6.0 / 20))
 
-        # Above the pre-emphasis range the taper has to dominate, or the
-        # 3-4 kHz region stands out on voice.
-        self.assertLess(gain_4000, gain_3000 * 0.40)
-        self.assertLess(gain_4500, gain_3500 * 0.45)
-
-        # Hiss further up still falls away hard, so the recovered speech
-        # band does not come with high-pitched static.
-        self.assertLess(gain_6000, gain_3000 * 0.10)
-        self.assertGreater(gain_6000, gain_3000 * 0.02)
+        # The 3-4 kHz region, mostly hiss, stays well down, and higher still falls away hard.
+        self.assertLess(gain_3500, gain_1000 * 10 ** (-9.0 / 20))
+        self.assertLess(gain_6000, gain_1000 * 10 ** (-22.0 / 20))
         self.assertLess(gain_8000, gain_6000 * 0.45)
         self.assertLess(float(np.max(response)), 1.0)
 
-        # Above the presence peak the curve must fall away smoothly all
-        # the way out rather than rolling off and shelving back up.
-        upper = response[(freqs >= 2200.0) & (freqs <= 11500.0)]
+        # Above 300 Hz the curve must fall all the way out rather than rolling off
+        # and shelving back up.
+        upper = response[(freqs >= 300.0) & (freqs <= 11500.0)]
         rise_db = 20.0 * np.log10(upper / np.minimum.accumulate(upper))
         self.assertLess(float(np.max(rise_db)), 0.5)
 
@@ -2367,6 +2359,148 @@ class EasAlertTests(unittest.TestCase):
         frame = self.web_control.next_web_fallback_frame(audio, state, loop_delay_seconds=0)
 
         self.assertEqual(len(frame), self.web_control.STREAM_FRAME_BYTES)
+
+    def test_listeners_are_told_when_the_server_shuts_down(self) -> None:
+        web_control = self.web_control
+        handler = object.__new__(web_control.RtlControlHandler)
+        handler.service = types.SimpleNamespace(shutting_down=threading.Event())
+        handler.service.shutting_down.set()
+        sent = []
+
+        class Writer:
+            def send_json(self, payload):
+                sent.append(("json", payload))
+
+            def send_close(self, code, reason=""):
+                sent.append(("close", code))
+
+        source = types.SimpleNamespace(audio_source=types.SimpleNamespace(underrun_frames=0, closed=threading.Event()))
+
+        handler._stream_live_audio_websocket(
+            Writer(), source, types.SimpleNamespace(), encoder=None, codec="pcm", mode="monitor", client_id="c"
+        )
+
+        self.assertEqual(sent, [("json", {"type": "server_shutdown"}), ("close", 1012)])
+
+    def test_stop_signal_warns_listeners_before_shutting_down(self) -> None:
+        web_control = self.web_control
+        order = []
+        server = types.SimpleNamespace(shutdown=lambda: order.append("http shutdown"))
+        previous = web_control.install_shutdown_signal_handlers(server, lambda: order.append("warn listeners"))
+        try:
+            web_control.signal.getsignal(web_control.signal.SIGTERM)(web_control.signal.SIGTERM, None)
+            deadline = time.monotonic() + 2.0
+            while len(order) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            web_control.restore_signal_handlers(previous)
+
+        self.assertEqual(order, ["warn listeners", "http shutdown"])
+
+    def test_page_waits_for_the_server_and_reloads_when_it_is_back(self) -> None:
+        html = self.web_control.INDEX_HTML
+
+        self.assertIn('<div id="server_unavailable_dialog" class="fullscreen-dialog" role="alertdialog"', html)
+        self.assertIn('if (message.type === "server_shutdown") {', html)
+        self.assertIn('fetch("/api/setup-state", {cache: "no-store"})', html)
+        # Unfinished work is never thrown away by an automatic reload.
+        self.assertIn("if (hasUnsavedNavigationState()) {", html)
+        self.assertIn("window.location.reload();", html)
+        self.assertIn('<button id="resume_listening" type="button">Resume listening</button>', html)
+        # Starting to listen by any route (new or resumed monitor or receiver) retires the offer.
+        self.assertEqual(html.count("hideResumeListeningOffer();"), 4)
+
+    def test_stop_capture_releases_the_service_lock_before_stopping_workers(self) -> None:
+        web_control = self.web_control
+        service = object.__new__(web_control.RtlControlService)
+        service.lock = threading.RLock()
+        service.drain_stop = threading.Event()
+        service.monitor_queue = web_control.queue.Queue(maxsize=4)
+        service.iq_recorder = None
+        service.preview_streams = {}
+        service.intermediate_fanout = None
+        service.raw_fanout = None
+        service.capture = None
+        service.iq_file_source_config = None
+        service.drain_thread = None
+        service.monitor_streams_by_client = {}
+        service.monitor_accounts_by_client = {}
+        service.receiver_accounts_by_client = {}
+        acquired = []
+
+        class Worker:
+            # A worker's thread reads settings under the service lock while it runs.
+            def stop(self) -> None:
+                def read_settings() -> None:
+                    got_lock = service.lock.acquire(timeout=1.0)
+                    acquired.append(got_lock)
+                    if got_lock:
+                        service.lock.release()
+
+                thread = threading.Thread(target=read_settings)
+                thread.start()
+                thread.join(timeout=2.0)
+
+        service.stream_workers = {"a": Worker(), "b": Worker()}
+        service.receiver_workers = {"rx": Worker()}
+        started = time.monotonic()
+
+        service.stop_capture()
+
+        self.assertEqual(acquired, [True, True, True])
+        self.assertLess(time.monotonic() - started, 0.9)
+        self.assertEqual(service.stream_workers, {})
+        self.assertEqual(service.receiver_workers, {})
+
+    def test_workers_stop_together_instead_of_one_after_another(self) -> None:
+        stopped = []
+
+        class SlowWorker:
+            def stop(self) -> None:
+                time.sleep(0.3)
+                stopped.append(self)
+
+        workers = [SlowWorker(), SlowWorker(), SlowWorker()]
+        started = time.monotonic()
+
+        self.web_control.stop_workers_together(workers)
+
+        self.assertEqual(len(stopped), 3)
+        self.assertLess(time.monotonic() - started, 0.6)
+
+    def test_queue_wakeup_is_never_mistaken_for_data(self) -> None:
+        web_control = self.web_control
+        items = web_control.queue.Queue(maxsize=3)
+        items.put("older")
+        web_control.wake_queue(items)
+        items.put("newest")
+        web_control.wake_queue(items)
+        # A full queue already wakes its reader, so waking it must not fail.
+        web_control.wake_queue(items)
+
+        self.assertEqual(web_control.drain_queue_to_latest(items, "first"), "newest")
+
+    def test_iq_fanout_stops_without_waiting_out_its_poll(self) -> None:
+        web_control = self.web_control
+
+        class RawFanout:
+            generation = 0
+
+            def subscribe(self, max_chunks=None, max_seconds=None, name="subscriber"):
+                return web_control.queue.Queue(maxsize=8)
+
+            def unsubscribe(self, subscriber) -> None:
+                pass
+
+        fanout = web_control.IntermediateIqFanout(RawFanout())
+        fanout.start()
+        time.sleep(0.05)
+        started = time.monotonic()
+
+        fanout.stop()
+
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertFalse(fanout.thread.is_alive())
 
     def test_icecast_outputs_with_same_encoding_share_encoder_group(self) -> None:
         web_control = self.web_control

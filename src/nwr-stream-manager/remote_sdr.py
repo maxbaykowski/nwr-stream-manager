@@ -87,8 +87,17 @@ HANDSHAKE_TIMEOUT_SECONDS = 10.0
 CONTROL_STATUS_INTERVAL_SECONDS = 1.0
 CONTROL_REQUEST_TIMEOUT_SECONDS = 10.0
 SOCKET_IO_TIMEOUT_SECONDS = 15.0
+# A host that loses power never closes its connections, so silence is the only sign it is
+# gone. The host sends status every CONTROL_STATUS_INTERVAL_SECONDS; after this long with
+# nothing, give up on the connection and reconnect.
+CONTROL_IDLE_TIMEOUT_SECONDS = 10.0
+# IQ arrives continuously while the host's SDR runs. This is a backstop: losing the control
+# connection already drops the IQ feeds.
+REMOTE_IQ_IDLE_TIMEOUT_SECONDS = 15.0
 RECONNECT_MIN_SECONDS = 1.0
-RECONNECT_MAX_SECONDS = 15.0
+# Kept short so a returning host is picked up within seconds; each attempt is only a
+# connection try and one discovery broadcast.
+RECONNECT_MAX_SECONDS = 5.0
 DISCOVERY_TIMEOUT_SECONDS = 2.0
 DISCOVERY_SEND_ROUNDS = 3  # Wi-Fi drops broadcast packets; ask more than once
 DISCOVERY_ROUND_SPACING_SECONDS = 0.3
@@ -1629,7 +1638,10 @@ class RemoteSdrClient:
                 self.error = ""
             try:
                 while not self.stop_event.is_set():
-                    message = connection.recv_json()
+                    try:
+                        message = connection.recv_json(timeout=CONTROL_IDLE_TIMEOUT_SECONDS)
+                    except TimeoutError as exc:
+                        raise ConnectionError("the remote SDR stopped responding") from exc
                     kind = message.get("type")
                     if kind == "status":
                         status = message.get("status") if isinstance(message.get("status"), dict) else {}
@@ -1648,10 +1660,19 @@ class RemoteSdrClient:
                 if not self.stop_event.is_set():
                     LOG.warning("remote SDR control connection lost: %s", exc)
                     self._set_unreachable(str(exc))
+                    # The IQ feeds ride on the same host; if it vanished they are dead too,
+                    # and may never notice on their own if its connections went silent.
+                    self._drop_feed_connections()
             finally:
                 with self.lock:
                     self.connection = None
                 connection.close()
+
+    def _drop_feed_connections(self) -> None:
+        with self.lock:
+            fanouts = list(self.fanouts)
+        for fanout in fanouts:
+            fanout.drop_connection()
 
     def _set_unreachable(self, error: str) -> None:
         with self.lock:
@@ -1684,7 +1705,10 @@ class RemoteSdrClient:
             self.fanouts.discard(fanout)
 
     def wideband_fanout(self, sample_rate: int, name: str = "wideband") -> "RemoteIqFanout":
-        return RemoteIqFanout(self, REMOTE_SDR_ROLE_WIDEBAND, {"sample_rate": int(sample_rate)}, name=name)
+        fanout = RemoteIqFanout(self, REMOTE_SDR_ROLE_WIDEBAND, {"sample_rate": int(sample_rate)}, name=name)
+        with self.lock:
+            self.fanouts.add(fanout)
+        return fanout
 
 
 class IqJitterBuffer:
@@ -1880,6 +1904,13 @@ class RemoteIqFanout:
                 pass
             connection.close()
 
+    def drop_connection(self) -> None:
+        """Close the current IQ connection so the feed reconnects."""
+        with self.lock:
+            connection = self.connection
+        if connection is not None:
+            connection.close()
+
     def set_buffer_seconds(self, seconds: float) -> None:
         if self.jitter is None:
             return
@@ -1943,7 +1974,10 @@ class RemoteIqFanout:
                 connection.send_json({"type": "retune", "frequency_hz": pending_frequency})
             try:
                 while not self.stop_event.is_set():
-                    kind, payload = connection.recv_frame()
+                    try:
+                        kind, payload = connection.recv_frame(timeout=REMOTE_IQ_IDLE_TIMEOUT_SECONDS)
+                    except TimeoutError as exc:
+                        raise ConnectionError("no IQ arrived from the remote SDR") from exc
                     if kind != FRAME_IQ:
                         continue
                     _sequence, sample_rate, center, _host_time, _host_generation, samples = decode_iq_frame(payload)

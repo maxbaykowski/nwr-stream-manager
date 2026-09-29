@@ -1540,7 +1540,7 @@ class AuthTests(unittest.TestCase):
         service = object.__new__(self.web_control.RtlControlService)
         service.lock = self.web_control.threading.RLock()
         service.capture = None
-        service.settings = self.web_control.RtlControlSettings()
+        service.settings = self.web_control.RtlControlSettings(notify_sdr_failures=True)
         service._effective_settings_locked = lambda: service.settings
         service.raw_fanout = None
         service.intermediate_fanout = None
@@ -1573,6 +1573,52 @@ class AuthTests(unittest.TestCase):
         status = service.status(read_only=True)
 
         self.assertEqual(status["test_mode"], {"active": False})
+        # Notification settings are for the owner and administrators only.
+        self.assertEqual(status["notifications"], {})
+        self.assertNotIn("notify_sdr_failures", status["settings"])
+
+    def test_only_owners_and_administrators_reach_notification_settings(self) -> None:
+        web_control = self.web_control
+        paths = [
+            ("GET", "/api/notification-settings"),
+            ("GET", "/api/notification-access-urls"),
+            ("PATCH", "/api/notification-settings"),
+            ("PATCH", "/api/stream-notifications"),
+            ("POST", "/api/notification-test"),
+        ]
+        for role, allowed in (
+            (web_control.ACCOUNT_ROLE_OWNER, True),
+            (web_control.ACCOUNT_ROLE_ADMIN, True),
+            (web_control.ACCOUNT_ROLE_READ_ONLY, False),
+        ):
+            account = web_control.AccountRecord(1, "someone", role, False, 0.0, None)
+            for method, path in paths:
+                handler = object.__new__(web_control.RtlControlHandler)
+                refused = []
+                handler._send_json = lambda payload, status=web_control.HTTPStatus.OK: refused.append(status)
+                self.assertEqual(
+                    handler._account_authorized_or_response(path, method, account), allowed, (role, method, path)
+                )
+                if not allowed:
+                    self.assertEqual(refused, [web_control.HTTPStatus.FORBIDDEN])
+
+    def test_notification_topic_is_never_written_to_the_log(self) -> None:
+        web_control = self.web_control
+        topic = "private-topic-name-123"
+        service = object.__new__(web_control.RtlControlService)
+        service.lock = threading.RLock()
+        service.notification_settings = web_control.WebNotificationSettings()
+        service.status = lambda: {}
+        service._notification_access_url_options = lambda: []
+        service.notification_effective_access_url_for_settings = lambda settings: "http://nwr.example"
+        with tempfile.TemporaryDirectory() as directory:
+            service.notification_state_path = Path(directory) / "notifications.json"
+            with self.assertLogs(web_control.LOG, level="INFO") as logs:
+                service.update_notification_settings({"enabled": True, "server_url": "https://ntfy.sh", "topic": topic})
+                with patch.object(web_control, "send_ntfy_notification", lambda *args, **kwargs: None):
+                    service.test_notification_settings({"topic": topic})
+
+        self.assertFalse(any(topic in line for line in logs.output), logs.output)
 
     def test_webrtc_client_controls_require_matching_account(self) -> None:
         service = object.__new__(self.web_control.RtlControlService)

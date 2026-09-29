@@ -33,7 +33,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
@@ -403,6 +403,9 @@ READ_ONLY_RESTRICTED_NOTIFICATION_VIEWS = {
 }
 STREAM_TEST_MODE_HEARTBEAT_TIMEOUT_SECONDS = 12.0
 STREAM_TEST_MODE_TIME_LIMIT_REASON = "time limit reached"
+# WebSocket close code 1012 means the server is restarting; browsers treat it as a clean close.
+LIVE_AUDIO_SHUTDOWN_CLOSE_CODE = 1012
+LIVE_AUDIO_SHUTDOWN_NOTICE_SECONDS = 0.5
 STREAM_TEST_MODE_DEVIATION_HZ = 5_000.0
 STREAM_TEST_MODE_NOISE_DBFS = -68.0
 STREAM_TEST_MODE_MIN_SIGNAL_DBFS = -80.0
@@ -1483,6 +1486,7 @@ class IntermediateIqFanout:
     def stop(self) -> None:
         self.stop_event.set()
         self.raw_fanout.unsubscribe(self.raw_queue)
+        wake_queue(self.raw_queue)
         if self.thread is not None:
             self.thread.join(timeout=2.0)
 
@@ -1527,6 +1531,8 @@ class IntermediateIqFanout:
                 continue
             except Exception as exc:
                 LOG.warning("intermediate IQ fanout failed to read RTL-SDR samples: %s", exc)
+                continue
+            if raw_batch is QUEUE_WAKEUP:
                 continue
             current_raw_generation = getattr(self.raw_fanout, "generation", raw_generation)
             incoming_generation = batch_generation(raw_batch)
@@ -2167,13 +2173,44 @@ class LocalSdrRemoteBackend:
         return HostWidebandSource(fanout_for, sample_rate, self.service._alias_filter_strength, name)
 
 
+def stop_workers_together(workers: list[Any]) -> None:
+    """Stop workers at the same time; each one's stop waits on its own threads."""
+    if len(workers) == 1:
+        workers[0].stop()
+        return
+    threads = [threading.Thread(target=worker.stop, name="worker-stop", daemon=True) for worker in workers]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+
+# Put on a worker's queue when it is told to stop, so a thread blocked waiting for data
+# wakes at once instead of at the end of its polling timeout.
+QUEUE_WAKEUP = object()
+
+
+def wake_queue(target: queue.Queue | None) -> None:
+    if target is None:
+        return
+    try:
+        target.put_nowait(QUEUE_WAKEUP)
+    except queue.Full:
+        pass  # A full queue already wakes its reader.
+    except Exception:
+        # Waking is only a speed-up; it must never stop a shutdown from finishing.
+        LOG.debug("could not wake queue while stopping", exc_info=True)
+
+
 def drain_queue_to_latest(source: queue.Queue, first_item: Any) -> Any:
     latest = first_item
     while True:
         try:
-            latest = source.get_nowait()
+            item = source.get_nowait()
         except queue.Empty:
             return latest
+        if item is not QUEUE_WAKEUP:
+            latest = item
 
 
 def iq_batch_complex(batch: RtlSampleBatch | IqSampleBatch) -> ComplexArray:
@@ -3367,6 +3404,9 @@ class LiveAudioWebSocketWriter:
         self.send_binary(header + payload)
         return time.monotonic() - started_at
 
+    def send_close(self, code: int, reason: str = "") -> None:
+        self._send_frame(struct.pack("!H", code) + reason.encode("utf-8")[:120], opcode=0x8)
+
     def _send_frame(self, payload: bytes, *, opcode: int = 0x1) -> None:
         length = len(payload)
         header = bytearray([0x80 | (opcode & 0x0F)])
@@ -3582,10 +3622,18 @@ class IcecastStreamWorker:
     def stop(self) -> None:
         self.stop_event.set()
         self.fanout.unsubscribe(self.queue)
-        for output in list(self.outputs.values()):
+        wake_queue(self.queue)
+        outputs = list(self.outputs.values())
+        encoder_groups = list(self.encoder_groups.values())
+        # Tell everything to stop before waiting on any of it, so the waits overlap.
+        for output in outputs:
+            output.request_stop()
+        for encoder_group in encoder_groups:
+            encoder_group.request_stop()
+        for output in outputs:
             output.stop()
         self.outputs = {}
-        for encoder_group in list(self.encoder_groups.values()):
+        for encoder_group in encoder_groups:
             encoder_group.stop()
         self.encoder_groups = {}
         for source in list(self.monitor_sources.values()):
@@ -4106,6 +4154,8 @@ class IcecastStreamWorker:
                 batch: RtlSampleBatch = self.queue.get(
                     timeout=queue_timeout
                 )
+                if batch is QUEUE_WAKEUP:
+                    continue
             except queue.Empty:
                 idle_output_active = True
                 now = time.monotonic()
@@ -4751,8 +4801,12 @@ class IcecastEncoderGroup:
     def start(self) -> None:
         self.thread.start()
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
         self.stop_event.set()
+        wake_queue(self.pcm_queue)
+
+    def stop(self) -> None:
+        self.request_stop()
         if self.thread.ident is not None:
             self.thread.join(timeout=2.0)
         self.encoder.close()
@@ -4779,6 +4833,8 @@ class IcecastEncoderGroup:
                 try:
                     pcm = self.pcm_queue.get(timeout=0.5)
                 except queue.Empty:
+                    continue
+                if pcm is QUEUE_WAKEUP:
                     continue
                 encoded = self.encoder.encode(pcm)
                 if encoded:
@@ -4820,9 +4876,13 @@ class IcecastOutputWriter:
     def start(self) -> None:
         self.thread.start()
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
         self.stop_event.set()
         self._close_current_connection()
+        wake_queue(self.encoded_queue)
+
+    def stop(self) -> None:
+        self.request_stop()
         if self.thread.ident is not None:
             self.thread.join(timeout=2.0)
         self._set_status("disabled")
@@ -4894,6 +4954,8 @@ class IcecastOutputWriter:
                     try:
                         encoded = self.encoded_queue.get(timeout=0.5)
                     except queue.Empty:
+                        continue
+                    if encoded is QUEUE_WAKEUP:
                         continue
                     if encoded:
                         sink.write(encoded)
@@ -4977,6 +5039,7 @@ class WeatherReceiverWorker:
     def stop(self) -> None:
         self.stop_event.set()
         self.fanout.unsubscribe(self.queue)
+        wake_queue(self.queue)
         self.source.close()
         if self.thread.ident is not None:
             self.thread.join(timeout=2.0)
@@ -5034,6 +5097,8 @@ class WeatherReceiverWorker:
                 continue
             except Exception as exc:
                 LOG.warning("weather receiver RTL-SDR source failed for client %s: %s", self.client_id, exc)
+                continue
+            if batch is QUEUE_WAKEUP:
                 continue
             if not startup_backlog_drained:
                 batch = drain_queue_to_latest(self.queue, batch)
@@ -5199,6 +5264,8 @@ class RtlControlService:
         self.rtl_notification_states: dict[str, dict[str, Any]] = {}
         self.stream_eas_alert_notification_seen: dict[str, set[str]] = {}
         self.stream_test_mode: dict[str, Any] | None = None
+        self.shutting_down = threading.Event()
+        self.live_audio_connections = 0
         self.iq_recorder: IqRecorderWorker | None = None
         self.iq_recorder_account_id: int | None = None
         self.iq_recording_downloads: set[str] = set()
@@ -5311,7 +5378,21 @@ class RtlControlService:
                 self.live_audio_feedback_by_client.pop(("monitor", client_id), None)
                 self.live_audio_feedback_by_client.pop(("receiver", client_id), None)
 
+    def begin_shutdown(self) -> None:
+        """Tell connected browsers the server is going away, before anything is stopped."""
+        self.shutting_down.set()
+
+    def _wait_for_live_audio_notices(self) -> None:
+        deadline = time.monotonic() + LIVE_AUDIO_SHUTDOWN_NOTICE_SECONDS
+        while time.monotonic() < deadline:
+            with self.lock:
+                if self.live_audio_connections <= 0:
+                    return
+            time.sleep(0.02)
+
     def close(self) -> None:
+        self.begin_shutdown()
+        self._wait_for_live_audio_notices()
         self.preview_cleanup_stop.set()
         self.stream_notification_stop.set()
         self.preview_cleanup_thread.join(timeout=2.0)
@@ -5486,6 +5567,9 @@ class RtlControlService:
             if notifications:
                 notifications["effective_access_url"] = self.notification_effective_access_url()
             settings_payload = asdict(settings)
+            if read_only:
+                # Notification settings are for the owner and administrators only.
+                settings_payload.pop("notify_sdr_failures", None)
             source_payload = {
                 "kind": source_kind,
                 "name": source_name,
@@ -6629,7 +6713,7 @@ class RtlControlService:
             "updated notification settings: enabled=%s server=%s topic=%s priority=%s token=%s username=%s password=%s",
             settings.enabled,
             settings.server_url,
-            settings.topic or "<none>",
+            "set" if settings.topic else "unset",
             settings.priority,
             "set" if settings.access_token else "unset",
             settings.username or "<none>",
@@ -6667,7 +6751,7 @@ class RtlControlService:
             priority=settings.priority,
             click_url=notification_click_url(self.notification_effective_access_url_for_settings(settings), "/"),
         )
-        LOG.info("sent test notification to ntfy topic %s", settings.topic)
+        LOG.info("sent test notification through %s", settings.server_url)
         return {"success": True, "message": "Test notification sent."}
 
     def notification_access_url_options(self) -> dict[str, Any]:
@@ -8252,10 +8336,12 @@ class RtlControlService:
     def stop_capture(self) -> None:
         with self.lock:
             self.drain_stop.set()
+            wake_queue(self.monitor_queue)
             recorder = self.iq_recorder
             self.iq_recorder = None
-            self._stop_receiver_workers_locked()
-            self._stop_stream_workers_locked()
+            # Workers read settings under this lock while they run, so they are stopped
+            # after it is released; waiting on them while holding it stalls every stop.
+            workers = self._detach_receiver_workers_locked() + self._detach_stream_workers_locked()
             self.preview_streams = {}
             intermediate = self.intermediate_fanout
             self.intermediate_fanout = None
@@ -8267,6 +8353,7 @@ class RtlControlService:
             self.iq_file_source_config = None
             drain_thread = self.drain_thread
             self.drain_thread = None
+        stop_workers_together(workers)
         if recorder is not None:
             recorder.stop()
         if intermediate is not None:
@@ -8302,6 +8389,8 @@ class RtlControlService:
                 with self.lock:
                     self.capture_error = str(exc)
                 LOG.warning("RTL-SDR control capture reported: %s", exc)
+                continue
+            if batch is QUEUE_WAKEUP:
                 continue
             with self.lock:
                 self.capture_error = None
@@ -8460,18 +8549,18 @@ class RtlControlService:
             daemon=True,
         ).start()
 
-    def _stop_stream_workers_locked(self) -> None:
-        for worker in list(self.stream_workers.values()):
-            worker.stop()
+    def _detach_stream_workers_locked(self) -> list[IcecastStreamWorker]:
+        workers = list(self.stream_workers.values())
         self.stream_workers = {}
         self.monitor_streams_by_client = {}
         self.monitor_accounts_by_client = {}
+        return workers
 
-    def _stop_receiver_workers_locked(self) -> None:
-        for worker in list(self.receiver_workers.values()):
-            worker.stop()
+    def _detach_receiver_workers_locked(self) -> list[WeatherReceiverWorker]:
+        workers = list(self.receiver_workers.values())
         self.receiver_workers = {}
         self.receiver_accounts_by_client = {}
+        return workers
 
     def _active_streams_locked(self) -> list[dict[str, Any]]:
         snapshots: list[dict[str, Any]] = []
@@ -8730,6 +8819,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         source: SameAwareWebRtcAudioSource | None = None
         cleanup_mode = ""
         encoder: OpusEncoder | None = None
+        counted = False
         writer = LiveAudioWebSocketWriter(self)
         try:
             if mode == "monitor":
@@ -8769,6 +8859,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 }
             )
             LOG.info("started %s live-audio WebSocket for client %s using %s", mode, client_id, codec)
+            self._change_live_audio_connections(1)
+            counted = True
             self._stream_live_audio_websocket(
                 writer,
                 source,
@@ -8789,6 +8881,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         finally:
+            if counted:
+                self._change_live_audio_connections(-1)
             if encoder is not None:
                 encoder.close()
             self.service.clear_live_audio_feedback(client_id, mode)
@@ -8807,6 +8901,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self.service._close_detached_monitor_sources([detached_monitor_source])
             if detached_receiver is not None:
                 detached_receiver.stop()
+
+    def _change_live_audio_connections(self, delta: int) -> None:
+        with self.service.lock:
+            self.service.live_audio_connections = getattr(self.service, "live_audio_connections", 0) + delta
 
     def _stream_live_audio_websocket(
         self,
@@ -8827,7 +8925,13 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         # behind) are not the browser's connection; see TcpOpusBitrateController.
         upstream_underruns = int(getattr(source.audio_source, "underrun_frames", 0))
         upstream_hold_until = 0.0
+        shutting_down = getattr(self.service, "shutting_down", None)
         while True:
+            if shutting_down is not None and shutting_down.is_set():
+                # Let the page know right away, so it can wait for the server to come back.
+                writer.send_json({"type": "server_shutdown"})
+                writer.send_close(LIVE_AUDIO_SHUTDOWN_CLOSE_CODE, "server shutting down")
+                return
             if source.audio_source.closed.is_set():
                 return
             now = time.monotonic()
@@ -11910,7 +12014,10 @@ def development_iq_sources_available(argv0: str | None = None) -> bool:
     return (current.parents[2] / "pyproject.toml").is_file()
 
 
-def install_shutdown_signal_handlers(server: ThreadingHTTPServer) -> dict[int, Any]:
+def install_shutdown_signal_handlers(
+    server: ThreadingHTTPServer,
+    on_shutdown: Callable[[], None] | None = None,
+) -> dict[int, Any]:
     if threading.current_thread() is not threading.main_thread():
         return {}
     previous_handlers: dict[int, Any] = {}
@@ -11918,6 +12025,8 @@ def install_shutdown_signal_handlers(server: ThreadingHTTPServer) -> dict[int, A
     def handle_shutdown(signum, _frame) -> None:
         signal_name = signal.Signals(signum).name
         LOG.info("received %s; shutting down NWR Stream Manager", signal_name)
+        if on_shutdown is not None:
+            on_shutdown()
         threading.Thread(
             target=server.shutdown,
             name="http-shutdown",
@@ -11965,7 +12074,7 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
     service.web_port = port
     RtlControlHandler.service = service
     server = ThreadingHTTPServer((host, port), RtlControlHandler)
-    previous_signal_handlers = install_shutdown_signal_handlers(server)
+    previous_signal_handlers = install_shutdown_signal_handlers(server, service.begin_shutdown)
     LOG.info("RTL-SDR control web interface bound to %s:%s", host, port)
     for url in access_urls(host, port):
         LOG.info("RTL-SDR control web interface available at %s", url)
@@ -11974,7 +12083,8 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
     if development_iq_sources:
         LOG.info("development I/Q file source controls are enabled")
     try:
-        server.serve_forever()
+        # Check for shutdown often, so a restart isn't held up waiting on this loop.
+        server.serve_forever(poll_interval=0.1)
     finally:
         restore_signal_handlers(previous_signal_handlers)
         server.server_close()
@@ -12528,6 +12638,23 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <button id="cancel_same_test_warning" type="button">Cancel</button>
       <button id="confirm_same_test_warning" type="button" class="primary" hidden>Send SAME test</button>
     </div>
+  </div>
+</div>
+<div id="server_unavailable_dialog" class="fullscreen-dialog" role="alertdialog" aria-modal="true" aria-labelledby="server_unavailable_title" aria-describedby="server_unavailable_message" hidden>
+  <div class="fullscreen-dialog-panel">
+    <h2 id="server_unavailable_title" tabindex="-1">Can't reach NWR Stream Manager</h2>
+    <p id="server_unavailable_message"></p>
+    <div class="actions">
+      <button id="server_unavailable_reload" type="button" class="primary" hidden>Reload page</button>
+    </div>
+  </div>
+</div>
+<div id="resume_listening_dialog" class="notice-dialog" role="dialog" aria-labelledby="resume_listening_title" aria-describedby="resume_listening_message" hidden>
+  <h2 id="resume_listening_title">NWR Stream Manager restarted</h2>
+  <p id="resume_listening_message"></p>
+  <div class="actions">
+    <button id="resume_listening" type="button">Resume listening</button>
+    <button id="dismiss_resume_listening" type="button">Dismiss</button>
   </div>
 </div>
 <div id="iq_recording_banner" class="global-status-banner" hidden>
@@ -14800,6 +14927,10 @@ async function handleLiveAudioMessage(event) {
   }
   if (typeof event.data !== "string") return;
   const message = JSON.parse(event.data);
+  if (message.type === "server_shutdown") {
+    enterServerUnavailable("shutdown");
+    return;
+  }
   if (message.type === "start") {
     liveAudioCodec = message.codec || "pcm";
     await configureLiveAudioDecoder();
@@ -15080,6 +15211,7 @@ async function startStreamMonitor(streamId) {
     monitorPeerConnection = liveAudioSocketPeer("monitor", socket);
     monitorStreamId = streamId;
     monitorPaused = false;
+    hideResumeListeningOffer();
     await startMediaSessionAnchor("monitor-start");
     updateMonitorMediaSession();
     startMonitorPacketStats();
@@ -15148,6 +15280,7 @@ async function resumeStreamMonitor() {
     return;
   }
   monitorPaused = false;
+  hideResumeListeningOffer();
   clearMonitorUnstableTimer();
   await startMediaSessionAnchor("monitor-resume");
   await ensureLiveAudioContext();
@@ -15376,6 +15509,7 @@ async function startWeatherReceiver() {
       }
       receiverPlaying = true;
       receiverPaused = false;
+      hideResumeListeningOffer();
       clearReceiverUnstableTimer();
       await ensureLiveAudioContext();
       liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
@@ -15401,6 +15535,7 @@ async function startWeatherReceiver() {
     receiverRemoteStream = {transport: "websocket"};
     receiverPlaying = true;
     receiverPaused = false;
+    hideResumeListeningOffer();
     await startMediaSessionAnchor("receiver-start");
     updateReceiverMediaSession();
     renderReceiverControls();
@@ -22421,6 +22556,11 @@ document.getElementById("accounts-body").addEventListener("keydown", event => {
 });
 
 document.getElementById("dismiss_nwrorg_submission").addEventListener("click", dismissNwrOrgSubmissionDialog);
+document.getElementById("server_unavailable_reload").addEventListener("click", () => window.location.reload());
+document.getElementById("resume_listening").addEventListener("click", resumeListening);
+document.getElementById("dismiss_resume_listening").addEventListener("click", () => {
+  document.getElementById("resume_listening_dialog").hidden = true;
+});
 document.getElementById("nwrorg_submission_link").addEventListener("click", dismissNwrOrgSubmissionDialog);
 document.getElementById("dismiss_monitor_unstable").addEventListener("click", dismissMonitorUnstableDialog);
 document.getElementById("dismiss_receiver_unstable").addEventListener("click", dismissReceiverUnstableDialog);
@@ -23806,8 +23946,160 @@ document.getElementById("eas_alert_audio").addEventListener("ended", async () =>
 });
 
 async function refresh() {
-  const data = await request(statusRequestPath());
+  if (serverUnavailable) return;
+  let data;
+  try {
+    data = await request(statusRequestPath());
+  } catch (error) {
+    noteServerRequestFailure(error);
+    throw error;
+  }
+  serverFailureCount = 0;
   applyStatus(data, {syncControls: false});
+}
+
+const RESUME_LISTENING_STORAGE_KEY = "nwr-stream-manager:resume-listening";
+// Status is checked every second; two misses in a row means the server is gone, not a blip.
+const SERVER_FAILURES_BEFORE_UNAVAILABLE = 2;
+const SERVER_RETURN_CHECK_MS = 1000;
+let serverUnavailable = false;
+let serverFailureCount = 0;
+let serverReturnTimer = null;
+
+function noteServerRequestFailure(error) {
+  // fetch() rejects with a TypeError when it can't reach the server at all.
+  if (!(error instanceof TypeError)) return;
+  serverFailureCount += 1;
+  if (serverFailureCount >= SERVER_FAILURES_BEFORE_UNAVAILABLE) enterServerUnavailable("unreachable");
+}
+
+function serverUnavailableModalTargets() {
+  return [
+    document.querySelector("header"),
+    document.querySelector("main"),
+    ...document.querySelectorAll(".global-status-banner, .notice-dialog, .same-alert-flash, #same_alert_live")
+  ].filter(Boolean);
+}
+
+function setServerUnavailableModalOpen(open) {
+  for (const element of serverUnavailableModalTargets()) {
+    if ("inert" in element) element.inert = open;
+    if (open) element.setAttribute("aria-hidden", "true");
+    else element.removeAttribute("aria-hidden");
+  }
+}
+
+function rememberListeningForRestart() {
+  let listening = null;
+  if (monitorStreamId) {
+    const stream = configuredStreams.find(item => item.id === monitorStreamId);
+    listening = {mode: "monitor", stream_id: monitorStreamId, label: streamCallsign(stream)};
+  } else if (receiverPeerConnection && receiverPlaying) {
+    const channel = currentReceiverChannel();
+    listening = {mode: "receiver", frequency_hz: channel.frequency_hz, label: channel.label};
+  }
+  if (!listening) return;
+  try {
+    sessionStorage.setItem(RESUME_LISTENING_STORAGE_KEY, JSON.stringify(listening));
+  } catch (error) {
+    console.debug("could not remember listening state", error);
+  }
+}
+
+function enterServerUnavailable(reason) {
+  if (serverUnavailable) return;
+  serverUnavailable = true;
+  logClientEvent("info", "server", "server unavailable", {reason});
+  rememberListeningForRestart();
+  // The server is gone, so stop listening here without asking it to, and without
+  // blaming the connection.
+  clearMonitorUnstableTimer();
+  clearReceiverUnstableTimer();
+  stopStreamMonitor({notifyServer: false}).catch(error => console.debug("monitor stop failed", error));
+  stopWeatherReceiver({notifyServer: false}).catch(error => console.debug("receiver stop failed", error));
+  dismissMonitorUnstableDialog();
+  dismissReceiverUnstableDialog();
+  setText("server_unavailable_title", reason === "shutdown" ? "NWR Stream Manager is shutting down" : "Can't reach NWR Stream Manager");
+  setText(
+    "server_unavailable_message",
+    reason === "shutdown"
+      ? "It may be restarting. This page will reload automatically as soon as it's back."
+      : "It may be restarting, or this device may have lost its network connection. This page will reload automatically as soon as NWR Stream Manager is back."
+  );
+  setHidden("server_unavailable_reload", true);
+  setServerUnavailableModalOpen(true);
+  setHidden("server_unavailable_dialog", false);
+  document.getElementById("server_unavailable_title").focus();
+  clearInterval(serverReturnTimer);
+  serverReturnTimer = setInterval(checkServerReturned, SERVER_RETURN_CHECK_MS);
+}
+
+async function checkServerReturned() {
+  try {
+    const response = await fetch("/api/setup-state", {cache: "no-store"});
+    if (!response.ok) return;
+  } catch (error) {
+    return;
+  }
+  clearInterval(serverReturnTimer);
+  serverReturnTimer = null;
+  if (hasUnsavedNavigationState()) {
+    // Reloading would throw away what they were in the middle of, so let them choose.
+    setText("server_unavailable_title", "NWR Stream Manager is back");
+    setText("server_unavailable_message", "Reload the page to continue. Anything you hadn't finished will need to be entered again.");
+    setHidden("server_unavailable_reload", false);
+    document.getElementById("server_unavailable_reload").focus();
+    return;
+  }
+  window.location.reload();
+}
+
+function offerResumeListening() {
+  let listening = null;
+  try {
+    listening = JSON.parse(sessionStorage.getItem(RESUME_LISTENING_STORAGE_KEY) || "null");
+    sessionStorage.removeItem(RESUME_LISTENING_STORAGE_KEY);
+  } catch (error) {
+    return;
+  }
+  if (!listening || !listening.mode) return;
+  const what = listening.mode === "monitor" ? `monitoring ${listening.label}` : `the weather radio receiver on ${listening.label}`;
+  setText("resume_listening_message", `Listening stopped while it restarted. Resume ${what}?`);
+  const dialog = document.getElementById("resume_listening_dialog");
+  dialog.dataset.listening = JSON.stringify(listening);
+  dialog.hidden = false;
+  document.getElementById("resume_listening").focus();
+}
+
+function hideResumeListeningOffer() {
+  // Once they are listening again, by any route, the offer no longer applies.
+  const dialog = document.getElementById("resume_listening_dialog");
+  if (dialog) dialog.hidden = true;
+}
+
+async function resumeListening() {
+  const dialog = document.getElementById("resume_listening_dialog");
+  let listening = null;
+  try {
+    listening = JSON.parse(dialog.dataset.listening || "null");
+  } catch (error) {
+    listening = null;
+  }
+  dialog.hidden = true;
+  if (!listening) return;
+  try {
+    if (listening.mode === "monitor") {
+      await toggleStreamMonitor(listening.stream_id);
+    } else if (listening.mode === "receiver") {
+      const index = NWR_RECEIVER_CHANNELS.findIndex(channel => channel.frequency_hz === listening.frequency_hz);
+      if (index >= 0) receiverChannelIndex = index;
+      renderReceiverControls();
+      await startWeatherReceiver();
+    }
+  } catch (error) {
+    setText("resume_listening_message", `Couldn't resume listening: ${error.message}`);
+    dialog.hidden = false;
+  }
 }
 
 (async function init() {
@@ -23833,6 +24125,7 @@ async function refresh() {
     recordingId: initialRoute.recordingId,
     page: initialRoute.page
   }, true);
+  offerResumeListening();
   setInterval(refresh, 1000);
   setInterval(async () => {
     try {
