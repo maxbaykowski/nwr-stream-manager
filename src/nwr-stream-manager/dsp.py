@@ -7,7 +7,7 @@ from fractions import Fraction
 import numpy as np
 from numpy.typing import NDArray
 
-from .liquid_dsp import FirDecimator
+from .liquid_dsp import FirDecimator, IqDcRemover
 
 
 ComplexArray = NDArray[np.complex64]
@@ -54,7 +54,7 @@ class IqDcBlocker:
     sample_rate: int
     time_constant_seconds: float = DEFAULT_DC_BLOCK_TIME_CONSTANT_SECONDS
     max_block_seconds: float = DEFAULT_DC_BLOCK_MAX_BLOCK_SECONDS
-    _mean: np.complex64 = np.complex64(0.0)
+    _remover: IqDcRemover = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -63,21 +63,12 @@ class IqDcBlocker:
             raise ValueError("time_constant_seconds must be greater than 0")
         if self.max_block_seconds <= 0.0:
             raise ValueError("max_block_seconds must be greater than 0")
+        self._remover = IqDcRemover(self.sample_rate, self.time_constant_seconds, self.max_block_seconds)
 
     def process(self, samples: ComplexArray) -> ComplexArray:
         if samples.size == 0:
             return np.array([], dtype=np.complex64)
-        samples = samples.astype(np.complex64, copy=False)
-        output = np.empty_like(samples, dtype=np.complex64)
-        block_size = max(1, int(round(float(self.sample_rate) * self.max_block_seconds)))
-        for start in range(0, samples.size, block_size):
-            stop = min(samples.size, start + block_size)
-            block = samples[start:stop]
-            block_average = np.complex128(np.mean(block, dtype=np.complex128))
-            decay = math.exp(-block.size / (float(self.sample_rate) * self.time_constant_seconds))
-            output[start:stop] = (block - self._mean).astype(np.complex64, copy=False)
-            self._mean = np.complex64(block_average + (np.complex128(self._mean) - block_average) * decay)
-        return output
+        return self._remover.process(samples)
 
 
 def design_lowpass_taps(

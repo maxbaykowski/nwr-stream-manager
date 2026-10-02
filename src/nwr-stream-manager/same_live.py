@@ -278,7 +278,8 @@ class SameMultimonLiveDecoder:
                 return
         try:
             process.stdin.write(pcm_s16le)
-        except (BrokenPipeError, OSError) as exc:
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            # ValueError: another thread closed the decoder while this write was on its way.
             self.disabled_reason = str(exc)
             self.close()
 

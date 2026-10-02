@@ -18,6 +18,12 @@ LIQUID_SONAMES = ("libliquid.so.1", "libliquid.so.2", "libliquid.so")
 # Recent input kept so new filter coefficients can start from the same history.
 FIR_DECIMATOR_HISTORY_SAMPLES = 2048
 
+class _FloatComplex(ctypes.Structure):
+    """C99 `float complex`, which liquid-dsp takes by value for scalar arguments."""
+
+    _fields_ = [("real", ctypes.c_float), ("imag", ctypes.c_float)]
+
+
 _library: ctypes.CDLL | None = None
 _library_lock = threading.Lock()
 
@@ -44,6 +50,16 @@ def liquid_library() -> ctypes.CDLL:
         library.firdecim_crcf_execute_block.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
         library.firdecim_crcf_destroy.restype = ctypes.c_int
         library.firdecim_crcf_destroy.argtypes = [pointer]
+        library.dotprod_crcf_create.restype = pointer
+        library.dotprod_crcf_create.argtypes = [pointer, ctypes.c_uint]
+        library.dotprod_crcf_execute.restype = ctypes.c_int
+        library.dotprod_crcf_execute.argtypes = [pointer, pointer, pointer]
+        library.dotprod_crcf_run4.restype = ctypes.c_int
+        library.dotprod_crcf_run4.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
+        library.dotprod_crcf_destroy.restype = ctypes.c_int
+        library.dotprod_crcf_destroy.argtypes = [pointer]
+        library.liquid_vectorcf_addscalar.restype = None
+        library.liquid_vectorcf_addscalar.argtypes = [pointer, ctypes.c_uint, _FloatComplex, pointer]
         _library = library
         return library
 
@@ -123,6 +139,65 @@ class FirDecimator:
         if handle and library is not None:
             try:
                 library.firdecim_crcf_destroy(handle)
+            except Exception:
+                pass
+            self._handle = None
+
+
+class IqDcRemover:
+    """Remove the receiver's DC offset from complex samples at any sample rate.
+
+    Every block (one millisecond by default), the block's average is measured and the
+    running estimate of the offset moves towards it with the given time constant; the
+    estimate from before the block is subtracted from it. liquid-dsp does the per-sample
+    sums and subtraction; the running estimate is kept in double precision, which keeps
+    even a one-second time constant accurate at the RTL-SDR's full sample rate.
+    """
+
+    def __init__(self, sample_rate: int, time_constant_seconds: float, block_seconds: float) -> None:
+        self.sample_rate = int(sample_rate)
+        self.time_constant_seconds = float(time_constant_seconds)
+        self.block_size = max(1, int(round(self.sample_rate * float(block_seconds))))
+        self.mean = 0j
+        self._library = liquid_library()
+        self._ones = np.ones(self.block_size, dtype=np.float32)
+        self._sum = np.zeros(1, dtype=np.complex64)
+        self._full_block_decay = self._decay(self.block_size)
+        self._handle = self._library.dotprod_crcf_create(self._ones.ctypes.data, self.block_size)
+        if not self._handle:
+            raise RuntimeError("liquid-dsp could not create the DC offset averager")
+
+    def _decay(self, samples: int) -> float:
+        return math.exp(-samples / (self.sample_rate * self.time_constant_seconds))
+
+    def process(self, samples: NDArray[np.complex64]) -> NDArray[np.complex64]:
+        samples = np.ascontiguousarray(samples, dtype=np.complex64)
+        output = np.empty_like(samples)
+        if samples.size == 0:
+            return output
+        library = self._library
+        item = samples.itemsize
+        source, target, total = samples.ctypes.data, output.ctypes.data, self._sum.ctypes.data
+        for start in range(0, samples.size, self.block_size):
+            count = min(self.block_size, samples.size - start)
+            if count == self.block_size:
+                library.dotprod_crcf_execute(self._handle, source + start * item, total)
+                decay = self._full_block_decay
+            else:
+                library.dotprod_crcf_run4(self._ones.ctypes.data, source + start * item, count, total)
+                decay = self._decay(count)
+            average = complex(self._sum[0]) / count
+            offset = _FloatComplex(-self.mean.real, -self.mean.imag)
+            library.liquid_vectorcf_addscalar(source + start * item, count, offset, target + start * item)
+            self.mean = average + (self.mean - average) * decay
+        return output
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_handle", None)
+        library = getattr(self, "_library", None)
+        if handle and library is not None:
+            try:
+                library.dotprod_crcf_destroy(handle)
             except Exception:
                 pass
             self._handle = None

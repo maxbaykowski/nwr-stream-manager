@@ -2081,6 +2081,8 @@ class HostWidebandSource:
         self.decimator = None
         self.decimator_key: tuple[int, int] | None = None
         self.decimator_strength: int | None = None
+        self.dc_blocker: IqDcBlocker | None = None
+        self.dc_blocker_key: tuple[int, int] | None = None
         self.generation = 0
 
     def set_frequency(self, frequency_hz: int) -> None:
@@ -2092,6 +2094,7 @@ class HostWidebandSource:
             self.close()
             self.fanout = fanout
             self.decimator = None
+            self.dc_blocker = None
             if fanout is not None:
                 self.queue = subscribe_raw_fanout(fanout, max_seconds=REMOTE_HOST_WIDEBAND_QUEUE_SECONDS, name=self.name)
                 self.generation = getattr(fanout, "generation", 0)
@@ -2108,7 +2111,16 @@ class HostWidebandSource:
         if incoming != self.generation:
             self.generation = incoming
             self.decimator = None
+            self.dc_blocker = None
         iq = iq_batch_complex(batch)
+        if isinstance(self.fanout, RawRtlFanout):
+            # Straight from the RTL-SDR, so the DC offset is still there; the 192 ksps
+            # feed has already had it removed.
+            dc_key = (batch.sample_rate, batch.center_frequency_hz)
+            if self.dc_blocker is None or self.dc_blocker_key != dc_key:
+                self.dc_blocker = IqDcBlocker(batch.sample_rate)
+                self.dc_blocker_key = dc_key
+            iq = self.dc_blocker.process(iq)
         if self.sample_rate > batch.sample_rate:
             raise ValueError("recording sample rate is higher than the RTL-SDR sample rate")
         if self.sample_rate == batch.sample_rate:
@@ -4651,6 +4663,11 @@ class IqRecorderWorker:
         decimator = None
         decimator_key: tuple[int, int] | None = None
         decimator_alias_filter_strength: int | None = None
+        # Samples straight from the RTL-SDR still carry its DC offset; the 192 ksps feed
+        # and remote feeds have already had it removed.
+        removes_dc = isinstance(self.fanout, RawRtlFanout)
+        dc_blocker: IqDcBlocker | None = None
+        dc_blocker_key: tuple[int, int] | None = None
         try:
             with self.config.output_path.open("wb") as output:
                 while not self.stop_event.is_set():
@@ -4668,6 +4685,12 @@ class IqRecorderWorker:
                     iq = iq_batch_complex(batch)
                     if iq.size == 0:
                         continue
+                    if removes_dc:
+                        next_dc_key = (batch.sample_rate, batch.center_frequency_hz)
+                        if dc_blocker is None or dc_blocker_key != next_dc_key:
+                            dc_blocker = IqDcBlocker(batch.sample_rate)
+                            dc_blocker_key = next_dc_key
+                        iq = dc_blocker.process(iq)
                     if self.config.mode == IQ_RECORDER_MODE_STREAM:
                         if self.config.target_frequency_hz is None:
                             raise ValueError("stream recording target frequency is missing")

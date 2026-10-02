@@ -39,6 +39,28 @@ class DspTests(unittest.TestCase):
         self.assertGreater(abs(output[-1]), 0.36)
         self.assertLess(abs(output[-1]), 0.40)
 
+    def test_iq_dc_blocker_matches_the_block_average_reference(self) -> None:
+        sample_rate = 1_536_000
+        rng = np.random.default_rng(11)
+        blocker = self.dsp.IqDcBlocker(sample_rate=sample_rate)
+        block_size = round(sample_rate * blocker.max_block_seconds)
+        mean = 0j
+        actual_parts = []
+        expected_parts = []
+        # Odd chunk sizes leave partial blocks at the end of each chunk.
+        for size in (153_600, 1_000, 77_777, 153_600):
+            samples = (rng.normal(size=size) + 1j * rng.normal(size=size) + (0.3 - 0.2j)).astype(np.complex64)
+            actual_parts.append(blocker.process(samples))
+            expected = np.empty_like(samples)
+            for start in range(0, size, block_size):
+                block = samples[start : start + block_size]
+                average = complex(np.mean(block, dtype=np.complex128))
+                expected[start : start + block.size] = block - np.complex64(mean)
+                mean = average + (mean - average) * np.exp(-block.size / (sample_rate * blocker.time_constant_seconds))
+            expected_parts.append(expected)
+
+        np.testing.assert_allclose(np.concatenate(actual_parts), np.concatenate(expected_parts), rtol=0, atol=1e-5)
+
     def test_iq_dc_blocker_is_sample_rate_aware(self) -> None:
         slow = self.dsp.IqDcBlocker(sample_rate=1000, time_constant_seconds=1.0)
         fast = self.dsp.IqDcBlocker(sample_rate=2000, time_constant_seconds=1.0)

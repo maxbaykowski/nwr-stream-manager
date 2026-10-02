@@ -2766,6 +2766,106 @@ class EasAlertTests(unittest.TestCase):
             actual = interleaved[0::2] + 1j * interleaved[1::2]
             np.testing.assert_array_equal(actual.astype(np.complex64), iq)
 
+    def test_full_rate_spectrum_recording_removes_the_rtl_sdr_dc_offset(self) -> None:
+        web_control = self.web_control
+
+        class Fanout(web_control.RawRtlFanout):
+            def __init__(self):
+                self.queue = web_control.queue.Queue(maxsize=64)
+
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return self.queue
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        class Storage:
+            def add_path(self, path):
+                pass
+
+            def recording_started(self):
+                pass
+
+            def recording_stopped(self):
+                pass
+
+            def is_critical(self, path):
+                return False
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            output_path = Path(tempdir) / "full-rate.cf32"
+            fanout = Fanout()
+            sample_rate = web_control.DEFAULT_RTL_SAMPLE_RATE
+            chunk = sample_rate // 10
+            time_axis = np.arange(chunk, dtype=np.float64) / sample_rate
+            # A station 25 kHz off centre, riding on a DC offset like the dongle's own.
+            iq = (0.5 * np.exp(1j * 2 * np.pi * 25_000 * time_axis) + (0.2 - 0.1j)).astype(np.complex64)
+            raw = self._complex_to_rtl_u8(iq)
+            chunks = 40
+            worker = web_control.IqRecorderWorker(
+                fanout=fanout,
+                config=web_control.IqRecorderConfig(
+                    recording_id="recording-full-rate",
+                    mode=web_control.IQ_RECORDER_MODE_SPECTRUM,
+                    sample_rate=sample_rate,
+                    duration_seconds=0,
+                    output_path=output_path,
+                    index_path=Path(tempdir) / "index.json",
+                    frequency_hz=162_475_000,
+                ),
+                storage_monitor=Storage(),
+                alias_filter_strength_provider=lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
+            )
+            worker.start()
+            for _index in range(chunks):
+                fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=sample_rate, center_frequency_hz=162_475_000))
+            self._wait_for(
+                lambda: output_path.exists() and output_path.stat().st_size >= iq.size * 8 * chunks,
+                timeout=20.0,
+            )
+            worker.stop()
+
+            interleaved = np.frombuffer(output_path.read_bytes(), dtype="<f4")
+            recorded = interleaved[0::2] + 1j * interleaved[1::2]
+            last_second = recorded[-sample_rate:]
+            # After four seconds the offset (0.22) is nearly gone and the station is untouched.
+            self.assertLess(abs(complex(np.mean(last_second))), 0.01)
+            self.assertAlmostEqual(float(np.mean(np.abs(last_second - np.mean(last_second)))), 0.5, delta=0.02)
+
+    def test_remote_wideband_feed_removes_the_rtl_sdr_dc_offset(self) -> None:
+        web_control = self.web_control
+
+        class Fanout(web_control.RawRtlFanout):
+            generation = 0
+
+            def __init__(self):
+                self.queue = web_control.queue.Queue(maxsize=64)
+
+            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
+                return self.queue
+
+            def unsubscribe(self, subscriber):
+                pass
+
+        fanout = Fanout()
+        sample_rate = web_control.DEFAULT_RTL_SAMPLE_RATE
+        source = web_control.HostWidebandSource(
+            lambda rate: fanout,
+            sample_rate,
+            lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
+            "remote:test",
+        )
+        iq = np.full(sample_rate // 10, 0.2 - 0.1j, dtype=np.complex64)
+        raw = self._complex_to_rtl_u8(iq)
+        outputs = []
+        for _index in range(40):
+            fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=sample_rate, center_frequency_hz=162_475_000))
+            outputs.append(source.read(timeout=1.0).data)
+        source.close()
+
+        self.assertGreater(abs(complex(np.mean(outputs[0][:1000]))), 0.2)
+        self.assertLess(abs(complex(np.mean(outputs[-1]))), 0.01)
+
     def test_192ksps_spectrum_recording_uses_intermediate_fanout(self) -> None:
         web_control = self.web_control
 
