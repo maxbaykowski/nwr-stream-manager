@@ -17,10 +17,13 @@ from .config import (
     notch_max_width,
 )
 from .deemphasis import DeemphasisFilter
-from .liquid_dsp import AudioDcBlocker
+from .liquid_dsp import AudioDcBlocker, DelayedFftFirFilter
 
 
 FILTER_TAPS = 1025
+# The highpass runs through liquid-dsp's FFT filter in blocks one tap shorter than the
+# filter, which adds a constant 1023 samples (about 43 ms) of delay while it is on.
+HIGHPASS_BLOCK_SAMPLES = FILTER_TAPS - 1
 FILTER_DESIGN_FFT_SIZE = 16384
 # Sharpness 0 is a gentle 6 dB/octave slope; 10 is as steep as the kernel allows.
 FILTER_MIN_ORDER = 1.0
@@ -268,27 +271,36 @@ def _interpolate_for_sharpness(sharpness: float, gentlest: float, sharpest: floa
     return float(gentlest * (sharpest / gentlest) ** normalized)
 
 
+def _new_filter(kind: str, kernel: NDArray[np.float32]) -> FirFilter | DelayedFftFirFilter:
+    if kind == "highpass":
+        return DelayedFftFirFilter(kernel, HIGHPASS_BLOCK_SAMPLES)
+    return FirFilter(kernel)
+
+
 def _build_filter(
     kind: str,
     config: FilterConfig | NotchConfig,
     sample_rate: int,
-) -> FirFilter | None:
+) -> FirFilter | DelayedFftFirFilter | None:
     kernel = _filter_kernel(kind, config, sample_rate)
-    return None if kernel is None else FirFilter(kernel)
+    return None if kernel is None else _new_filter(kind, kernel)
 
 
 def _update_or_build_filter(
-    current: FirFilter | None,
+    current: FirFilter | DelayedFftFirFilter | None,
     kind: str,
     config: FilterConfig | NotchConfig,
     sample_rate: int,
-) -> FirFilter | None:
+) -> FirFilter | DelayedFftFirFilter | None:
     kernel = _filter_kernel(kind, config, sample_rate)
     if kernel is None:
         return None
     if current is None:
-        return FirFilter(kernel)
-    current.update_kernel(kernel)
+        return _new_filter(kind, kernel)
+    if isinstance(current, DelayedFftFirFilter):
+        current.update_taps(kernel)
+    else:
+        current.update_kernel(kernel)
     return current
 
 

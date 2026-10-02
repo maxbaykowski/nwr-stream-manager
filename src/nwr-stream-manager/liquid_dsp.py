@@ -470,3 +470,78 @@ class AudioFirFilter:
             except Exception:
                 pass
             self._handle = None
+
+
+class DelayedFftFirFilter:
+    """Filter real audio with a FIR longer than the frames it arrives in.
+
+    liquid-dsp's FFT filter needs blocks at least as long as the filter, so samples wait
+    until a whole block has arrived. The output is delayed by a constant block - 1
+    samples, which lets every call return exactly as many samples as it was given.
+    """
+
+    def __init__(self, taps: NDArray[np.float32], block: int) -> None:
+        self.block = int(block)
+        self.delay = self.block - 1
+        self._library = liquid_library()
+        self._handle = None
+        self.taps = np.zeros(0, dtype=np.float32)
+        self._create(taps)
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._ready = np.zeros(self.delay, dtype=np.float32)
+        self._recent = np.zeros(self.block, dtype=np.float32)
+
+    def _create(self, taps: NDArray[np.float32]) -> None:
+        taps = np.ascontiguousarray(taps, dtype=np.float32)
+        if taps.ndim != 1 or taps.size == 0:
+            raise ValueError("FIR taps must be a non-empty one-dimensional array")
+        if self.block < taps.size - 1:
+            raise ValueError("FFT filter block must be at least the filter length minus one")
+        with _fft_plan_lock:
+            handle = self._library.fftfilt_rrrf_create(taps.ctypes.data, taps.size, self.block)
+        if not handle:
+            raise RuntimeError("liquid-dsp could not create the FFT filter")
+        self.taps = taps
+        self._handle = handle
+
+    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
+        samples = np.asarray(samples, dtype=np.float32)
+        if samples.size == 0:
+            return samples.copy()
+        work = np.concatenate((self._pending, samples))
+        whole = work.size - work.size % self.block
+        if whole:
+            work = np.ascontiguousarray(work)
+            filtered = np.empty(whole, dtype=np.float32)
+            item = work.itemsize
+            for start in range(0, whole, self.block):
+                self._library.fftfilt_rrrf_execute(
+                    self._handle, work.ctypes.data + start * item, filtered.ctypes.data + start * item
+                )
+            self._recent = work[whole - self.block : whole].copy()
+            self._ready = np.concatenate((self._ready, filtered))
+        self._pending = work[whole:].copy()
+        output = self._ready[: samples.size]
+        self._ready = self._ready[samples.size :]
+        return output
+
+    def update_taps(self, taps: NDArray[np.float32]) -> None:
+        """Switch to new taps, carrying on from the latest audio instead of silence."""
+        old_handle = self._handle
+        self._create(taps)
+        discard = np.empty(self.block, dtype=np.float32)
+        self._library.fftfilt_rrrf_execute(self._handle, self._recent.ctypes.data, discard.ctypes.data)
+        if old_handle:
+            with _fft_plan_lock:
+                self._library.fftfilt_rrrf_destroy(old_handle)
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_handle", None)
+        library = getattr(self, "_library", None)
+        if handle and library is not None:
+            try:
+                with _fft_plan_lock:
+                    library.fftfilt_rrrf_destroy(handle)
+            except Exception:
+                pass
+            self._handle = None

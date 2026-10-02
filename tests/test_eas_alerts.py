@@ -2048,7 +2048,7 @@ class EasAlertTests(unittest.TestCase):
         highpass = processor.highpass
         lowpass = processor.lowpass
         notch = processor.notch
-        highpass_kernel = highpass.kernel.copy()
+        highpass_kernel = highpass.taps.copy()
         comfort_noise = processor.comfort_noise
         deemphasis = processor.deemphasis
 
@@ -2060,7 +2060,7 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertEqual(changed, ("highpass",))
         self.assertIs(processor.highpass, highpass)
-        self.assertFalse(np.array_equal(processor.highpass.kernel, highpass_kernel))
+        self.assertFalse(np.array_equal(processor.highpass.taps, highpass_kernel))
         self.assertIs(processor.lowpass, lowpass)
         self.assertIs(processor.notch, notch)
         self.assertIs(processor.comfort_noise, comfort_noise)

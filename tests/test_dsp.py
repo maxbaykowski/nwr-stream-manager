@@ -547,6 +547,54 @@ class DspTests(unittest.TestCase):
         self.assertGreater(decimator.process(samples).size, 0)
 
 
+    def _liquid_dsp(self):
+        package = self.dsp.__name__.rsplit(".", 1)[0]
+        return importlib.import_module(f"{package}.liquid_dsp")
+
+    def test_delayed_fft_filter_matches_direct_filtering_a_constant_block_later(self) -> None:
+        liquid_dsp = self._liquid_dsp()
+        rng = np.random.default_rng(31)
+        taps = (rng.standard_normal(1025) * np.hamming(1025)).astype(np.float32)
+        samples = rng.standard_normal(30_000).astype(np.float32)
+        fir = liquid_dsp.DelayedFftFirFilter(taps, 1024)
+
+        sizes = [480] * 20 + [17, 2048, 1] + [480] * 20
+        sizes.append(samples.size - sum(sizes))
+        outputs, position = [], 0
+        for size in sizes:
+            output = fir.process(samples[position : position + size])
+            self.assertEqual(output.size, size)
+            outputs.append(output)
+            position += size
+        actual = np.concatenate(outputs)
+        expected = np.convolve(samples, taps)[: samples.size]
+
+        self.assertEqual(fir.delay, 1023)
+        np.testing.assert_allclose(actual[: fir.delay], 0.0, atol=1e-6)
+        np.testing.assert_allclose(actual[fir.delay :], expected[: samples.size - fir.delay], rtol=0, atol=1e-3)
+
+    def test_delayed_fft_filter_switches_taps_at_a_block_without_losing_history(self) -> None:
+        liquid_dsp = self._liquid_dsp()
+        rng = np.random.default_rng(32)
+        old_taps = (rng.standard_normal(1025) * np.hamming(1025)).astype(np.float32)
+        new_taps = (rng.standard_normal(1025) * np.hamming(1025)).astype(np.float32)
+        samples = rng.standard_normal(480 * 60).astype(np.float32)
+        fir = liquid_dsp.DelayedFftFirFilter(old_taps, 1024)
+
+        before = 480 * 25
+        first = np.concatenate([fir.process(samples[i : i + 480]) for i in range(0, before, 480)])
+        fir.update_taps(new_taps)
+        second = np.concatenate([fir.process(samples[i : i + 480]) for i in range(before, samples.size, 480)])
+        actual = np.concatenate((first, second))[fir.delay :]
+
+        # Blocks already filtered keep the old taps; every later block uses the new taps
+        # applied to the real audio before it, not to silence.
+        switch = (before // 1024) * 1024
+        old = np.convolve(samples, old_taps)[: samples.size]
+        new = np.convolve(samples, new_taps)[: samples.size]
+        np.testing.assert_allclose(actual[:switch], old[:switch], rtol=0, atol=1e-3)
+        np.testing.assert_allclose(actual[switch:], new[switch : actual.size], rtol=0, atol=1e-3)
+
     def test_fft_audio_filters_can_be_created_from_many_threads_at_once(self) -> None:
         # Streams start together on separate threads. liquid-dsp plans its FFTs with
         # FFTW, whose planner crashes the whole process if used from two threads at once,
@@ -568,7 +616,10 @@ def worker():
     for _ in range(100):
         fir = liquid_dsp.AudioFirFilter(taps, 480)
         fir.process(np.ones(480, dtype=np.float32))
-        del fir
+        delayed = liquid_dsp.DelayedFftFirFilter(taps, 1024)
+        delayed.process(np.ones(1024, dtype=np.float32))
+        delayed.update_taps(taps)
+        del fir, delayed
 threads = [threading.Thread(target=worker) for _ in range(8)]
 for thread in threads:
     thread.start()
