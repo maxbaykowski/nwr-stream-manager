@@ -18,12 +18,14 @@ from typing import Any, Callable
 import numpy as np
 
 from .encoder import PcmResampler
+from .liquid_dsp import Oscillator
 
 
 LOG = logging.getLogger(__name__)
 
 SAME_MARK_HZ = 2083.3
 SAME_SPACE_HZ = 1562.5
+SAME_ATTENTION_TONE_HZ = 1050.0
 SAME_BAUD = 520.83
 SAME_PREAMBLE_BYTE = 0xAB
 SAME_PREAMBLE_BYTES = 16
@@ -94,28 +96,36 @@ def generate_same_burst(
     sample_rate = int(sample_rate)
     if sample_rate <= 0:
         raise ValueError("sample rate must be positive")
-    phase = 0.0
     mark_step = (2.0 * math.pi * SAME_MARK_HZ) / sample_rate
     space_step = (2.0 * math.pi * SAME_SPACE_HZ) / sample_rate
     samples_per_bit = sample_rate / SAME_BAUD
     sample_cursor = 0
     sample_target = 0.0
-    output: list[float] = []
     bytes_to_send = [SAME_PREAMBLE_BYTE] * SAME_PREAMBLE_BYTES
     bytes_to_send.extend(ord(ch) & 0x7F for ch in str(payload))
     bytes_to_send.extend([0x00] * SAME_TRAILING_NUL_BYTES)
+    # One oscillator retuned for each bit keeps the phase continuous between tones,
+    # as SAME encoders do.
+    oscillator = Oscillator()
+    parts: list[np.ndarray] = []
     for byte in bytes_to_send:
         for bit_index in range(8):
             sample_target += samples_per_bit
             bit_samples = int(round(sample_target)) - sample_cursor
             sample_cursor += bit_samples
-            step = mark_step if ((byte >> bit_index) & 1) else space_step
-            for _ in range(bit_samples):
-                output.append(amplitude * math.sin(phase))
-                phase += step
-                if phase >= 2.0 * math.pi:
-                    phase -= 2.0 * math.pi
-    return np.asarray(output, dtype=np.float32)
+            oscillator.set_frequency(mark_step if ((byte >> bit_index) & 1) else space_step)
+            parts.append(oscillator.generate(bit_samples))
+    return (float(amplitude) * np.concatenate(parts).imag).astype(np.float32)
+
+
+def generate_attention_tone(sample_rate: int, *, seconds: float = 8.0, amplitude: float = 1.0) -> np.ndarray:
+    """The 1050 Hz NOAA Weather Radio attention tone."""
+    sample_rate = int(sample_rate)
+    if sample_rate <= 0:
+        raise ValueError("sample rate must be positive")
+    oscillator = Oscillator(2.0 * math.pi * SAME_ATTENTION_TONE_HZ / sample_rate)
+    samples = oscillator.generate(max(0, round(float(seconds) * sample_rate)))
+    return (float(amplitude) * samples.imag).astype(np.float32)
 
 
 def generate_same_message(

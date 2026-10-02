@@ -4,6 +4,7 @@ import argparse
 import base64
 import binascii
 import fcntl
+import functools
 import hmac
 import hashlib
 from http.cookies import SimpleCookie
@@ -106,7 +107,7 @@ if __package__:
         validate_ppm_correction,
     )
     from .same_data import lookup_event, lookup_location
-    from .same_live import SameEventQueue, SameSuppressionProcessor, generate_same_message
+    from .same_live import SameEventQueue, SameSuppressionProcessor, generate_attention_tone, generate_same_message
     from .signal_meter import ChannelSignalMeter, SignalPresenceTracker, noise_reference_band_for_transition
     from .remote_sdr import (
         REMOTE_IQ_BUFFER_SECONDS,
@@ -226,6 +227,7 @@ else:
     SameEventQueue = same_live.SameEventQueue
     SameSuppressionProcessor = same_live.SameSuppressionProcessor
     generate_same_message = same_live.generate_same_message
+    generate_attention_tone = same_live.generate_attention_tone
     ChannelSignalMeter = signal_meter.ChannelSignalMeter
     SignalPresenceTracker = signal_meter.SignalPresenceTracker
     REMOTE_IQ_BUFFER_SECONDS = remote_sdr.REMOTE_IQ_BUFFER_SECONDS
@@ -2406,6 +2408,30 @@ def stream_test_mode_same_header(origin_time: datetime | None = None) -> str:
     return f"ZCZC-WXR-DMO-{STREAM_TEST_MODE_SAME_LOCATION}+0015-{timestamp}-{STREAM_TEST_MODE_SAME_SENDER_ID}-"
 
 
+def _read_only(audio: np.ndarray) -> np.ndarray:
+    audio = np.asarray(audio, dtype=np.float32)
+    audio.setflags(write=False)
+    return audio
+
+
+# The parts of a SAME test that never change are built once and shared by every test
+# mode stream; only the header, which carries the time, is built for each test.
+@functools.lru_cache(maxsize=4)
+def _test_mode_same_message_audio(sample_rate: int) -> np.ndarray:
+    message = load_mono_wav_float(asset_path(STREAM_TEST_MODE_SAME_AUDIO), sample_rate)
+    return _read_only(shape_test_mode_program_audio(message, sample_rate))
+
+
+@functools.lru_cache(maxsize=4)
+def _test_mode_attention_audio(sample_rate: int) -> np.ndarray:
+    return _read_only(condition_test_mode_tone_audio(generate_attention_tone(sample_rate, seconds=8.0)))
+
+
+@functools.lru_cache(maxsize=4)
+def _test_mode_eom_audio(sample_rate: int) -> np.ndarray:
+    return _read_only(condition_test_mode_tone_audio(generate_same_message("NNNN", sample_rate)))
+
+
 class SyntheticNwrTestModeSource:
     def __init__(self, *, sample_rate: int = IQ_SAMPLE_RATE) -> None:
         self.sample_rate = int(sample_rate)
@@ -2454,7 +2480,12 @@ class SyntheticNwrTestModeSource:
         with self.lock:
             if self.alert_active or self.stop_requested:
                 return False
-            self.alert_segments = deque(self._build_same_alert_segments())
+        # Built without holding the lock, so the audio thread keeps playing meanwhile.
+        segments = deque(self._build_same_alert_segments())
+        with self.lock:
+            if self.alert_active or self.stop_requested:
+                return False
+            self.alert_segments = segments
             self.alert_segment = None
             self.alert_position = 0
             self.alert_active = True
@@ -2500,10 +2531,9 @@ class SyntheticNwrTestModeSource:
     def _build_same_alert_segments(self) -> list[tuple[str, np.ndarray, bool]]:
         header = stream_test_mode_same_header()
         header_audio = condition_test_mode_tone_audio(generate_same_message(header, self.sample_rate))
-        eom_audio = condition_test_mode_tone_audio(generate_same_message("NNNN", self.sample_rate))
-        attention = condition_test_mode_tone_audio(self._tone(1050.0, 8.0, amplitude=1.0))
-        message = load_mono_wav_float(asset_path(STREAM_TEST_MODE_SAME_AUDIO), self.sample_rate)
-        message = shape_test_mode_program_audio(message, self.sample_rate)
+        eom_audio = _test_mode_eom_audio(self.sample_rate)
+        attention = _test_mode_attention_audio(self.sample_rate)
+        message = _test_mode_same_message_audio(self.sample_rate)
         return [
             ("header", header_audio, True),
             ("header_silence", np.zeros(round(self.sample_rate * 2.0), dtype=np.float32), False),
@@ -2516,7 +2546,7 @@ class SyntheticNwrTestModeSource:
         ]
 
     def _build_eom_segments(self) -> deque[tuple[str, np.ndarray, bool]]:
-        eom_audio = condition_test_mode_tone_audio(generate_same_message("NNNN", self.sample_rate))
+        eom_audio = _test_mode_eom_audio(self.sample_rate)
         return deque(
             [
                 ("pre_eom_silence", np.zeros(round(self.sample_rate * STREAM_TEST_MODE_PRE_EOM_SILENCE_SECONDS), dtype=np.float32), False),
@@ -2588,11 +2618,6 @@ class SyntheticNwrTestModeSource:
             written += take
             self.loop_position = (self.loop_position + take) % int(self.loop_audio.size)
         return output
-
-    def _tone(self, frequency_hz: float, seconds: float, *, amplitude: float) -> np.ndarray:
-        count = max(0, round(float(seconds) * self.sample_rate))
-        t = np.arange(count, dtype=np.float32) / float(self.sample_rate)
-        return (np.sin(2.0 * np.pi * float(frequency_hz) * t) * float(amplitude)).astype(np.float32)
 
     def _signal_ramp_locked(self, count: int) -> tuple[float, float]:
         start = float(self.current_signal_dbfs)

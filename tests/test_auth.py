@@ -715,6 +715,60 @@ class AuthTests(unittest.TestCase):
         self.assertGreater(self.web_control.rms_float(audio), 0.04)
         self.assertLess(float(self.web_control.np.mean(self.web_control.np.abs(audio) >= 1.0)), 0.001)
 
+    def test_same_test_reuses_its_fixed_audio_and_only_rebuilds_the_header(self) -> None:
+        web_control = self.web_control
+        np = web_control.np
+        first = web_control.SyntheticNwrTestModeSource(sample_rate=web_control.IQ_SAMPLE_RATE)._build_same_alert_segments()
+        second = web_control.SyntheticNwrTestModeSource(sample_rate=web_control.IQ_SAMPLE_RATE)._build_same_alert_segments()
+
+        self.assertEqual(
+            [kind for kind, _audio, _protected in first],
+            ["header", "header_silence", "attention", "attention_silence", "message", "pre_eom_silence", "eom", "post_eom_silence"],
+        )
+        segments = {kind: audio for kind, audio, _protected in first}
+        expected_message = web_control.shape_test_mode_program_audio(
+            web_control.load_mono_wav_float(
+                web_control.asset_path(web_control.STREAM_TEST_MODE_SAME_AUDIO), web_control.IQ_SAMPLE_RATE
+            ),
+            web_control.IQ_SAMPLE_RATE,
+        )
+        np.testing.assert_array_equal(segments["message"], expected_message)
+        for kind in ("attention", "message", "eom"):
+            with self.subTest(kind=kind):
+                # Shared between tests and streams, built once and never changed.
+                self.assertIs(segments[kind], {k: a for k, a, _p in second}[kind])
+                self.assertFalse(segments[kind].flags.writeable)
+
+    def test_starting_a_same_test_does_not_hold_up_test_mode_audio(self) -> None:
+        web_control = self.web_control
+        source = web_control.SyntheticNwrTestModeSource(sample_rate=web_control.IQ_SAMPLE_RATE)
+        building = web_control.threading.Event()
+        release = web_control.threading.Event()
+        original_build = source._build_same_alert_segments
+
+        def slow_build():
+            building.set()
+            release.wait(5.0)
+            return original_build()
+
+        source._build_same_alert_segments = slow_build
+        queued = []
+        worker = web_control.threading.Thread(target=lambda: queued.append(source.queue_same_test()))
+        worker.start()
+        try:
+            self.assertTrue(building.wait(5.0))
+            started = web_control.time.monotonic()
+            frame = source.process(web_control.STREAM_FRAME_SAMPLES)
+            elapsed = web_control.time.monotonic() - started
+        finally:
+            release.set()
+            worker.join(5.0)
+
+        self.assertEqual(frame.size, web_control.STREAM_FRAME_SAMPLES)
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(queued, [True])
+        self.assertTrue(source.snapshot()["same_active"])
+
     def test_synthetic_test_mode_signal_change_ramps(self) -> None:
         source = self.web_control.SyntheticNwrTestModeSource(sample_rate=self.web_control.IQ_SAMPLE_RATE)
         source.set_signal_dbfs(-80.0)

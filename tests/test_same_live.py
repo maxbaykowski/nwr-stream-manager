@@ -154,6 +154,66 @@ class SameLiveTests(unittest.TestCase):
 
         self.assertEqual(len(message), expected)
 
+    def test_same_burst_matches_the_original_phase_continuous_encoder(self) -> None:
+        # The original pure-Python encoder, kept here as the reference.
+        def reference(payload: str, sample_rate: int, amplitude: float = 0.73) -> np.ndarray:
+            same = self.same_live
+            phase, cursor, target, output = 0.0, 0, 0.0, []
+            data = [same.SAME_PREAMBLE_BYTE] * same.SAME_PREAMBLE_BYTES + [ord(ch) & 0x7F for ch in payload]
+            data += [0x00] * same.SAME_TRAILING_NUL_BYTES
+            for byte in data:
+                for bit_index in range(8):
+                    target += sample_rate / same.SAME_BAUD
+                    count = int(round(target)) - cursor
+                    cursor += count
+                    step = 2.0 * np.pi * (same.SAME_MARK_HZ if (byte >> bit_index) & 1 else same.SAME_SPACE_HZ) / sample_rate
+                    for _sample in range(count):
+                        output.append(amplitude * np.sin(phase))
+                        phase = (phase + step) % (2.0 * np.pi)
+            return np.asarray(output, dtype=np.float32)
+
+        payload = "ZCZC-WXR-RWT-026081+0030-2211907-KGRR/NWS-"
+        for sample_rate in (22_050, 24_000, 48_000):
+            with self.subTest(sample_rate=sample_rate):
+                burst = self.same_live.generate_same_burst(payload, sample_rate)
+                expected = reference(payload, sample_rate)
+                self.assertEqual(burst.size, expected.size)
+                np.testing.assert_allclose(burst, expected, rtol=0, atol=1e-3)
+
+    def test_attention_tone_is_a_steady_1050_hz_tone(self) -> None:
+        sample_rate = 24_000
+        tone = self.same_live.generate_attention_tone(sample_rate, seconds=8.0, amplitude=0.55)
+        spectrum = np.abs(np.fft.rfft(tone * np.hanning(tone.size)))
+        frequencies = np.fft.rfftfreq(tone.size, 1.0 / sample_rate)
+
+        self.assertEqual(tone.size, 8 * sample_rate)
+        self.assertAlmostEqual(float(frequencies[np.argmax(spectrum)]), 1050.0, delta=0.5)
+        self.assertAlmostEqual(float(np.max(np.abs(tone))), 0.55, delta=0.001)
+
+    @unittest.skipUnless(shutil.which("multimon-ng"), "multimon-ng is not installed")
+    def test_generated_same_messages_decode_with_multimon_ng(self) -> None:
+        import subprocess
+
+        eas_recording = importlib.import_module(f"{self.same_live.__package__}.eas_recording")
+        sample_rate = 22_050
+        header = "ZCZC-WXR-RWT-026081+0030-2211907-KGRR/NWS-"
+        for label, audio in (
+            ("test mode and live SAME", self.same_live.generate_same_message(header, sample_rate)),
+            ("pipeline SAME test", eas_recording.generate_same_test_audio(sample_rate=sample_rate, header=header)),
+        ):
+            with self.subTest(label):
+                padded = np.concatenate((np.zeros(sample_rate, dtype=np.float32), audio, np.zeros(sample_rate, dtype=np.float32)))
+                pcm = np.clip(padded * 32767.0, -32768, 32767).astype("<i2").tobytes()
+                decoded = subprocess.run(
+                    ["multimon-ng", "-q", "-t", "raw", "-a", "EAS", "-"],
+                    input=pcm,
+                    capture_output=True,
+                    timeout=30,
+                ).stdout.decode("utf-8", "replace")
+                self.assertIn(f"EAS: {header}", decoded)
+                if label == "pipeline SAME test":
+                    self.assertIn("EAS: NNNN", decoded)
+
     def test_detector_identifies_same_preamble(self) -> None:
         sample_rate = 24_000
         detector = self.same_live.SameToneDetector(sample_rate)
