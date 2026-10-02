@@ -3,8 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import math
+
 import numpy as np
 from numpy.typing import NDArray
+
+from .liquid_dsp import Oscillator
 
 
 TONE_WAVEFORMS = ("sine", "square", "triangle", "sawtooth")
@@ -132,6 +136,8 @@ class _ToneVoice:
     table: NDArray[np.float32] | None = None
     phase: float = 0.0
     level: float = 0.0
+    # The sine comes straight from liquid-dsp's precise oscillator instead of a table.
+    oscillator: Oscillator | None = None
 
 
 class ToneGeneratorBank:
@@ -167,18 +173,30 @@ class ToneGeneratorBank:
             if voice.level == 0.0 and target == 0.0:
                 continue
             frequency = self.settings.generators[name].frequency
-            if voice.table is None or frequency != voice.frequency:
-                voice.table = band_limited_wavetable(name, frequency, self.max_frequency_hz)
-                voice.frequency = frequency
             # Ramp level changes so toggling or adjusting a generator never clicks.
             steps = voice.level + np.sign(target - voice.level) * fade_step * np.arange(1, count + 1)
             levels = np.clip(steps, min(voice.level, target), max(voice.level, target))
-            phases = voice.phase + (frequency / self.sample_rate) * np.arange(count, dtype=np.float64)
-            voice.phase = float((phases[-1] + frequency / self.sample_rate) % 1.0)
-            output += (levels * _read_table(voice.table, phases % 1.0)).astype(np.float32)
+            output += (levels * self._waveform(name, voice, frequency, count)).astype(np.float32)
             total_levels += levels
             voice.level = float(levels[-1])
         return output, total_levels
+
+    def _waveform(self, name: str, voice: _ToneVoice, frequency: float, count: int) -> NDArray[np.float64]:
+        if name == "sine":
+            # A pure sine has no harmonics to limit, so no table is needed. Retuning keeps
+            # the oscillator's phase, so changing the frequency never clicks.
+            if voice.oscillator is None or frequency != voice.frequency:
+                if voice.oscillator is None:
+                    voice.oscillator = Oscillator()
+                voice.oscillator.set_frequency(2.0 * math.pi * frequency / self.sample_rate)
+                voice.frequency = frequency
+            return voice.oscillator.generate(count).imag.astype(np.float64)
+        if voice.table is None or frequency != voice.frequency:
+            voice.table = band_limited_wavetable(name, frequency, self.max_frequency_hz)
+            voice.frequency = frequency
+        phases = voice.phase + (frequency / self.sample_rate) * np.arange(count, dtype=np.float64)
+        voice.phase = float((phases[-1] + frequency / self.sample_rate) % 1.0)
+        return _read_table(voice.table, phases % 1.0)
 
 
 def _read_table(table: NDArray[np.float32], phases: NDArray[np.float64]) -> NDArray[np.float64]:

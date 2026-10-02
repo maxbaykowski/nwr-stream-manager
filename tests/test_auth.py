@@ -1033,6 +1033,33 @@ class AuthTests(unittest.TestCase):
             self.assertLessEqual(float(np.max(np.abs(audio))), 1.0 + 1e-6)
             self.assertLess(float(np.max(spectrum[frequencies > 7100.0]) / np.max(spectrum)), 1e-4)
 
+    def test_sine_generator_plays_the_default_frequency_and_retunes_smoothly(self) -> None:
+        np = self.web_control.np
+        sample_rate = self.web_control.IQ_SAMPLE_RATE
+        maximum = self.web_control.STREAM_TEST_MODE_TONE_MAX_FREQUENCY_HZ
+        bank = self.web_control.ToneGeneratorBank(sample_rate=sample_rate, max_frequency_hz=maximum)
+
+        def play(frequency: float, seconds: float):
+            bank.update(self.web_control.parse_tone_generator_settings(
+                {"generators": {"sine": {"enabled": True, "frequency": frequency, "amplitude": 100}}},
+                bank.settings,
+                max_frequency_hz=maximum,
+            ))
+            return np.concatenate([bank.process(480)[0] for _index in range(int(seconds * sample_rate / 480))])
+
+        first = play(440.0, 1.0)  # the generator's default frequency
+        second = play(1_000.0, 1.0)
+        settled = first[sample_rate // 2 :]
+        spectrum = np.abs(np.fft.rfft(settled * np.hanning(settled.size)))
+        frequencies = np.fft.rfftfreq(settled.size, 1.0 / sample_rate)
+
+        self.assertAlmostEqual(float(frequencies[np.argmax(spectrum)]), 440.0, delta=2.0)
+        self.assertAlmostEqual(float(np.max(np.abs(settled))), 1.0, delta=0.01)
+        # Retuning carries the phase on, so the step at the change is no bigger than a
+        # normal step of the new 1 kHz tone.
+        largest_step = 2.0 * np.sin(np.pi * 1_000.0 / sample_rate)
+        self.assertLessEqual(abs(float(second[0] - first[-1])), largest_step + 1e-3)
+
     def test_tone_generators_only_show_while_test_mode_is_on(self) -> None:
         html = self.web_control.INDEX_HTML
 

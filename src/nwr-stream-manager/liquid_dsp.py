@@ -298,6 +298,10 @@ class Oscillator:
         with self._lock:
             self._library.nco_crcf_set_phase(self._handle, float(radians))
 
+    def generate(self, count: int) -> NDArray[np.complex64]:
+        """The oscillator itself, exp(j * phase), for `count` samples."""
+        return self.mix_up(np.ones(max(0, int(count)), dtype=np.complex64))
+
     def mix_up(self, samples: NDArray[np.complex64]) -> NDArray[np.complex64]:
         samples = np.ascontiguousarray(samples, dtype=np.complex64)
         output = np.empty_like(samples)
