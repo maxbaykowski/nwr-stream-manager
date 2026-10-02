@@ -703,7 +703,7 @@ class AuthTests(unittest.TestCase):
 
     def test_synthetic_test_mode_source_demodulates_at_normal_level(self) -> None:
         source = self.web_control.SyntheticNwrTestModeSource(sample_rate=self.web_control.IQ_SAMPLE_RATE)
-        demodulator = self.web_control.ComplexNfmDemodulator()
+        demodulator = self.web_control.NfmDemodulator()
         effects = self.web_control.AudioEffectsProcessor(self.web_control.RECEIVER_AUDIO_CONFIG)
         frames = []
         for _ in range(int(1.0 / self.web_control.STREAM_FRAME_SECONDS)):
@@ -1580,6 +1580,7 @@ class AuthTests(unittest.TestCase):
         service.settings = self.web_control.RtlControlSettings(notify_sdr_failures=True)
         service._effective_settings_locked = lambda: service.settings
         service.raw_fanout = None
+        service.clean_fanout = None
         service.intermediate_fanout = None
         service.iq_file_source_config = None
         service.streams = []

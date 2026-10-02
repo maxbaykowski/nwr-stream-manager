@@ -89,7 +89,7 @@ if __package__:
     from .fallback_audio import load_fallback_audio
     from .icecast import IcecastSource
     from .icecastauth import IcecastSettings, normalize_server, test_mountpoint_authentication
-    from .nfm import float_to_s16
+    from .nfm import NfmDemodulator, float_to_s16
     from .rtl import (
         DEFAULT_RTL_SAMPLE_RATE,
         NWR_CENTER_FREQUENCY_HZ,
@@ -206,6 +206,7 @@ else:
     normalize_server = icecastauth_module.normalize_server
     test_mountpoint_authentication = icecastauth_module.test_mountpoint_authentication
     float_to_s16 = nfm.float_to_s16
+    NfmDemodulator = nfm.NfmDemodulator
     DEFAULT_RTL_SAMPLE_RATE = rtl.DEFAULT_RTL_SAMPLE_RATE
     NWR_CENTER_FREQUENCY_HZ = rtl.NWR_CENTER_FREQUENCY_HZ
     IqDcBlocker = rtl.IqDcBlocker
@@ -1401,21 +1402,24 @@ class RawRtlFanout:
             )
 
 
-class IntermediateIqFanout:
-    def __init__(
-        self,
-        raw_fanout: RawRtlFanout,
-        output_rate: int = INTERMEDIATE_IQ_SAMPLE_RATE,
-        *,
-        alias_filter_strength: int = ALIAS_FILTER_STRENGTH_DEFAULT,
-    ) -> None:
-        self.raw_fanout = raw_fanout
-        self.output_rate = int(output_rate)
-        self.alias_filter_strength = validate_alias_filter_strength(alias_filter_strength)
-        self.raw_queue = subscribe_raw_fanout(
-            raw_fanout,
+class ProcessedIqFanout:
+    """Read batches from another fanout, process them once, and share the result.
+
+    Subscribers get their own queue; a subscriber that falls behind loses its oldest
+    batch rather than holding everyone else up.
+    """
+
+    label = "IQ fanout"
+    thread_name = "iq-fanout"
+    source_queue_name = "iq-fanout-source"
+
+    def __init__(self, source_fanout, output_rate: int | None = None) -> None:
+        self.source_fanout = source_fanout
+        self.output_rate = None if output_rate is None else int(output_rate)
+        self.source_queue = subscribe_raw_fanout(
+            source_fanout,
             max_chunks=INTERMEDIATE_SOURCE_QUEUE_CHUNKS,
-            name="iq-intermediate-source",
+            name=self.source_queue_name,
         )
         self.subscribers: set[queue.Queue] = set()
         self.subscriber_names: dict[queue.Queue, str] = {}
@@ -1434,11 +1438,6 @@ class IntermediateIqFanout:
         self.last_output_at = 0.0
         self.last_drop_log_at = 0.0
         self.generation = 0
-
-    def set_alias_filter_strength(self, value: int) -> None:
-        value = validate_alias_filter_strength(value)
-        with self.subscribers_lock:
-            self.alias_filter_strength = value
 
     def subscribe(
         self,
@@ -1466,9 +1465,9 @@ class IntermediateIqFanout:
             self.subscriber_max_depth.pop(subscriber, None)
 
     def _chunks_for_seconds(self, seconds: float) -> int:
-        raw_chunks_for_seconds = getattr(self.raw_fanout, "_chunks_for_seconds", None)
-        if callable(raw_chunks_for_seconds):
-            return int(raw_chunks_for_seconds(seconds))
+        source_chunks_for_seconds = getattr(self.source_fanout, "_chunks_for_seconds", None)
+        if callable(source_chunks_for_seconds):
+            return int(source_chunks_for_seconds(seconds))
         return max(
             STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS,
             min(
@@ -1481,13 +1480,13 @@ class IntermediateIqFanout:
         if self.thread is not None and self.thread.is_alive():
             return
         self.stop_event.clear()
-        self.thread = threading.Thread(target=self._run, name="iq-intermediate-fanout", daemon=True)
+        self.thread = threading.Thread(target=self._run, name=self.thread_name, daemon=True)
         self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
-        self.raw_fanout.unsubscribe(self.raw_queue)
-        wake_queue(self.raw_queue)
+        self.source_fanout.unsubscribe(self.source_queue)
+        wake_queue(self.source_queue)
         if self.thread is not None:
             self.thread.join(timeout=2.0)
 
@@ -1496,7 +1495,7 @@ class IntermediateIqFanout:
             subscribers = [self._subscriber_stats_locked(subscriber) for subscriber in self.subscribers]
             return {
                 "sample_rate": self.output_rate,
-                "alias_filter_strength": self.alias_filter_strength,
+                **self._extra_stats_locked(),
                 "read_batches": self.read_batches,
                 "read_samples": self.read_samples,
                 "output_batches": self.output_batches,
@@ -1512,107 +1511,81 @@ class IntermediateIqFanout:
                 "subscribers": subscribers,
             }
 
+    def _extra_stats_locked(self) -> dict[str, Any]:
+        return {}
+
     def subscriber_stats(self, subscriber: queue.Queue | None) -> dict[str, Any]:
         if subscriber is None:
             return {}
         with self.subscribers_lock:
             return self._subscriber_stats_locked(subscriber)
 
+    def _reset_processing(self) -> None:
+        """Forget processing state when the source switches to a different SDR or file."""
+
+    def _process(self, source_batch, iq: np.ndarray) -> tuple[np.ndarray, int]:
+        """Return the processed samples and their sample rate."""
+        raise NotImplementedError
+
     def _run(self) -> None:
-        dc_blocker: IqDcBlocker | None = None
-        decimator = None
-        decimator_key: tuple[int, int] | None = None
-        decimator_alias_filter_strength: int | None = None
-        raw_generation = getattr(self.raw_fanout, "generation", 0)
+        source_generation = getattr(self.source_fanout, "generation", 0)
         last_slow_batch_log_at = 0.0
         while not self.stop_event.is_set():
             try:
-                raw_batch: RtlSampleBatch | IqSampleBatch = self.raw_queue.get(timeout=0.5)
+                source_batch: RtlSampleBatch | IqSampleBatch = self.source_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             except Exception as exc:
-                LOG.warning("intermediate IQ fanout failed to read RTL-SDR samples: %s", exc)
+                LOG.warning("%s failed to read IQ samples: %s", self.label, exc)
                 continue
-            if raw_batch is QUEUE_WAKEUP:
+            if source_batch is QUEUE_WAKEUP:
                 continue
-            current_raw_generation = getattr(self.raw_fanout, "generation", raw_generation)
-            incoming_generation = batch_generation(raw_batch)
-            if incoming_generation < current_raw_generation:
+            current_source_generation = getattr(self.source_fanout, "generation", source_generation)
+            incoming_generation = batch_generation(source_batch)
+            if incoming_generation < current_source_generation:
                 continue
-            if incoming_generation != raw_generation:
-                raw_generation = incoming_generation
-                dc_blocker = None
-                decimator = None
-                decimator_key = None
-                decimator_alias_filter_strength = None
+            if incoming_generation != source_generation:
+                source_generation = incoming_generation
+                self._reset_processing()
                 with self.subscribers_lock:
                     self.generation += 1
                     cleared = 0
                     for subscriber in self.subscribers:
                         cleared += clear_queue_items(subscriber)
                 LOG.info(
-                    "intermediate IQ fanout switched source generation to %s; cleared %s queued batches",
+                    "%s switched source generation to %s; cleared %s queued batches",
+                    self.label,
                     self.generation,
                     cleared,
                 )
-            with self.subscribers_lock:
-                alias_filter_strength = self.alias_filter_strength
-            transition_hz = alias_filter_transition_hz(
-                INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ,
-                alias_filter_strength,
-            )
-            attenuation_db = alias_filter_attenuation_db(
-                INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
-                alias_filter_strength,
-            )
-            key = (raw_batch.sample_rate, self.output_rate)
-            if decimator is None or decimator_key != key:
-                dc_blocker = IqDcBlocker(raw_batch.sample_rate)
-                decimator = create_decimator(
-                    raw_batch.sample_rate,
-                    self.output_rate,
-                    transition_hz=transition_hz,
-                    attenuation_db=attenuation_db,
-                )
-                decimator_key = key
-                decimator_alias_filter_strength = alias_filter_strength
-            elif decimator_alias_filter_strength != alias_filter_strength:
-                update_decimator_alias_filter(
-                    decimator,
-                    raw_batch.sample_rate,
-                    self.output_rate,
-                    transition_hz=transition_hz,
-                    attenuation_db=attenuation_db,
-                )
-                decimator_alias_filter_strength = alias_filter_strength
-            iq = iq_batch_complex(raw_batch)
+            iq = iq_batch_complex(source_batch)
             if iq.size == 0:
                 continue
-            if dc_blocker is None:
-                dc_blocker = IqDcBlocker(raw_batch.sample_rate)
             process_started_at = time.monotonic()
-            output = decimator.process(dc_blocker.process(iq))
+            output, output_rate = self._process(source_batch, iq)
             process_seconds = time.monotonic() - process_started_at
-            batch_seconds = float(iq.size) / float(max(1, raw_batch.sample_rate))
+            batch_seconds = float(iq.size) / float(max(1, source_batch.sample_rate))
             if process_seconds > batch_seconds and process_started_at - last_slow_batch_log_at >= 10.0:
                 last_slow_batch_log_at = process_started_at
                 LOG.warning(
-                    "intermediate IQ decimator is slower than realtime: source_rate=%s output_rate=%s processed %.3fs IQ in %.3fs",
-                    raw_batch.sample_rate,
-                    self.output_rate,
+                    "%s is slower than realtime: source_rate=%s output_rate=%s processed %.3fs IQ in %.3fs",
+                    self.label,
+                    source_batch.sample_rate,
+                    output_rate,
                     batch_seconds,
                     process_seconds,
                 )
             with self.subscribers_lock:
                 self.read_batches += 1
                 self.read_samples += int(iq.size)
+                self.output_rate = int(output_rate)
             if output.size == 0:
                 continue
             batch = IqSampleBatch(
                 data=output,
-                sample_rate=self.output_rate,
-                center_frequency_hz=raw_batch.center_frequency_hz,
-                captured_at=raw_batch.captured_at,
+                sample_rate=int(output_rate),
+                center_frequency_hz=source_batch.center_frequency_hz,
+                captured_at=source_batch.captured_at,
             )
             batch = set_batch_generation(batch, self.generation)
             self._publish(batch)
@@ -1674,11 +1647,98 @@ class IntermediateIqFanout:
                 self.last_drop_log_at = now
         if should_log:
             LOG.warning(
-                "intermediate IQ fanout is dropping batches for %s: subscriber_drops=%s total_drops=%s",
+                "%s is dropping batches for %s: subscriber_drops=%s total_drops=%s",
+                self.label,
                 name,
                 drops,
                 self.total_dropped_batches,
             )
+
+
+class CleanIqFanout(ProcessedIqFanout):
+    """The SDR's full-rate samples with its DC offset removed, shared by everything.
+
+    Removing the offset once, here, means every stream, recording and remote feed
+    starts from the same settled DC estimate instead of each settling its own.
+    """
+
+    label = "full-rate IQ fanout"
+    thread_name = "iq-clean-fanout"
+    source_queue_name = "iq-clean-source"
+
+    def __init__(self, raw_fanout: RawRtlFanout) -> None:
+        super().__init__(raw_fanout)
+        self.dc_blocker: IqDcBlocker | None = None
+
+    def _reset_processing(self) -> None:
+        self.dc_blocker = None
+
+    def _process(self, source_batch, iq: np.ndarray) -> tuple[np.ndarray, int]:
+        sample_rate = int(source_batch.sample_rate)
+        if self.dc_blocker is None or self.dc_blocker.sample_rate != sample_rate:
+            self.dc_blocker = IqDcBlocker(sample_rate)
+        return self.dc_blocker.process(iq), sample_rate
+
+
+class IntermediateIqFanout(ProcessedIqFanout):
+    """The full-rate feed decimated once to 192 ksps for streams and the receiver."""
+
+    label = "intermediate IQ fanout"
+    thread_name = "iq-intermediate-fanout"
+    source_queue_name = "iq-intermediate-source"
+
+    def __init__(
+        self,
+        source_fanout,
+        output_rate: int = INTERMEDIATE_IQ_SAMPLE_RATE,
+        *,
+        alias_filter_strength: int = ALIAS_FILTER_STRENGTH_DEFAULT,
+    ) -> None:
+        super().__init__(source_fanout, output_rate)
+        self.alias_filter_strength = validate_alias_filter_strength(alias_filter_strength)
+        self.decimator = None
+        self.decimator_key: tuple[int, int] | None = None
+        self.decimator_alias_filter_strength: int | None = None
+
+    def set_alias_filter_strength(self, value: int) -> None:
+        value = validate_alias_filter_strength(value)
+        with self.subscribers_lock:
+            self.alias_filter_strength = value
+
+    def _extra_stats_locked(self) -> dict[str, Any]:
+        return {"alias_filter_strength": self.alias_filter_strength}
+
+    def _reset_processing(self) -> None:
+        self.decimator = None
+        self.decimator_key = None
+        self.decimator_alias_filter_strength = None
+
+    def _process(self, source_batch, iq: np.ndarray) -> tuple[np.ndarray, int]:
+        with self.subscribers_lock:
+            alias_filter_strength = self.alias_filter_strength
+        output_rate = int(INTERMEDIATE_IQ_SAMPLE_RATE if self.output_rate is None else self.output_rate)
+        transition_hz = alias_filter_transition_hz(INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ, alias_filter_strength)
+        attenuation_db = alias_filter_attenuation_db(INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB, alias_filter_strength)
+        key = (int(source_batch.sample_rate), output_rate)
+        if self.decimator is None or self.decimator_key != key:
+            self.decimator = create_decimator(
+                source_batch.sample_rate,
+                output_rate,
+                transition_hz=transition_hz,
+                attenuation_db=attenuation_db,
+            )
+            self.decimator_key = key
+            self.decimator_alias_filter_strength = alias_filter_strength
+        elif self.decimator_alias_filter_strength != alias_filter_strength:
+            update_decimator_alias_filter(
+                self.decimator,
+                source_batch.sample_rate,
+                output_rate,
+                transition_hz=transition_hz,
+                attenuation_db=attenuation_db,
+            )
+            self.decimator_alias_filter_strength = alias_filter_strength
+        return self.decimator.process(iq), output_rate
 
 
 def subscribe_raw_fanout(
@@ -1938,8 +1998,11 @@ def fanout_channel_profile(fanout: RawRtlFanout | IntermediateIqFanout) -> tuple
     if not isinstance(fanout, IntermediateIqFanout):
         return None
     center_frequency_hz = NWR_CENTER_FREQUENCY_HZ
-    raw_fanout = getattr(fanout, "raw_fanout", None)
-    source = getattr(raw_fanout, "source", None)
+    # Walk back through the processing stages to the fanout that reads the SDR itself.
+    upstream = getattr(fanout, "source_fanout", None)
+    while upstream is not None and not hasattr(upstream, "source"):
+        upstream = getattr(upstream, "source_fanout", None)
+    source = getattr(upstream, "source", None)
     config = getattr(source, "config", None)
     if config is not None:
         center_frequency_hz = int(getattr(config, "center_frequency_hz", center_frequency_hz))
@@ -2081,8 +2144,6 @@ class HostWidebandSource:
         self.decimator = None
         self.decimator_key: tuple[int, int] | None = None
         self.decimator_strength: int | None = None
-        self.dc_blocker: IqDcBlocker | None = None
-        self.dc_blocker_key: tuple[int, int] | None = None
         self.generation = 0
 
     def set_frequency(self, frequency_hz: int) -> None:
@@ -2094,7 +2155,6 @@ class HostWidebandSource:
             self.close()
             self.fanout = fanout
             self.decimator = None
-            self.dc_blocker = None
             if fanout is not None:
                 self.queue = subscribe_raw_fanout(fanout, max_seconds=REMOTE_HOST_WIDEBAND_QUEUE_SECONDS, name=self.name)
                 self.generation = getattr(fanout, "generation", 0)
@@ -2111,16 +2171,7 @@ class HostWidebandSource:
         if incoming != self.generation:
             self.generation = incoming
             self.decimator = None
-            self.dc_blocker = None
         iq = iq_batch_complex(batch)
-        if isinstance(self.fanout, RawRtlFanout):
-            # Straight from the RTL-SDR, so the DC offset is still there; the 192 ksps
-            # feed has already had it removed.
-            dc_key = (batch.sample_rate, batch.center_frequency_hz)
-            if self.dc_blocker is None or self.dc_blocker_key != dc_key:
-                self.dc_blocker = IqDcBlocker(batch.sample_rate)
-                self.dc_blocker_key = dc_key
-            iq = self.dc_blocker.process(iq)
         if self.sample_rate > batch.sample_rate:
             raise ValueError("recording sample rate is higher than the RTL-SDR sample rate")
         if self.sample_rate == batch.sample_rate:
@@ -2181,7 +2232,7 @@ class LocalSdrRemoteBackend:
         def fanout_for(rate: int):
             if rate == INTERMEDIATE_IQ_SAMPLE_RATE:
                 return self.service.intermediate_fanout
-            return self.service.raw_fanout
+            return self.service.clean_fanout
 
         return HostWidebandSource(fanout_for, sample_rate, self.service._alias_filter_strength, name)
 
@@ -2231,30 +2282,6 @@ def iq_batch_complex(batch: RtlSampleBatch | IqSampleBatch) -> ComplexArray:
     if isinstance(data, np.ndarray):
         return data.astype(np.complex64, copy=False)
     return rtl_u8_to_complex64(data)
-
-
-class ComplexNfmDemodulator:
-    def __init__(self) -> None:
-        self.previous_sample: np.complex64 | None = None
-
-    def reset(self) -> None:
-        self.previous_sample = None
-
-    def process(self, iq: np.ndarray) -> np.ndarray:
-        if len(iq) == 0:
-            return np.array([], dtype=np.float32)
-        if len(iq) < 2 and self.previous_sample is None:
-            self.previous_sample = iq[-1]
-            return np.array([], dtype=np.float32)
-        if self.previous_sample is None:
-            output = np.angle(iq[1:] * np.conj(iq[:-1])).astype(np.float32)
-        else:
-            output = np.empty(len(iq), dtype=np.float32)
-            output[0] = np.angle(iq[0] * np.conj(self.previous_sample))
-            if len(iq) > 1:
-                output[1:] = np.angle(iq[1:] * np.conj(iq[:-1])).astype(np.float32)
-        self.previous_sample = iq[-1]
-        return (output / np.pi * 1.5).astype(np.float32, copy=False)
 
 
 def clamp_test_mode_signal_dbfs(value: Any) -> float:
@@ -2688,7 +2715,7 @@ def channel_audio_diagnostics(
             alias_filter_strength,
         ),
     )
-    demodulator = ComplexNfmDemodulator()
+    demodulator = NfmDemodulator()
     channel_iq = channelizer.process_complex(dc_blocker.process(iq))
     audio = demodulator.process(channel_iq)
     tone_peak_hz = None
@@ -3926,7 +3953,7 @@ class IcecastStreamWorker:
         signal_meter_gain = self.gain_provider()
         startup_backlog_drained = False
         last_slow_batch_log_at = 0.0
-        demodulator = ComplexNfmDemodulator()
+        demodulator = NfmDemodulator()
         audio_config = self.audio_config()
         effects = AudioEffectsProcessor(audio_config)
         frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
@@ -3943,7 +3970,7 @@ class IcecastStreamWorker:
         source_generation = getattr(self.fanout, "generation", 0)
         test_mode_was_active = False
         test_mode_next_frame_at: float | None = None
-        test_demodulator = ComplexNfmDemodulator()
+        test_demodulator = NfmDemodulator()
         test_frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
         real_test_iq_frame_buffer = ComplexFrameBuffer(STREAM_FRAME_SAMPLES)
         real_test_iq_frames: deque[np.ndarray] = deque()
@@ -3969,7 +3996,7 @@ class IcecastStreamWorker:
                 channelizer_key = None
                 channelizer_alias_filter_strength = None
                 channelizer_target_frequency_hz = None
-                demodulator = ComplexNfmDemodulator()
+                demodulator = NfmDemodulator()
                 real_test_iq_frame_buffer.clear()
                 real_test_iq_frames.clear()
                 startup_backlog_drained = False
@@ -4005,7 +4032,7 @@ class IcecastStreamWorker:
                 channelizer_key = next_channelizer_key
                 channelizer_alias_filter_strength = alias_filter_strength
                 channelizer_target_frequency_hz = target_frequency_hz
-                demodulator = ComplexNfmDemodulator()
+                demodulator = NfmDemodulator()
                 real_test_iq_frame_buffer.clear()
                 real_test_iq_frames.clear()
             elif channelizer_alias_filter_strength != alias_filter_strength:
@@ -4217,7 +4244,7 @@ class IcecastStreamWorker:
                 channelizer_key = None
                 channelizer_alias_filter_strength = None
                 channelizer_target_frequency_hz = None
-                demodulator = ComplexNfmDemodulator()
+                demodulator = NfmDemodulator()
                 self.signal_meter.reset()
                 frame_buffer.clear()
                 idle_next_frame_at = None
@@ -4266,7 +4293,7 @@ class IcecastStreamWorker:
                 channelizer_key = next_channelizer_key
                 channelizer_alias_filter_strength = alias_filter_strength
                 channelizer_target_frequency_hz = target_frequency_hz
-                demodulator = ComplexNfmDemodulator()
+                demodulator = NfmDemodulator()
                 self._configure_signal_meter(channel_transition_hz)
                 frame_buffer.clear()
             elif channelizer_alias_filter_strength != alias_filter_strength:
@@ -4663,11 +4690,6 @@ class IqRecorderWorker:
         decimator = None
         decimator_key: tuple[int, int] | None = None
         decimator_alias_filter_strength: int | None = None
-        # Samples straight from the RTL-SDR still carry its DC offset; the 192 ksps feed
-        # and remote feeds have already had it removed.
-        removes_dc = isinstance(self.fanout, RawRtlFanout)
-        dc_blocker: IqDcBlocker | None = None
-        dc_blocker_key: tuple[int, int] | None = None
         try:
             with self.config.output_path.open("wb") as output:
                 while not self.stop_event.is_set():
@@ -4685,12 +4707,6 @@ class IqRecorderWorker:
                     iq = iq_batch_complex(batch)
                     if iq.size == 0:
                         continue
-                    if removes_dc:
-                        next_dc_key = (batch.sample_rate, batch.center_frequency_hz)
-                        if dc_blocker is None or dc_blocker_key != next_dc_key:
-                            dc_blocker = IqDcBlocker(batch.sample_rate)
-                            dc_blocker_key = next_dc_key
-                        iq = dc_blocker.process(iq)
                     if self.config.mode == IQ_RECORDER_MODE_STREAM:
                         if self.config.target_frequency_hz is None:
                             raise ValueError("stream recording target frequency is missing")
@@ -5110,7 +5126,7 @@ class WeatherReceiverWorker:
         )
         startup_backlog_drained = False
         last_slow_batch_log_at = 0.0
-        demodulator = ComplexNfmDemodulator()
+        demodulator = NfmDemodulator()
         effects = AudioEffectsProcessor(RECEIVER_AUDIO_CONFIG)
         frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
         source_generation = getattr(self.fanout, "generation", 0)
@@ -5137,7 +5153,7 @@ class WeatherReceiverWorker:
                 channelizer_key = None
                 channelizer_alias_filter_strength = None
                 channelizer_target_frequency_hz = None
-                demodulator = ComplexNfmDemodulator()
+                demodulator = NfmDemodulator()
                 frame_buffer.clear()
                 LOG.info("weather receiver source generation changed for client %s; reset channel state", self.client_id)
             target_frequency_hz = self._frequency_hz()
@@ -5177,7 +5193,7 @@ class WeatherReceiverWorker:
                 if remote_retune:
                     demodulator.reset()
                 else:
-                    demodulator = ComplexNfmDemodulator()
+                    demodulator = NfmDemodulator()
                     frame_buffer.clear()
             elif channelizer_alias_filter_strength != alias_filter_strength:
                 channelizer.update_alias_filter(
@@ -5257,6 +5273,7 @@ class RtlControlService:
         self.capture: RtlCaptureSource | IqFileCaptureSource | None = None
         self.iq_file_source_config: IqFileSourceConfig | None = None
         self.raw_fanout: RawRtlFanout | None = None
+        self.clean_fanout: CleanIqFanout | None = None
         self.intermediate_fanout: IntermediateIqFanout | None = None
         self.test_mode_fanout = NullIqFanout()
         self.monitor_queue: queue.Queue | None = None
@@ -5573,6 +5590,7 @@ class RtlControlService:
             gain_values = capture.get_gain_values() if isinstance(capture, RtlCaptureSource) else []
             capture_stats = capture.stats() if capture is not None else {}
             fanout_stats = self.raw_fanout.stats() if self.raw_fanout is not None else {}
+            clean_stats = self.clean_fanout.stats() if self.clean_fanout is not None else {}
             intermediate_stats = self.intermediate_fanout.stats() if self.intermediate_fanout is not None else {}
             source_kind = "iq_file" if self.iq_file_source_config is not None else "rtl"
             source_name = (
@@ -5637,6 +5655,7 @@ class RtlControlService:
                 "capture_error": capture_error,
                 "capture_stats": capture_stats,
                 "raw_fanout_stats": fanout_stats,
+                "clean_fanout_stats": clean_stats,
                 "intermediate_fanout_stats": intermediate_stats,
                 "last_batch_at": self.last_batch_at,
                 "received_chunks": self.received_chunks,
@@ -6176,7 +6195,7 @@ class RtlControlService:
             existing = self.iq_recorder
             if existing is not None and existing.snapshot().get("active"):
                 raise ValueError("I/Q recording is already in progress")
-            raw_fanout = self.raw_fanout
+            clean_fanout = self.clean_fanout
             intermediate_fanout = self.intermediate_fanout
             config = self._iq_recorder_config_from_payload_locked(payload)
             if self.settings.uses_remote_sdr:
@@ -6193,7 +6212,7 @@ class RtlControlService:
             elif config.sample_rate == INTERMEDIATE_IQ_SAMPLE_RATE:
                 fanout = intermediate_fanout
             else:
-                fanout = raw_fanout
+                fanout = clean_fanout
             if fanout is None:
                 raise ValueError("RTL-SDR capture is not active")
             if self.storage_monitor.is_critical(config.output_path.parent):
@@ -8312,9 +8331,12 @@ class RtlControlService:
                 max_chunks=64,
                 name="web-status-drain",
             )
+        if self.clean_fanout is None:
+            self.clean_fanout = CleanIqFanout(self.raw_fanout)
+        self.clean_fanout.start()
         if self.intermediate_fanout is None:
             self.intermediate_fanout = IntermediateIqFanout(
-                self.raw_fanout,
+                self.clean_fanout,
                 alias_filter_strength=self.settings.alias_filter_strength,
             )
             self.intermediate_fanout.start()
@@ -8337,6 +8359,8 @@ class RtlControlService:
         self._stop_iq_recorder_locked()
         intermediate = self.intermediate_fanout
         self.intermediate_fanout = None
+        clean = self.clean_fanout
+        self.clean_fanout = None
         fanout = self.raw_fanout
         self.raw_fanout = None
         self.monitor_queue = None
@@ -8347,6 +8371,8 @@ class RtlControlService:
         LOG.info("stopped RTL-SDR control capture")
         if intermediate is not None:
             intermediate.stop()
+        if clean is not None:
+            clean.stop()
         if fanout is not None:
             fanout.stop()
         if capture is not None:
@@ -8369,6 +8395,8 @@ class RtlControlService:
             self.preview_streams = {}
             intermediate = self.intermediate_fanout
             self.intermediate_fanout = None
+            clean = self.clean_fanout
+            self.clean_fanout = None
             fanout = self.raw_fanout
             self.raw_fanout = None
             self.monitor_queue = None
@@ -8382,6 +8410,8 @@ class RtlControlService:
             recorder.stop()
         if intermediate is not None:
             intermediate.stop()
+        if clean is not None:
+            clean.stop()
         if fanout is not None:
             fanout.stop()
         if capture is not None:

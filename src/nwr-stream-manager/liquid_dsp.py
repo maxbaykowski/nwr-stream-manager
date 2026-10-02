@@ -81,6 +81,14 @@ def liquid_library() -> ctypes.CDLL:
         library.nco_crcf_mix_block_up.argtypes = [pointer, pointer, pointer, ctypes.c_uint]
         library.nco_crcf_destroy.restype = ctypes.c_int
         library.nco_crcf_destroy.argtypes = [pointer]
+        library.freqdem_create.restype = pointer
+        library.freqdem_create.argtypes = [ctypes.c_float]
+        library.freqdem_reset.restype = ctypes.c_int
+        library.freqdem_reset.argtypes = [pointer]
+        library.freqdem_demodulate_block.restype = ctypes.c_int
+        library.freqdem_demodulate_block.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
+        library.freqdem_destroy.restype = ctypes.c_int
+        library.freqdem_destroy.argtypes = [pointer]
         library.liquid_vectorcf_addscalar.restype = None
         library.liquid_vectorcf_addscalar.argtypes = [pointer, ctypes.c_uint, _FloatComplex, pointer]
         _library = library
@@ -300,6 +308,39 @@ class Oscillator:
         if handle and library is not None:
             try:
                 library.nco_crcf_destroy(handle)
+            except Exception:
+                pass
+            self._handle = None
+
+
+class FmDemodulator:
+    """FM demodulation: the phase change from each sample to the next, times `gain` / pi."""
+
+    def __init__(self, gain: float) -> None:
+        self._library = liquid_library()
+        # liquid-dsp outputs the phase change divided by 2 * pi * kf.
+        self._handle = self._library.freqdem_create(1.0 / (2.0 * float(gain)))
+        if not self._handle:
+            raise RuntimeError("liquid-dsp could not create the FM demodulator")
+
+    def reset(self) -> None:
+        self._library.freqdem_reset(self._handle)
+
+    def demodulate(self, samples: NDArray[np.complex64]) -> NDArray[np.float32]:
+        samples = np.ascontiguousarray(samples, dtype=np.complex64)
+        output = np.empty(samples.size, dtype=np.float32)
+        if samples.size:
+            self._library.freqdem_demodulate_block(
+                self._handle, samples.ctypes.data, samples.size, output.ctypes.data
+            )
+        return output
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_handle", None)
+        library = getattr(self, "_library", None)
+        if handle and library is not None:
+            try:
+                library.freqdem_destroy(handle)
             except Exception:
                 pass
             self._handle = None

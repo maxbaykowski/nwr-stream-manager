@@ -1,49 +1,54 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 from numpy.typing import NDArray
+
+from .liquid_dsp import FmDemodulator
 
 
 PCM_SCALE = 32768.0
 NFM_DEVIATION_GAIN = 1.5
+IQ_BYTES_PER_SAMPLE = {"f32": 8, "s16": 4}
 
 
-@dataclass
 class NfmDemodulator:
-    iq_format: str = "f32"
-    _pending_bytes: bytes = b""
-    _previous_sample: np.complex64 | None = None
+    """Narrowband FM demodulator for every receive path.
 
-    def process(self, chunk: bytes) -> NDArray[np.float32]:
+    `process` takes complex samples; `process_bytes` takes raw interleaved I/Q from a
+    file or pipe in `iq_format` ("f32" or "s16"), even when a sample is split across reads.
+    """
+
+    def __init__(self, iq_format: str = "f32") -> None:
+        if iq_format not in IQ_BYTES_PER_SAMPLE:
+            raise ValueError(f"unsupported IQ format: {iq_format}")
+        self.iq_format = iq_format
+        self._demodulator = FmDemodulator(NFM_DEVIATION_GAIN)
+        self._pending_bytes = b""
+        self._started = False
+
+    def reset(self) -> None:
+        """Forget the previous sample, e.g. after retuning, so no phase jump is heard."""
+        self._demodulator.reset()
+        self._started = False
+
+    def process(self, iq: NDArray[np.complex64]) -> NDArray[np.float32]:
+        if len(iq) == 0:
+            return np.array([], dtype=np.float32)
+        audio = self._demodulator.demodulate(iq)
+        if not self._started:
+            # The very first sample has nothing before it to measure a phase change from.
+            self._started = True
+            audio = audio[1:]
+        return audio
+
+    def process_bytes(self, chunk: bytes) -> NDArray[np.float32]:
         chunk = self._pending_bytes + chunk
-        bytes_per_iq_sample = 8 if self.iq_format == "f32" else 4
+        bytes_per_iq_sample = IQ_BYTES_PER_SAMPLE[self.iq_format]
         aligned_size = len(chunk) - (len(chunk) % bytes_per_iq_sample)
         self._pending_bytes = chunk[aligned_size:]
-        chunk = chunk[:aligned_size]
-        if not chunk:
+        if not aligned_size:
             return np.array([], dtype=np.float32)
-
-        iq = _iq_bytes_to_complex64(chunk, self.iq_format)
-        if len(iq) < 2 and self._previous_sample is None:
-            if len(iq) == 1:
-                self._previous_sample = iq[-1]
-            return np.array([], dtype=np.float32)
-
-        if self._previous_sample is None:
-            previous = iq[:-1]
-            current = iq[1:]
-        else:
-            previous = np.concatenate((np.array([self._previous_sample]), iq[:-1]))
-            current = iq
-
-        self._previous_sample = iq[-1]
-        demodulated = np.angle(current * np.conj(previous)).astype(np.float32)
-        return (demodulated / np.pi * NFM_DEVIATION_GAIN).astype(
-            np.float32,
-            copy=False,
-        )
+        return self.process(_iq_bytes_to_complex64(chunk[:aligned_size], self.iq_format))
 
 
 def _iq_bytes_to_complex64(chunk: bytes, iq_format: str) -> NDArray[np.complex64]:

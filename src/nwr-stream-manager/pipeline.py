@@ -738,7 +738,7 @@ class StreamPipeline:
         chunk: bytes,
         demodulator: NfmDemodulator,
     ) -> None:
-        audio = demodulator.process(chunk)
+        audio = demodulator.process_bytes(chunk)
         if len(audio) == 0:
             return
         self._queue_audio(audio)

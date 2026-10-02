@@ -2333,8 +2333,8 @@ class EasAlertTests(unittest.TestCase):
         self.assertLess(float(np.max(np.abs(output))), 0.32)
         self.assertGreater(float(np.max(np.abs(output))), 0.28)
 
-    def test_complex_nfm_demodulator_accepts_empty_streaming_blocks(self) -> None:
-        demodulator = self.web_control.ComplexNfmDemodulator()
+    def test_nfm_demodulator_accepts_empty_streaming_blocks(self) -> None:
+        demodulator = self.web_control.NfmDemodulator()
 
         first = demodulator.process(np.array([1 + 0j], dtype=np.complex64))
         empty = demodulator.process(np.array([], dtype=np.complex64))
@@ -2344,8 +2344,42 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(len(empty), 0)
         self.assertEqual(len(resumed), 1)
 
-    def test_complex_nfm_demodulator_reset_drops_cross_channel_phase_step(self) -> None:
-        demodulator = self.web_control.ComplexNfmDemodulator()
+    def test_nfm_demodulator_matches_the_phase_difference_reference_across_frames(self) -> None:
+        rng = np.random.default_rng(9)
+        time_axis = np.arange(24_000) / 24_000
+        audio = 0.6 * np.sin(2 * np.pi * 1050 * time_axis)
+        iq = (
+            np.exp(1j * 2 * np.pi * np.cumsum(5_000 * audio) / 24_000)
+            + 0.05 * (rng.standard_normal(time_axis.size) + 1j * rng.standard_normal(time_axis.size))
+        ).astype(np.complex64)
+        demodulator = self.web_control.NfmDemodulator()
+
+        actual = np.concatenate([demodulator.process(iq[index : index + 480]) for index in range(0, iq.size, 480)])
+        expected = np.angle(iq[1:] * np.conj(iq[:-1])) / np.pi * 1.5
+
+        self.assertEqual(actual.size, iq.size - 1)
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-5)
+
+    def test_nfm_demodulator_bytes_match_samples_even_when_split_mid_sample(self) -> None:
+        nfm = importlib.import_module(f"{self.web_control.__package__}.nfm")
+        rng = np.random.default_rng(10)
+        iq = (0.5 * np.exp(1j * rng.uniform(-np.pi, np.pi, 1_000))).astype(np.complex64)
+        expected = nfm.NfmDemodulator().process(iq)
+
+        interleaved = np.empty(iq.size * 2, dtype="<f4")
+        interleaved[0::2] = iq.real
+        interleaved[1::2] = iq.imag
+        f32 = interleaved.tobytes()
+        s16 = np.round(interleaved * 32768.0).astype("<i2").tobytes()
+        for iq_format, data, tolerance in (("f32", f32, 1e-5), ("s16", s16, 1e-3)):
+            with self.subTest(iq_format=iq_format):
+                demodulator = nfm.NfmDemodulator(iq_format)
+                # 1,003 bytes: every read but the last ends partway through a sample.
+                actual = np.concatenate([demodulator.process_bytes(data[index : index + 1_003]) for index in range(0, len(data), 1_003)])
+                np.testing.assert_allclose(actual, expected, rtol=0, atol=tolerance)
+
+    def test_nfm_demodulator_reset_drops_cross_channel_phase_step(self) -> None:
+        demodulator = self.web_control.NfmDemodulator()
 
         demodulator.process(np.array([1 + 0j], dtype=np.complex64))
         with_step = demodulator.process(np.array([0 + 1j], dtype=np.complex64))
@@ -2446,6 +2480,7 @@ class EasAlertTests(unittest.TestCase):
         service.iq_recorder = None
         service.preview_streams = {}
         service.intermediate_fanout = None
+        service.clean_fanout = None
         service.raw_fanout = None
         service.capture = None
         service.iq_file_source_config = None
@@ -2783,76 +2818,10 @@ class EasAlertTests(unittest.TestCase):
             actual = interleaved[0::2] + 1j * interleaved[1::2]
             np.testing.assert_array_equal(actual.astype(np.complex64), iq)
 
-    def test_full_rate_spectrum_recording_removes_the_rtl_sdr_dc_offset(self) -> None:
+    def test_clean_iq_fanout_hands_every_subscriber_the_same_dc_blocked_samples(self) -> None:
         web_control = self.web_control
 
-        class Fanout(web_control.RawRtlFanout):
-            def __init__(self):
-                self.queue = web_control.queue.Queue(maxsize=64)
-
-            def subscribe(self, max_chunks=64, max_seconds=None, name="subscriber"):
-                return self.queue
-
-            def unsubscribe(self, subscriber):
-                pass
-
-        class Storage:
-            def add_path(self, path):
-                pass
-
-            def recording_started(self):
-                pass
-
-            def recording_stopped(self):
-                pass
-
-            def is_critical(self, path):
-                return False
-
-        with tempfile.TemporaryDirectory() as tempdir:
-            output_path = Path(tempdir) / "full-rate.cf32"
-            fanout = Fanout()
-            sample_rate = web_control.DEFAULT_RTL_SAMPLE_RATE
-            chunk = sample_rate // 10
-            time_axis = np.arange(chunk, dtype=np.float64) / sample_rate
-            # A station 25 kHz off centre, riding on a DC offset like the dongle's own.
-            iq = (0.5 * np.exp(1j * 2 * np.pi * 25_000 * time_axis) + (0.2 - 0.1j)).astype(np.complex64)
-            raw = self._complex_to_rtl_u8(iq)
-            chunks = 40
-            worker = web_control.IqRecorderWorker(
-                fanout=fanout,
-                config=web_control.IqRecorderConfig(
-                    recording_id="recording-full-rate",
-                    mode=web_control.IQ_RECORDER_MODE_SPECTRUM,
-                    sample_rate=sample_rate,
-                    duration_seconds=0,
-                    output_path=output_path,
-                    index_path=Path(tempdir) / "index.json",
-                    frequency_hz=162_475_000,
-                ),
-                storage_monitor=Storage(),
-                alias_filter_strength_provider=lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
-            )
-            worker.start()
-            for _index in range(chunks):
-                fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=sample_rate, center_frequency_hz=162_475_000))
-            self._wait_for(
-                lambda: output_path.exists() and output_path.stat().st_size >= iq.size * 8 * chunks,
-                timeout=20.0,
-            )
-            worker.stop()
-
-            interleaved = np.frombuffer(output_path.read_bytes(), dtype="<f4")
-            recorded = interleaved[0::2] + 1j * interleaved[1::2]
-            last_second = recorded[-sample_rate:]
-            # After four seconds the offset (0.22) is nearly gone and the station is untouched.
-            self.assertLess(abs(complex(np.mean(last_second))), 0.01)
-            self.assertAlmostEqual(float(np.mean(np.abs(last_second - np.mean(last_second)))), 0.5, delta=0.02)
-
-    def test_remote_wideband_feed_removes_the_rtl_sdr_dc_offset(self) -> None:
-        web_control = self.web_control
-
-        class Fanout(web_control.RawRtlFanout):
+        class RawFanout:
             generation = 0
 
             def __init__(self):
@@ -2864,26 +2833,58 @@ class EasAlertTests(unittest.TestCase):
             def unsubscribe(self, subscriber):
                 pass
 
-        fanout = Fanout()
+        raw_fanout = RawFanout()
+        clean = web_control.CleanIqFanout(raw_fanout)
+        recording = clean.subscribe(max_chunks=64, name="recording")
+        wideband = clean.subscribe(max_chunks=64, name="wideband")
         sample_rate = web_control.DEFAULT_RTL_SAMPLE_RATE
-        source = web_control.HostWidebandSource(
-            lambda rate: fanout,
-            sample_rate,
-            lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
-            "remote:test",
+        time_axis = np.arange(sample_rate // 10, dtype=np.float64) / sample_rate
+        # A station 25 kHz off centre, riding on a DC offset like the dongle's own.
+        raw = self._complex_to_rtl_u8(
+            (0.5 * np.exp(1j * 2 * np.pi * 25_000 * time_axis) + (0.2 - 0.1j)).astype(np.complex64)
         )
-        iq = np.full(sample_rate // 10, 0.2 - 0.1j, dtype=np.complex64)
-        raw = self._complex_to_rtl_u8(iq)
-        outputs = []
-        for _index in range(40):
-            fanout.queue.put(web_control.RtlSampleBatch(data=raw, sample_rate=sample_rate, center_frequency_hz=162_475_000))
-            outputs.append(source.read(timeout=1.0).data)
-        source.close()
+        clean.start()
+        try:
+            for _index in range(40):
+                raw_fanout.queue.put(
+                    web_control.RtlSampleBatch(data=raw, sample_rate=sample_rate, center_frequency_hz=162_475_000)
+                )
+            batches = {}
+            for name, subscriber in (("recording", recording), ("wideband", wideband)):
+                batches[name] = [subscriber.get(timeout=10.0) for _index in range(40)]
+        finally:
+            clean.stop()
 
-        self.assertGreater(abs(complex(np.mean(outputs[0][:1000]))), 0.2)
-        self.assertLess(abs(complex(np.mean(outputs[-1]))), 0.01)
+        first = batches["recording"]
+        self.assertEqual({batch.sample_rate for batch in first}, {sample_rate})
+        for mine, theirs in zip(first, batches["wideband"]):
+            self.assertIs(mine.data, theirs.data)
+        last_second = np.concatenate([batch.data for batch in first[-10:]])
+        # After four seconds the offset (0.22) is nearly gone and the station is untouched.
+        self.assertGreater(abs(complex(np.mean(first[0].data[:1000]))), 0.2)
+        self.assertLess(abs(complex(np.mean(last_second))), 0.01)
+        self.assertAlmostEqual(float(np.mean(np.abs(last_second - np.mean(last_second)))), 0.5, delta=0.02)
 
-    def test_192ksps_spectrum_recording_uses_intermediate_fanout(self) -> None:
+    def test_remote_wideband_feeds_tap_the_shared_dc_blocked_feeds(self) -> None:
+        web_control = self.web_control
+        service = types.SimpleNamespace(
+            clean_fanout=object(),
+            intermediate_fanout=object(),
+            _alias_filter_strength=lambda: web_control.ALIAS_FILTER_STRENGTH_DEFAULT,
+        )
+        backend = object.__new__(web_control.LocalSdrRemoteBackend)
+        backend.service = service
+
+        for sample_rate, expected in (
+            (web_control.INTERMEDIATE_IQ_SAMPLE_RATE, service.intermediate_fanout),
+            (768_000, service.clean_fanout),
+            (web_control.DEFAULT_RTL_SAMPLE_RATE, service.clean_fanout),
+        ):
+            with self.subTest(sample_rate=sample_rate):
+                source = backend.open_wideband(sample_rate, "remote:test")
+                self.assertIs(source.fanout_provider(sample_rate), expected)
+
+    def test_spectrum_recordings_tap_the_shared_dc_blocked_feeds(self) -> None:
         web_control = self.web_control
 
         class Storage:
@@ -2918,6 +2919,7 @@ class EasAlertTests(unittest.TestCase):
         service.iq_recorder = None
         service.iq_recorder_account_id = None
         service.raw_fanout = object()
+        service.clean_fanout = object()
         service.intermediate_fanout = object()
         service.storage_monitor = Storage()
         service.iq_recordings_directory = Path(tempfile.gettempdir()) / "nwr-stream-manager-test-iq"
@@ -2925,18 +2927,24 @@ class EasAlertTests(unittest.TestCase):
         service.settings = web_control.RtlControlSettings(alias_filter_strength=web_control.ALIAS_FILTER_STRENGTH_DEFAULT)
         web_control.IqRecorderWorker = Worker
         try:
-            service.start_iq_recording(
-                {
-                    "mode": web_control.IQ_RECORDER_MODE_SPECTRUM,
-                    "sample_rate": web_control.INTERMEDIATE_IQ_SAMPLE_RATE,
-                    "duration_seconds": 1,
-                }
-            )
+            for sample_rate in (web_control.INTERMEDIATE_IQ_SAMPLE_RATE, 768_000, web_control.DEFAULT_RTL_SAMPLE_RATE):
+                service.iq_recorder = None
+                service.start_iq_recording(
+                    {
+                        "mode": web_control.IQ_RECORDER_MODE_SPECTRUM,
+                        "sample_rate": sample_rate,
+                        "duration_seconds": 1,
+                    }
+                )
         finally:
             web_control.IqRecorderWorker = original_worker
 
-        self.assertEqual(len(Worker.instances), 1)
-        self.assertIs(Worker.instances[0].fanout, service.intermediate_fanout)
+        # 192 ksps comes straight from the shared decimated feed; higher rates decimate
+        # from the shared DC-blocked full-rate feed, never the dongle's raw bytes.
+        self.assertEqual(
+            [worker.fanout for worker in Worker.instances],
+            [service.intermediate_fanout, service.clean_fanout, service.clean_fanout],
+        )
 
     def test_iq_recorder_spectrum_decimators_support_all_recording_rates(self) -> None:
         web_control = self.web_control

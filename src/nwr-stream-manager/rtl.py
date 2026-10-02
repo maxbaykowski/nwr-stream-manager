@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from .dsp import DEFAULT_OUTPUT_SAMPLE_RATE, IqChannelizer, IqDcBlocker, rtl_u8_to_complex64
+from .dsp import IqDcBlocker, rtl_u8_to_complex64
 
 
 LOG = logging.getLogger(__name__)
@@ -946,102 +946,6 @@ class RtlCaptureSource:
         return True
 
 
-class ProcessedIqSource:
-    """Converts raw RTL-SDR bytes into shifted 24 kS/s complex float32 IQ."""
-
-    def __init__(
-        self,
-        rtl_source: RtlCaptureSource,
-        target_frequency_hz: int = NWR_CENTER_FREQUENCY_HZ,
-        output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
-    ) -> None:
-        self.rtl_source = rtl_source
-        self.target_frequency_hz = target_frequency_hz
-        self.output_rate = output_rate
-        self.dc_blocker: IqDcBlocker | None = None
-        self.channelizer: IqChannelizer | None = None
-        self.channelizer_key: tuple[int, int, int] | None = None
-
-    def read(self, timeout: float | None = None):
-        batch = self.rtl_source.read(timeout=timeout)
-        next_key = (
-            batch.sample_rate,
-            batch.center_frequency_hz,
-            int(round(self.target_frequency_hz)),
-        )
-        if self.channelizer is None or self.channelizer_key != next_key:
-            self.dc_blocker = IqDcBlocker(batch.sample_rate)
-            self.channelizer = IqChannelizer(
-                input_rate=batch.sample_rate,
-                center_frequency_hz=batch.center_frequency_hz,
-                target_frequency_hz=int(round(self.target_frequency_hz)),
-                output_rate=self.output_rate,
-            )
-            self.channelizer_key = next_key
-        centered_iq = rtl_u8_to_complex64(batch.data)
-        if self.dc_blocker is None:
-            self.dc_blocker = IqDcBlocker(batch.sample_rate)
-        dc_blocked_iq = self.dc_blocker.process(centered_iq)
-        assert self.channelizer is not None
-        return self.channelizer.process_complex(dc_blocked_iq)
-
-
-class IqFanout:
-    """Small in-process fanout for later stream workers."""
-
-    def __init__(self, source: ProcessedIqSource) -> None:
-        self.source = source
-        self.subscribers: set[queue.Queue] = set()
-        self.subscribers_lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread: threading.Thread | None = None
-
-    def subscribe(self, max_chunks: int = 32) -> queue.Queue:
-        subscriber: queue.Queue = queue.Queue(maxsize=max_chunks)
-        with self.subscribers_lock:
-            self.subscribers.add(subscriber)
-        return subscriber
-
-    def unsubscribe(self, subscriber: queue.Queue) -> None:
-        with self.subscribers_lock:
-            self.subscribers.discard(subscriber)
-
-    def start(self) -> None:
-        if self.thread is not None and self.thread.is_alive():
-            return
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._run, name="iq-fanout", daemon=True)
-        self.thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        if self.thread is not None:
-            self.thread.join(timeout=2.0)
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                samples = self.source.read(timeout=0.5)
-            except queue.Empty:
-                continue
-            except EOFError:
-                return
-            except RtlError as exc:
-                LOG.warning("processed IQ source read failed: %s", exc)
-                continue
-            with self.subscribers_lock:
-                subscribers = list(self.subscribers)
-            for subscriber in subscribers:
-                try:
-                    subscriber.put_nowait(samples)
-                except queue.Full:
-                    try:
-                        subscriber.get_nowait()
-                        subscriber.put_nowait(samples)
-                    except queue.Empty:
-                        pass
-
-
 def list_rtl_devices() -> list[RtlDeviceInfo]:
     if rtlsdr_lib is None:
         raise RtlDependencyError(str(RTLSDR_IMPORT_ERROR))
@@ -1205,20 +1109,3 @@ def reset_usb_rtl_device(serial: str, *, timeout_seconds: float = 5.0) -> tuple[
     except OSError as exc:
         raise RtlUsbResetError(f"USB reset failed for RTL-SDR serial {serial}: {exc}") from exc
     return device, method
-
-
-def run_processed_iq_loop(
-    callback: Callable,
-    *,
-    config: RtlConfig,
-    target_frequency_hz: int = NWR_CENTER_FREQUENCY_HZ,
-    output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
-) -> None:
-    source = RtlCaptureSource(config)
-    processed = ProcessedIqSource(source, target_frequency_hz, output_rate)
-    source.start()
-    try:
-        while True:
-            callback(processed.read())
-    finally:
-        source.stop()
