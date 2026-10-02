@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -102,7 +103,10 @@ class DspTests(unittest.TestCase):
 
         actual = np.concatenate(actual_parts)
         expected = np.concatenate(expected_parts)
-        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        # liquid-dsp waits for a whole group of input before producing its output, so the
+        # newest output can still be pending; everything produced must match exactly.
+        self.assertIn(expected.size - actual.size, (0, 1))
+        np.testing.assert_allclose(actual, expected[: actual.size], rtol=1e-5, atol=1e-5)
 
     def test_rational_resampler_chunking_matches_single_pass(self) -> None:
         rng = np.random.default_rng(456)
@@ -306,13 +310,14 @@ class DspTests(unittest.TestCase):
             transition_hz=1_000,
         )
         decimator = channelizer.decimator
-        fir = decimator.fir
+        self.assertIsInstance(decimator, self.dsp.TwoStageChannelDecimator)
+        fir = decimator.final_stage.fir
         original_taps = fir.taps.copy()
 
         channelizer.update_alias_filter(transition_hz=4_000)
 
         self.assertIs(channelizer.decimator, decimator)
-        self.assertIs(decimator.fir, fir)
+        self.assertIs(decimator.final_stage.fir, fir)
         self.assertFalse(np.array_equal(fir.taps, original_taps))
 
     def test_staged_decimator_alias_filter_update_retunes_first_and_final_stage(self) -> None:
@@ -439,6 +444,65 @@ class DspTests(unittest.TestCase):
 
                 self.assertLess(abs(peak_frequency - audio_frequency_hz), 25.0)
                 self.assertGreater(float(np.sqrt(np.mean(settled * settled))), 0.05)
+
+
+    def test_two_stage_channel_decimator_keeps_the_channel_and_rejects_neighbours(self) -> None:
+        sample_rate, output_rate = 192_000, 24_000
+        time_axis = np.arange(sample_rate // 2, dtype=np.float64) / sample_rate
+
+        def level_db(frequency_hz: float) -> float:
+            decimator = self.dsp.create_decimator(sample_rate, output_rate, transition_hz=1_000)
+            tone = np.exp(1j * 2.0 * np.pi * frequency_hz * time_axis).astype(np.complex64)
+            output = np.concatenate([decimator.process(tone[i : i + 19_200]) for i in range(0, tone.size, 19_200)])
+            settled = output[output_rate // 10 :]
+            return 10.0 * np.log10(float(np.mean(np.abs(settled) ** 2)) + 1e-20)
+
+        self.assertIsInstance(self.dsp.create_decimator(sample_rate, output_rate), self.dsp.TwoStageChannelDecimator)
+        reference = level_db(0.0)
+        # The channel itself stays flat out to its edge...
+        for frequency_hz in (5_000.0, 9_000.0, 10_500.0):
+            self.assertGreater(level_db(frequency_hz) - reference, -0.5, frequency_hz)
+        # ...and everything that would fold back into it is gone, including the next channel.
+        for frequency_hz in (12_500.0, 20_000.0, 25_000.0, -25_000.0, 50_000.0, 75_000.0):
+            self.assertLess(level_db(frequency_hz) - reference, -85.0, frequency_hz)
+
+    def test_changing_filter_coefficients_continues_without_a_glitch(self) -> None:
+        rng = np.random.default_rng(7)
+        samples = (rng.normal(size=20_000) + 1j * rng.normal(size=20_000)).astype(np.complex64)
+        steady = self.dsp.IntegerDecimator.create(192_000, 24_000, transition_hz=1_000, attenuation_db=80)
+        updated = self.dsp.IntegerDecimator.create(192_000, 24_000, transition_hz=1_000, attenuation_db=80)
+
+        expected = np.concatenate([steady.process(samples[:7_003]), steady.process(samples[7_003:])])
+        first = updated.process(samples[:7_003])
+        updated.fir.update_taps(updated.fir.taps.copy())
+        actual = np.concatenate([first, updated.process(samples[7_003:])])
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+    def test_filtering_and_changing_coefficients_at_once_is_safe(self) -> None:
+        decimator = self.dsp.IntegerDecimator.create(192_000, 24_000, transition_hz=1_000, attenuation_db=80)
+        samples = np.ones(19_200, dtype=np.complex64)
+        errors = []
+        stop = threading.Event()
+
+        def keep_filtering() -> None:
+            try:
+                while not stop.is_set():
+                    decimator.process(samples)
+            except Exception as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        worker = threading.Thread(target=keep_filtering)
+        worker.start()
+        try:
+            for transition_hz in (1_000, 2_000, 4_000) * 10:
+                decimator.update_alias_filter(192_000, 24_000, transition_hz=transition_hz)
+        finally:
+            stop.set()
+            worker.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        self.assertGreater(decimator.process(samples).size, 0)
 
 
 if __name__ == "__main__":

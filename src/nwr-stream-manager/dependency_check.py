@@ -132,6 +132,16 @@ NATIVE_DEPENDENCIES = (
         ("libvorbisenc.so.2", "libvorbisenc.so"),
         ("vorbis_encode_init",),
     ),
+    NativeDependency(
+        "liquid-dsp",
+        "liquid",
+        ("libliquid.so.1", "libliquid.so.2", "libliquid.so"),
+        (
+            "firdecim_crcf_create",
+            "firdecim_crcf_execute_block",
+            "firdecim_crcf_destroy",
+        ),
+    ),
 )
 
 EXECUTABLE_DEPENDENCIES = ("multimon-ng", "openssl")

@@ -17,6 +17,8 @@ need:
 - `libogg`, `libvorbis`, and `libvorbisenc` runtime libraries for OGG streaming
 - `libopus` runtime libraries for browser stream monitoring and the weather
   radio receiver
+- `liquid-dsp` runtime library for signal processing (`libliquid1` on Debian and
+  Raspberry Pi OS, `liquid-dsp` on Fedora)
 
 On x86_64 systems, the Python dependency set may install `pyrtlsdrlib`. On ARM
 systems such as Raspberry Pi, use the distribution-provided `librtlsdr` package

@@ -7,6 +7,8 @@ from fractions import Fraction
 import numpy as np
 from numpy.typing import NDArray
 
+from .liquid_dsp import FirDecimator
+
 
 ComplexArray = NDArray[np.complex64]
 FloatArray = NDArray[np.float32]
@@ -200,47 +202,16 @@ class FirFilter:
         self._history = work[-keep:].copy() if keep else np.array([], dtype=np.complex64)
         return filtered
 
-    def process_decimated(self, samples: ComplexArray, *, factor: int, offset: int) -> ComplexArray:
-        samples = samples.astype(np.complex64, copy=False)
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
-        factor = max(1, int(factor))
-        offset = int(offset) % factor
-        if factor == 1:
-            return self.process(samples)
-        work = np.concatenate((self._history, samples))
-        taps = self.taps[::-1]
-        valid_count = int(samples.size)
-        if offset >= valid_count:
-            keep = self.taps.size - 1
-            self._history = work[-keep:].copy() if keep else np.array([], dtype=np.complex64)
-            return np.array([], dtype=np.complex64)
-        output_count = 1 + ((valid_count - 1 - offset) // factor)
-        output = np.empty(output_count, dtype=np.complex64)
-        sample_stride = work.strides[0]
-        block_rows = 2048
-        written = 0
-        for row_start in range(0, output_count, block_rows):
-            rows = min(block_rows, output_count - row_start)
-            start_index = offset + (row_start * factor)
-            windows = np.lib.stride_tricks.as_strided(
-                work[start_index:],
-                shape=(rows, taps.size),
-                strides=(sample_stride * factor, sample_stride),
-                writeable=False,
-            )
-            output[written : written + rows] = windows @ taps
-            written += rows
-        keep = self.taps.size - 1
-        self._history = work[-keep:].copy() if keep else np.array([], dtype=np.complex64)
-        return output
-
 
 @dataclass
 class IntegerDecimator:
     factor: int
-    fir: FirFilter
-    _filtered_samples_seen: int = 0
+    fir: FirFilter | FirDecimator
+
+    def __post_init__(self) -> None:
+        # liquid-dsp filters and decimates in one pass; a factor of 1 is just a filter.
+        if int(self.factor) >= 2 and isinstance(self.fir, FirFilter):
+            self.fir = FirDecimator(int(self.factor), self.fir.taps)
 
     @classmethod
     def create(
@@ -269,11 +240,7 @@ class IntegerDecimator:
         samples = samples.astype(np.complex64, copy=False)
         if samples.size == 0:
             return np.array([], dtype=np.complex64)
-        start = self._filtered_samples_seen
-        offset = (-start) % self.factor
-        decimated = self.fir.process_decimated(samples, factor=self.factor, offset=offset)
-        self._filtered_samples_seen = start + int(samples.size)
-        return decimated.astype(np.complex64, copy=False)
+        return self.fir.process(samples)
 
     def update_alias_filter(
         self,
@@ -317,70 +284,35 @@ def design_halfband_taps(
     return response.astype(np.float32)
 
 
-@dataclass
 class HalfBandDecimator2x:
-    taps: FloatArray
-    _history: ComplexArray = field(init=False)
-    _samples_seen: int = 0
-    _center_index: int = field(init=False)
-    _nonzero_indices: NDArray[np.int64] = field(init=False)
-    _nonzero_taps: FloatArray = field(init=False)
+    """Decimate by two with a half-band filter."""
 
-    def __post_init__(self) -> None:
-        self.update_taps(self.taps)
+    def __init__(self, taps: FloatArray) -> None:
+        self.fir = FirDecimator(2, self._checked(taps))
+
+    @staticmethod
+    def _checked(taps: FloatArray) -> FloatArray:
+        taps = np.asarray(taps, dtype=np.float32)
+        if taps.ndim != 1 or taps.size < 7 or taps.size % 4 != 3:
+            raise ValueError("half-band FIR taps must be one-dimensional with 4m+3 taps")
+        return taps
+
+    @property
+    def taps(self) -> FloatArray:
+        return self.fir.taps
 
     @property
     def is_integer_decimation(self) -> bool:
         return True
 
     def update_taps(self, taps: FloatArray) -> None:
-        taps = np.asarray(taps, dtype=np.float32)
-        if taps.ndim != 1 or taps.size < 7 or taps.size % 4 != 3:
-            raise ValueError("half-band FIR taps must be one-dimensional with 4m+3 taps")
-        center = int(taps.size // 2)
-        keep = int(taps.size - 1)
-        if hasattr(self, "_history"):
-            if self._history.size >= keep:
-                history = self._history[-keep:].copy()
-            else:
-                history = np.zeros(keep, dtype=np.complex64)
-                if self._history.size:
-                    history[-self._history.size :] = self._history
-        else:
-            history = np.zeros(keep, dtype=np.complex64)
-        nonzero_indices = np.array(
-            [
-                index
-                for index, value in enumerate(taps)
-                if index != center and abs(float(value)) > 1e-12
-            ],
-            dtype=np.int64,
-        )
-        self.taps = taps
-        self._history = history
-        self._center_index = center
-        self._nonzero_indices = nonzero_indices
-        self._nonzero_taps = taps[nonzero_indices]
+        self.fir.update_taps(self._checked(taps))
 
     def process(self, samples: ComplexArray) -> ComplexArray:
         samples = samples.astype(np.complex64, copy=False)
         if samples.size == 0:
             return np.array([], dtype=np.complex64)
-        work = np.concatenate((self._history, samples))
-        offset = (-self._samples_seen) % 2
-        valid_count = int(samples.size)
-        if offset >= valid_count:
-            self._history = work[-(self.taps.size - 1) :].copy()
-            self._samples_seen += valid_count
-            return np.array([], dtype=np.complex64)
-        output_count = 1 + ((valid_count - 1 - offset) // 2)
-        starts = offset + (np.arange(output_count, dtype=np.int64) * 2)
-        output = work[starts + self._center_index] * self.taps[self._center_index]
-        for index, tap in zip(self._nonzero_indices, self._nonzero_taps):
-            output = output + work[starts + index] * tap
-        self._history = work[-(self.taps.size - 1) :].copy()
-        self._samples_seen += valid_count
-        return output.astype(np.complex64, copy=False)
+        return self.fir.process(samples)
 
 
 @dataclass
@@ -447,6 +379,84 @@ class FixedFactor8IntermediateDecimator:
             transition_hz=self.transition_hz,
             attenuation_db=self.attenuation_db,
         )
+
+
+@dataclass
+class TwoStageChannelDecimator:
+    """Decimate one channel by 4 or more in two steps instead of one long filter.
+
+    The first step is a short filter that only has to keep the final channel flat and
+    stop anything that would fold back into it; the second, at twice the output rate,
+    is the sharp filter that sets the channel edge. It does the same job as a single
+    filter at the input rate with roughly a third of the work.
+    """
+
+    input_rate: int
+    output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE
+    transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ
+    attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB
+    first_stage: IntegerDecimator = field(init=False)
+    final_stage: IntegerDecimator = field(init=False)
+    intermediate_rate: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.input_rate % (self.output_rate * 2) != 0:
+            raise ValueError("input_rate must be a multiple of twice output_rate")
+        self.intermediate_rate = self.output_rate * 2
+        self.first_stage = IntegerDecimator(
+            factor=self.input_rate // self.intermediate_rate,
+            fir=FirFilter(self._design_first_stage_taps()),
+        )
+        self.final_stage = IntegerDecimator(factor=2, fir=FirFilter(self._design_final_stage_taps()))
+
+    def _design_first_stage_taps(self) -> FloatArray:
+        # Flat up to the output's Nyquist (the channel edge) and fully stopped from where
+        # signals would fold back onto it at the intermediate rate; the final stage
+        # removes everything in between.
+        keep_hz = self.output_rate / 2.0
+        stop_hz = self.intermediate_rate - keep_hz
+        return design_lowpass_taps(
+            self.input_rate,
+            (keep_hz + stop_hz) / 2.0,
+            stop_hz - keep_hz,
+            attenuation_db=self.attenuation_db,
+        )
+
+    def _design_final_stage_taps(self) -> FloatArray:
+        return design_alias_filter_taps(
+            self.intermediate_rate,
+            self.output_rate,
+            transition_hz=self.transition_hz,
+            attenuation_db=self.attenuation_db,
+        )
+
+    @property
+    def is_integer_decimation(self) -> bool:
+        return True
+
+    def process(self, samples: ComplexArray) -> ComplexArray:
+        if samples.size == 0:
+            return np.array([], dtype=np.complex64)
+        return self.final_stage.process(self.first_stage.process(samples))
+
+    def update_alias_filter(
+        self,
+        input_rate: int,
+        output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
+        *,
+        transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ,
+        attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
+    ) -> None:
+        if int(input_rate) != self.input_rate or int(output_rate) != self.output_rate:
+            raise ValueError("two-stage decimator rates cannot change during alias filter update")
+        self.transition_hz = float(transition_hz)
+        self.attenuation_db = float(attenuation_db)
+        self.first_stage.fir.update_taps(self._design_first_stage_taps())
+        self.final_stage.fir.update_taps(self._design_final_stage_taps())
+
+
+def _uses_two_stage_channel_decimator(input_rate: int, output_rate: int) -> bool:
+    return input_rate % (output_rate * 2) == 0 and input_rate // output_rate >= 4
 
 
 @dataclass
@@ -719,7 +729,7 @@ def create_decimator(
     *,
     transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ,
     attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB,
-) -> IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator | FixedFactor8IntermediateDecimator:
+) -> IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator | FixedFactor8IntermediateDecimator | TwoStageChannelDecimator:
     if input_rate <= 0 or output_rate <= 0:
         raise ValueError("input_rate and output_rate must be greater than 0")
     if input_rate < output_rate:
@@ -759,6 +769,13 @@ def create_decimator(
             attenuation_db=attenuation_db,
         )
     if input_rate <= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
+        if _uses_two_stage_channel_decimator(input_rate, output_rate):
+            return TwoStageChannelDecimator(
+                input_rate,
+                output_rate,
+                transition_hz=transition_hz,
+                attenuation_db=attenuation_db,
+            )
         if input_rate % output_rate == 0:
             return IntegerDecimator.create(
                 input_rate,
@@ -781,7 +798,7 @@ def create_decimator(
 
 
 def update_decimator_alias_filter(
-    decimator: IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator | FixedFactor8IntermediateDecimator,
+    decimator: IdentityDecimator | IntegerDecimator | RationalResampler | StagedDecimator | FixedFactor8IntermediateDecimator | TwoStageChannelDecimator,
     input_rate: int,
     output_rate: int = DEFAULT_OUTPUT_SAMPLE_RATE,
     *,
@@ -816,7 +833,7 @@ class IqChannelizer:
     transition_hz: float = DEFAULT_ALIAS_TRANSITION_HZ
     alias_attenuation_db: float = DEFAULT_ALIAS_ATTENUATION_DB
     shifter: FrequencyShifter = field(init=False)
-    decimator: IntegerDecimator | RationalResampler | StagedDecimator = field(init=False)
+    decimator: IntegerDecimator | RationalResampler | StagedDecimator | TwoStageChannelDecimator = field(init=False)
 
     def __post_init__(self) -> None:
         offset = float(self.center_frequency_hz - self.target_frequency_hz)
