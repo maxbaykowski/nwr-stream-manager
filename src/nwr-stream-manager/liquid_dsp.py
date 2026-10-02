@@ -29,6 +29,12 @@ class _FloatComplex(ctypes.Structure):
 
 _library: ctypes.CDLL | None = None
 _library_lock = threading.Lock()
+# liquid-dsp's FFT filters plan their FFTs with FFTW where it is available, and FFTW's
+# planner is not thread-safe: streams starting together on separate threads crashed the
+# whole process. Creating and destroying them happens one at a time; running them is
+# safe in parallel. Re-entrant, because garbage collection can destroy one filter while
+# the same thread is creating another.
+_fft_plan_lock = threading.RLock()
 
 
 def liquid_library() -> ctypes.CDLL:
@@ -95,6 +101,14 @@ def liquid_library() -> ctypes.CDLL:
         library.freqdem_demodulate_block.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
         library.freqdem_destroy.restype = ctypes.c_int
         library.freqdem_destroy.argtypes = [pointer]
+        library.fftfilt_rrrf_create.restype = pointer
+        library.fftfilt_rrrf_create.argtypes = [pointer, ctypes.c_uint, ctypes.c_uint]
+        library.fftfilt_rrrf_reset.restype = ctypes.c_int
+        library.fftfilt_rrrf_reset.argtypes = [pointer]
+        library.fftfilt_rrrf_execute.restype = ctypes.c_int
+        library.fftfilt_rrrf_execute.argtypes = [pointer, pointer, pointer]
+        library.fftfilt_rrrf_destroy.restype = ctypes.c_int
+        library.fftfilt_rrrf_destroy.argtypes = [pointer]
         library.liquid_vectorcf_addscalar.restype = None
         library.liquid_vectorcf_addscalar.argtypes = [pointer, ctypes.c_uint, _FloatComplex, pointer]
         _library = library
@@ -378,6 +392,81 @@ class FmModulator:
         if handle and library is not None:
             try:
                 library.freqmod_destroy(handle)
+            except Exception:
+                pass
+            self._handle = None
+
+
+class AudioFirFilter:
+    """Filter real audio with a long FIR, using liquid-dsp's FFT filter for whole blocks.
+
+    Chunks made of whole `block`-sample blocks, which is what every audio path sends,
+    go through the FFT filter. Any other length is filtered directly from the same
+    history, so the output is identical whatever lengths arrive, with no added delay.
+    """
+
+    def __init__(self, taps: NDArray[np.float32], block: int) -> None:
+        taps = np.ascontiguousarray(taps, dtype=np.float32)
+        if taps.ndim != 1 or taps.size == 0:
+            raise ValueError("FIR taps must be a non-empty one-dimensional array")
+        if int(block) < taps.size - 1:
+            raise ValueError("FFT filter block must be at least the filter length minus one")
+        self.taps = taps
+        self.block = int(block)
+        self._library = liquid_library()
+        with _fft_plan_lock:
+            self._handle = self._library.fftfilt_rrrf_create(taps.ctypes.data, taps.size, self.block)
+        if not self._handle:
+            raise RuntimeError("liquid-dsp could not create the FFT filter")
+        self._history = np.zeros(taps.size - 1, dtype=np.float32)
+        self._in_step = True  # the FFT filter's own state matches self._history
+
+    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
+        samples = np.ascontiguousarray(samples, dtype=np.float32)
+        if samples.size == 0:
+            return samples.copy()
+        if samples.size % self.block:
+            output = np.convolve(np.concatenate((self._history, samples)), self.taps, mode="valid").astype(np.float32)
+            self._in_step = False
+        else:
+            if not self._in_step:
+                self._prime()
+            output = np.empty_like(samples)
+            item = samples.itemsize
+            for start in range(0, samples.size, self.block):
+                self._library.fftfilt_rrrf_execute(
+                    self._handle, samples.ctypes.data + start * item, output.ctypes.data + start * item
+                )
+        self._remember(samples)
+        return output
+
+    def _prime(self) -> None:
+        # Run one block ending in the remembered input, so the FFT filter carries on
+        # from exactly where direct filtering left off.
+        primer = np.zeros(self.block, dtype=np.float32)
+        if self._history.size:
+            primer[-self._history.size :] = self._history
+        discard = np.empty_like(primer)
+        self._library.fftfilt_rrrf_reset(self._handle)
+        self._library.fftfilt_rrrf_execute(self._handle, primer.ctypes.data, discard.ctypes.data)
+        self._in_step = True
+
+    def _remember(self, samples: NDArray[np.float32]) -> None:
+        keep = self._history.size
+        if not keep:
+            return
+        if samples.size >= keep:
+            self._history = samples[-keep:].copy()
+        else:
+            self._history = np.concatenate((self._history[samples.size :], samples))
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_handle", None)
+        library = getattr(self, "_library", None)
+        if handle and library is not None:
+            try:
+                with _fft_plan_lock:
+                    library.fftfilt_rrrf_destroy(handle)
             except Exception:
                 pass
             self._handle = None

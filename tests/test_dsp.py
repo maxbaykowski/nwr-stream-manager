@@ -547,5 +547,39 @@ class DspTests(unittest.TestCase):
         self.assertGreater(decimator.process(samples).size, 0)
 
 
+    def test_fft_audio_filters_can_be_created_from_many_threads_at_once(self) -> None:
+        # Streams start together on separate threads. liquid-dsp plans its FFTs with
+        # FFTW, whose planner crashes the whole process if used from two threads at once,
+        # so this runs in a child process where a crash fails the test instead.
+        import subprocess
+
+        package_dir = Path(self.dsp.__file__).resolve().parent
+        script = f"""
+import importlib.util, sys, threading, types
+import numpy as np
+package = types.ModuleType("nwr_fft_thread_check")
+package.__path__ = [{str(package_dir)!r}]
+sys.modules["nwr_fft_thread_check"] = package
+liquid_dsp = importlib.import_module("nwr_fft_thread_check.liquid_dsp")
+taps = np.hanning(257).astype(np.float32)
+start = threading.Barrier(8)
+def worker():
+    start.wait()
+    for _ in range(100):
+        fir = liquid_dsp.AudioFirFilter(taps, 480)
+        fir.process(np.ones(480, dtype=np.float32))
+        del fir
+threads = [threading.Thread(target=worker) for _ in range(8)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+print("ok")
+"""
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertEqual(result.stdout.strip(), "ok")
+
 if __name__ == "__main__":
     unittest.main()

@@ -2083,6 +2083,25 @@ class EasAlertTests(unittest.TestCase):
         self.assertNotEqual(processor.deemphasis.curve.tobytes(), curve.tobytes())
         self.assertEqual(processor.deemphasis.tau, 0.0)
 
+    def test_deemphasis_matches_direct_filtering_for_any_mix_of_frame_sizes(self) -> None:
+        rng = np.random.default_rng(21)
+        samples = (0.3 * rng.standard_normal(24_000)).astype(np.float32)
+        deemphasis = self.deemphasis.DeemphasisFilter(24_000, 300)
+        expected = np.convolve(samples, deemphasis.curve)[: samples.size]
+
+        # Whole 20 ms frames use the FFT filter; odd sizes are filtered directly, and the
+        # FFT filter has to pick up exactly where they left off.
+        sizes = [480] * 5 + [2048, 17, 479] + [480] * 5 + [960, 1] + [480] * 10
+        sizes.append(samples.size - sum(sizes))
+        outputs, position = [], 0
+        for size in sizes:
+            outputs.append(deemphasis.process_float(samples[position : position + size]))
+            position += size
+        actual = np.concatenate(outputs)
+
+        self.assertEqual(actual.size, samples.size)
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-5)
+
     def test_nwr_deemphasis_curve_follows_fixed_weather_radio_slope(self) -> None:
         curve = self.deemphasis.generate_deemphasis_curve(24_000, 300)
         disabled = self.deemphasis.generate_deemphasis_curve(24_000, 0)

@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
+from .liquid_dsp import AudioFirFilter
+
 
 PCM_SCALE = 32768.0
 # The receive curve as levels in dB relative to 1 kHz, joined smoothly on a log-frequency axis.
@@ -35,6 +37,9 @@ NWR_DEEMPHASIS_VOICING: tuple[tuple[float, float], ...] = (
 )
 NWR_DEEMPHASIS_1KHZ_DB = -12.1
 NWR_DEEMPHASIS_TAPS = 257
+# Every audio path hands the effects 20 ms frames, 480 samples at 24 kHz, so the FFT
+# filter works on exactly one frame at a time and adds no delay.
+DEEMPHASIS_BLOCK_SAMPLES = 480
 
 
 @dataclass
@@ -42,12 +47,11 @@ class DeemphasisFilter:
     sample_rate: int
     tau: float
     curve: NDArray[np.float32] = field(init=False)
-    _history: NDArray[np.float32] = field(init=False)
+    _fir: AudioFirFilter | None = field(init=False, default=None)
     _pending_byte: bytes = b""
 
     def __post_init__(self) -> None:
-        self.curve = generate_deemphasis_curve(self.sample_rate, self.tau)
-        self._history = np.zeros(max(len(self.curve) - 1, 0), dtype=np.float32)
+        self._update_curve(generate_deemphasis_curve(self.sample_rate, self.tau))
 
     @property
     def enabled(self) -> bool:
@@ -80,28 +84,14 @@ class DeemphasisFilter:
         return b""
 
     def _filter(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        if not self.enabled:
+        if not self.enabled or self._fir is None:
             return samples
-        window = np.concatenate((self._history, samples))
-        filtered = np.convolve(window, self.curve, mode="full")
-        start = len(self._history)
-        stop = start + len(samples)
-        self._history = window[-len(self._history) :]
-        return filtered[start:stop].astype(np.float32, copy=False)
+        return self._fir.process(samples)
 
     def _update_curve(self, curve: NDArray[np.float32]) -> None:
-        curve = np.asarray(curve, dtype=np.float32)
-        keep = max(len(curve) - 1, 0)
-        if keep <= 0:
-            history = np.array([], dtype=np.float32)
-        elif len(self._history) >= keep:
-            history = self._history[-keep:].copy()
-        else:
-            history = np.zeros(keep, dtype=np.float32)
-            if len(self._history):
-                history[-len(self._history) :] = self._history
-        self.curve = curve
-        self._history = history
+        self.curve = np.asarray(curve, dtype=np.float32)
+        # Turning de-emphasis back on starts the filter from silence, as before.
+        self._fir = AudioFirFilter(self.curve, DEEMPHASIS_BLOCK_SAMPLES) if self.curve.size > 1 else None
 
 
 def generate_deemphasis_curve(sample_rate: int, tau: float) -> NDArray[np.float32]:
