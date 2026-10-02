@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from .liquid_dsp import FmDemodulator
+from .liquid_dsp import FmDemodulator, FmModulator
 
 
 PCM_SCALE = 32768.0
@@ -49,6 +49,16 @@ class NfmDemodulator:
         if not aligned_size:
             return np.array([], dtype=np.float32)
         return self.process(_iq_bytes_to_complex64(chunk[:aligned_size], self.iq_format))
+
+
+class NfmModulator:
+    """Narrowband FM modulator: audio of +/-1 swings the carrier by +/-deviation_hz."""
+
+    def __init__(self, sample_rate: int, deviation_hz: float) -> None:
+        self._modulator = FmModulator(float(deviation_hz) / float(sample_rate))
+
+    def process(self, audio: NDArray[np.float32]) -> NDArray[np.complex64]:
+        return self._modulator.modulate(np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0))
 
 
 def _iq_bytes_to_complex64(chunk: bytes, iq_format: str) -> NDArray[np.complex64]:

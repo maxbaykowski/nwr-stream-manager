@@ -89,7 +89,7 @@ if __package__:
     from .fallback_audio import load_fallback_audio
     from .icecast import IcecastSource
     from .icecastauth import IcecastSettings, normalize_server, test_mountpoint_authentication
-    from .nfm import NfmDemodulator, float_to_s16
+    from .nfm import NfmDemodulator, NfmModulator, float_to_s16
     from .rtl import (
         DEFAULT_RTL_SAMPLE_RATE,
         NWR_CENTER_FREQUENCY_HZ,
@@ -207,6 +207,7 @@ else:
     test_mountpoint_authentication = icecastauth_module.test_mountpoint_authentication
     float_to_s16 = nfm.float_to_s16
     NfmDemodulator = nfm.NfmDemodulator
+    NfmModulator = nfm.NfmModulator
     DEFAULT_RTL_SAMPLE_RATE = rtl.DEFAULT_RTL_SAMPLE_RATE
     NWR_CENTER_FREQUENCY_HZ = rtl.NWR_CENTER_FREQUENCY_HZ
     IqDcBlocker = rtl.IqDcBlocker
@@ -2410,7 +2411,7 @@ class SyntheticNwrTestModeSource:
         self.sample_rate = int(sample_rate)
         self.signal_dbfs = STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS
         self.current_signal_dbfs = STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS
-        self.phase = 0.0
+        self.modulator = NfmModulator(self.sample_rate, STREAM_TEST_MODE_DEVIATION_HZ)
         self.rng = np.random.default_rng()
         self.loop_audio = self._build_loop_audio()
         self.loop_position = 0
@@ -2605,16 +2606,12 @@ class SyntheticNwrTestModeSource:
         return start, end
 
     def _fm_modulate(self, audio: np.ndarray, signal_start_dbfs: float, signal_end_dbfs: float) -> np.ndarray:
-        audio = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
-        increments = (2.0 * np.pi * STREAM_TEST_MODE_DEVIATION_HZ / float(self.sample_rate)) * audio
-        phases = self.phase + np.cumsum(increments.astype(np.float64), dtype=np.float64)
-        if phases.size:
-            self.phase = float(phases[-1] % (2.0 * np.pi))
+        carrier = self.modulator.process(audio)
         if abs(signal_end_dbfs - signal_start_dbfs) < 1e-6:
             amplitude = dbfs_to_linear(signal_end_dbfs)
         else:
             amplitude = dbfs_to_linear(np.linspace(signal_start_dbfs, signal_end_dbfs, audio.size, dtype=np.float32))
-        iq = amplitude * np.exp(1j * phases).astype(np.complex64)
+        iq = amplitude * carrier
         noise_level = dbfs_to_linear(STREAM_TEST_MODE_NOISE_DBFS)
         noise = (
             self.rng.normal(0.0, noise_level, audio.size)

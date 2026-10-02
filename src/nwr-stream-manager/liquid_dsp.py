@@ -81,6 +81,12 @@ def liquid_library() -> ctypes.CDLL:
         library.nco_crcf_mix_block_up.argtypes = [pointer, pointer, pointer, ctypes.c_uint]
         library.nco_crcf_destroy.restype = ctypes.c_int
         library.nco_crcf_destroy.argtypes = [pointer]
+        library.freqmod_create.restype = pointer
+        library.freqmod_create.argtypes = [ctypes.c_float]
+        library.freqmod_modulate_block.restype = ctypes.c_int
+        library.freqmod_modulate_block.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
+        library.freqmod_destroy.restype = ctypes.c_int
+        library.freqmod_destroy.argtypes = [pointer]
         library.freqdem_create.restype = pointer
         library.freqdem_create.argtypes = [ctypes.c_float]
         library.freqdem_reset.restype = ctypes.c_int
@@ -341,6 +347,33 @@ class FmDemodulator:
         if handle and library is not None:
             try:
                 library.freqdem_destroy(handle)
+            except Exception:
+                pass
+            self._handle = None
+
+
+class FmModulator:
+    """FM modulation: each sample advances the phase by 2 * pi * kf * audio."""
+
+    def __init__(self, kf: float) -> None:
+        self._library = liquid_library()
+        self._handle = self._library.freqmod_create(float(kf))
+        if not self._handle:
+            raise RuntimeError("liquid-dsp could not create the FM modulator")
+
+    def modulate(self, audio: NDArray[np.float32]) -> NDArray[np.complex64]:
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+        output = np.empty(audio.size, dtype=np.complex64)
+        if audio.size:
+            self._library.freqmod_modulate_block(self._handle, audio.ctypes.data, audio.size, output.ctypes.data)
+        return output
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_handle", None)
+        library = getattr(self, "_library", None)
+        if handle and library is not None:
+            try:
+                library.freqmod_destroy(handle)
             except Exception:
                 pass
             self._handle = None

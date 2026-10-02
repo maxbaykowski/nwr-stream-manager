@@ -2378,6 +2378,23 @@ class EasAlertTests(unittest.TestCase):
                 actual = np.concatenate([demodulator.process_bytes(data[index : index + 1_003]) for index in range(0, len(data), 1_003)])
                 np.testing.assert_allclose(actual, expected, rtol=0, atol=tolerance)
 
+    def test_nfm_modulator_round_trips_through_the_demodulator_across_frames(self) -> None:
+        nfm = importlib.import_module(f"{self.web_control.__package__}.nfm")
+        sample_rate, deviation_hz = 24_000, 5_000.0
+        time_axis = np.arange(sample_rate) / sample_rate
+        audio = (0.6 * np.sin(2 * np.pi * 1050 * time_axis) + 0.3 * np.sin(2 * np.pi * 853 * time_axis)).astype(np.float32)
+        framed = nfm.NfmModulator(sample_rate, deviation_hz)
+        whole = nfm.NfmModulator(sample_rate, deviation_hz)
+
+        iq = np.concatenate([framed.process(audio[index : index + 480]) for index in range(0, audio.size, 480)])
+        np.testing.assert_allclose(iq, whole.process(audio), rtol=0, atol=1e-5)
+        np.testing.assert_allclose(np.abs(iq), 1.0, atol=1e-3)
+
+        # Our demodulator's full scale is 1.5 at 1/3 of the sample rate; scale back to audio.
+        recovered = nfm.NfmDemodulator().process(iq) / nfm.NFM_DEVIATION_GAIN * (sample_rate / (2.0 * deviation_hz))
+        error_db = 10 * np.log10(np.mean((recovered - audio[1:]) ** 2) / np.mean(audio ** 2))
+        self.assertLess(error_db, -45.0)
+
     def test_nfm_demodulator_reset_drops_cross_channel_phase_step(self) -> None:
         demodulator = self.web_control.NfmDemodulator()
 
