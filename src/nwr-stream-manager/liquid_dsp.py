@@ -58,6 +58,14 @@ def liquid_library() -> ctypes.CDLL:
         library.dotprod_crcf_run4.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
         library.dotprod_crcf_destroy.restype = ctypes.c_int
         library.dotprod_crcf_destroy.argtypes = [pointer]
+        library.iirfilt_rrrf_create_dc_blocker.restype = pointer
+        library.iirfilt_rrrf_create_dc_blocker.argtypes = [ctypes.c_float]
+        library.iirfilt_rrrf_set_scale.restype = ctypes.c_int
+        library.iirfilt_rrrf_set_scale.argtypes = [pointer, ctypes.c_float]
+        library.iirfilt_rrrf_execute_block.restype = ctypes.c_int
+        library.iirfilt_rrrf_execute_block.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
+        library.iirfilt_rrrf_destroy.restype = ctypes.c_int
+        library.iirfilt_rrrf_destroy.argtypes = [pointer]
         library.liquid_vectorcf_addscalar.restype = None
         library.liquid_vectorcf_addscalar.argtypes = [pointer, ctypes.c_uint, _FloatComplex, pointer]
         _library = library
@@ -198,6 +206,39 @@ class IqDcRemover:
         if handle and library is not None:
             try:
                 library.dotprod_crcf_destroy(handle)
+            except Exception:
+                pass
+            self._handle = None
+
+
+class AudioDcBlocker:
+    """First-order DC-blocking filter for real audio: y[n] = x[n] - x[n-1] + r * y[n-1]."""
+
+    def __init__(self, coefficient: float) -> None:
+        if not 0.0 < coefficient < 1.0:
+            raise ValueError("DC blocker coefficient must be between 0 and 1")
+        self._library = liquid_library()
+        self._handle = self._library.iirfilt_rrrf_create_dc_blocker(1.0 - float(coefficient))
+        if not self._handle:
+            raise RuntimeError("liquid-dsp could not create the audio DC blocker")
+        # liquid-dsp turns the level down very slightly by default; keep it unchanged.
+        self._library.iirfilt_rrrf_set_scale(self._handle, 1.0)
+
+    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
+        samples = np.ascontiguousarray(samples, dtype=np.float32)
+        output = np.empty_like(samples)
+        if samples.size:
+            self._library.iirfilt_rrrf_execute_block(
+                self._handle, samples.ctypes.data, samples.size, output.ctypes.data
+            )
+        return output
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_handle", None)
+        library = getattr(self, "_library", None)
+        if handle and library is not None:
+            try:
+                library.iirfilt_rrrf_destroy(handle)
             except Exception:
                 pass
             self._handle = None

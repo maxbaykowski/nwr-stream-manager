@@ -17,6 +17,7 @@ from .config import (
     notch_max_width,
 )
 from .deemphasis import DeemphasisFilter
+from .liquid_dsp import AudioDcBlocker
 
 
 FILTER_TAPS = 1025
@@ -27,7 +28,6 @@ FILTER_MAX_ORDER = 40.0
 # The kernel's own resolution widens a notch by roughly this much (added in quadrature).
 NOTCH_WINDOW_WIDTH_HZ = 50.0
 DC_BLOCK_CUTOFF_HZ = 20.0
-DC_BLOCK_VECTOR_CHUNK_SAMPLES = 4096
 NWR_DEEMPHASIS_MAKEUP_GAIN = 2.0
 NWR_DEEMPHASIS_DISABLED_GAIN = 0.75
 COMFORT_NOISE_BASS_CUTOFF_HZ = 900.0
@@ -121,8 +121,6 @@ class FirFilter:
 class DcBlocker:
     sample_rate: int = IQ_SAMPLE_RATE
     cutoff_hz: float = DC_BLOCK_CUTOFF_HZ
-    _previous_input: float = 0.0
-    _previous_output: float = 0.0
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -130,38 +128,12 @@ class DcBlocker:
         if self.cutoff_hz <= 0:
             raise ValueError("cutoff_hz must be greater than 0")
         self.coefficient = float(np.exp(-2.0 * np.pi * self.cutoff_hz / self.sample_rate))
+        self._filter = AudioDcBlocker(self.coefficient)
 
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         if len(samples) == 0:
             return samples
-        samples = samples.astype(np.float32, copy=False)
-        if len(samples) <= DC_BLOCK_VECTOR_CHUNK_SAMPLES:
-            return self._process_vector_chunk(samples)
-        output = np.empty_like(samples, dtype=np.float32)
-        for start in range(0, len(samples), DC_BLOCK_VECTOR_CHUNK_SAMPLES):
-            stop = min(start + DC_BLOCK_VECTOR_CHUNK_SAMPLES, len(samples))
-            output[start:stop] = self._process_vector_chunk(samples[start:stop])
-        return output
-
-    def _process_vector_chunk(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        # Streaming one-pole DC blocker:
-        # y[n] = x[n] - x[n-1] + r*y[n-1].
-        # Compute the recursive tail in float64 chunks to avoid the large
-        # exponent/division terms used by the old running-mean form.
-        x = samples.astype(np.float64, copy=False)
-        r = self.coefficient
-        highpass_input = np.empty_like(x)
-        highpass_input[0] = x[0] - self._previous_input
-        if len(x) > 1:
-            highpass_input[1:] = np.diff(x)
-        indices = np.arange(len(x), dtype=np.float64)
-        powers = r**indices
-        weighted = np.cumsum(highpass_input / powers)
-        output = (r ** (indices + 1.0)) * self._previous_output
-        output += powers * weighted
-        self._previous_input = float(x[-1])
-        self._previous_output = float(output[-1])
-        return output.astype(np.float32, copy=False)
+        return self._filter.process(samples)
 
 
 @dataclass

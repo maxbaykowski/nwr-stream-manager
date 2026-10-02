@@ -2200,6 +2200,23 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertLess(float(np.max(np.abs(chunked_output - single_output))), 1e-5)
 
+    def test_audio_dc_blocker_matches_the_one_pole_reference_at_unity_gain(self) -> None:
+        sample_rate = 24_000
+        rng = np.random.default_rng(42)
+        samples = (0.2 * rng.normal(size=9_600) + 0.1).astype(np.float32)
+        blocker = self.audio_effects.DcBlocker(sample_rate=sample_rate)
+        r = blocker.coefficient
+
+        actual = np.concatenate([blocker.process(samples[index : index + 480]) for index in range(0, samples.size, 480)])
+        expected = np.empty(samples.size, dtype=np.float64)
+        previous_input = previous_output = 0.0
+        for index, value in enumerate(samples.astype(np.float64)):
+            previous_output = value - previous_input + r * previous_output
+            previous_input = value
+            expected[index] = previous_output
+
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-5)
+
     def _notch_audio_payload(self, notch: dict) -> dict:
         return {
             "deemphasis": {"enabled": True, "tau": 530},
