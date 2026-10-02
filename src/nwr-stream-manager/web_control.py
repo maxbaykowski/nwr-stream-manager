@@ -12460,8 +12460,10 @@ body { margin: 0; background: #f6f7f9; color: #14181f; }
 header { background: #fff; border-bottom: 1px solid #d8dde6; }
 .topbar { max-width: 980px; margin: 0 auto; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 main { max-width: 980px; margin: 0 auto; padding: 24px; }
-.global-status-banner { max-width: 980px; margin: 14px auto 0; padding: 12px 24px; border: 1px solid #2557a7; border-radius: 8px; background: #eaf1ff; color: #14181f; font-weight: 700; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.global-status-banner { margin: 14px max(24px, calc((100% - 932px) / 2)) 0; padding: 12px 24px; border: 1px solid #2557a7; border-radius: 8px; background: #eaf1ff; color: #14181f; font-weight: 700; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .global-status-banner a { color: #174a98; }
+.insecure-audio-banner p { flex: 1 1 320px; margin: 0; font-weight: 400; }
+.insecure-audio-banner strong { font-weight: 700; }
 h1 { font-size: 22px; margin: 0; }
 h2 { font-size: 20px; margin: 0 0 16px; }
 h3 { font-size: 16px; margin: 18px 0 10px; }
@@ -12586,6 +12588,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .nav-more { display: block; min-width: 0; }
   .nav-more-menu { left: 0; right: auto; width: min(260px, calc(100vw - 32px)); }
   main { padding: 16px; }
+  .global-status-banner { margin: 14px 16px 0; padding: 12px 16px; }
   .effects-layout { display: block; }
   .effects-layout.effect-detail-active .effects-list { display: none; }
   .effects-layout:not(.effect-detail-active) .effects-detail { display: none; }
@@ -12617,6 +12620,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   nav a, nav button { min-height: 40px; padding: 6px 8px; text-align: center; }
   .nav-more-menu { right: 0; left: auto; }
   main { padding: 16px; }
+  .global-status-banner { margin: 14px 16px 0; padding: 12px 16px; }
   .desktop-volume-control { display: none; }
 }
 </style>
@@ -12745,6 +12749,14 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <span>I/Q recording in progress</span>
   <a href="/?view=iq_recorder" data-view="iq_recorder">Return to I/Q recorder</a>
   <span id="iq_recording_banner_elapsed">0:00</span>
+</div>
+<div id="insecure_audio_banner" class="global-status-banner insecure-audio-banner" role="status" hidden>
+  <p>
+    <strong>Listening will use more data, and the audio may stutter more often.</strong>
+    This browser only allows efficient audio on secure (https) addresses, so NWR Stream Manager is sending uncompressed audio.
+    <a href="/help#secure-address" target="_blank" rel="noopener">Learn how to use a secure address<span class="screen-reader-only"> (opens in a new tab)</span></a>
+  </p>
+  <button id="dismiss_insecure_audio_banner" type="button">Dismiss</button>
 </div>
 <div id="same_alert_flash" class="same-alert-flash" hidden></div>
 <div id="same_alert_live" class="screen-reader-only" aria-live="assertive" aria-relevant="additions text" aria-atomic="false"></div>
@@ -15094,9 +15106,21 @@ function isInactiveLiveAudioSessionError(error) {
   return /client session is not active|receiver is not playing|monitor is not active/i.test(String(error && error.message || error || ""));
 }
 
+let insecureAudioNoticeShown = false;
+
+function noteInsecureAudioFallback(opus) {
+  // Browsers such as Firefox and Chrome only offer the Opus decoder on secure (https)
+  // pages; elsewhere audio falls back to uncompressed PCM. Say so once per page load.
+  if (opus || window.isSecureContext || insecureAudioNoticeShown) return;
+  insecureAudioNoticeShown = true;
+  setHidden("insecure_audio_banner", false);
+  logClientEvent("info", "live-audio", "uncompressed audio used on an insecure page", {});
+}
+
 async function startLiveAudioSocket(params) {
   await ensureLiveAudioContext();
   const opus = await supportsWebCodecsOpusAudio();
+  noteInsecureAudioFallback(opus);
   closeLiveAudioSocket();
   liveAudioMode = params.mode;
   liveAudioCodec = opus ? "opus" : "pcm";
@@ -22640,6 +22664,9 @@ document.getElementById("accounts-body").addEventListener("keydown", event => {
 });
 
 document.getElementById("dismiss_nwrorg_submission").addEventListener("click", dismissNwrOrgSubmissionDialog);
+document.getElementById("dismiss_insecure_audio_banner").addEventListener("click", () => {
+  setHidden("insecure_audio_banner", true);
+});
 document.getElementById("server_unavailable_reload").addEventListener("click", () => window.location.reload());
 document.getElementById("resume_listening").addEventListener("click", resumeListening);
 document.getElementById("dismiss_resume_listening").addEventListener("click", () => {

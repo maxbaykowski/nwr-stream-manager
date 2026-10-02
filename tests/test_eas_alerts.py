@@ -2397,6 +2397,16 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertEqual(order, ["warn listeners", "http shutdown"])
 
+    def test_page_warns_once_when_listening_falls_back_to_uncompressed_audio(self) -> None:
+        html = self.web_control.INDEX_HTML
+
+        self.assertIn('<div id="insecure_audio_banner" class="global-status-banner insecure-audio-banner" role="status" hidden>', html)
+        self.assertIn('<a href="/help#secure-address" target="_blank" rel="noopener">', html)
+        self.assertIn('<button id="dismiss_insecure_audio_banner" type="button">Dismiss</button>', html)
+        # Only on insecure pages without Opus (Safari has Opus there), and once per page load.
+        self.assertIn("if (opus || window.isSecureContext || insecureAudioNoticeShown) return;", html)
+        self.assertIn("noteInsecureAudioFallback(opus);", html)
+
     def test_page_waits_for_the_server_and_reloads_when_it_is_back(self) -> None:
         html = self.web_control.INDEX_HTML
 
