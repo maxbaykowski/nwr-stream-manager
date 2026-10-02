@@ -1455,13 +1455,13 @@ class EasAlertTests(unittest.TestCase):
             target_frequency_hz=162475000,
         )
         shifter = channelizer.shifter
-        channelizer.shifter._phase = 1.25
+        channelizer.shifter.phase = 1.25
         channelizer.target_frequency_hz = 162425000
         channelizer.shifter.offset_hz = float(162475000 - 162425000)
 
         self.assertIs(channelizer.shifter, shifter)
         self.assertEqual(channelizer.shifter.offset_hz, 50000.0)
-        self.assertEqual(channelizer.shifter._phase, 1.25)
+        self.assertAlmostEqual(channelizer.shifter.phase, 1.25, places=5)
 
     def test_live_audio_source_outputs_silence_while_paused(self) -> None:
         source = self.web_control.SameAwareWebRtcAudioSource(sample_rate=24_000, event_queue=None)

@@ -15,6 +15,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 LIQUID_SONAMES = ("libliquid.so.1", "libliquid.so.2", "libliquid.so")
+# liquid-dsp's precise oscillator (LIQUID_VCO); the default table-based one adds
+# spurious tones only 60-70 dB down.
+LIQUID_PRECISE_OSCILLATOR = 1
 # Recent input kept so new filter coefficients can start from the same history.
 FIR_DECIMATOR_HISTORY_SAMPLES = 2048
 
@@ -66,6 +69,18 @@ def liquid_library() -> ctypes.CDLL:
         library.iirfilt_rrrf_execute_block.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
         library.iirfilt_rrrf_destroy.restype = ctypes.c_int
         library.iirfilt_rrrf_destroy.argtypes = [pointer]
+        library.nco_crcf_create.restype = pointer
+        library.nco_crcf_create.argtypes = [ctypes.c_int]
+        library.nco_crcf_set_frequency.restype = ctypes.c_int
+        library.nco_crcf_set_frequency.argtypes = [pointer, ctypes.c_float]
+        library.nco_crcf_get_phase.restype = ctypes.c_float
+        library.nco_crcf_get_phase.argtypes = [pointer]
+        library.nco_crcf_set_phase.restype = ctypes.c_int
+        library.nco_crcf_set_phase.argtypes = [pointer, ctypes.c_float]
+        library.nco_crcf_mix_block_up.restype = ctypes.c_int
+        library.nco_crcf_mix_block_up.argtypes = [pointer, pointer, pointer, ctypes.c_uint]
+        library.nco_crcf_destroy.restype = ctypes.c_int
+        library.nco_crcf_destroy.argtypes = [pointer]
         library.liquid_vectorcf_addscalar.restype = None
         library.liquid_vectorcf_addscalar.argtypes = [pointer, ctypes.c_uint, _FloatComplex, pointer]
         _library = library
@@ -239,6 +254,52 @@ class AudioDcBlocker:
         if handle and library is not None:
             try:
                 library.iirfilt_rrrf_destroy(handle)
+            except Exception:
+                pass
+            self._handle = None
+
+
+class Oscillator:
+    """Shift complex samples up in frequency by mixing them with a precise oscillator."""
+
+    def __init__(self, radians_per_sample: float = 0.0) -> None:
+        self._library = liquid_library()
+        self._lock = threading.Lock()
+        self._handle = self._library.nco_crcf_create(LIQUID_PRECISE_OSCILLATOR)
+        if not self._handle:
+            raise RuntimeError("liquid-dsp could not create the oscillator")
+        self.set_frequency(radians_per_sample)
+
+    def set_frequency(self, radians_per_sample: float) -> None:
+        with self._lock:
+            self._library.nco_crcf_set_frequency(self._handle, float(radians_per_sample))
+
+    @property
+    def phase(self) -> float:
+        with self._lock:
+            return float(self._library.nco_crcf_get_phase(self._handle))
+
+    @phase.setter
+    def phase(self, radians: float) -> None:
+        with self._lock:
+            self._library.nco_crcf_set_phase(self._handle, float(radians))
+
+    def mix_up(self, samples: NDArray[np.complex64]) -> NDArray[np.complex64]:
+        samples = np.ascontiguousarray(samples, dtype=np.complex64)
+        output = np.empty_like(samples)
+        if samples.size:
+            with self._lock:
+                self._library.nco_crcf_mix_block_up(
+                    self._handle, samples.ctypes.data, output.ctypes.data, samples.size
+                )
+        return output
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_handle", None)
+        library = getattr(self, "_library", None)
+        if handle and library is not None:
+            try:
+                library.nco_crcf_destroy(handle)
             except Exception:
                 pass
             self._handle = None

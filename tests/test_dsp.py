@@ -362,6 +362,26 @@ class DspTests(unittest.TestCase):
         self.assertFalse(np.array_equal(decimator.first_stage.fir.taps, first_taps))
         self.assertFalse(np.array_equal(decimator.final_stage.fir.taps, final_taps))
 
+    def test_frequency_shifter_moves_the_channel_cleanly_and_continuously(self) -> None:
+        sample_rate = 192_000
+        offset_hz = -75_000.0
+        count = sample_rate * 2
+        tone = np.exp(-1j * 2.0 * np.pi * offset_hz * np.arange(count) / sample_rate).astype(np.complex64)
+        chunked = self.dsp.FrequencyShifter(sample_rate, offset_hz)
+        single = self.dsp.FrequencyShifter(sample_rate, offset_hz)
+
+        output = np.concatenate([chunked.process(tone[index : index + 19_201]) for index in range(0, count, 19_201)])
+
+        # Chunk boundaries make no difference...
+        np.testing.assert_allclose(output, single.process(tone), rtol=0, atol=1e-5)
+        # ...the station lands on 0 Hz, and the shift adds no audible spurious tones.
+        spectrum = np.abs(np.fft.fft(output.astype(np.complex128) * np.hanning(count))) ** 2
+        spectrum /= spectrum.max()
+        self.assertEqual(int(np.argmax(spectrum)), 0)
+        spectrum[:20] = 0.0
+        spectrum[-20:] = 0.0
+        self.assertLess(10.0 * np.log10(spectrum.max()), -100.0)
+
     def test_channelizer_target_frequency_update_keeps_existing_dsp_stages(self) -> None:
         channelizer = self.dsp.IqChannelizer(
             input_rate=192_000,
@@ -371,7 +391,7 @@ class DspTests(unittest.TestCase):
         )
         shifter = channelizer.shifter
         decimator = channelizer.decimator
-        shifter._phase = 1.25
+        shifter.phase = 1.25
 
         channelizer.set_target_frequency(162_550_000)
 
@@ -379,7 +399,7 @@ class DspTests(unittest.TestCase):
         self.assertIs(channelizer.decimator, decimator)
         self.assertEqual(channelizer.target_frequency_hz, 162_550_000)
         self.assertEqual(channelizer.shifter.offset_hz, -75_000.0)
-        self.assertEqual(channelizer.shifter._phase, 1.25)
+        self.assertAlmostEqual(channelizer.shifter.phase, 1.25, places=5)
 
     def test_identity_decimator_for_matching_spectrum_rate(self) -> None:
         decimator = self.dsp.create_decimator(1_536_000, 1_536_000)

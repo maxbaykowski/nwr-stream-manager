@@ -7,7 +7,7 @@ from fractions import Fraction
 import numpy as np
 from numpy.typing import NDArray
 
-from .liquid_dsp import FirDecimator, IqDcRemover
+from .liquid_dsp import FirDecimator, IqDcRemover, Oscillator
 
 
 ComplexArray = NDArray[np.complex64]
@@ -131,29 +131,36 @@ def design_alias_filter_taps(
     )
 
 
-@dataclass
 class FrequencyShifter:
-    sample_rate: int
-    offset_hz: float
-    _phase: float = 0.0
-    _oscillator_cache_key: tuple[int, float] | None = None
-    _oscillator_cache: ComplexArray | None = None
+    """Move the signal at -offset_hz to 0 Hz by mixing it with an oscillator."""
+
+    def __init__(self, sample_rate: int, offset_hz: float) -> None:
+        self.sample_rate = int(sample_rate)
+        self._oscillator = Oscillator()
+        self.offset_hz = offset_hz
+
+    @property
+    def offset_hz(self) -> float:
+        return self._offset_hz
+
+    @offset_hz.setter
+    def offset_hz(self, offset_hz: float) -> None:
+        # Retuning keeps the oscillator's phase, so the shift carries on without a click.
+        self._offset_hz = float(offset_hz)
+        self._oscillator.set_frequency(2.0 * math.pi * self._offset_hz / float(self.sample_rate))
+
+    @property
+    def phase(self) -> float:
+        return self._oscillator.phase
+
+    @phase.setter
+    def phase(self, radians: float) -> None:
+        self._oscillator.phase = radians
 
     def process(self, samples: ComplexArray) -> ComplexArray:
-        if samples.size == 0 or self.offset_hz == 0.0:
+        if samples.size == 0 or self._offset_hz == 0.0:
             return samples.astype(np.complex64, copy=False)
-        step = 2.0 * math.pi * self.offset_hz / float(self.sample_rate)
-        cache_key = (int(samples.size), float(step))
-        oscillator = self._oscillator_cache if self._oscillator_cache_key == cache_key else None
-        if oscillator is None:
-            phases = step * np.arange(samples.size, dtype=np.float32)
-            oscillator = np.exp(1j * phases).astype(np.complex64)
-            self._oscillator_cache_key = cache_key
-            self._oscillator_cache = oscillator
-        phase_rotation = np.complex64(np.exp(1j * self._phase))
-        shifted = samples * (phase_rotation * oscillator)
-        self._phase = float((self._phase + step * samples.size) % (2.0 * math.pi))
-        return shifted.astype(np.complex64, copy=False)
+        return self._oscillator.mix_up(samples)
 
 
 @dataclass
