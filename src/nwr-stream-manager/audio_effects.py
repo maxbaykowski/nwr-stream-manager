@@ -21,9 +21,11 @@ from .liquid_dsp import AudioDcBlocker, DelayedFftFirFilter
 
 
 FILTER_TAPS = 1025
-# The highpass runs through liquid-dsp's FFT filter in blocks one tap shorter than the
-# filter, which adds a constant 1023 samples (about 43 ms) of delay while it is on.
-HIGHPASS_BLOCK_SAMPLES = FILTER_TAPS - 1
+# The highpass, lowpass and notch run as one combined filter through liquid-dsp's FFT
+# filter, in blocks one tap shorter than the filter. That adds a constant 1023 samples
+# (about 43 ms) of delay while any of them is on.
+EQ_FILTER_BLOCK_SAMPLES = FILTER_TAPS - 1
+EQ_FILTER_KINDS = ("highpass", "lowpass", "notch")
 FILTER_DESIGN_FFT_SIZE = 16384
 # Sharpness 0 is a gentle 6 dB/octave slope; 10 is as steep as the kernel allows.
 FILTER_MIN_ORDER = 1.0
@@ -86,41 +88,6 @@ class ComfortNoiseGenerator:
 
 
 @dataclass
-class FirFilter:
-    kernel: NDArray[np.float32]
-    history: NDArray[np.float32] = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.history = np.zeros(max(len(self.kernel) - 1, 0), dtype=np.float32)
-
-    def update_kernel(self, kernel: NDArray[np.float32]) -> None:
-        kernel = np.asarray(kernel, dtype=np.float32)
-        keep = max(len(kernel) - 1, 0)
-        if keep <= 0:
-            history = np.array([], dtype=np.float32)
-        elif len(self.history) >= keep:
-            history = self.history[-keep:].copy()
-        else:
-            history = np.zeros(keep, dtype=np.float32)
-            if len(self.history):
-                history[-len(self.history) :] = self.history
-        self.kernel = kernel
-        self.history = history
-
-    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        if len(samples) == 0:
-            return samples
-        window = np.concatenate((self.history, samples))
-        filtered = np.convolve(window, self.kernel, mode="full")
-        start = len(self.history)
-        stop = start + len(samples)
-        if len(self.history):
-            self.history = window[-len(self.history) :]
-        filtered = filtered[start:stop].astype(np.float32, copy=False)
-        return filtered
-
-
-@dataclass
 class DcBlocker:
     sample_rate: int = IQ_SAMPLE_RATE
     cutoff_hz: float = DC_BLOCK_CUTOFF_HZ
@@ -151,21 +118,16 @@ class AudioEffectsProcessor:
             self.config.deemphasis_tau,
         )
         self.dc_blocker = DcBlocker(self.sample_rate)
-        self.highpass = _build_filter("highpass", self.config.highpass, self.sample_rate)
-        self.lowpass = _build_filter("lowpass", self.config.lowpass, self.sample_rate)
-        self.notch = _build_filter("notch", self.config.notch, self.sample_rate)
+        # Highpass, lowpass and notch combined into one filter; None while all are off.
+        self.eq_filter = _build_eq_filter(None, self.config, self.sample_rate)
 
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         audio = self.comfort_noise.process(samples)
         audio = self.deemphasis.process_float(audio)
         audio = audio * deemphasis_makeup_gain(self.config.deemphasis_tau)
         audio = self.dc_blocker.process(audio)
-        if self.highpass is not None:
-            audio = self.highpass.process(audio)
-        if self.lowpass is not None:
-            audio = self.lowpass.process(audio)
-        if self.notch is not None:
-            audio = self.notch.process(audio)
+        if self.eq_filter is not None:
+            audio = self.eq_filter.process(audio)
         if self.config.volume.enabled:
             audio = audio * self.config.volume.multiplier
         return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
@@ -183,32 +145,10 @@ class AudioEffectsProcessor:
             self.deemphasis.update_tau(config.deemphasis_tau)
             changed.append("deemphasis")
 
-        if config.highpass != self.config.highpass:
-            self.highpass = _update_or_build_filter(
-                self.highpass,
-                "highpass",
-                config.highpass,
-                self.sample_rate,
-            )
-            changed.append("highpass")
-
-        if config.lowpass != self.config.lowpass:
-            self.lowpass = _update_or_build_filter(
-                self.lowpass,
-                "lowpass",
-                config.lowpass,
-                self.sample_rate,
-            )
-            changed.append("lowpass")
-
-        if config.notch != self.config.notch:
-            self.notch = _update_or_build_filter(
-                self.notch,
-                "notch",
-                config.notch,
-                self.sample_rate,
-            )
-            changed.append("notch")
+        eq_changes = [kind for kind in EQ_FILTER_KINDS if getattr(config, kind) != getattr(self.config, kind)]
+        if eq_changes:
+            self.eq_filter = _build_eq_filter(self.eq_filter, config, self.sample_rate)
+            changed.extend(eq_changes)
 
         if config.volume != self.config.volume:
             changed.append("volume")
@@ -271,36 +211,18 @@ def _interpolate_for_sharpness(sharpness: float, gentlest: float, sharpest: floa
     return float(gentlest * (sharpest / gentlest) ** normalized)
 
 
-def _new_filter(kind: str, kernel: NDArray[np.float32]) -> FirFilter | DelayedFftFirFilter:
-    if kind == "highpass":
-        return DelayedFftFirFilter(kernel, HIGHPASS_BLOCK_SAMPLES)
-    return FirFilter(kernel)
-
-
-def _build_filter(
-    kind: str,
-    config: FilterConfig | NotchConfig,
+def _build_eq_filter(
+    current: DelayedFftFirFilter | None,
+    config: AudioConfig,
     sample_rate: int,
-) -> FirFilter | DelayedFftFirFilter | None:
-    kernel = _filter_kernel(kind, config, sample_rate)
-    return None if kernel is None else _new_filter(kind, kernel)
-
-
-def _update_or_build_filter(
-    current: FirFilter | DelayedFftFirFilter | None,
-    kind: str,
-    config: FilterConfig | NotchConfig,
-    sample_rate: int,
-) -> FirFilter | DelayedFftFirFilter | None:
-    kernel = _filter_kernel(kind, config, sample_rate)
+) -> DelayedFftFirFilter | None:
+    kernel = _combined_kernel([(kind, getattr(config, kind)) for kind in EQ_FILTER_KINDS], sample_rate)
     if kernel is None:
         return None
     if current is None:
-        return _new_filter(kind, kernel)
-    if isinstance(current, DelayedFftFirFilter):
-        current.update_taps(kernel)
-    else:
-        current.update_kernel(kernel)
+        return DelayedFftFirFilter(kernel, EQ_FILTER_BLOCK_SAMPLES)
+    # Retuned in place, carrying on from the latest audio, so changing a setting is seamless.
+    current.update_taps(kernel)
     return current
 
 
@@ -309,32 +231,63 @@ def _filter_kernel(
     config: FilterConfig | NotchConfig,
     sample_rate: int,
 ) -> NDArray[np.float32] | None:
+    return _combined_kernel([(kind, config)], sample_rate)
+
+
+def _combined_kernel(
+    filters: list[tuple[str, FilterConfig | NotchConfig]],
+    sample_rate: int,
+) -> NDArray[np.float32] | None:
+    """One kernel for every enabled filter, designed from the product of their curves.
+
+    The filters run one after another, so their combined curve is the product of theirs;
+    designing one kernel from it costs the same however many are on.
+    """
+    frequencies = np.fft.rfftfreq(FILTER_DESIGN_FFT_SIZE, 1 / sample_rate)
+    magnitude = None
+    active: list[tuple[str, FilterConfig | NotchConfig]] = []
+    for kind, config in filters:
+        curve = _filter_magnitude(kind, config, sample_rate, frequencies)
+        if curve is not None:
+            magnitude = curve if magnitude is None else magnitude * curve
+            active.append((kind, config))
+    if magnitude is None:
+        return None
+    kernel = _kernel_from_magnitude(magnitude, FILTER_TAPS).astype(np.float64)
+    kinds = {kind for kind, _config in active}
+    for kind, config in active:
+        if kind == "notch":
+            kernel = _deepen_null(kernel, config.frequency / sample_rate)
+    if "lowpass" in kinds and "highpass" not in kinds:
+        # Keep the bass at exactly its original level.
+        kernel = kernel / np.sum(kernel)
+    return kernel.astype(np.float32)
+
+
+def _filter_magnitude(
+    kind: str,
+    config: FilterConfig | NotchConfig,
+    sample_rate: int,
+    frequencies: NDArray[np.float64],
+) -> NDArray[np.float64] | None:
     if not config.enabled:
         return None
-    frequencies = np.fft.rfftfreq(FILTER_DESIGN_FFT_SIZE, 1 / sample_rate)
     if kind == "highpass":
         order = highpass_order(config.frequency, config.sharpness)
         with np.errstate(divide="ignore", over="ignore"):
-            magnitude = 1 / np.sqrt(1 + (config.frequency / frequencies) ** (2 * order))
-        return _kernel_from_magnitude(magnitude, FILTER_TAPS)
+            return 1 / np.sqrt(1 + (config.frequency / frequencies) ** (2 * order))
     if kind == "lowpass":
         if config.frequency >= sample_rate / 2:
             return None
         order = lowpass_order(config.frequency, config.sharpness)
         with np.errstate(over="ignore"):
-            magnitude = 1 / np.sqrt(1 + (frequencies / config.frequency) ** (2 * order))
-        kernel = _kernel_from_magnitude(magnitude, FILTER_TAPS)
-        return (kernel / np.sum(kernel)).astype(np.float32)
+            return 1 / np.sqrt(1 + (frequencies / config.frequency) ** (2 * order))
     if kind == "notch":
         if not 0 < config.frequency < sample_rate / 2:
             return None
         q = config.frequency / notch_design_width(config.frequency, config.width)
         distance = frequencies**2 - config.frequency**2
-        magnitude = np.abs(distance) / np.sqrt(
-            distance**2 + (frequencies * config.frequency / q) ** 2
-        )
-        kernel = _kernel_from_magnitude(magnitude, FILTER_TAPS).astype(np.float64)
-        return _deepen_null(kernel, config.frequency / sample_rate).astype(np.float32)
+        return np.abs(distance) / np.sqrt(distance**2 + (frequencies * config.frequency / q) ** 2)
     raise ValueError(f"unsupported filter kind: {kind}")
 
 

@@ -1938,7 +1938,7 @@ class EasAlertTests(unittest.TestCase):
         self.assertTrue(receiver_audio.deemphasis.enabled)
         self.assertFalse(receiver_audio.lowpass.enabled)
         self.assertGreater(len(processor.deemphasis.curve), 1)
-        self.assertIsNone(processor.lowpass)
+        self.assertIsNone(processor.eq_filter)
 
     def test_audio_effects_update_does_not_stop_active_workers(self) -> None:
         class Worker:
@@ -2003,9 +2003,7 @@ class EasAlertTests(unittest.TestCase):
         processor = self.web_control.AudioEffectsProcessor(config.AudioConfig())
         comfort_noise = processor.comfort_noise
         deemphasis = processor.deemphasis
-        highpass = processor.highpass
-        lowpass = processor.lowpass
-        notch = processor.notch
+        eq_filter = processor.eq_filter
 
         changed = processor.update_config(config.AudioConfig(
             volume=config.VolumeConfig(enabled=True, multiplier=1.5)
@@ -2014,9 +2012,7 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(changed, ("volume",))
         self.assertIs(processor.comfort_noise, comfort_noise)
         self.assertIs(processor.deemphasis, deemphasis)
-        self.assertIs(processor.highpass, highpass)
-        self.assertIs(processor.lowpass, lowpass)
-        self.assertIs(processor.notch, notch)
+        self.assertIs(processor.eq_filter, eq_filter)
 
     def test_comfort_noise_is_bass_weighted_without_changing_level_control(self) -> None:
         config = self.config
@@ -2045,10 +2041,8 @@ class EasAlertTests(unittest.TestCase):
             lowpass=config.FilterConfig(enabled=True, frequency=4000, sharpness=1),
             notch=config.NotchConfig(enabled=True, frequency=3000, width=100),
         ))
-        highpass = processor.highpass
-        lowpass = processor.lowpass
-        notch = processor.notch
-        highpass_kernel = highpass.taps.copy()
+        eq_filter = processor.eq_filter
+        taps = eq_filter.taps.copy()
         comfort_noise = processor.comfort_noise
         deemphasis = processor.deemphasis
 
@@ -2059,10 +2053,9 @@ class EasAlertTests(unittest.TestCase):
         ))
 
         self.assertEqual(changed, ("highpass",))
-        self.assertIs(processor.highpass, highpass)
-        self.assertFalse(np.array_equal(processor.highpass.taps, highpass_kernel))
-        self.assertIs(processor.lowpass, lowpass)
-        self.assertIs(processor.notch, notch)
+        # Highpass, lowpass and notch share one filter, retuned in place.
+        self.assertIs(processor.eq_filter, eq_filter)
+        self.assertFalse(np.array_equal(processor.eq_filter.taps, taps))
         self.assertIs(processor.comfort_noise, comfort_noise)
         self.assertIs(processor.deemphasis, deemphasis)
 
@@ -2273,6 +2266,59 @@ class EasAlertTests(unittest.TestCase):
         stream = {"id": "s", "audio": {"notch": {"enabled": False, "frequency": 3000, "sharpness": 5}}}
         self.web_control.migrate_stream_notch_width(stream)
         self.assertEqual(stream["audio"]["notch"], {"enabled": False, "frequency": 3000.0, "width": 230.0})
+
+    def test_combined_eq_filter_matches_separate_filters(self) -> None:
+        config = self.config
+        effects = self.audio_effects
+        sample_rate, size = 24_000, effects.FILTER_DESIGN_FFT_SIZE
+        frequencies = np.fft.rfftfreq(size, 1 / sample_rate)
+
+        def response_db(kernel):
+            return 20 * np.log10(np.maximum(np.abs(np.fft.rfft(kernel.astype(np.float64), size)), 1e-12))
+
+        cases = [
+            [("lowpass", config.FilterConfig(True, 3400.0, 2.0)), ("notch", config.NotchConfig(True, 4000.0, 60.0))],
+            [("highpass", config.FilterConfig(True, 300.0, 5.0)), ("lowpass", config.FilterConfig(True, 3400.0, 10.0))],
+            [("highpass", config.FilterConfig(True, 400.0, 10.0)), ("lowpass", config.FilterConfig(True, 3000.0, 10.0)),
+             ("notch", config.NotchConfig(True, 2800.0, 150.0))],
+            [("highpass", config.FilterConfig(True, 200.0, 0.0)), ("lowpass", config.FilterConfig(True, 5000.0, 0.0)),
+             ("notch", config.NotchConfig(True, 600.0, 60.0))],
+        ]
+        for filters in cases:
+            with self.subTest(filters=[kind for kind, _config in filters]):
+                separate = sum(response_db(effects._filter_kernel(kind, cfg, sample_rate)) for kind, cfg in filters)
+                combined = response_db(effects._combined_kernel(filters, sample_rate))
+                audible = (separate > -40.0) & (frequencies >= 100.0)
+                self.assertLess(float(np.max(np.abs(separate[audible] - combined[audible]))), 1.0)
+                for tone in config.PROTECTED_TONES_HZ:
+                    index = int(round(tone * size / sample_rate))
+                    self.assertAlmostEqual(float(combined[index]), float(separate[index]), delta=0.05)
+                for kind, cfg in filters:
+                    if kind == "notch":
+                        self.assertLess(float(combined[int(round(cfg.frequency * size / sample_rate))]), -60.0)
+
+    def test_eq_filter_is_shared_and_only_runs_while_a_filter_is_on(self) -> None:
+        config = self.config
+        processor = self.web_control.AudioEffectsProcessor(config.AudioConfig())
+        self.assertIsNone(processor.eq_filter)
+
+        lowpass_only = config.AudioConfig(lowpass=config.FilterConfig(enabled=True, frequency=3400, sharpness=2))
+        self.assertEqual(processor.update_config(lowpass_only), ("lowpass",))
+        shared = processor.eq_filter
+        self.assertIsNotNone(shared)
+
+        all_three = config.AudioConfig(
+            highpass=config.FilterConfig(enabled=True, frequency=300, sharpness=5),
+            lowpass=config.FilterConfig(enabled=True, frequency=3400, sharpness=2),
+            notch=config.NotchConfig(enabled=True, frequency=4000, width=60),
+        )
+        self.assertEqual(processor.update_config(all_three), ("highpass", "notch"))
+        self.assertIs(processor.eq_filter, shared)
+        output = processor.process(np.zeros(480, dtype=np.float32))
+        self.assertEqual(output.size, 480)
+
+        self.assertEqual(processor.update_config(config.AudioConfig()), ("highpass", "lowpass", "notch"))
+        self.assertIsNone(processor.eq_filter)
 
     def test_notch_width_sets_heard_width_and_spares_protected_tones(self) -> None:
         sample_rate = 24_000
