@@ -35,56 +35,22 @@ NOTCH_WINDOW_WIDTH_HZ = 50.0
 DC_BLOCK_CUTOFF_HZ = 20.0
 NWR_DEEMPHASIS_MAKEUP_GAIN = 2.0
 NWR_DEEMPHASIS_DISABLED_GAIN = 0.75
-COMFORT_NOISE_BASS_CUTOFF_HZ = 900.0
-COMFORT_NOISE_VECTOR_CHUNK_SAMPLES = 1024
 
 
 @dataclass
 class ComfortNoiseGenerator:
+    """Very quiet white noise mixed into the audio; level_db is its RMS level in dBFS."""
+
     config: ComfortNoiseConfig
     rng: np.random.Generator = field(default_factory=np.random.default_rng)
     sample_rate: int = IQ_SAMPLE_RATE
-    _brownish_previous: float = 0.0
-
-    def __post_init__(self) -> None:
-        self._brownish_coefficient = float(
-            np.exp(-2.0 * np.pi * COMFORT_NOISE_BASS_CUTOFF_HZ / self.sample_rate)
-        )
 
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         if not self.config.enabled or len(samples) == 0:
             return samples
         level = comfort_noise_linear_level(self.config.level_db)
-        noise = self.rng.normal(0.0, 1.0, len(samples)).astype(np.float32)
-        noise = self._brownish_noise(noise, level)
+        noise = self.rng.normal(0.0, level, len(samples)).astype(np.float32)
         return (samples + noise).astype(np.float32, copy=False)
-
-    def _brownish_noise(
-        self,
-        noise: NDArray[np.float32],
-        level: float,
-    ) -> NDArray[np.float32]:
-        shaped = np.empty_like(noise, dtype=np.float32)
-        for start in range(0, len(noise), COMFORT_NOISE_VECTOR_CHUNK_SAMPLES):
-            stop = min(start + COMFORT_NOISE_VECTOR_CHUNK_SAMPLES, len(noise))
-            shaped[start:stop] = self._brownish_noise_chunk(noise[start:stop])
-        rms = float(np.sqrt(np.mean(shaped.astype(np.float64) ** 2)))
-        if rms > 1e-12:
-            shaped *= level / rms
-        else:
-            shaped *= 0.0
-        return shaped
-
-    def _brownish_noise_chunk(self, noise: NDArray[np.float32]) -> NDArray[np.float32]:
-        coefficient = self._brownish_coefficient
-        samples = noise.astype(np.float64, copy=False)
-        indices = np.arange(len(samples), dtype=np.float64)
-        powers = coefficient**indices
-        weighted = np.cumsum(((1.0 - coefficient) * samples) / powers)
-        shaped = (coefficient ** (indices + 1.0)) * self._brownish_previous
-        shaped += powers * weighted
-        self._brownish_previous = float(shaped[-1])
-        return shaped.astype(np.float32, copy=False)
 
 
 @dataclass

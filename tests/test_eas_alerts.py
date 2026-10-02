@@ -1901,6 +1901,31 @@ class EasAlertTests(unittest.TestCase):
                 "notch": {"enabled": True, "frequency": 1500, "sharpness": 5},
             })
 
+    def test_audio_effects_allow_a_notch_outside_the_other_filters(self) -> None:
+        # A notch the highpass or lowpass already covers does nothing harmful, so saving
+        # it must not be refused (a refusal blocked every later audio change).
+        base = {
+            "deemphasis": {"enabled": True, "tau": 300},
+            "comfort_noise": {"enabled": False, "level_db": -40},
+            "volume": {"enabled": True, "multiplier": 1},
+        }
+        for label, filters in (
+            ("notch above lowpass", {
+                "highpass": {"enabled": True, "frequency": 500, "sharpness": 0},
+                "lowpass": {"enabled": True, "frequency": 3400, "sharpness": 10},
+                "notch": {"enabled": True, "frequency": 4000, "width": 60},
+            }),
+            ("notch below highpass", {
+                "highpass": {"enabled": True, "frequency": 500, "sharpness": 5},
+                "lowpass": {"enabled": False, "frequency": 3400, "sharpness": 2},
+                "notch": {"enabled": True, "frequency": 400, "width": 60},
+            }),
+        ):
+            with self.subTest(label):
+                audio = self.web_control.validate_audio_payload({**base, **filters})
+                processor = self.web_control.AudioEffectsProcessor(self.config.parse_audio_config(audio))
+                self.assertEqual(processor.process(np.zeros(480, dtype=np.float32)).size, 480)
+
     def test_audio_effects_allow_lowpass_and_notch_up_to_24khz_nyquist(self) -> None:
         audio = self.web_control.validate_audio_payload({
             "deemphasis": {"enabled": True, "tau": 530},
@@ -2014,7 +2039,7 @@ class EasAlertTests(unittest.TestCase):
         self.assertIs(processor.deemphasis, deemphasis)
         self.assertIs(processor.eq_filter, eq_filter)
 
-    def test_comfort_noise_is_bass_weighted_without_changing_level_control(self) -> None:
+    def test_comfort_noise_is_white_noise_at_the_chosen_level(self) -> None:
         config = self.config
         rng = np.random.default_rng(1234)
         generator = self.audio_effects.ComfortNoiseGenerator(
@@ -2031,8 +2056,9 @@ class EasAlertTests(unittest.TestCase):
         low_power = float(np.mean(spectrum[(freqs >= 100.0) & (freqs < 700.0)]))
         high_power = float(np.mean(spectrum[(freqs >= 3000.0) & (freqs < 6000.0)]))
 
+        # -40 dB is an RMS level of 0.01, spread evenly across the band (white noise).
         self.assertAlmostEqual(float(np.sqrt(np.mean(output.astype(np.float64) ** 2))), 0.01, places=3)
-        self.assertGreater(low_power, high_power * 8.0)
+        self.assertAlmostEqual(10.0 * np.log10(low_power / high_power), 0.0, delta=1.0)
 
     def test_audio_effects_processor_retunes_changed_fir_filter_in_place(self) -> None:
         config = self.config

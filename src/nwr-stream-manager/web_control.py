@@ -13624,7 +13624,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 <input id="audio_comfort_noise_enabled" type="checkbox" aria-describedby="audio_comfort_noise_enabled_hint">
                 Enable comfort noise
               </label>
-              <span id="audio_comfort_noise_enabled_hint" class="hint">Mixes very quiet bass-weighted noise into demodulated audio, similar to some analog receivers.</span>
+              <span id="audio_comfort_noise_enabled_hint" class="hint">Mixes very quiet white noise into demodulated audio, similar to some analog receivers.</span>
               <label>Level
                 <input id="audio_comfort_noise_level" type="number" min="-60" max="-30" step="1" aria-describedby="audio_comfort_noise_level_hint">
               </label>
@@ -13689,7 +13689,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             </div>
           </div>
         </div>
-        <div id="audio-effects-result" class="message"></div>
+        <div id="audio-effects-result" class="message" aria-live="polite"></div>
       </div>
       <div id="panel_eas" class="tabpanel" role="tabpanel" aria-labelledby="tab_eas" hidden>
         <h3>EAS recording</h3>
@@ -21903,44 +21903,50 @@ function syncControls(data) {
 }
 
 function applyStatus(data, options = {}) {
+  // Settings changes are not saved while this fills the page from the server, so the
+  // flag must always be cleared: if any update below fails, every later change would
+  // otherwise be silently dropped.
   applying = true;
-  if (data.account) applyAccountUi(data.account);
-  const nextSignature = controlSignature(data);
-  if (
-    options.syncControls ||
-    lastControlSignature === "" ||
-    (nextSignature !== lastControlSignature && !controlHasFocus())
-  ) {
-    syncControls(data);
-  } else {
-    gainValues = data.gain_values || gainValues;
-  }
-  setText("active", data.active ? "active" : "inactive");
-  setText("chunks", data.received_chunks);
-  setText("bytes", data.received_bytes);
-  setText("last", data.last_batch_at ? `${data.last_batch_at.toFixed(3)}s` : "never");
-  setText("capture-error", data.capture_error || "");
-  if (data.remote_sdr && data.remote_sdr.identity) renderRemoteSdr(data);
-  renderLogs(data.logs || []);
-  renderIqTestSourceStatus(data);
-  setFallbackControls(data.fallback);
-  setNotificationSettings(data.notifications || {});
-  setStreamTestModeStatus(data.test_mode || {});
-  syncConfiguredStreamsFromStatus(data);
-  updateDashboard(data);
-  const now = Date.now();
-  if (now - lastEasAlertRefreshAt > 10000) {
-    lastEasAlertRefreshAt = now;
-    loadEasAlertStreams({preserve: true, quiet: true});
-    if (currentViewName() === "eas_alert_detail") {
-      updateEasAlertDetailNavigation().catch(error => console.debug("EAS alert detail navigation refresh failed", error));
+  try {
+    if (data.account) applyAccountUi(data.account);
+    const nextSignature = controlSignature(data);
+    if (
+      options.syncControls ||
+      lastControlSignature === "" ||
+      (nextSignature !== lastControlSignature && !controlHasFocus())
+    ) {
+      syncControls(data);
+    } else {
+      gainValues = data.gain_values || gainValues;
     }
+    setText("active", data.active ? "active" : "inactive");
+    setText("chunks", data.received_chunks);
+    setText("bytes", data.received_bytes);
+    setText("last", data.last_batch_at ? `${data.last_batch_at.toFixed(3)}s` : "never");
+    setText("capture-error", data.capture_error || "");
+    if (data.remote_sdr && data.remote_sdr.identity) renderRemoteSdr(data);
+    renderLogs(data.logs || []);
+    renderIqTestSourceStatus(data);
+    setFallbackControls(data.fallback);
+    setNotificationSettings(data.notifications || {});
+    setStreamTestModeStatus(data.test_mode || {});
+    syncConfiguredStreamsFromStatus(data);
+    updateDashboard(data);
+    const now = Date.now();
+    if (now - lastEasAlertRefreshAt > 10000) {
+      lastEasAlertRefreshAt = now;
+      loadEasAlertStreams({preserve: true, quiet: true});
+      if (currentViewName() === "eas_alert_detail") {
+        updateEasAlertDetailNavigation().catch(error => console.debug("EAS alert detail navigation refresh failed", error));
+      }
+    }
+    if (currentViewName().startsWith("iq_") && now - lastIqRecordingsRefreshAt > 5000) {
+      lastIqRecordingsRefreshAt = now;
+      loadIqRecordings().catch(() => {});
+    }
+  } finally {
+    applying = false;
   }
-  if (currentViewName().startsWith("iq_") && now - lastIqRecordingsRefreshAt > 5000) {
-    lastIqRecordingsRefreshAt = now;
-    loadIqRecordings().catch(() => {});
-  }
-  applying = false;
 }
 
 function currentPayload() {

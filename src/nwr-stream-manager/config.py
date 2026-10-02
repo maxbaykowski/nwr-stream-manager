@@ -393,7 +393,6 @@ def merge_valid_audio_config(
     current: AudioConfig,
 ) -> tuple[AudioConfig, list[str]]:
     errors: list[str] = []
-    changed_filters: set[str] = set()
 
     try:
         if "deemphasis_tau" in raw and "deemphasis" not in raw:
@@ -423,8 +422,6 @@ def merge_valid_audio_config(
     try:
         highpass = parse_filter_config(raw.get("highpass"))
         validate_filter_config("highpass", highpass)
-        if highpass != current.highpass:
-            changed_filters.add("highpass")
     except (ConfigError, KeyError, TypeError, ValueError) as exc:
         errors.append(f"highpass: {exc}")
         highpass = current.highpass
@@ -432,8 +429,6 @@ def merge_valid_audio_config(
     try:
         lowpass = parse_filter_config(raw.get("lowpass"))
         validate_filter_config("lowpass", lowpass)
-        if lowpass != current.lowpass:
-            changed_filters.add("lowpass")
     except (ConfigError, KeyError, TypeError, ValueError) as exc:
         errors.append(f"lowpass: {exc}")
         lowpass = current.lowpass
@@ -441,8 +436,6 @@ def merge_valid_audio_config(
     try:
         notch = parse_notch_config(raw.get("notch"))
         validate_notch_config(notch)
-        if notch != current.notch:
-            changed_filters.add("notch")
     except (ConfigError, KeyError, TypeError, ValueError) as exc:
         errors.append(f"notch: {exc}")
         notch = current.notch
@@ -455,12 +448,6 @@ def merge_valid_audio_config(
         lowpass=lowpass,
         notch=notch,
     )
-    audio, relationship_errors = _merge_valid_audio_filter_relationships(
-        audio,
-        current,
-        changed_filters,
-    )
-    errors.extend(relationship_errors)
     return audio, errors
 
 
@@ -672,7 +659,6 @@ def validate_audio_config(config: AudioConfig) -> None:
     validate_filter_config("highpass", config.highpass)
     validate_filter_config("lowpass", config.lowpass)
     validate_notch_config(config.notch)
-    validate_audio_filter_relationships(config)
 
 
 def validate_deemphasis_config(config: DeemphasisConfig) -> None:
@@ -724,12 +710,6 @@ def validate_notch_config(config: NotchConfig) -> None:
             f"notch.width must be between {NOTCH_MIN_WIDTH_HZ:g} and {widest:g} Hz "
             f"at {config.frequency:g} Hz, to protect the attention and SAME tones"
         )
-
-
-def validate_audio_filter_relationships(config: AudioConfig) -> None:
-    errors = _audio_filter_relationship_errors(config)
-    if errors:
-        raise ConfigError("; ".join(errors))
 
 
 def validate_fallback_config(config: FallbackConfig) -> None:
@@ -796,113 +776,6 @@ def validate_buffer_config(
             "csdr_server.buffer_seconds must be less than "
             "fallback.silence_timeout_seconds"
         )
-
-
-def _audio_filter_relationship_errors(config: AudioConfig) -> list[str]:
-    if not config.notch.enabled:
-        return []
-    errors: list[str] = []
-    if (
-        config.highpass.enabled
-        and config.notch.frequency <= config.highpass.frequency
-    ):
-        errors.append(
-            "notch.frequency must be greater than highpass.frequency "
-            "when both filters are enabled"
-        )
-    if (
-        config.lowpass.enabled
-        and config.notch.frequency >= config.lowpass.frequency
-    ):
-        errors.append(
-            "notch.frequency must be less than lowpass.frequency "
-            "when both filters are enabled"
-        )
-    return errors
-
-
-def _merge_valid_audio_filter_relationships(
-    audio: AudioConfig,
-    current: AudioConfig,
-    changed_filters: set[str],
-) -> tuple[AudioConfig, list[str]]:
-    errors = _audio_filter_relationship_errors(audio)
-    if not errors:
-        return audio, []
-
-    highpass = audio.highpass
-    lowpass = audio.lowpass
-    notch = audio.notch
-    reload_errors: list[str] = []
-
-    if notch.enabled and highpass.enabled and notch.frequency <= highpass.frequency:
-        if "notch" in changed_filters:
-            reload_errors.append(
-                "notch: notch.frequency must be greater than highpass.frequency "
-                "when both filters are enabled"
-            )
-            notch = current.notch
-        elif "highpass" in changed_filters:
-            reload_errors.append(
-                "highpass: highpass.frequency must be less than notch.frequency "
-                "when both filters are enabled"
-            )
-            highpass = current.highpass
-        else:
-            reload_errors.append(
-                "notch: notch.frequency must be greater than highpass.frequency "
-                "when both filters are enabled"
-            )
-            notch = current.notch
-
-    candidate = AudioConfig(
-        deemphasis=audio.deemphasis,
-        comfort_noise=audio.comfort_noise,
-        volume=audio.volume,
-        highpass=highpass,
-        lowpass=lowpass,
-        notch=notch,
-    )
-    if notch.enabled and lowpass.enabled and notch.frequency >= lowpass.frequency:
-        if "notch" in changed_filters:
-            reload_errors.append(
-                "notch: notch.frequency must be less than lowpass.frequency "
-                "when both filters are enabled"
-            )
-            notch = current.notch
-        elif "lowpass" in changed_filters:
-            reload_errors.append(
-                "lowpass: lowpass.frequency must be greater than notch.frequency "
-                "when both filters are enabled"
-            )
-            lowpass = current.lowpass
-        else:
-            reload_errors.append(
-                "notch: notch.frequency must be less than lowpass.frequency "
-                "when both filters are enabled"
-            )
-            notch = current.notch
-
-    candidate = AudioConfig(
-        deemphasis=audio.deemphasis,
-        comfort_noise=audio.comfort_noise,
-        volume=audio.volume,
-        highpass=highpass,
-        lowpass=lowpass,
-        notch=notch,
-    )
-    remaining_errors = _audio_filter_relationship_errors(candidate)
-    if remaining_errors:
-        reload_errors.extend(f"notch: {error}" for error in remaining_errors)
-        candidate = AudioConfig(
-            deemphasis=audio.deemphasis,
-            comfort_noise=audio.comfort_noise,
-            volume=audio.volume,
-            highpass=current.highpass,
-            lowpass=current.lowpass,
-            notch=current.notch,
-        )
-    return candidate, reload_errors
 
 
 def _output_config_errors(config: IcecastConfig) -> list[str]:
