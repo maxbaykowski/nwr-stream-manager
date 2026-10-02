@@ -118,6 +118,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li><a href="#notifications">Notifications</a></li>
     <li><a href="#remote-sdr">Using an SDR from another NWR Stream Manager</a></li>
     <li><a href="#tailscale">Setting up Tailscale</a></li>
+    <li><a href="#secure-address">Using a secure (https) address with Tailscale Serve</a></li>
     <li><a href="#accounts">Accounts</a></li>
     <li><a href="#iq-recorder">I/Q Recorder</a></li>
     <li><a href="#logs">Logs</a></li>
@@ -474,6 +475,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li>On Android, listening usually keeps going when you switch to another app or lock the screen.</li>
     <li>On iPhone and iPad, listening stops when Safari goes into the background. This is a known limitation; there's nothing I can do about it, unfortunately.</li>
     <li>If your internet connection is too unstable, listening stops and NWR Stream Manager tells you why.</li>
+    <li>In Firefox, Chrome and Edge, listening uses much less data and copes better with a slow connection when you open NWR Stream Manager with a secure <code>https://</code> address. See <a href="#secure-address">Using a secure (https) address with Tailscale Serve</a>.</li>
   </ul>
 </section>
 
@@ -554,14 +556,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>Tailscale needs to be installed on every device, including the devices with NWR Stream Manager installed and the computers, phones, and tablets you use to access NWR Stream Manager, and said devices all need to be on the same account and tailnet.</p>
   <h3 id="tailscale-server">On the computer running NWR Stream Manager</h3>
   <ol>
-    <li>Open a command line (terminal) on the computer running NWR Stream Manager, and install Tailscale with its install script:
+    <li>Open a command line (terminal) on the computer running NWR Stream Manager, and run the following command to install Tailscale:
       <div class="command"><code>curl -fsSL https://tailscale.com/install.sh | sh</code><button type="button" class="copy-button" hidden>Copy</button></div>
     </li>
     <li>Start Tailscale:
       <div class="command"><code>sudo tailscale up</code><button type="button" class="copy-button" hidden>Copy</button></div>
-      This shows a web link. Open it in a browser and sign in to your Tailscale account (or create one) to add this computer.
+      After a few seconds, a web link will be printed to the terminal. Copy this link, open it in a browser and sign in to your Tailscale account (or create one) to add the machine.
     </li>
-    <li>Find this computer's Tailscale address:
+    <li>Find the computer's Tailscale address:
       <div class="command"><code>tailscale ip -4</code><button type="button" class="copy-button" hidden>Copy</button></div>
       It's a number starting with 100, such as 100.101.102.103.
     </li>
@@ -570,6 +572,47 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>Install the Tailscale app from <a href="https://tailscale.com/download">tailscale.com/download</a> or from the <a href="https://play.google.com/store/apps/details?id=com.tailscale.ipn&amp;hl=en_US">Google Play Store</a> or <a href="https://apps.apple.com/us/app/tailscale/id1470499037">Apple App Store</a>, and sign in with the same Tailscale account. For a second NWR Stream Manager, repeat the steps above on that computer.</p>
   <h3 id="tailscale-using">Using it</h3>
   <p>With Tailscale on, you can open NWR Stream Manager from anywhere using its Tailscale address and port, for example <code>http://100.101.102.103:8080</code>. Once Tailscale is running on the computer with NWR Stream Manager, it also appears as a choice for where <a href="#notifications">notifications</a> should open, and paired devices can be found over Tailscale when <a href="#remote-sdr">sharing an RTL-SDR</a>.</p>
+</section>
+
+<section aria-labelledby="secure-address">
+  <h2 id="secure-address">Using a secure (https) address with Tailscale Serve</h2>
+  <h3 id="secure-address-why">What http and https mean</h3>
+  <p>Every website you visit starts with either <code>http://</code> ot <code>https://</code> before the web address. Most addresses you visit start with <code>https://</code>. Both are ways for your browser to talk to a website, and the difference is the "s", which stands for secure:</p>
+  <ul>
+    <li><strong>http</strong> sends everything as is. Anyone who can see the traffic along the way can read it, including bad actors.</li>
+    <li><strong>https</strong> scrambles (encrypts) everything between your browser and the website, so only the two of them can read it. It also proves the website is really the one you meant to visit. Most browsers show a padlock next to https addresses.</li>
+  </ul>
+  <p>If you haven't noticed by now, when you open NWR Stream Manager, it starts with <code>http://</code>. That works, and on your home network or through Tailscale your connection is already protected in other ways. However, because browsers can't verify an <code>http://</code> address, some of them, including Firefox, Chrome and Edge, turn off certain features there. The one that matters most is listening in your browser: on an <code>http://</code> address, those browsers can't use the efficient audio format, so <a href="#monitoring">monitoring a stream</a> or using the <a href="#weather-radio-receiver">Weather Radio Receiver</a> uses several times more data, and the audio can't adjust itself when your connection gets slow. Safari on iPhone and iPad isn't affected.</p>
+  <p>Giving NWR Stream Manager an <code>https://</code> address fixes that. It needs a certificate, which is a kind of digital ID card proving the address is genuine. Getting one normally takes some technical work, but Tailscale can handle all of it for you. This is another reason I strongly recommend having Tailscale set up.</p>
+  <h3 id="secure-address-what">What Tailscale Serve does</h3>
+  <p>If you use <a href="#tailscale">Tailscale</a>, its Serve feature gives NWR Stream Manager a secure address that works on all of your Tailscale devices, such as <code>https://my-pi.example-tailnet.ts.net</code>, and takes care of the certificate for you. The annoying part is serve isn't turned on by default for new Tailscale accounts, so there are a few steps that need to be completed first. The good news is, once those steps are completed, you won't need to do them ever again.</p>
+  <h3 id="secure-address-enable">Turn on secure addresses for your Tailscale account</h3>
+  <ol>
+    <li>Sign in to the <a href="https://login.tailscale.com/admin/dns">DNS page of the Tailscale admin console</a>.</li>
+    <li><strong>MagicDNS</strong> should already be enabled unless you manually disabled it. If you manually disabled it, you'll need to enable it again. It gives each of your devices a web address, which the secure address is built from.</li>
+    <li>Under <strong>HTTPS Certificates</strong>, select <strong>Enable HTTPS</strong>.</li>
+  </ol>
+  <div class="warning">
+    <p><strong>Your device names become public.</strong> Certificates are recorded in public logs that anyone can search, and those logs include the name of each device that gets a certificate, along with your Tailscale account's network name. Nothing else about your devices is shared, but if any of your device names contain something private, such as your full name or address, it might be a good idea to either get those devices off your tailnet or rename them.</p>
+  </div>
+  <h3 id="secure-address-serve">Give NWR Stream Manager a secure address</h3>
+  <p>Now that we've gotten the boring stuff out of the way, we can finally enable Tailscale Serve for NWR Stream Manager! Follow the steps below to turn it on:</main>p>
+  <ol>
+    <li>On the computer running NWR Stream Manager, open a command line and run the following. If you started NWR Stream Manager on a different port than 8080, use that number instead.
+      <div class="command"><code>sudo tailscale serve --bg 8080</code><button type="button" class="copy-button" hidden>Copy</button></div>
+      The first time you do this, Tailscale may show a web link asking you to allow Serve on your account. Open the link, approve it, then run the command again.
+    </li>
+    <li>Tailscale shows the secure address NWR Stream Manager is now available at. You can see it again at any time with:
+      <div class="command"><code>tailscale serve status</code><button type="button" class="copy-button" hidden>Copy</button></div>
+    </li>
+    <li>Open that <code>https://</code> address on any device signed in to your Tailscale account. Only your own Tailscale devices can reach it; it isn't put on the public internet.</li>
+  </ol>
+  <p>Serve keeps running in the background and comes back on its own after the computer restarts.</p>
+  <p>If you use <a href="#notifications">notifications</a>, NWR Stream Manager notices the secure address within a minute and lists it as <strong>Tailscale Serve</strong> under <strong>Open NWR Stream Manager from notifications</strong> in Notification settings. If that setting is on <strong>Automatic</strong>, notifications start opening the secure address on their own; you don't need to change anything.</p>
+  <p>To stop serving the secure address, run:</p>
+  <div class="command"><code>sudo tailscale serve reset</code><button type="button" class="copy-button" hidden>Copy</button></div>
+  <h3 id="secure-address-other">Other ways to get a secure address</h3>
+  <p>You can also put NWR Stream Manager behind a reverse proxy with a certificate, such as Caddy or nginx, or reach it through a Cloudflare Tunnel. If you have no idea what any of that means, just follow the steps above. A reverse proxy or Cloudflare tunnel is more involved and is outside the scope of this help.</p>
 </section>
 
 <section aria-labelledby="accounts">
@@ -594,7 +637,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <ul>
     <li>To change your own password, open <strong>More</strong>, then <strong>Change account password</strong>. The owner does this from <strong>Manage accounts</strong> instead, by choosing <strong>Change account password</strong> from their own account's <strong>More actions</strong> menu.</li>
     <li>If someone forgets their password, the owner can open <strong>Manage accounts</strong> and choose <strong>Reset password</strong> from that account's <strong>More actions</strong> menu. This gives them a new temporary password.</li>
-    <li>If the owner password is lost, NWR Stream Manager has to be stopped and its account database (the <code>accounts.db</code> file in its settings folder) deleted. The setup page then appears again so a new owner account can be created. Your streams and settings are kept. Starting to get the memo yet?</li>
+    <li>If the owner password is lost, NWR Stream Manager has to be stopped and its account database (the <code>accounts.db</code> file in its settings folder) deleted. The setup page then appears again so a new owner account can be created. Your streams and settings are kept. Starting to get the memo yet? Don't forget your password!</li>
   </ul>
 </section>
 

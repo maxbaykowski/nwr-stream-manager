@@ -19,6 +19,7 @@ import signal
 import socket
 import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -11725,6 +11726,13 @@ VIRTUAL_INTERFACE_PREFIXES = (
 VIRTUAL_INTERFACE_NAMES = {"lo", "tunl0"}
 IFF_UP = 0x1
 TAILSCALE_DNS_RESOLVER = "100.100.100.100"
+TAILSCALE_SERVE_STATUS_TIMEOUT_SECONDS = 3.0
+# The notification address list is rebuilt on every status refresh; don't run the
+# tailscale command that often.
+TAILSCALE_SERVE_CACHE_SECONDS = 30.0
+LOCAL_PROXY_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_tailscale_serve_cache: dict[int, tuple[float, dict[str, Any] | None]] = {}
+_tailscale_serve_cache_lock = threading.Lock()
 DNS_TYPE_PTR = 12
 DNS_CLASS_IN = 1
 
@@ -11873,6 +11881,77 @@ def tailscale_magicdns_name(address: str) -> str:
     return ""
 
 
+def tailscale_serve_address(serve_status: dict[str, Any], port: int) -> dict[str, Any] | None:
+    """Find the https address Tailscale Serve proxies to this NWR Stream Manager, if any.
+
+    serve_status is the output of `tailscale serve status --json`.
+    """
+    web = serve_status.get("Web") if isinstance(serve_status, dict) else None
+    if not isinstance(web, dict):
+        return None
+    funnel = serve_status.get("AllowFunnel") if isinstance(serve_status.get("AllowFunnel"), dict) else {}
+    for host_port, config in web.items():
+        handlers = config.get("Handlers") if isinstance(config, dict) else None
+        root = handlers.get("/") if isinstance(handlers, dict) else None
+        proxy = str(root.get("Proxy", "")).strip() if isinstance(root, dict) else ""
+        if not proxy:
+            continue
+        target = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+        try:
+            target_port = target.port
+        except ValueError:
+            continue
+        if proxy.isdigit():
+            target_host, target_port = "127.0.0.1", int(proxy)
+        else:
+            target_host = target.hostname or ""
+        if target.scheme != "http" or target_host not in LOCAL_PROXY_HOSTS or target_port != port:
+            continue
+        host, _separator, serve_port = str(host_port).rpartition(":")
+        if not host or not serve_port.isdigit():
+            continue
+        url = f"https://{host}" if serve_port == "443" else f"https://{host}:{serve_port}"
+        return {"url": url, "host": host, "public": bool(funnel.get(host_port))}
+    return None
+
+
+def tailscale_serve_url_for_port(port: int) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _tailscale_serve_cache_lock:
+        cached = _tailscale_serve_cache.get(port)
+        if cached is not None and now - cached[0] < TAILSCALE_SERVE_CACHE_SECONDS:
+            return cached[1]
+    found = None
+    try:
+        result = subprocess.run(
+            ["tailscale", "serve", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=TAILSCALE_SERVE_STATUS_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            found = tailscale_serve_address(json.loads(result.stdout), port)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        found = None  # Tailscale isn't installed, isn't running, or answered oddly.
+    with _tailscale_serve_cache_lock:
+        _tailscale_serve_cache[port] = (now, found)
+    return found
+
+
+def tailscale_serve_option(port: int) -> dict[str, str] | None:
+    serve = tailscale_serve_url_for_port(port)
+    if serve is None:
+        return None
+    detail = f"{serve['url']}, public on the internet through Tailscale Funnel" if serve["public"] else serve["url"]
+    return {
+        "id": f"tailscale-serve:{serve['host']}",
+        "label": f"Tailscale Serve ({detail})",
+        "url": serve["url"],
+        "interface": "tailscale-serve",
+    }
+
+
 def default_route_ipv4_address() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -11887,9 +11966,12 @@ def notification_access_url_options(host: str, port: int) -> list[dict[str, str]
     options: list[dict[str, str]] = []
     seen_urls: set[str] = set()
     default_route_address = default_route_ipv4_address()
+    # A secure Tailscale Serve address comes first, so Automatic uses it when there is one.
+    serve_option = tailscale_serve_option(port)
     if host not in {"0.0.0.0", "::", ""}:
         url = f"http://{host}:{port}"
-        return [{"id": "auto", "label": f"Server bind address ({url})", "url": url, "interface": ""}]
+        bound = {"id": "auto", "label": f"Server bind address ({url})", "url": url, "interface": ""}
+        return [serve_option, bound] if serve_option is not None else [bound]
     try:
         for _index, name in socket.if_nameindex():
             if not interface_is_up(name) or not interface_is_physical_or_tailscale(name):
@@ -11947,6 +12029,8 @@ def notification_access_url_options(host: str, port: int) -> list[dict[str, str]
         return (2, str(default_rank), option["label"].lower())
 
     options.sort(key=option_sort_key)
+    if serve_option is not None:
+        options.insert(0, serve_option)
     return options
 
 

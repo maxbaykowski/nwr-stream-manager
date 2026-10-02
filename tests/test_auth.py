@@ -1082,8 +1082,43 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(rdlength, len(target))
         self.assertEqual(decoded, "max-thinkpad.example.ts.net")
 
+    def test_tailscale_serve_address_is_found_only_when_it_serves_this_port(self) -> None:
+        find = self.web_control.tailscale_serve_address
+        status = {
+            "TCP": {"443": {"HTTPS": True}},
+            "Web": {"max-pi5.example.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080"}}}},
+        }
+
+        self.assertEqual(find(status, 8080), {"url": "https://max-pi5.example.ts.net", "host": "max-pi5.example.ts.net", "public": False})
+        self.assertIsNone(find(status, 9090))
+        self.assertIsNone(find({}, 8080))
+        other_ports = {"Web": {"pi.example.ts.net:8443": {"Handlers": {"/": {"Proxy": "localhost:8080"}}}}}
+        self.assertEqual(find(other_ports, 8080)["url"], "https://pi.example.ts.net:8443")
+        other_machine = {"Web": {"pi.example.ts.net:443": {"Handlers": {"/": {"Proxy": "http://192.168.1.20:8080"}}}}}
+        self.assertIsNone(find(other_machine, 8080))
+        public = dict(status, AllowFunnel={"max-pi5.example.ts.net:443": True})
+        self.assertTrue(find(public, 8080)["public"])
+
+    def test_automatic_notification_address_prefers_tailscale_serve(self) -> None:
+        serve = {"url": "https://max-pi5.example.ts.net", "host": "max-pi5.example.ts.net", "public": False}
+        with (
+            patch.object(self.web_control, "tailscale_serve_url_for_port", return_value=serve),
+            patch.object(self.web_control.socket, "if_nameindex", return_value=[(1, "tailscale0")]),
+            patch.object(self.web_control, "interface_is_up", return_value=True),
+            patch.object(self.web_control, "interface_is_physical_or_tailscale", return_value=True),
+            patch.object(self.web_control, "interface_ipv4_address", return_value="100.108.97.122"),
+            patch.object(self.web_control, "tailscale_magicdns_name", return_value="max-pi5.example.ts.net"),
+        ):
+            options = self.web_control.notification_access_url_options("0.0.0.0", 8080)
+
+        self.assertEqual(options[0]["id"], "tailscale-serve:max-pi5.example.ts.net")
+        self.assertEqual(options[0]["url"], "https://max-pi5.example.ts.net")
+        self.assertEqual(options[0]["label"], "Tailscale Serve (https://max-pi5.example.ts.net)")
+        self.assertTrue(any(option["url"] == "http://100.108.97.122:8080" for option in options))
+
     def test_notification_access_urls_include_tailscale_magicdns_when_detected(self) -> None:
         with (
+            patch.object(self.web_control, "tailscale_serve_url_for_port", return_value=None),
             patch.object(self.web_control.socket, "if_nameindex", return_value=[(1, "tailscale0"), (2, "wlp9s0")]),
             patch.object(self.web_control, "interface_is_up", return_value=True),
             patch.object(self.web_control, "interface_is_physical_or_tailscale", return_value=True),
@@ -1103,6 +1138,7 @@ class AuthTests(unittest.TestCase):
 
     def test_notification_access_urls_prefer_default_route_after_tailscale(self) -> None:
         with (
+            patch.object(self.web_control, "tailscale_serve_url_for_port", return_value=None),
             patch.object(
                 self.web_control.socket,
                 "if_nameindex",
@@ -1124,6 +1160,7 @@ class AuthTests(unittest.TestCase):
 
     def test_notification_access_urls_use_default_route_when_no_interfaces_match(self) -> None:
         with (
+            patch.object(self.web_control, "tailscale_serve_url_for_port", return_value=None),
             patch.object(self.web_control.socket, "if_nameindex", return_value=[]),
             patch.object(self.web_control, "default_route_ipv4_address", return_value="172.20.10.2"),
         ):
