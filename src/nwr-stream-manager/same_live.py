@@ -32,14 +32,9 @@ SAME_PREAMBLE_BYTES = 16
 SAME_TRAILING_NUL_BYTES = 3
 SAME_REPETITIONS = 3
 SAME_INTER_BURST_GAP_SECONDS = 1.0
-SAME_DETECT_RATE = 22050
-SAME_DETECT_MIN_SECONDS = 0.08
-SAME_DETECT_END_SECONDS = 0.18
-SAME_CANDIDATE_TIMEOUT_SECONDS = 12.0
+SAME_DECODE_RATE = 22050
 SAME_EVENT_DEDUP_SECONDS = 45.0
 SAME_HEADER_CONFIRM_TIMEOUT_SECONDS = 30.0
-SAME_PREAMBLE_DETECT_MIN_BITS = 28
-SAME_PREAMBLE_DETECT_SECONDS = 0.36
 MULTIMON_RESET_AFTER_PAYLOADS = 3
 SAME_HEADER_RE = re.compile(
     r"^ZCZC-(?P<originator>[A-Z0-9]{3})-(?P<event_type>[A-Z0-9]{3})-"
@@ -68,8 +63,6 @@ class SameParsedHeader:
 class SameLiveEvent:
     type: str
     id: str
-    sample_offset: int
-    sample_rate: int
     payload: dict[str, Any]
 
 
@@ -221,7 +214,7 @@ class SameMultimonLiveDecoder:
         self,
         input_sample_rate: int,
         *,
-        detect_rate: int = SAME_DETECT_RATE,
+        detect_rate: int = SAME_DECODE_RATE,
         reset_after_payloads: int = MULTIMON_RESET_AFTER_PAYLOADS,
     ) -> None:
         self.input_sample_rate = int(input_sample_rate)
@@ -354,147 +347,24 @@ class SameMultimonLiveDecoder:
                 self.lines.append(line.decode("utf-8", "ignore").rstrip("\n"))
 
 
-class SameToneDetector:
-    def __init__(self, sample_rate: int) -> None:
-        self.sample_rate = int(sample_rate)
-        self._cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-        self._symbol_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-        self._preamble_bits = tuple((SAME_PREAMBLE_BYTE >> bit_index) & 1 for bit_index in range(8))
+class SameAlertDecoder:
+    """Decode SAME alerts from live audio with multimon-ng, for the weather radio receiver.
 
-    def is_same_like(self, pcm_s16le: bytes) -> bool:
-        if not pcm_s16le:
-            return False
-        samples = np.frombuffer(pcm_s16le, dtype="<i2").astype(np.float32)
-        if samples.size < 32:
-            return False
-        samples -= float(np.mean(samples))
-        total = float(np.dot(samples, samples))
-        if total <= 1.0:
-            return False
-        mark_i, mark_q, space_i, space_q = self._basis(samples.size)
-        mark = float(np.dot(samples, mark_i) ** 2 + np.dot(samples, mark_q) ** 2)
-        space = float(np.dot(samples, space_i) ** 2 + np.dot(samples, space_q) ** 2)
-        dominant_ratio = max(mark, space) / total
-        weaker_ratio = min(mark, space) / total
-        combined_ratio = (mark + space) / total
-        if dominant_ratio < 24.0 or weaker_ratio < 4.0 or combined_ratio < 48.0:
-            return False
-        return True
+    The audio itself passes through untouched. A header counts as an alert once two of
+    the last three decoded headers match, within SAME_HEADER_CONFIRM_TIMEOUT_SECONDS,
+    and the same alert is not reported again within SAME_EVENT_DEDUP_SECONDS.
+    """
 
-    def has_same_preamble(self, pcm_s16le: bytes) -> bool:
-        if not pcm_s16le:
-            return False
-        samples = np.frombuffer(pcm_s16le, dtype="<i2").astype(np.float32)
-        if samples.size < round(self.sample_rate * 0.12):
-            return False
-        max_samples = round(self.sample_rate * SAME_PREAMBLE_DETECT_SECONDS)
-        if samples.size > max_samples:
-            samples = samples[-max_samples:]
-        samples -= float(np.mean(samples))
-        total = float(np.dot(samples, samples))
-        if total <= 1.0:
-            return False
-        mark_i, mark_q, space_i, space_q = self._basis(samples.size)
-        mark = float(np.dot(samples, mark_i) ** 2 + np.dot(samples, mark_q) ** 2)
-        space = float(np.dot(samples, space_i) ** 2 + np.dot(samples, space_q) ** 2)
-        if (mark + space) / total < 0.10:
-            return False
-        return self._has_same_preamble_pattern(samples)
-
-    def _has_same_preamble_pattern(self, samples: np.ndarray) -> bool:
-        symbol_samples = max(8, round(self.sample_rate / SAME_BAUD))
-        if samples.size < symbol_samples * SAME_PREAMBLE_DETECT_MIN_BITS:
-            return False
-        best_run = 0
-        offset_step = max(1, symbol_samples // 6)
-        for start_offset in range(0, symbol_samples, offset_step):
-            symbols: list[int] = []
-            confidence: list[bool] = []
-            for start in range(start_offset, samples.size - symbol_samples + 1, symbol_samples):
-                symbol = samples[start : start + symbol_samples]
-                total = float(np.dot(symbol, symbol))
-                if total <= 1.0:
-                    symbols.append(0)
-                    confidence.append(False)
-                    continue
-                mark_i, mark_q, space_i, space_q = self._symbol_basis(symbol.size)
-                mark = float(np.dot(symbol, mark_i) ** 2 + np.dot(symbol, mark_q) ** 2)
-                space = float(np.dot(symbol, space_i) ** 2 + np.dot(symbol, space_q) ** 2)
-                symbols.append(1 if mark > space else 0)
-                confidence.append(
-                    max(mark, space) / total >= 0.14
-                    and abs(mark - space) / max(mark, space) >= 0.10
-                )
-            if len(symbols) < SAME_PREAMBLE_DETECT_MIN_BITS:
-                continue
-            for phase in range(8):
-                run = 0
-                for index, bit in enumerate(symbols):
-                    expected = self._preamble_bits[(index + phase) % 8]
-                    if confidence[index] and bit == expected:
-                        run += 1
-                        best_run = max(best_run, run)
-                    else:
-                        run = 0
-        return best_run >= SAME_PREAMBLE_DETECT_MIN_BITS
-
-    def _symbol_basis(self, size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        cached = self._symbol_cache.get(size)
-        if cached is not None:
-            return cached
-        t = np.arange(size, dtype=np.float32) / float(self.sample_rate)
-        basis = (
-            np.sin(2.0 * np.pi * SAME_MARK_HZ * t).astype(np.float32),
-            np.cos(2.0 * np.pi * SAME_MARK_HZ * t).astype(np.float32),
-            np.sin(2.0 * np.pi * SAME_SPACE_HZ * t).astype(np.float32),
-            np.cos(2.0 * np.pi * SAME_SPACE_HZ * t).astype(np.float32),
-        )
-        self._symbol_cache[size] = basis
-        return basis
-
-    def _basis(self, size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        cached = self._cache.get(size)
-        if cached is not None:
-            return cached
-        t = np.arange(size, dtype=np.float32) / float(self.sample_rate)
-        basis = (
-            np.sin(2.0 * np.pi * SAME_MARK_HZ * t).astype(np.float32),
-            np.cos(2.0 * np.pi * SAME_MARK_HZ * t).astype(np.float32),
-            np.sin(2.0 * np.pi * SAME_SPACE_HZ * t).astype(np.float32),
-            np.cos(2.0 * np.pi * SAME_SPACE_HZ * t).astype(np.float32),
-        )
-        self._cache[size] = basis
-        return basis
-
-
-class SameSuppressionProcessor:
     def __init__(
         self,
         *,
         sample_rate: int,
         event_sink: Callable[[dict[str, Any]], None] | None = None,
-        lookbehind_seconds: float = 0.22,
         decoder_factory: Callable[[int], Any] | None = None,
-        enable_decoder: bool = True,
     ) -> None:
         self.sample_rate = int(sample_rate)
         self.event_sink = event_sink
-        self.frame_samples = round(self.sample_rate * 0.02)
-        self.frame_bytes = self.frame_samples * 2
-        self.detector = SameToneDetector(self.sample_rate)
-        self.decoder = (decoder_factory or SameMultimonLiveDecoder)(self.sample_rate) if enable_decoder else None
-        self.pending: deque[bytes] = deque()
-        self.state = "normal"
-        self.candidate_validated = False
-        self.candidate_start_sample_offset = 0
-        self.sample_offset = 0
-        self.candidate_started_at = 0.0
-        self.candidate_tone_frames = 0
-        self.last_preamble_check_tone_frames = 0
-        self.quiet_frames = 0
-        self.min_tone_frames = max(1, round(SAME_DETECT_MIN_SECONDS / 0.02))
-        self.lookbehind_frames = max(self.min_tone_frames, round(float(lookbehind_seconds) / 0.02))
-        self.end_quiet_frames = max(1, round(SAME_DETECT_END_SECONDS / 0.02))
+        self.decoder = (decoder_factory or SameMultimonLiveDecoder)(self.sample_rate)
         self.last_events: dict[tuple[str, str], float] = {}
         self.decoded_header_window: deque[str] = deque(maxlen=3)
         self.last_decoded_header_at: float | None = None
@@ -504,142 +374,23 @@ class SameSuppressionProcessor:
         if close is not None:
             close()
 
-    def process_pcm(self, pcm_s16le: bytes) -> list[bytes]:
-        output: list[bytes] = []
-        for frame in self._split_frames(pcm_s16le):
-            output.extend(self._process_frame(frame))
-        return output
+    def process_pcm(self, pcm_s16le: bytes) -> list[dict[str, Any]]:
+        self.decoder.write(pcm_s16le)
+        events: list[dict[str, Any]] = []
+        for payload in self.decoder.poll():
+            events.extend(self.submit_decoded_payload(payload))
+        return events
 
     def submit_decoded_payload(self, payload: str) -> list[dict[str, Any]]:
         payload = str(payload or "").strip()
         if payload.startswith("ZCZC"):
             parsed = parse_same_header(payload)
-            if parsed is None:
-                return []
-            self._mark_candidate_validated()
-            event = SameLiveEvent(
-                type="same_header",
-                id=same_event_id("header", parsed.raw_header),
-                sample_offset=self.candidate_start_sample_offset,
-                sample_rate=self.sample_rate,
-                payload={
-                    "raw_header": parsed.raw_header,
-                    "parsed": asdict(parsed),
-                    "repetitions": SAME_REPETITIONS,
-                    "gap_seconds": SAME_INTER_BURST_GAP_SECONDS,
-                },
-            )
-            events = self._emit_once("header", parsed.raw_header, event)
-            events.extend(self._confirmed_header_events(parsed))
-            return events
+            return [] if parsed is None else self._confirmed_header_events(parsed)
         if payload.startswith("NNNN"):
-            self._mark_candidate_validated()
+            # The message is over; a repeat of the same header now is a new alert.
             self.decoded_header_window.clear()
             self.last_decoded_header_at = None
-            event = SameLiveEvent(
-                type="same_eom",
-                id=same_event_id("eom", "NNNN"),
-                sample_offset=self.candidate_start_sample_offset,
-                sample_rate=self.sample_rate,
-                payload={
-                    "raw_eom": "NNNN",
-                    "repetitions": SAME_REPETITIONS,
-                    "gap_seconds": SAME_INTER_BURST_GAP_SECONDS,
-                },
-            )
-            return self._emit_once("eom", "NNNN", event)
         return []
-
-    def flush(self) -> list[bytes]:
-        output = list(self.pending)
-        self.pending.clear()
-        return output
-
-    def _process_frame(self, frame: bytes) -> list[bytes]:
-        if self.decoder is not None:
-            self.decoder.write(frame)
-            for payload in self.decoder.poll():
-                self.submit_decoded_payload(payload)
-        same_like = self.detector.is_same_like(frame)
-        now = time.monotonic()
-        output: list[bytes] = []
-        if self.state == "suppressing":
-            output.append(self._silence_like(frame))
-            if same_like:
-                self.quiet_frames = 0
-            else:
-                self.quiet_frames += 1
-            timed_out = now - self.candidate_started_at > SAME_CANDIDATE_TIMEOUT_SECONDS
-            if self.quiet_frames >= self.end_quiet_frames or timed_out:
-                self.state = "normal"
-                self.candidate_tone_frames = 0
-                self.last_preamble_check_tone_frames = 0
-                self.quiet_frames = 0
-                self.candidate_validated = False
-            self.sample_offset += len(frame) // 2
-            return output
-        if self.state == "normal":
-            self.pending.append(frame)
-            if same_like:
-                self.candidate_tone_frames += 1
-            else:
-                self.candidate_tone_frames = 0
-                self.last_preamble_check_tone_frames = 0
-            if self.candidate_validated:
-                self.candidate_start_sample_offset = self.sample_offset
-                output.append(self._silence_like(frame))
-                self.pending.clear()
-                self.state = "suppressing"
-                self.candidate_started_at = now
-                self.candidate_validated = False
-                self.quiet_frames = 0
-            elif (
-                self.candidate_tone_frames >= self.min_tone_frames
-                and self._should_check_preamble()
-                and self.detector.has_same_preamble(b"".join(self.pending))
-            ):
-                self.state = "candidate"
-                self.candidate_started_at = now
-                self.quiet_frames = 0
-                self.last_preamble_check_tone_frames = 0
-                first_pending_sample = self.sample_offset - (
-                    max(0, len(self.pending) - 1) * self.frame_samples
-                )
-                self.candidate_start_sample_offset = max(0, first_pending_sample)
-                while self.pending:
-                    output.append(self._silence_like(self.pending.popleft()))
-            else:
-                while len(self.pending) > self.lookbehind_frames:
-                    output.append(self.pending.popleft())
-        elif self.state == "candidate":
-            output.append(self._silence_like(frame))
-            if same_like:
-                self.quiet_frames = 0
-            else:
-                self.quiet_frames += 1
-            timed_out = now - self.candidate_started_at > SAME_CANDIDATE_TIMEOUT_SECONDS
-            if self.candidate_validated:
-                self.state = "suppressing"
-                self.candidate_validated = False
-                self.quiet_frames = 0
-            elif self.quiet_frames >= self.end_quiet_frames or timed_out:
-                self.state = "normal"
-                self.candidate_tone_frames = 0
-                self.last_preamble_check_tone_frames = 0
-                self.quiet_frames = 0
-        self.sample_offset += len(frame) // 2
-        return output
-
-    def _mark_candidate_validated(self) -> None:
-        self.candidate_validated = True
-
-    def _should_check_preamble(self) -> bool:
-        if self.candidate_tone_frames < self.min_tone_frames:
-            return False
-        if self.candidate_tone_frames - self.last_preamble_check_tone_frames < 4:
-            return False
-        self.last_preamble_check_tone_frames = self.candidate_tone_frames
-        return True
 
     def _confirmed_header_events(self, parsed: SameParsedHeader) -> list[dict[str, Any]]:
         now = time.monotonic()
@@ -655,8 +406,6 @@ class SameSuppressionProcessor:
         event = SameLiveEvent(
             type="same_alert_confirmed",
             id=same_event_id("alert-confirmed", parsed.raw_header),
-            sample_offset=self.candidate_start_sample_offset,
-            sample_rate=self.sample_rate,
             payload={
                 "raw_header": parsed.raw_header,
                 "parsed": asdict(parsed),
@@ -680,19 +429,6 @@ class SameSuppressionProcessor:
         if self.event_sink is not None:
             self.event_sink(payload)
         return [payload]
-
-    def _split_frames(self, pcm_s16le: bytes) -> list[bytes]:
-        frames = []
-        for offset in range(0, len(pcm_s16le), self.frame_bytes):
-            frame = pcm_s16le[offset : offset + self.frame_bytes]
-            if len(frame) < self.frame_bytes:
-                frame += b"\x00" * (self.frame_bytes - len(frame))
-            frames.append(frame)
-        return frames
-
-    @staticmethod
-    def _silence_like(frame: bytes) -> bytes:
-        return b"\x00" * len(frame)
 
 
 class SameEventQueue:

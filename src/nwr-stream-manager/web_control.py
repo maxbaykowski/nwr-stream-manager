@@ -107,7 +107,7 @@ if __package__:
         validate_ppm_correction,
     )
     from .same_data import lookup_event, lookup_location
-    from .same_live import SameEventQueue, SameSuppressionProcessor, generate_attention_tone, generate_same_message
+    from .same_live import SameAlertDecoder, SameEventQueue, generate_attention_tone, generate_same_message
     from .signal_meter import ChannelSignalMeter, SignalPresenceTracker, noise_reference_band_for_transition
     from .remote_sdr import (
         REMOTE_IQ_BUFFER_SECONDS,
@@ -225,7 +225,7 @@ else:
     lookup_event = same_data.lookup_event
     lookup_location = same_data.lookup_location
     SameEventQueue = same_live.SameEventQueue
-    SameSuppressionProcessor = same_live.SameSuppressionProcessor
+    SameAlertDecoder = same_live.SameAlertDecoder
     generate_same_message = same_live.generate_same_message
     generate_attention_tone = same_live.generate_attention_tone
     ChannelSignalMeter = signal_meter.ChannelSignalMeter
@@ -3337,7 +3337,14 @@ def enrich_live_same_event(event: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
-class SameAwareWebRtcAudioSource:
+class LiveAudioSource:
+    """Audio for one browser listening live, plus SAME alerts when it has an event queue.
+
+    The weather radio receiver passes an event queue so it can show alerts as they are
+    decoded; that runs multimon-ng behind the session. Stream monitoring does not, so it
+    plays the stream exactly as it is with no decoder.
+    """
+
     def __init__(self, *, sample_rate: int = IQ_SAMPLE_RATE, event_queue: SameEventQueue | None = None) -> None:
         self.audio_source = WebRtcAudioSource(sample_rate=sample_rate)
         self.sample_rate = sample_rate
@@ -3345,11 +3352,10 @@ class SameAwareWebRtcAudioSource:
         self.event_queue = event_queue
         self.paused = False
         self.lock = threading.Lock()
-        event_sink = (lambda event: event_queue.put(enrich_live_same_event(event))) if event_queue is not None else None
-        self.suppressor = (
-            SameSuppressionProcessor(
+        self.alert_decoder = (
+            SameAlertDecoder(
                 sample_rate=sample_rate,
-                event_sink=event_sink,
+                event_sink=lambda event: event_queue.put(enrich_live_same_event(event)),
             )
             if event_queue is not None
             else None
@@ -3373,11 +3379,9 @@ class SameAwareWebRtcAudioSource:
         return bytes(len(frame))
 
     def push_pcm(self, pcm: bytes) -> None:
-        if self.suppressor is None:
-            self.audio_source.push_pcm(self._pause_frame(pcm))
-            return
-        for frame in self.suppressor.process_pcm(pcm):
-            self.audio_source.push_pcm(self._pause_frame(frame))
+        if self.alert_decoder is not None:
+            self.alert_decoder.process_pcm(pcm)
+        self.audio_source.push_pcm(self._pause_frame(pcm))
 
     def read_pcm_blocking(self, timeout: float = 0.25) -> bytes:
         return self._pause_frame(self.audio_source.read_pcm_blocking(timeout=timeout))
@@ -3388,15 +3392,12 @@ class SameAwareWebRtcAudioSource:
     def stats(self) -> dict[str, Any]:
         stats = self.audio_source.stats()
         stats["paused"] = self.is_paused()
-        suppressor = self.suppressor
-        if suppressor is not None:
-            stats["same_suppression_state"] = suppressor.state
-            stats["same_suppression_pending_frames"] = len(suppressor.pending)
+        stats["same_alert_decoding"] = self.alert_decoder is not None
         return stats
 
     def close(self) -> None:
-        if self.suppressor is not None:
-            self.suppressor.close()
+        if self.alert_decoder is not None:
+            self.alert_decoder.close()
         self.audio_source.close()
 
 
@@ -3642,7 +3643,7 @@ class IcecastStreamWorker:
         self.thread = threading.Thread(target=self._run_pcm_producer, name=f"icecast-stream-{stream['id']}", daemon=True)
         self.outputs: dict[str, IcecastOutputWriter] = {}
         self.encoder_groups: dict[tuple[str, int, int], IcecastEncoderGroup] = {}
-        self.monitor_sources: dict[str, SameAwareWebRtcAudioSource] = {}
+        self.monitor_sources: dict[str, LiveAudioSource] = {}
         self.soundcard_outputs: set[str] = set()
         self.eas_config: EasRecordingConfig | None = None
         self.eas_recorder: EasRecorderOutput | None = None
@@ -3789,8 +3790,9 @@ class IcecastStreamWorker:
             "directory": config.directory,
         }
 
-    def add_monitor_source(self, client_id: str, event_queue: SameEventQueue | None = None) -> SameAwareWebRtcAudioSource:
-        source = SameAwareWebRtcAudioSource(sample_rate=IQ_SAMPLE_RATE, event_queue=event_queue)
+    def add_monitor_source(self, client_id: str) -> LiveAudioSource:
+        # Monitoring plays the stream as it is, so no SAME decoder runs behind it.
+        source = LiveAudioSource(sample_rate=IQ_SAMPLE_RATE)
         with self.lock:
             old_source = self.monitor_sources.pop(client_id, None)
             self.monitor_sources[client_id] = source
@@ -3803,7 +3805,7 @@ class IcecastStreamWorker:
         if source is not None:
             source.close()
 
-    def detach_monitor_source(self, client_id: str) -> SameAwareWebRtcAudioSource | None:
+    def detach_monitor_source(self, client_id: str) -> LiveAudioSource | None:
         with self.lock:
             return self.monitor_sources.pop(client_id, None)
 
@@ -5069,7 +5071,7 @@ class WeatherReceiverWorker:
             max_seconds=LIVE_IQ_QUEUE_SECONDS,
             name=f"receiver:{client_id}",
         )
-        self.source = SameAwareWebRtcAudioSource(sample_rate=IQ_SAMPLE_RATE, event_queue=event_queue)
+        self.source = LiveAudioSource(sample_rate=IQ_SAMPLE_RATE, event_queue=event_queue)
         self.frequency_hz = frequency_hz
         self.stop_event = threading.Event()
         self.thread = threading.Thread(
@@ -7305,7 +7307,7 @@ class RtlControlService:
         client_id: str,
         stream_id: str,
         account_id: int | None = None,
-    ) -> tuple[SameAwareWebRtcAudioSource, SameEventQueue, dict[str, Any]]:
+    ) -> tuple[LiveAudioSource, None, dict[str, Any]]:
         client_id = str(client_id).strip()
         stream_id = str(stream_id).strip()
         LOG.info("WebSocket monitor start requested: client=%s stream=%s", client_id or "<missing>", stream_id or "<missing>")
@@ -7313,7 +7315,6 @@ class RtlControlService:
             raise ValueError("monitor client id is required")
         if not stream_id:
             raise ValueError("stream id is required")
-        event_queue = SameEventQueue()
         self.stop_receiver({"client_id": client_id}, account_id=account_id)
         self.stop_monitor({"client_id": client_id}, account_id=account_id)
         with self.lock:
@@ -7329,8 +7330,8 @@ class RtlControlService:
                 self.monitor_streams_by_client.pop(client_id, None)
                 self.monitor_accounts_by_client.pop(client_id, None)
                 raise ValueError("stream worker could not be started for monitoring")
-            source = worker.add_monitor_source(client_id, event_queue)
-        return source, event_queue, self.monitor_status(client_id)
+            source = worker.add_monitor_source(client_id)
+        return source, None, self.monitor_status(client_id)
 
     def stop_monitor(self, payload: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
         client_id = str(payload.get("client_id", "")).strip()
@@ -7406,7 +7407,7 @@ class RtlControlService:
 
     def remove_stream(self, stream_id: str) -> dict[str, Any]:
         stream_id = stream_id.strip()
-        detached_monitor_sources: list[SameAwareWebRtcAudioSource] = []
+        detached_monitor_sources: list[LiveAudioSource] = []
         with self.lock:
             removed = [stream for stream in self.streams if stream.get("id") == stream_id]
             self.streams = [stream for stream in self.streams if stream.get("id") != stream_id]
@@ -7425,7 +7426,7 @@ class RtlControlService:
         client_id: str,
         frequency_hz: int,
         account_id: int | None = None,
-    ) -> tuple[SameAwareWebRtcAudioSource, SameEventQueue, dict[str, Any]]:
+    ) -> tuple[LiveAudioSource, SameEventQueue, dict[str, Any]]:
         client_id = str(client_id).strip()
         frequency_hz = validate_receiver_frequency(frequency_hz)
         LOG.info(
@@ -7554,7 +7555,7 @@ class RtlControlService:
         if "enabled" not in payload:
             raise ValueError("stream enabled state is required")
         enabled = bool(payload.get("enabled"))
-        detached_monitor_sources: list[SameAwareWebRtcAudioSource] = []
+        detached_monitor_sources: list[LiveAudioSource] = []
         with self.lock:
             stream = self._stream_locked(stream_id)
             stream["enabled"] = enabled
@@ -8537,7 +8538,7 @@ class RtlControlService:
         ).start()
 
     @staticmethod
-    def _close_detached_monitor_sources(sources: list[SameAwareWebRtcAudioSource | None]) -> None:
+    def _close_detached_monitor_sources(sources: list[LiveAudioSource | None]) -> None:
         for source in sources:
             if source is None:
                 continue
@@ -8546,7 +8547,7 @@ class RtlControlService:
             except Exception as exc:
                 LOG.debug("monitor source close failed: %s", exc)
 
-    def _remove_monitor_source_locked(self, client_id: str) -> SameAwareWebRtcAudioSource | None:
+    def _remove_monitor_source_locked(self, client_id: str) -> LiveAudioSource | None:
         stream_id = self.monitor_streams_by_client.pop(client_id, "")
         self.monitor_accounts_by_client.pop(client_id, None)
         if not stream_id:
@@ -8566,7 +8567,7 @@ class RtlControlService:
     def _remove_monitor_sources_for_stream_locked(
         self,
         stream_id: str,
-        detached_sources: list[SameAwareWebRtcAudioSource | None] | None = None,
+        detached_sources: list[LiveAudioSource | None] | None = None,
     ) -> list[str]:
         client_ids = [
             client_id
@@ -8871,7 +8872,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         codec = query.get("codec", ["opus"])[0].strip().lower()
         account = getattr(self, "current_account", None)
         account_id = account.id if isinstance(account, AccountRecord) else None
-        source: SameAwareWebRtcAudioSource | None = None
+        source: LiveAudioSource | None = None
         cleanup_mode = ""
         encoder: OpusEncoder | None = None
         counted = False
@@ -8964,8 +8965,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
     def _stream_live_audio_websocket(
         self,
         writer: LiveAudioWebSocketWriter,
-        source: SameAwareWebRtcAudioSource,
-        event_queue: SameEventQueue,
+        source: LiveAudioSource,
+        event_queue: SameEventQueue | None,
         *,
         encoder: OpusEncoder | None,
         codec: str,
@@ -8990,7 +8991,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             if source.audio_source.closed.is_set():
                 return
             now = time.monotonic()
-            if now - last_event_check >= 0.02:
+            if event_queue is not None and now - last_event_check >= 0.02:
                 last_event_check = now
                 for _ in range(8):
                     try:
@@ -14225,15 +14226,6 @@ const LIVE_AUDIO_CODEC_OPUS = 1;
 const LIVE_AUDIO_CODEC_PCM_S16LE = 2;
 const MEDIA_SESSION_ANCHOR_SECONDS = 8;
 const MEDIA_SESSION_ANCHOR_SAMPLE_RATE = 8000;
-const SAME_MARK_HZ = 2083.3;
-const SAME_SPACE_HZ = 1562.5;
-const SAME_BAUD = 520.83;
-const SAME_PREAMBLE_BYTE = 0xAB;
-const SAME_PREAMBLE_BYTES = 16;
-const SAME_TRAILING_NUL_BYTES = 3;
-const SAME_GENERATED_AMPLITUDE = 0.5;
-const SAME_CLIENT_PLAYOUT_DELAY_SECONDS = 0.45;
-const SAME_LIVE_AUDIO_MUTE_TAIL_SECONDS = 1.0;
 const IQ_RECORDER_SAMPLE_RATES = [192000, 256000, 384000, 512000, 768000, 1024000, 1536000];
 const IQ_RECORDER_DEFAULT_SAMPLE_RATE = 192000;
 const IQ_RECORDER_DEFAULT_DURATION_MINUTES = 0;
@@ -14258,90 +14250,9 @@ const PROTECTED_AUDIO_TONES = [1050, 1562.5, 2083.3];
 const PROTECTED_TONE_MAX_LOSS_DB = 1.0;
 const NOTCH_MIN_WIDTH_HZ = 60;
 const NOTCH_MAX_WIDTH_HZ = 2000;
-let sameAudioContext = null;
-let sameOutputGain = null;
-let sameLiveAudioMuteTimer = null;
-let sameLiveAudioMutedBySame = false;
-let sameActiveSources = new Set();
 let sameAlertFlashTimer = null;
 let sameAlertLastAnnouncementId = "";
 let sameAlertLiveRegionTimer = null;
-
-async function ensureSameAudioContext() {
-  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContextClass) return null;
-  if (!sameAudioContext) sameAudioContext = new AudioContextClass();
-  if (!sameOutputGain || sameOutputGain.context !== sameAudioContext) {
-    sameOutputGain = sameAudioContext.createGain();
-    sameOutputGain.connect(sameAudioContext.destination);
-  }
-  updateSameOutputGain();
-  if (sameAudioContext.state === "suspended") {
-    try {
-      await sameAudioContext.resume();
-    } catch (error) {
-      logClientEvent("warning", "same", "SAME audio context resume failed", {error: error.message});
-      console.debug("SAME audio context resume failed", error);
-    }
-  }
-  return sameAudioContext;
-}
-
-function updateSameOutputGain() {
-  if (!sameOutputGain || !sameAudioContext) return;
-  const target = playbackVolumeScalar(receiverPlaybackVolume);
-  try {
-    sameOutputGain.gain.setTargetAtTime(target, sameAudioContext.currentTime, 0.01);
-  } catch (error) {
-    sameOutputGain.gain.value = target;
-  }
-}
-
-function samePayloadBytes(payload) {
-  const bytes = [];
-  for (let index = 0; index < SAME_PREAMBLE_BYTES; index += 1) bytes.push(SAME_PREAMBLE_BYTE);
-  const text = String(payload || "");
-  for (let index = 0; index < text.length; index += 1) bytes.push(text.charCodeAt(index) & 0x7f);
-  for (let index = 0; index < SAME_TRAILING_NUL_BYTES; index += 1) bytes.push(0);
-  return bytes;
-}
-
-function generateSameBurst(payload, sampleRate) {
-  const samplesPerBit = sampleRate / SAME_BAUD;
-  const bytes = samePayloadBytes(payload);
-  let totalSamples = 0;
-  let sampleCursor = 0;
-  let sampleTarget = 0;
-  for (const byte of bytes) {
-    for (let bitIndex = 0; bitIndex < 8; bitIndex += 1) {
-      sampleTarget += samplesPerBit;
-      const bitSamples = Math.round(sampleTarget) - sampleCursor;
-      sampleCursor += bitSamples;
-      totalSamples += bitSamples;
-    }
-  }
-  const output = new Float32Array(totalSamples);
-  let phase = 0;
-  let offset = 0;
-  sampleCursor = 0;
-  sampleTarget = 0;
-  for (const byte of bytes) {
-    for (let bitIndex = 0; bitIndex < 8; bitIndex += 1) {
-      sampleTarget += samplesPerBit;
-      const bitSamples = Math.round(sampleTarget) - sampleCursor;
-      sampleCursor += bitSamples;
-      const frequency = ((byte >> bitIndex) & 1) ? SAME_MARK_HZ : SAME_SPACE_HZ;
-      const step = 2 * Math.PI * frequency / sampleRate;
-      for (let index = 0; index < bitSamples; index += 1) {
-        output[offset] = SAME_GENERATED_AMPLITUDE * Math.sin(phase);
-        offset += 1;
-        phase += step;
-        if (phase >= 2 * Math.PI) phase -= 2 * Math.PI;
-      }
-    }
-  }
-  return output;
-}
 
 function concatenateFloatAudio(parts) {
   const total = parts.reduce((sum, part) => sum + part.length, 0);
@@ -14352,21 +14263,6 @@ function concatenateFloatAudio(parts) {
     offset += part.length;
   }
   return output;
-}
-
-function generateSameMessageAudio(payload, sampleRate, repetitions = 3, gapSeconds = 1.0) {
-  const burst = generateSameBurst(payload, sampleRate);
-  const gap = new Float32Array(Math.round(sampleRate * Number(gapSeconds || 0)));
-  const parts = [];
-  for (let index = 0; index < repetitions; index += 1) {
-    if (index) parts.push(gap);
-    parts.push(burst);
-  }
-  return concatenateFloatAudio(parts);
-}
-
-function shouldSuppressLiveSamePlayback() {
-  return Boolean(receiverPeerConnection && receiverPaused && !monitorStreamId);
 }
 
 function shouldAnnounceReceiverSameAlert() {
@@ -14475,100 +14371,12 @@ function flashReceiverSameAlert(event) {
   });
 }
 
-function clearSameLiveAudioMute() {
-  if (sameLiveAudioMuteTimer) {
-    clearTimeout(sameLiveAudioMuteTimer);
-    sameLiveAudioMuteTimer = null;
-  }
-  if (!sameLiveAudioMutedBySame) return;
-  sameLiveAudioMutedBySame = false;
-  const audio = document.getElementById("stream_monitor_audio");
-  if (audio && (monitorStreamId || (receiverPeerConnection && receiverPlaying && !receiverPaused))) {
-    audio.muted = false;
-  }
-  applyLiveAudioVolume();
-}
-
-function stopGeneratedSameAudio() {
-  for (const source of Array.from(sameActiveSources)) {
-    try {
-      source.stop();
-    } catch (error) {
-      console.debug("generated SAME source stop failed", error);
-    }
-  }
-  sameActiveSources.clear();
-}
-
-function stopLiveSamePlayback() {
-  stopGeneratedSameAudio();
-  clearSameLiveAudioMute();
-  hideSameAlertFlash();
-}
-
-function muteLiveAudioForSame(durationSeconds) {
-  const audio = document.getElementById("stream_monitor_audio");
-  const muteMs = Math.max(0, Math.ceil(Number(durationSeconds || 0) * 1000));
-  if (audio) audio.muted = true;
-  if (liveAudioGain && liveAudioContext) {
-    try {
-      liveAudioGain.gain.setTargetAtTime(0, liveAudioContext.currentTime, 0.005);
-    } catch (error) {
-      liveAudioGain.gain.value = 0;
-    }
-  }
-  sameLiveAudioMutedBySame = true;
-  if (sameLiveAudioMuteTimer) clearTimeout(sameLiveAudioMuteTimer);
-  sameLiveAudioMuteTimer = setTimeout(() => {
-    sameLiveAudioMuteTimer = null;
-    clearSameLiveAudioMute();
-  }, muteMs);
-}
-
-async function playSamePayload(payload, repetitions = 3, gapSeconds = 1.0) {
-  if (shouldSuppressLiveSamePlayback()) {
-    logClientEvent("info", "same", "skipped live SAME playback while receiver is paused", {payload});
-    return;
-  }
-  const context = await ensureSameAudioContext();
-  if (!context) return;
-  if (context.state === "suspended") {
-    logClientEvent("warning", "same", "SAME audio context is still suspended", {payload});
-    return;
-  }
-  const samples = generateSameMessageAudio(payload, context.sampleRate, repetitions, gapSeconds);
-  const durationSeconds = samples.length / context.sampleRate;
-  muteLiveAudioForSame(SAME_CLIENT_PLAYOUT_DELAY_SECONDS + durationSeconds + SAME_LIVE_AUDIO_MUTE_TAIL_SECONDS);
-  const buffer = context.createBuffer(1, samples.length, context.sampleRate);
-  buffer.copyToChannel(samples, 0);
-  const source = context.createBufferSource();
-  source.buffer = buffer;
-  source.connect(sameOutputGain || context.destination);
-  sameActiveSources.add(source);
-  source.addEventListener("ended", () => {
-    sameActiveSources.delete(source);
-  });
-  source.start(context.currentTime + SAME_CLIENT_PLAYOUT_DELAY_SECONDS);
-}
-
 function handleLiveSameEvent(event) {
-  if (!event || typeof event !== "object") return;
-  if (event.type === "same_header") {
-    const rawHeader = event.payload && event.payload.raw_header;
-    if (!rawHeader) return;
-    logClientEvent("info", "same", "received live SAME header event", {id: event.id, header: rawHeader});
-    playSamePayload(rawHeader, Number(event.payload.repetitions || 3), Number(event.payload.gap_seconds || 1.0)).catch(error => {
-      logClientEvent("warning", "same", "SAME header playback failed", {error: error.message});
-    });
-  } else if (event.type === "same_alert_confirmed") {
-    logClientEvent("info", "same", "received confirmed live SAME alert event", {id: event.id});
-    flashReceiverSameAlert(event);
-  } else if (event.type === "same_eom") {
-    logClientEvent("info", "same", "received live SAME EOM event", {id: event.id});
-    playSamePayload("NNNN", Number(event.payload && event.payload.repetitions || 3), Number(event.payload && event.payload.gap_seconds || 1.0)).catch(error => {
-      logClientEvent("warning", "same", "SAME EOM playback failed", {error: error.message});
-    });
-  }
+  // The weather radio receiver shows alerts as they are decoded; the SAME tones
+  // themselves arrive untouched in the audio.
+  if (!event || typeof event !== "object" || event.type !== "same_alert_confirmed") return;
+  logClientEvent("info", "same", "received confirmed live SAME alert event", {id: event.id});
+  flashReceiverSameAlert(event);
 }
 
 async function request(path, options = {}) {
@@ -15229,7 +15037,7 @@ function liveAudioPeerIsUnusable(peer) {
 }
 
 function resetLiveAudioElement() {
-  stopLiveSamePlayback();
+  hideSameAlertFlash();
   const audio = document.getElementById("stream_monitor_audio");
   if (!audio) return;
   prepareLiveAudioElement(audio);
@@ -15363,7 +15171,6 @@ async function startStreamMonitor(streamId) {
   logClientEvent("info", "monitor", "monitor start requested", {stream_id: streamId});
   await stopWeatherReceiver({notifyServer: true});
   await stopStreamMonitor({notifyServer: true});
-  await ensureSameAudioContext();
   if (supportsWebSocketLiveAudio()) {
     const socket = await startLiveAudioSocket({
       mode: "monitor",
@@ -15411,7 +15218,7 @@ async function pauseStreamMonitor() {
   const streamId = monitorStreamId;
   monitorPaused = true;
   clearMonitorUnstableTimer();
-  stopLiveSamePlayback();
+  hideSameAlertFlash();
   await request("/api/monitor/pause", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
@@ -15685,7 +15492,6 @@ async function startWeatherReceiver() {
   }
   logClientEvent("info", "receiver", "receiver start requested", {frequency: currentReceiverChannel().label});
   await stopStreamMonitor({notifyServer: true});
-  await ensureSameAudioContext();
   if (supportsWebSocketLiveAudio()) {
     const channel = currentReceiverChannel();
     const socket = await startLiveAudioSocket({
@@ -15719,7 +15525,7 @@ async function stopWeatherReceiver(options = {}) {
   receiverPaused = preserveMediaSession && !!peer;
   clearReceiverWatchdogs();
   if (preserveMediaSession && peer) {
-    stopLiveSamePlayback();
+    hideSameAlertFlash();
     stopScheduledLiveAudioSources();
     logClientEvent("info", "receiver", "receiver pause requested", {frequency: currentReceiverChannel().label});
     await request("/api/receiver/pause", {
@@ -22742,7 +22548,6 @@ document.getElementById("receiver_volume").addEventListener("input", event => {
   receiverPlaybackVolume = Number(event.target.value);
   applyReceiverPlaybackVolume();
   applyLiveAudioVolume();
-  updateSameOutputGain();
 });
 document.getElementById("receiver_play_pause").addEventListener("click", async () => {
   try {

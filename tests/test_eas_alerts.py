@@ -1463,8 +1463,32 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(channelizer.shifter.offset_hz, 50000.0)
         self.assertAlmostEqual(channelizer.shifter.phase, 1.25, places=5)
 
+    def test_monitoring_plays_same_tones_untouched_with_no_decoder_but_the_receiver_decodes(self) -> None:
+        web_control = self.web_control
+        worker = object.__new__(web_control.IcecastStreamWorker)
+        worker.monitor_sources = {}
+        worker.lock = web_control.threading.Lock()
+        monitor = worker.add_monitor_source("client-1")
+        burst = web_control.generate_same_message("ZCZC-WXR-RWT-026081+0030-2211907-KGRR/NWS-", 24_000)
+        pcm = np.clip(burst[: monitor.frame_bytes * 10 // 2] * 32767.0, -32768, 32767).astype("<i2").tobytes()
+        try:
+            self.assertIsNone(monitor.alert_decoder)
+            monitor.push_pcm(pcm)
+            received = b"".join(monitor.read_pcm_blocking(timeout=0.05) for _ in range(10))
+            # The SAME burst reaches the listener as it is, not muted for regeneration.
+            self.assertEqual(received, pcm)
+        finally:
+            monitor.close()
+
+        receiver = web_control.LiveAudioSource(sample_rate=24_000, event_queue=web_control.SameEventQueue())
+        try:
+            self.assertIsNotNone(receiver.alert_decoder)
+            self.assertTrue(receiver.stats()["same_alert_decoding"])
+        finally:
+            receiver.close()
+
     def test_live_audio_source_outputs_silence_while_paused(self) -> None:
-        source = self.web_control.SameAwareWebRtcAudioSource(sample_rate=24_000, event_queue=None)
+        source = self.web_control.LiveAudioSource(sample_rate=24_000, event_queue=None)
         try:
             frame = b"\x01\x02" * (source.frame_bytes // 2)
             source.push_pcm(frame)

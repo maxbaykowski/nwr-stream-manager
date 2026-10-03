@@ -211,237 +211,119 @@ class SameLiveTests(unittest.TestCase):
                 ).stdout.decode("utf-8", "replace")
                 self.assertIn(f"EAS: {header if label == 'SAME header' else 'NNNN'}", decoded)
 
-    def test_detector_identifies_same_preamble(self) -> None:
-        sample_rate = 24_000
-        detector = self.same_live.SameToneDetector(sample_rate)
-        burst = self.same_live.generate_same_burst("ZCZC-WXR-RWT-026081+0030-2211907-KGRR/NWS-", sample_rate)
-        pcm = np.clip(burst[: round(sample_rate * 0.36)] * 32767.0, -32768, 32767).astype("<i2").tobytes()
+    class _FakeDecoder:
+        """Stands in for multimon-ng: records audio written and returns queued payloads."""
 
-        self.assertTrue(detector.has_same_preamble(pcm))
+        def __init__(self, sample_rate: int) -> None:
+            self.sample_rate = sample_rate
+            self.written: list[bytes] = []
+            self.payloads: list[str] = []
+            self.closed = False
 
-    def test_detector_rejects_voice_and_attention_tone_as_same_preamble(self) -> None:
-        sample_rate = 24_000
-        detector = self.same_live.SameToneDetector(sample_rate)
-        t = np.arange(round(sample_rate * 0.4), dtype=np.float32) / sample_rate
-        voice_like = (
-            0.25 * np.sin(2 * np.pi * 420 * t)
-            + 0.12 * np.sin(2 * np.pi * 930 * t)
-            + 0.06 * np.sin(2 * np.pi * 1850 * t)
-        )
-        attention_tone = 0.35 * np.sin(2 * np.pi * 1050 * t)
+        def write(self, pcm: bytes) -> None:
+            self.written.append(pcm)
 
-        voice_pcm = np.clip(voice_like * 32767.0, -32768, 32767).astype("<i2").tobytes()
-        tone_pcm = np.clip(attention_tone * 32767.0, -32768, 32767).astype("<i2").tobytes()
+        def poll(self) -> list[str]:
+            payloads, self.payloads = self.payloads, []
+            return payloads
 
-        self.assertFalse(detector.has_same_preamble(voice_pcm))
-        self.assertFalse(detector.has_same_preamble(tone_pcm))
+        def close(self) -> None:
+            self.closed = True
 
-    def test_grr_rwt_fixture_detects_same_bursts_without_voice_false_trigger(self) -> None:
-        fixture = REPO_ROOT / "GRR-RWT.wav"
-        if not fixture.exists():
-            self.skipTest("GRR-RWT.wav calibration fixture is not present")
-        sample_rate, samples = self._read_float_wav(fixture)
-        self.assertEqual(sample_rate, 24_000)
-        detector = self.same_live.SameToneDetector(sample_rate)
-        frame_samples = round(sample_rate * 0.02)
-        lookbehind_frames = round(0.22 / 0.02)
-        min_tone_frames = round(self.same_live.SAME_DETECT_MIN_SECONDS / 0.02)
-        pending: list[bytes] = []
-        tone_frames = 0
-        triggers: list[float] = []
-        for frame_index, offset in enumerate(range(0, len(samples) - frame_samples + 1, frame_samples)):
-            frame = samples[offset : offset + frame_samples]
-            pcm = np.clip(frame * 32767.0, -32768, 32767).astype("<i2").tobytes()
-            pending.append(pcm)
-            if len(pending) > lookbehind_frames:
-                pending.pop(0)
-            if detector.is_same_like(pcm):
-                tone_frames += 1
-            else:
-                tone_frames = 0
-            if tone_frames >= min_tone_frames and detector.has_same_preamble(b"".join(pending)):
-                triggers.append(frame_index * 0.02)
-                tone_frames = 0
-                pending.clear()
-
-        self.assertFalse([trigger for trigger in triggers if trigger < 8.0])
-        self.assertTrue(any(10.0 <= trigger <= 18.0 for trigger in triggers), triggers)
-        self.assertTrue(any(136.0 <= trigger <= 143.5 for trigger in triggers), triggers)
-
-    def test_eom_event_generation_and_duplicate_suppression(self) -> None:
-        events = []
-        processor = self.same_live.SameSuppressionProcessor(
+    def _alert_decoder(self, events: list | None = None):
+        return self.same_live.SameAlertDecoder(
             sample_rate=24_000,
-            event_sink=events.append,
-            enable_decoder=False,
+            event_sink=None if events is None else events.append,
+            decoder_factory=self._FakeDecoder,
         )
 
-        first = processor.submit_decoded_payload("NNNN")
-        second = processor.submit_decoded_payload("NNNN")
-
-        self.assertEqual(len(first), 1)
-        self.assertEqual(second, [])
-        self.assertEqual(events[0]["type"], "same_eom")
-
-    def test_header_event_contains_raw_and_parsed_fields(self) -> None:
+    def test_one_header_is_not_yet_an_alert_but_a_matching_second_confirms_it(self) -> None:
         events = []
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            event_sink=events.append,
-            enable_decoder=False,
-        )
+        decoder = self._alert_decoder(events)
+        header = "ZCZC-WXR-TOR-026139+0030-2211907-KDTX/NWS-"
 
-        generated = processor.submit_decoded_payload("ZCZC-WXR-TOR-026139+0030-2211907-KDTX/NWS-")
+        first = decoder.submit_decoded_payload(header)
+        second = decoder.submit_decoded_payload(header)
 
-        self.assertEqual(len(generated), 1)
-        self.assertEqual(events[0]["type"], "same_header")
-        self.assertEqual(events[0]["payload"]["raw_header"], "ZCZC-WXR-TOR-026139+0030-2211907-KDTX/NWS-")
+        self.assertEqual(first, [])
+        self.assertEqual(len(second), 1)
+        self.assertEqual(events, second)
+        self.assertEqual(events[0]["type"], "same_alert_confirmed")
+        self.assertEqual(events[0]["payload"]["raw_header"], header)
         self.assertEqual(events[0]["payload"]["parsed"]["event_type"], "TOR")
 
-    def test_duplicate_headers_emit_once_and_confirm_alert(self) -> None:
-        events = []
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            event_sink=events.append,
-            enable_decoder=False,
-        )
-        header = "ZCZC-WXR-RWT-026121-026005-026139+0030-0911515-KGRR/NWS-"
-
-        first = processor.submit_decoded_payload(header)
-        second = processor.submit_decoded_payload(header)
-
-        self.assertEqual(len(first), 1)
-        self.assertEqual(len(second), 1)
-        self.assertEqual(len(events), 2)
-        self.assertEqual(events[0]["type"], "same_header")
-        self.assertEqual(events[1]["type"], "same_alert_confirmed")
-        self.assertEqual(events[0]["payload"]["raw_header"], header)
-        self.assertEqual(events[1]["payload"]["raw_header"], header)
-
     def test_first_and_third_matching_headers_confirm_alert(self) -> None:
-        events = []
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            event_sink=events.append,
-            enable_decoder=False,
-        )
+        decoder = self._alert_decoder()
         first = "ZCZC-WXR-RWT-026121-026005-026139+0030-0911515-KGRR/NWS-"
         second = "ZCZC-WXR-RWT-026121-026005+0030-0911515-KGRR/NWS-"
 
-        processor.submit_decoded_payload(first)
-        processor.submit_decoded_payload(second)
-        third = processor.submit_decoded_payload(first)
+        decoder.submit_decoded_payload(first)
+        decoder.submit_decoded_payload(second)
+        third = decoder.submit_decoded_payload(first)
 
         self.assertEqual(len(third), 1)
         self.assertEqual(third[0]["type"], "same_alert_confirmed")
         self.assertEqual(third[0]["payload"]["raw_header"], first)
 
     def test_second_and_third_matching_headers_confirm_alert(self) -> None:
-        events = []
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            event_sink=events.append,
-            enable_decoder=False,
-        )
+        decoder = self._alert_decoder()
         first = "ZCZC-WXR-RWT-026121+0030-0911515-KGRR/NWS-"
         second = "ZCZC-WXR-RWT-026121-026005-026139+0030-0911515-KGRR/NWS-"
 
-        processor.submit_decoded_payload(first)
-        processor.submit_decoded_payload(second)
-        third = processor.submit_decoded_payload(second)
+        decoder.submit_decoded_payload(first)
+        decoder.submit_decoded_payload(second)
+        third = decoder.submit_decoded_payload(second)
 
         self.assertEqual(len(third), 1)
-        self.assertEqual(third[0]["type"], "same_alert_confirmed")
         self.assertEqual(third[0]["payload"]["raw_header"], second)
 
     def test_header_confirmation_window_expires_after_thirty_seconds(self) -> None:
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            enable_decoder=False,
-        )
+        decoder = self._alert_decoder()
         header = "ZCZC-WXR-RWT-026121-026005-026139+0030-0911515-KGRR/NWS-"
 
-        processor.submit_decoded_payload(header)
-        processor.last_decoded_header_at = time.monotonic() - 31.0
-        second = processor.submit_decoded_payload(header)
+        decoder.submit_decoded_payload(header)
+        decoder.last_decoded_header_at = time.monotonic() - 31.0
+        second = decoder.submit_decoded_payload(header)
 
         self.assertEqual(second, [])
-        self.assertEqual(list(processor.decoded_header_window), [header])
+        self.assertEqual(list(decoder.decoded_header_window), [header])
 
-    def test_confirmed_header_clears_confirmation_window(self) -> None:
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            enable_decoder=False,
-        )
+    def test_confirmed_alert_clears_the_window_and_is_not_repeated_soon_after(self) -> None:
+        decoder = self._alert_decoder()
         header = "ZCZC-WXR-RWT-026121-026005-026139+0030-0911515-KGRR/NWS-"
 
-        processor.submit_decoded_payload(header)
-        confirmed = processor.submit_decoded_payload(header)
-
+        decoder.submit_decoded_payload(header)
+        confirmed = decoder.submit_decoded_payload(header)
         self.assertEqual(len(confirmed), 1)
-        self.assertEqual(confirmed[0]["type"], "same_alert_confirmed")
-        self.assertEqual(list(processor.decoded_header_window), [])
-        self.assertIsNone(processor.last_decoded_header_at)
+        self.assertEqual(list(decoder.decoded_header_window), [])
+        self.assertIsNone(decoder.last_decoded_header_at)
 
-    def test_detector_candidate_feeds_silence_before_validation(self) -> None:
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            lookbehind_seconds=0.22,
-            enable_decoder=False,
-        )
-        burst = self.same_live.generate_same_burst("ZCZC-WXR-RWT-026081+0030-2211907-KGRR/NWS-", 24_000)
-        pcm = np.clip(burst * 32767.0, -32768, 32767).astype("<i2").tobytes()
+        # The third burst of the same message must not announce the alert a second time.
+        decoder.submit_decoded_payload(header)
+        self.assertEqual(decoder.submit_decoded_payload(header), [])
 
-        output = b"".join(processor.process_pcm(pcm) + processor.flush())
+    def test_end_of_message_resets_the_confirmation_window(self) -> None:
+        decoder = self._alert_decoder()
+        header = "ZCZC-WXR-RWT-026121+0030-0911515-KGRR/NWS-"
 
-        self.assertGreater(len(output), 0)
-        self.assertLess(np.frombuffer(output, dtype="<i2").std(), 1.0)
+        decoder.submit_decoded_payload(header)
+        self.assertEqual(decoder.submit_decoded_payload("NNNN"), [])
+        self.assertEqual(decoder.submit_decoded_payload(header), [])
 
-    def test_validated_same_replaces_following_frames_with_silence(self) -> None:
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            lookbehind_seconds=0.22,
-            enable_decoder=False,
-        )
-        voice_like = (np.sin(2 * np.pi * 440 * np.arange(2400) / 24000) * 8000).astype("<i2").tobytes()
+    def test_audio_goes_to_multimon_and_decoded_alerts_come_back(self) -> None:
+        events = []
+        decoder = self._alert_decoder(events)
+        header = "ZCZC-WXR-RWT-026121+0030-0911515-KGRR/NWS-"
+        pcm = b"\x01\x02" * 480
 
-        processor.submit_decoded_payload("NNNN")
-        output = b"".join(processor.process_pcm(voice_like))
+        decoder.decoder.payloads = [header, header]
+        returned = decoder.process_pcm(pcm)
+        decoder.close()
 
-        self.assertGreater(len(output), 0)
-        self.assertLess(np.frombuffer(output, dtype="<i2").std(), 1.0)
-
-    def test_validated_candidate_continues_feeding_silence(self) -> None:
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            lookbehind_seconds=0.22,
-            enable_decoder=False,
-        )
-        burst = self.same_live.generate_same_burst("ZCZC-WXR-RWT-026081+0030-2211907-KGRR/NWS-", 24_000)
-        pcm = np.clip(burst * 32767.0, -32768, 32767).astype("<i2").tobytes()
-        first = pcm[: processor.frame_bytes * 24]
-        second = pcm[processor.frame_bytes * 24 : processor.frame_bytes * 32]
-
-        held_output = processor.process_pcm(first)
-        processor.submit_decoded_payload("NNNN")
-        validated_output = b"".join(processor.process_pcm(second))
-
-        self.assertGreater(len(b"".join(held_output)), 0)
-        self.assertLess(np.frombuffer(b"".join(held_output), dtype="<i2").std(), 1.0)
-        self.assertGreater(len(validated_output), 0)
-        self.assertLess(np.frombuffer(validated_output, dtype="<i2").std(), 1.0)
-
-    def test_short_false_candidate_fails_open(self) -> None:
-        processor = self.same_live.SameSuppressionProcessor(
-            sample_rate=24_000,
-            lookbehind_seconds=0.04,
-            enable_decoder=False,
-        )
-        voice_like = (np.sin(2 * np.pi * 440 * np.arange(2400) / 24000) * 8000).astype("<i2").tobytes()
-
-        output = b"".join(processor.process_pcm(voice_like) + processor.flush())
-
-        self.assertGreater(np.frombuffer(output, dtype="<i2").std(), 1000.0)
+        self.assertEqual(decoder.decoder.written, [pcm])
+        self.assertEqual([event["type"] for event in returned], ["same_alert_confirmed"])
+        self.assertEqual(events, returned)
+        self.assertTrue(decoder.decoder.closed)
 
     def test_multimon_decoder_reads_fixture_header_and_eom(self) -> None:
         fixture = REPO_ROOT / "GRR-RWT.wav"
