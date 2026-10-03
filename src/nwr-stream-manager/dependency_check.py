@@ -37,7 +37,6 @@ class NativeDependency:
 
 PYTHON_DEPENDENCIES = (
     PythonDependency("numpy", "numpy"),
-    PythonDependency("lameenc", "lameenc"),
     PythonDependency("easrecorder", "easrecorder"),
 )
 
@@ -120,6 +119,12 @@ NATIVE_DEPENDENCIES = (
         "vorbisenc",
         ("libvorbisenc.so.2", "libvorbisenc.so"),
         ("vorbis_encode_init",),
+    ),
+    NativeDependency(
+        "libmp3lame",
+        "mp3lame",
+        ("libmp3lame.so.0", "libmp3lame.so"),
+        ("lame_init", "lame_init_params", "lame_encode_buffer", "lame_encode_flush", "lame_close"),
     ),
     NativeDependency(
         "libsoxr",

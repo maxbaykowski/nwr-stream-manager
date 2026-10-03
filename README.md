@@ -16,6 +16,8 @@ need:
 - `multimon-ng` for EAS/SAME decoding support
 - ALSA runtime/development libraries for optional soundcard output support
 - `libogg`, `libvorbis`, and `libvorbisenc` runtime libraries for OGG streaming
+- `libmp3lame` runtime library for MP3 streaming (`libmp3lame0` on Debian and
+  Raspberry Pi OS, `lame-libs` on Fedora)
 - `libopus` runtime libraries for browser stream monitoring and the weather
   radio receiver
 - `liquid-dsp` runtime library for signal processing (`libliquid1` on Debian and
