@@ -3,7 +3,6 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import importlib.util
-import platform
 import shutil
 from dataclasses import dataclass
 from typing import Callable, Iterable
@@ -26,7 +25,6 @@ class DependencyCheckResult:
 class PythonDependency:
     name: str
     module: str
-    required_machines: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -39,12 +37,6 @@ class NativeDependency:
 
 PYTHON_DEPENDENCIES = (
     PythonDependency("numpy", "numpy"),
-    PythonDependency("pyrtlsdr", "rtlsdr"),
-    PythonDependency(
-        "pyrtlsdrlib",
-        "pyrtlsdrlib",
-        frozenset({"x86_64", "amd64"}),
-    ),
     PythonDependency("lameenc", "lameenc"),
     PythonDependency("easrecorder", "easrecorder"),
 )
@@ -164,28 +156,23 @@ def check_startup_dependencies() -> list[DependencyCheckResult]:
 
 def gather_dependency_results(
     *,
-    machine: str | None = None,
     find_spec: Callable[[str], object | None] = importlib.util.find_spec,
     find_library: Callable[[str], str | None] = ctypes.util.find_library,
     load_library: Callable[[str], object] = ctypes.CDLL,
     which: Callable[[str], str | None] = shutil.which,
 ) -> list[DependencyCheckResult]:
-    machine_key = (machine or platform.machine()).lower()
     results: list[DependencyCheckResult] = []
     for dependency in PYTHON_DEPENDENCIES:
-        required = _python_dependency_required(dependency, machine_key)
         available = find_spec(dependency.module) is not None
         detail = f"Python module {dependency.module}"
-        if not required:
-            detail += f" is not required on {machine_key or 'this architecture'}"
-        elif not available:
+        if not available:
             detail += " was not found"
         results.append(
             DependencyCheckResult(
                 name=dependency.name,
                 kind="python",
-                required=required,
-                available=available or not required,
+                required=True,
+                available=available,
                 detail=detail,
             )
         )
@@ -223,12 +210,6 @@ def format_dependency_summary(results: Iterable[DependencyCheckResult]) -> str:
         f"{kind}: {', '.join(sorted(names))}"
         for kind, names in sorted(grouped.items())
     )
-
-
-def _python_dependency_required(dependency: PythonDependency, machine_key: str) -> bool:
-    if dependency.required_machines is None:
-        return True
-    return machine_key in dependency.required_machines
 
 
 def _check_native_dependency(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import re
 import tomllib
 import types
 import unittest
@@ -34,19 +35,12 @@ class PackagingTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.web_control = load_web_control_module()
 
-    def test_pyrtlsdrlib_is_x86_64_only(self) -> None:
+    def test_librtlsdr_comes_from_the_system_not_pypi(self) -> None:
         project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
-        dependencies = project["dependencies"]
-        pyrtlsdrlib = [dependency for dependency in dependencies if dependency.startswith("pyrtlsdrlib")]
+        names = [re.split(r"[ ;<>=@]", dependency, maxsplit=1)[0] for dependency in project["dependencies"]]
 
-        self.assertEqual(len(pyrtlsdrlib), 1)
-        self.assertIn("platform_machine == 'x86_64'", pyrtlsdrlib[0])
-        self.assertIn("platform_machine == 'AMD64'", pyrtlsdrlib[0])
-
-    def test_pyrtlsdr_python_wrapper_remains_unconditional(self) -> None:
-        project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
-
-        self.assertIn("pyrtlsdr", project["dependencies"])
+        self.assertNotIn("pyrtlsdr", names)
+        self.assertNotIn("pyrtlsdrlib", names)
 
     def test_only_primary_console_script_is_installed(self) -> None:
         project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]

@@ -12,6 +12,7 @@ Install the system packages first. Package names vary by distribution, but you
 need:
 
 - `librtlsdr` and its command-line tools/udev rules for RTL-SDR access
+  (`librtlsdr0` and `rtl-sdr` on Debian and Raspberry Pi OS, `rtl-sdr` on Fedora)
 - `multimon-ng` for EAS/SAME decoding support
 - ALSA runtime/development libraries for optional soundcard output support
 - `libogg`, `libvorbis`, and `libvorbisenc` runtime libraries for OGG streaming
@@ -21,11 +22,6 @@ need:
   Raspberry Pi OS, `liquid-dsp` on Fedora)
 - `libsoxr` runtime library for sample-rate conversion (`libsoxr0` on Debian and
   Raspberry Pi OS, `soxr` on Fedora)
-
-On x86_64 systems, the Python dependency set may install `pyrtlsdrlib`. On ARM
-systems such as Raspberry Pi, use the distribution-provided `librtlsdr` package
-or another system-installed `librtlsdr`; `pyrtlsdrlib` is intentionally not
-required there.
 
 Then install the Python package directly from GitHub:
 

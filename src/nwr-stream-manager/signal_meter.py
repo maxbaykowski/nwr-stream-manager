@@ -40,11 +40,10 @@ Callers that can see gain change (IcecastStreamWorker.gain_provider) must
 call reset() (or set_noise_reference(), which also resets) at the moment
 it does. That covers a deliberate manual gain change or toggling the RTL's
 hardware/tuner AGC on or off; it does not cover the RTL's own AGC quietly
-drifting gain on its own, since the compat RTL-SDR wrapper this project
-falls back to cannot read the live gain back from the device to detect
-that (and even where pyrtlsdr can, polling it from another thread while a
-zero-copy async read is in progress on the same device is a real-hardware
-risk not worth taking for a receiver an EAS alerting pipeline depends on).
+drifting gain on its own, since librtlsdr cannot read the live gain back
+from the device to detect that (and polling the device from another thread
+while a zero-copy async read is in progress on it is a real-hardware risk
+not worth taking for a receiver an EAS alerting pipeline depends on).
 In practice this residual drift is self-limiting (the window ages out
 within SIGNAL_METER_NOISE_WINDOW_SECONDS) and skews toward overstating
 reception, not understating it, so it will not cause a false "bad

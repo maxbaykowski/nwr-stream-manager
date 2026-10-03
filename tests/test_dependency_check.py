@@ -48,7 +48,6 @@ class DependencyCheckTests(unittest.TestCase):
 
     def test_all_dependencies_available_passes(self) -> None:
         results = self.dependency_check.gather_dependency_results(
-            machine="x86_64",
             find_spec=self.all_python_modules_present,
             find_library=self.all_native_libraries_present,
             load_library=self.load_complete_library,
@@ -59,24 +58,6 @@ class DependencyCheckTests(unittest.TestCase):
         self.assertIn("python:", self.dependency_check.format_dependency_summary(results))
         self.assertIn("native:", self.dependency_check.format_dependency_summary(results))
 
-    def test_pyrtlsdrlib_is_not_required_on_arm(self) -> None:
-        def find_spec(module: str) -> object | None:
-            if module == "pyrtlsdrlib":
-                return None
-            return object()
-
-        results = self.dependency_check.gather_dependency_results(
-            machine="aarch64",
-            find_spec=find_spec,
-            find_library=self.all_native_libraries_present,
-            load_library=self.load_complete_library,
-            which=lambda name: f"/usr/bin/{name}",
-        )
-        pyrtlsdrlib = next(result for result in results if result.name == "pyrtlsdrlib")
-
-        self.assertFalse(pyrtlsdrlib.required)
-        self.assertTrue(pyrtlsdrlib.available)
-
     def test_missing_required_python_dependency_fails_startup_check(self) -> None:
         def find_spec(module: str) -> object | None:
             if module == "numpy":
@@ -85,7 +66,6 @@ class DependencyCheckTests(unittest.TestCase):
 
         with self.assertRaises(self.dependency_check.DependencyCheckError) as context:
             results = self.dependency_check.gather_dependency_results(
-                machine="x86_64",
                 find_spec=find_spec,
                 find_library=self.all_native_libraries_present,
                 load_library=self.load_complete_library,
@@ -108,7 +88,6 @@ class DependencyCheckTests(unittest.TestCase):
         required_symbols.discard("opus_encode")
 
         results = self.dependency_check.gather_dependency_results(
-            machine="x86_64",
             find_spec=self.all_python_modules_present,
             find_library=self.all_native_libraries_present,
             load_library=lambda _candidate: FakeLibrary(required_symbols),
@@ -121,7 +100,6 @@ class DependencyCheckTests(unittest.TestCase):
 
     def test_missing_multimon_is_reported(self) -> None:
         results = self.dependency_check.gather_dependency_results(
-            machine="x86_64",
             find_spec=self.all_python_modules_present,
             find_library=self.all_native_libraries_present,
             load_library=self.load_complete_library,

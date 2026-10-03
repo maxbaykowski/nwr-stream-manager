@@ -134,68 +134,29 @@ class RtlCaptureTests(unittest.TestCase):
         self.assertEqual(index, 7)
         self.assertEqual(direct_calls, {"rtl": 0, "usb": 0})
 
-    def test_open_rtlsdr_device_uses_compat_wrapper_when_dithering_symbol_is_missing(self) -> None:
-        class PyBase:
-            called = False
-
-            def __init__(self, *args, **kwargs) -> None:
-                PyBase.called = True
-
-        class Compat:
+    def test_open_rtlsdr_device_opens_librtlsdr_directly_with_dithering_off(self) -> None:
+        class Device:
             called_with = None
 
             def __init__(self, *args, **kwargs) -> None:
-                Compat.called_with = (args, kwargs)
+                Device.called_with = (args, kwargs)
 
-        original_base = self.rtl.BaseRtlSdr
-        original_compat = self.rtl.CompatBaseRtlSdr
+        original_device = self.rtl.RtlSdrDevice
         original_lib = self.rtl.rtlsdr_lib
         try:
-            self.rtl.BaseRtlSdr = PyBase
-            self.rtl.CompatBaseRtlSdr = Compat
+            self.rtl.RtlSdrDevice = Device
             self.rtl.rtlsdr_lib = object()
-
             sdr = self.rtl._open_rtlsdr_device(2, quiet=True)
+
+            self.rtl.rtlsdr_lib = None
+            with self.assertRaises(self.rtl.RtlDependencyError):
+                self.rtl._open_rtlsdr_device(2, quiet=True)
         finally:
-            self.rtl.BaseRtlSdr = original_base
-            self.rtl.CompatBaseRtlSdr = original_compat
+            self.rtl.RtlSdrDevice = original_device
             self.rtl.rtlsdr_lib = original_lib
 
-        self.assertIsInstance(sdr, Compat)
-        self.assertFalse(PyBase.called)
-        self.assertEqual(Compat.called_with, ((), {"device_index": 2, "dithering_enabled": False}))
-
-    def test_open_rtlsdr_device_retries_compat_wrapper_when_pyrtlsdr_uses_missing_dithering(self) -> None:
-        class PyBase:
-            def __init__(self, *args, **kwargs) -> None:
-                raise AttributeError("rtlsdr_set_dithering")
-
-        class Compat:
-            called_with = None
-
-            def __init__(self, *args, **kwargs) -> None:
-                Compat.called_with = (args, kwargs)
-
-        class Lib:
-            def rtlsdr_set_dithering(self) -> None:
-                pass
-
-        original_base = self.rtl.BaseRtlSdr
-        original_compat = self.rtl.CompatBaseRtlSdr
-        original_lib = self.rtl.rtlsdr_lib
-        try:
-            self.rtl.BaseRtlSdr = PyBase
-            self.rtl.CompatBaseRtlSdr = Compat
-            self.rtl.rtlsdr_lib = Lib()
-
-            sdr = self.rtl._open_rtlsdr_device(3, quiet=True)
-        finally:
-            self.rtl.BaseRtlSdr = original_base
-            self.rtl.CompatBaseRtlSdr = original_compat
-            self.rtl.rtlsdr_lib = original_lib
-
-        self.assertIsInstance(sdr, Compat)
-        self.assertEqual(Compat.called_with, ((), {"device_index": 3, "dithering_enabled": False}))
+        self.assertIsInstance(sdr, Device)
+        self.assertEqual(Device.called_with, ((), {"device_index": 2, "dithering_enabled": False}))
 
 
 if __name__ == "__main__":

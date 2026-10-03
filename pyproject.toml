@@ -27,8 +27,6 @@ classifiers = [
 ]
 dependencies = [
   "numpy",
-  "pyrtlsdr",
-  "pyrtlsdrlib; platform_machine == 'x86_64' or platform_machine == 'AMD64'",
   "lameenc",
   "easrecorder @ git+https://github.com/maxbaykowski/easrecorder.git@main",
 ]

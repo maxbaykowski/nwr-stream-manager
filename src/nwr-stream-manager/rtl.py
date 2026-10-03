@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.util
-import importlib
 import logging
 import os
 import queue
@@ -45,7 +44,7 @@ class RtlError(RuntimeError):
 
 
 class RtlDependencyError(RtlError):
-    """Raised when pyrtlsdr/librtlsdr is not available."""
+    """Raised when librtlsdr is not available."""
 
 
 class RtlDeviceError(RtlError):
@@ -80,7 +79,7 @@ class RtlReadError(RtlError):
     """Raised when an active RTL-SDR capture stops unexpectedly."""
 
 
-class CompatLibUSBError(IOError):
+class LibUsbError(IOError):
     _errno_map = {
         -1: ("LIBUSB_ERROR_IO", "Input/output error"),
         -2: ("LIBUSB_ERROR_INVALID_PARAM", "Invalid parameter"),
@@ -280,11 +279,11 @@ def _load_system_librtlsdr() -> ctypes.CDLL:
     detail = "; ".join(errors) if errors else "ctypes could not locate librtlsdr"
     raise RtlDependencyError(
         "could not load librtlsdr. Install your distribution's librtlsdr package "
-        f"or install pyrtlsdrlib on supported architectures. Details: {detail}"
+        f"(librtlsdr0 on Debian and Raspberry Pi OS, rtl-sdr on Fedora). Details: {detail}"
     )
 
 
-class CompatBaseRtlSdr:
+class RtlSdrDevice:
     def __init__(
         self,
         device_index: int = 0,
@@ -293,13 +292,13 @@ class CompatBaseRtlSdr:
         dithering_enabled: bool = True,
     ) -> None:
         if serial_number is not None:
-            raise NotImplementedError("serial_number is not supported by the compatibility wrapper")
+            raise NotImplementedError("opening by serial number is not supported; resolve it to an index first")
         assert rtlsdr_lib is not None
         self.dev_p = ctypes.c_void_p(None)
         self.device_opened = False
         result = rtlsdr_lib.rtlsdr_open(ctypes.byref(self.dev_p), int(device_index))
         if result < 0:
-            raise CompatLibUSBError(result, f"Could not open SDR (device index = {device_index})")
+            raise LibUsbError(result, f"Could not open SDR (device index = {device_index})")
         self.device_opened = True
         try:
             self._set_optional_int("rtlsdr_set_testmode", int(test_mode_enabled))
@@ -327,17 +326,17 @@ class CompatBaseRtlSdr:
             if name == "rtlsdr_set_dithering" and value == 0:
                 LOG.debug("librtlsdr rejected disabling dithering with %s; continuing", result)
                 return
-            raise CompatLibUSBError(result, f"Could not set {name}")
+            raise LibUsbError(result, f"Could not set {name}")
 
     def _reset_buffer(self) -> None:
         assert rtlsdr_lib is not None
         result = rtlsdr_lib.rtlsdr_reset_buffer(self.dev_p)
         if result < 0:
-            raise CompatLibUSBError(result, "Could not reset buffer")
+            raise LibUsbError(result, "Could not reset buffer")
 
     @property
     def sample_rate(self) -> int:
-        raise AttributeError("sample_rate is write-only in compatibility mode")
+        raise AttributeError("sample_rate can be set but not read back")
 
     @sample_rate.setter
     def sample_rate(self, rate: int) -> None:
@@ -345,11 +344,11 @@ class CompatBaseRtlSdr:
         result = rtlsdr_lib.rtlsdr_set_sample_rate(self.dev_p, int(rate))
         if result < 0:
             self.close()
-            raise CompatLibUSBError(result, f"Could not set sample rate to {int(rate)} Hz")
+            raise LibUsbError(result, f"Could not set sample rate to {int(rate)} Hz")
 
     @property
     def center_freq(self) -> int:
-        raise AttributeError("center_freq is write-only in compatibility mode")
+        raise AttributeError("center_freq can be set but not read back")
 
     @center_freq.setter
     def center_freq(self, freq: int) -> None:
@@ -357,11 +356,11 @@ class CompatBaseRtlSdr:
         result = rtlsdr_lib.rtlsdr_set_center_freq(self.dev_p, int(freq))
         if result < 0:
             self.close()
-            raise CompatLibUSBError(result, f"Could not set center frequency to {int(freq)} Hz")
+            raise LibUsbError(result, f"Could not set center frequency to {int(freq)} Hz")
 
     @property
     def freq_correction(self) -> int:
-        raise AttributeError("freq_correction is write-only in compatibility mode")
+        raise AttributeError("freq_correction can be set but not read back")
 
     @freq_correction.setter
     def freq_correction(self, ppm: int) -> None:
@@ -369,11 +368,11 @@ class CompatBaseRtlSdr:
         result = rtlsdr_lib.rtlsdr_set_freq_correction(self.dev_p, int(ppm))
         if result < 0:
             self.close()
-            raise CompatLibUSBError(result, f"Could not set frequency correction to {int(ppm)} ppm")
+            raise LibUsbError(result, f"Could not set frequency correction to {int(ppm)} ppm")
 
     @property
     def gain(self) -> float | str:
-        raise AttributeError("gain is write-only in compatibility mode")
+        raise AttributeError("gain can be set but not read back")
 
     @gain.setter
     def gain(self, gain: float | str) -> None:
@@ -381,12 +380,12 @@ class CompatBaseRtlSdr:
         if isinstance(gain, str) and gain == "auto":
             result = rtlsdr_lib.rtlsdr_set_tuner_gain_mode(self.dev_p, 0)
             if result < 0:
-                raise CompatLibUSBError(result, "Could not set tuner gain mode")
+                raise LibUsbError(result, "Could not set tuner gain mode")
             agc = getattr(rtlsdr_lib, "rtlsdr_set_agc_mode", None)
             if agc is not None:
                 result = agc(self.dev_p, 1)
                 if result < 0:
-                    raise CompatLibUSBError(result, "Could not set AGC mode")
+                    raise LibUsbError(result, "Could not set AGC mode")
             return
 
         requested_tenths = int(round(float(gain) * 10))
@@ -395,11 +394,11 @@ class CompatBaseRtlSdr:
             selected_gain = min(self.gain_values, key=lambda value: abs(value - requested_tenths))
         result = rtlsdr_lib.rtlsdr_set_tuner_gain_mode(self.dev_p, 1)
         if result < 0:
-            raise CompatLibUSBError(result, "Could not set tuner gain mode")
+            raise LibUsbError(result, "Could not set tuner gain mode")
         result = rtlsdr_lib.rtlsdr_set_tuner_gain(self.dev_p, selected_gain)
         if result < 0:
             self.close()
-            raise CompatLibUSBError(result, f"Could not set gain to {gain}")
+            raise LibUsbError(result, f"Could not set gain to {gain}")
 
     def get_gains(self) -> list[int]:
         assert rtlsdr_lib is not None
@@ -417,59 +416,22 @@ class CompatBaseRtlSdr:
             return
         result = function(self.dev_p, int(enabled))
         if result < 0:
-            raise CompatLibUSBError(result, "Could not set bias tee")
+            raise LibUsbError(result, "Could not set bias tee")
 
 
 try:
-    rtlsdr_librtlsdr_module = importlib.import_module("rtlsdr.librtlsdr")
-    rtlsdr_lib = rtlsdr_librtlsdr_module.librtlsdr
-    from rtlsdr.rtlsdr import BaseRtlSdr, LibUSBError
-
-    _configure_librtlsdr_functions(rtlsdr_lib)
+    rtlsdr_lib: ctypes.CDLL | None = _load_system_librtlsdr()
     RTLSDR_IMPORT_ERROR: Exception | None = None
 except Exception as exc:
-    try:
-        rtlsdr_lib = _load_system_librtlsdr()
-        BaseRtlSdr = CompatBaseRtlSdr
-        LibUSBError = CompatLibUSBError
-        RTLSDR_IMPORT_ERROR = None
-        LOG.warning(
-            "PyRTLSDR could not initialize its native wrapper (%s); using direct librtlsdr mode",
-            exc,
-        )
-    except Exception as fallback_exc:
-        rtlsdr_lib = None  # type: ignore[assignment]
-        BaseRtlSdr = None  # type: ignore[assignment]
-        LibUSBError = IOError  # type: ignore[assignment]
-        RTLSDR_IMPORT_ERROR = fallback_exc
+    rtlsdr_lib = None
+    RTLSDR_IMPORT_ERROR = exc
 
 
-def _librtlsdr_supports_dithering() -> bool:
-    return rtlsdr_lib is not None and getattr(rtlsdr_lib, "rtlsdr_set_dithering", None) is not None
-
-
-def _open_rtlsdr_device(device_index: int, *, quiet: bool) -> BaseRtlSdr:
-    if BaseRtlSdr is None:
+def _open_rtlsdr_device(device_index: int, *, quiet: bool) -> "RtlSdrDevice":
+    if rtlsdr_lib is None:
         raise RtlDependencyError(str(RTLSDR_IMPORT_ERROR))
-    if BaseRtlSdr is not CompatBaseRtlSdr and not _librtlsdr_supports_dithering():
-        LOG.info(
-            "librtlsdr does not support dithering control; using direct compatibility wrapper "
-            "to keep dithering disabled-compatible"
-        )
-        with _suppress_native_stderr(quiet):
-            return CompatBaseRtlSdr(device_index=device_index, dithering_enabled=False)
-    try:
-        with _suppress_native_stderr(quiet):
-            return BaseRtlSdr(device_index=device_index, dithering_enabled=False)
-    except AttributeError as exc:
-        if BaseRtlSdr is CompatBaseRtlSdr or "rtlsdr_set_dithering" not in str(exc):
-            raise
-        LOG.info(
-            "PyRTLSDR tried to use unsupported dithering control; retrying with direct "
-            "librtlsdr compatibility wrapper"
-        )
-        with _suppress_native_stderr(quiet):
-            return CompatBaseRtlSdr(device_index=device_index, dithering_enabled=False)
+    with _suppress_native_stderr(quiet):
+        return RtlSdrDevice(device_index=device_index, dithering_enabled=False)
 
 
 class RtlCaptureSource:
@@ -479,7 +441,7 @@ class RtlCaptureSource:
         self.config = config
         self.rtl_devices_provider: Callable[[], list[RtlDeviceInfo]] = list_rtl_devices
         self.usb_rtl_devices_provider: Callable[[], list[UsbDeviceInfo]] = list_usb_rtl_devices
-        self.sdr: BaseRtlSdr | None = None
+        self.sdr: RtlSdrDevice | None = None
         self.sdr_lock = threading.Lock()
         self.output_queue: queue.Queue[RtlSampleBatch | Exception | None] = queue.Queue(
             maxsize=32
@@ -656,15 +618,15 @@ class RtlCaptureSource:
         with self.sdr_lock:
             return list(self.gain_values_db)
 
-    def _open_configured_sdr(self, *, quiet: bool) -> BaseRtlSdr:
-        if BaseRtlSdr is None or rtlsdr_lib is None:
+    def _open_configured_sdr(self, *, quiet: bool) -> RtlSdrDevice:
+        if rtlsdr_lib is None:
             raise RtlDependencyError(str(RTLSDR_IMPORT_ERROR))
         validate_rtl_sample_rate(self.config.sample_rate)
         validate_ppm_correction(self.config.ppm_correction)
         device_index = self._resolve_serial_to_device_index(self.config.serial)
         try:
             sdr = _open_rtlsdr_device(device_index, quiet=quiet)
-        except LibUSBError as exc:
+        except LibUsbError as exc:
             if getattr(exc, "errno", None) == -3:
                 raise RtlDeviceAccessFatalError(
                     "Access denied while opening RTL-SDR. Check udev permissions "
@@ -708,7 +670,7 @@ class RtlCaptureSource:
             sdr.close()
             raise
 
-    def _reader_loop(self, sdr: BaseRtlSdr) -> None:
+    def _reader_loop(self, sdr: RtlSdrDevice) -> None:
         assert rtlsdr_lib is not None
         loop_config = self.config
         async_buffer_size = self._rtl_async_buffer_size(loop_config)
@@ -774,7 +736,7 @@ class RtlCaptureSource:
             if callback_errors:
                 raise callback_errors[0]
             if result < 0 and not should_stop():
-                raise LibUSBError(result, "RTL-SDR async read failed")
+                raise LibUsbError(result, "RTL-SDR async read failed")
         finally:
             async_done.set()
             watchdog.join(timeout=1.0)
@@ -841,7 +803,7 @@ class RtlCaptureSource:
         self._cancel_specific_sdr_async(sdr)
 
     @staticmethod
-    def _cancel_specific_sdr_async(sdr: BaseRtlSdr | None) -> None:
+    def _cancel_specific_sdr_async(sdr: RtlSdrDevice | None) -> None:
         if rtlsdr_lib is None or sdr is None:
             return
         try:
@@ -850,14 +812,14 @@ class RtlCaptureSource:
             LOG.debug("failed to cancel RTL-SDR async read", exc_info=True)
 
     @staticmethod
-    def _reset_sdr_buffer(sdr: BaseRtlSdr) -> None:
+    def _reset_sdr_buffer(sdr: RtlSdrDevice) -> None:
         assert rtlsdr_lib is not None
         result = rtlsdr_lib.rtlsdr_reset_buffer(sdr.dev_p)
         if result < 0:
-            raise LibUSBError(result, "Could not reset RTL-SDR buffer")
+            raise LibUsbError(result, "Could not reset RTL-SDR buffer")
 
     @staticmethod
-    def _set_bias_tee(sdr: BaseRtlSdr, enabled: bool) -> None:
+    def _set_bias_tee(sdr: RtlSdrDevice, enabled: bool) -> None:
         set_bias_tee = getattr(sdr, "set_bias_tee", None)
         if set_bias_tee is None:
             if enabled:
@@ -873,7 +835,7 @@ class RtlCaptureSource:
         return min(self.gain_values_db, key=lambda value: abs(value - float(gain)))
 
     @staticmethod
-    def _read_tuner_gains(sdr: BaseRtlSdr) -> list[float]:
+    def _read_tuner_gains(sdr: RtlSdrDevice) -> list[float]:
         assert rtlsdr_lib is not None
         buffer = (ctypes.c_int * 256)()
         result = rtlsdr_lib.rtlsdr_get_tuner_gains(sdr.dev_p, buffer)
@@ -960,7 +922,7 @@ def list_rtl_devices() -> list[RtlDeviceInfo]:
                     f"Access denied while reading USB strings for RTL-SDR {index}. "
                     "Check udev permissions or run with sufficient access."
                 )
-            raise LibUSBError(result, f"while reading USB strings for RTL-SDR {index}")
+            raise LibUsbError(result, f"while reading USB strings for RTL-SDR {index}")
         manufacturer_text = "".join(chr(value) for value in manufacturer if value > 0)
         product_text = "".join(chr(value) for value in product if value > 0)
         serial_text = "".join(chr(value) for value in serial if value > 0)
