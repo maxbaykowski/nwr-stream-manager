@@ -6,13 +6,13 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
 
 import numpy as np
 
-from .encoder import PcmResampler
+from .soxr_native import SoxrStream
 
 
 LOG = logging.getLogger(__name__)
@@ -30,7 +30,6 @@ SND_PCM_FORMAT_U32_LE = 12
 SND_PCM_FORMAT_FLOAT_LE = 14
 SND_PCM_FORMAT_S24_3LE = 32
 SND_PCM_FORMAT_U24_3LE = 34
-SND_PCM_NONBLOCK = 1
 ALSA_STREAM_SOURCE_SAMPLE_RATE = 24_000
 ALSA_STREAM_OUTPUT_CHANNELS = 2
 ALSA_STREAM_FRAME_SECONDS = 0.02
@@ -151,7 +150,26 @@ def _discover_with_backend(backend: AlsaDiscoveryBackend) -> list[AlsaPlaybackDe
         card = backend.card_info(card_index)
         for pcm in backend.playback_pcm_devices(card_index):
             devices.append(playback_device_from_info(card, pcm))
+    devices = _separate_identical_usb_devices(devices)
     return sorted(devices, key=lambda device: (device.card_index, device.pcm_device, device.stable_id))
+
+
+def _separate_identical_usb_devices(devices: list[AlsaPlaybackDevice]) -> list[AlsaPlaybackDevice]:
+    """Tell apart identical USB soundcards that report the same serial number.
+
+    A card is normally known by its serial number, so it keeps its identity when moved
+    to another USB port. Cheap cards often share one serial, though; when two connected
+    cards would get the same ID, they are known by the USB port they are plugged into.
+    """
+    counts: dict[str, int] = {}
+    for device in devices:
+        counts[device.stable_id] = counts.get(device.stable_id, 0) + 1
+    separated = []
+    for device in devices:
+        if counts[device.stable_id] > 1 and device.bus == "usb" and device.device_path:
+            device = replace(device, stable_id=_usb_port_stable_id(device))
+        separated.append(device)
+    return separated
 
 
 def playback_device_from_info(card: AlsaCardInfo, pcm: AlsaPcmInfo) -> AlsaPlaybackDevice:
@@ -221,34 +239,12 @@ def resolve_playback_device(
         return matches[0]
     if len(matches) > 1:
         raise AlsaError(f"ALSA playback device stable ID is ambiguous: {stable_id}")
-    return None
-
-
-def resolve_playback_device_by_usb_topology(
-    *,
-    vendor_id: str,
-    product_id: str,
-    usb_port_path: str,
-    pcm_device: int | None = None,
-    devices: list[AlsaPlaybackDevice] | None = None,
-    backend: AlsaDiscoveryBackend | None = None,
-) -> AlsaPlaybackDevice | None:
-    candidates = devices if devices is not None else discover_playback_devices(backend)
-    matches = [
-        device
-        for device in candidates
-        if device.bus == "usb"
-        and _normalized_token(device.vendor_id) == _normalized_token(vendor_id)
-        and _normalized_token(device.product_id) == _normalized_token(product_id)
-        and device.usb_port_path == usb_port_path
-        and (pcm_device is None or device.pcm_device == pcm_device)
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
+    # A card chosen by its serial number is now one of several identical cards sharing
+    # that serial, so it is known by its USB port instead and has to be chosen again.
+    if any(device.bus == "usb" and device.serial and _usb_serial_stable_id(device) == stable_id for device in candidates):
         raise AlsaError(
-            "USB ALSA playback device topology is ambiguous: "
-            f"{vendor_id}:{product_id} at {usb_port_path}"
+            "this soundcard is now one of several identical cards with the same serial number; "
+            "choose which one to use again in the stream's soundcard output"
         )
     return None
 
@@ -1125,15 +1121,9 @@ class FloatPcmResampler:
         self.stream = None
         if self.input_rate != self.output_rate:
             try:
-                import soxr
-            except ImportError as exc:
-                raise AlsaError("soundcard sample-rate conversion requires the 'soxr' Python package") from exc
-            self.stream = soxr.ResampleStream(
-                self.input_rate,
-                self.output_rate,
-                1,
-                dtype="float32",
-            )
+                self.stream = SoxrStream(self.input_rate, self.output_rate, "float32")
+            except OSError as exc:
+                raise AlsaError(f"soundcard sample-rate conversion requires libsoxr: {exc}") from exc
 
     def process(self, samples: np.ndarray) -> np.ndarray:
         samples = np.asarray(samples, dtype=np.float32)
@@ -1141,12 +1131,12 @@ class FloatPcmResampler:
             return np.empty(0, dtype=np.float32)
         if self.stream is None:
             return samples
-        return self.stream.resample_chunk(samples, last=False).astype(np.float32, copy=False)
+        return self.stream.process(samples)
 
     def flush(self) -> np.ndarray:
         if self.stream is None:
             return np.empty(0, dtype=np.float32)
-        return self.stream.resample_chunk(np.empty(0, dtype=np.float32), last=True).astype(np.float32, copy=False)
+        return self.stream.process(np.empty(0, dtype=np.float32), last=True)
 
 
 def s16le_to_float32(pcm_s16le: bytes) -> np.ndarray:
@@ -1189,49 +1179,6 @@ def convert_float32_channels(samples: np.ndarray, *, input_channels: int, output
     if input_channels == 1 and output_channels > 1:
         output[:, :2] = samples
     return np.ascontiguousarray(output).reshape(-1)
-
-
-def mono_s16le_to_stereo(pcm_s16le: bytes, *, mode: str = ALSA_CHANNEL_BOTH) -> bytes:
-    if mode not in ALSA_CHANNEL_MODES:
-        raise AlsaError(f"unsupported ALSA channel mode: {mode}")
-    samples = np.frombuffer(pcm_s16le, dtype="<i2")
-    if samples.size == 0:
-        return b""
-    stereo = np.zeros((samples.size, 2), dtype="<i2")
-    if mode in {ALSA_CHANNEL_BOTH, ALSA_CHANNEL_LEFT}:
-        stereo[:, 0] = samples
-    if mode in {ALSA_CHANNEL_BOTH, ALSA_CHANNEL_RIGHT}:
-        stereo[:, 1] = samples
-    return np.ascontiguousarray(stereo).tobytes()
-
-
-def convert_s16le_channels(pcm_s16le: bytes, *, input_channels: int, output_channels: int) -> bytes:
-    if input_channels <= 0 or output_channels <= 0:
-        raise AlsaError("channel counts must be positive")
-    if input_channels == output_channels:
-        return pcm_s16le
-    samples = np.frombuffer(pcm_s16le, dtype="<i2")
-    frames = len(samples) // input_channels
-    if frames <= 0:
-        return b""
-    samples = samples[: frames * input_channels].reshape(frames, input_channels)
-    if input_channels == 1:
-        output = np.repeat(samples, output_channels, axis=1)
-    elif output_channels == 1:
-        output = np.rint(samples.astype(np.float32).mean(axis=1)).astype("<i2").reshape(frames, 1)
-    else:
-        output = np.zeros((frames, output_channels), dtype="<i2")
-        shared = min(input_channels, output_channels)
-        output[:, :shared] = samples[:, :shared]
-        if output_channels > input_channels:
-            output[:, input_channels:] = samples[:, input_channels - 1 : input_channels]
-    return np.ascontiguousarray(output).astype("<i2", copy=False).tobytes()
-
-
-def convert_s16le_sample_format(pcm_s16le: bytes, pcm_format: int) -> bytes:
-    if pcm_format == SND_PCM_FORMAT_S16_LE:
-        return pcm_s16le
-    return convert_float32_sample_format(s16le_to_float32(pcm_s16le), pcm_format)
 
 
 def convert_float32_sample_format(samples: np.ndarray, pcm_format: int) -> bytes:
@@ -1346,6 +1293,33 @@ def mixer_unity_target_mb(minimum_mb: int, maximum_mb: int) -> int | None:
     return None
 
 
+def _usb_port_stable_id(device: AlsaPlaybackDevice) -> str:
+    """The USB-port form of a card's ID, as used for cards without a serial number."""
+    return _stable_id(
+        "alsa",
+        "usb-path",
+        device.vendor_id,
+        device.product_id,
+        device.device_path,
+        device.usb_port_path,
+        f"pcm{device.pcm_device}",
+        device.pcm_id or device.pcm_name,
+    )
+
+
+def _usb_serial_stable_id(device: AlsaPlaybackDevice) -> str:
+    """The serial-number form of a card's ID, which is what it is normally known by."""
+    return _stable_id(
+        "alsa",
+        "usb",
+        device.vendor_id,
+        device.product_id,
+        device.serial,
+        f"pcm{device.pcm_device}",
+        device.pcm_id or device.pcm_name,
+    )
+
+
 def _stable_id(*parts: object) -> str:
     return ":".join(_stable_part(str(part)) for part in parts if str(part).strip())
 
@@ -1362,10 +1336,6 @@ def _stable_part(value: str) -> str:
             output.append("-")
             last_dash = True
     return "".join(output).strip("-") or "unknown"
-
-
-def _normalized_token(value: str) -> str:
-    return value.strip().casefold()
 
 
 def _card_index_from_hw_device(device: str) -> int | None:

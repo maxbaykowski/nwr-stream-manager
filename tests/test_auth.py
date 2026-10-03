@@ -46,9 +46,9 @@ class AuthTests(unittest.TestCase):
             store.create_admin("Admin_User-1", "StrongPass!1", "StrongPass!1")
 
             self.assertTrue(store.has_account())
-            self.assertTrue(store.verify_basic_credentials("Admin_User-1", "StrongPass!1"))
-            self.assertFalse(store.verify_basic_credentials("Admin_User-1", "wrong-password"))
-            self.assertFalse(store.verify_basic_credentials("other", "StrongPass!1"))
+            self.assertIsNotNone(store.verify_basic_account("Admin_User-1", "StrongPass!1"))
+            self.assertIsNone(store.verify_basic_account("Admin_User-1", "wrong-password"))
+            self.assertIsNone(store.verify_basic_account("other", "StrongPass!1"))
 
     def test_account_store_rejects_invalid_usernames_and_passwords(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -926,7 +926,10 @@ class AuthTests(unittest.TestCase):
         # Pretend this session has been running for the whole 10 minutes.
         service.test_mode_time.session_started_at = self.web_control.time.time() - 600.0
 
-        status = service.stream_test_mode_status()
+        # As the server's status updates do: end anything whose time ran out, then report.
+        with service.lock:
+            service._cleanup_expired_stream_test_mode_locked(self.web_control.time.time())
+            status = service._stream_test_mode_status_locked()
 
         self.assertFalse(status["active"])
         self.assertEqual(status["time"]["remaining_seconds"], 0.0)
@@ -1348,7 +1351,7 @@ class AuthTests(unittest.TestCase):
                 connection.commit()
 
             self.assertTrue(self.web_control.account_password_hash_needs_upgrade(legacy_hash))
-            self.assertTrue(store.verify_basic_credentials("admin", password))
+            self.assertIsNotNone(store.verify_basic_account("admin", password))
             with store._connect() as connection:
                 upgraded = connection.execute("SELECT password FROM accounts WHERE id = 1").fetchone()["password"]
 
@@ -1387,7 +1390,7 @@ class AuthTests(unittest.TestCase):
             has_account=lambda: True,
             account_by_id=lambda account_id: account if account_id == 1 else None,
             touch_account_access=lambda _account_id: None,
-            verify_basic_credentials=lambda _username, _password: self.fail("password hash should not be checked"),
+            verify_basic_account=lambda _username, _password: self.fail("password hash should not be checked"),
         )
         handler = object.__new__(self.web_control.RtlControlHandler)
         handler.service = types.SimpleNamespace(accounts=accounts, auth_sessions=sessions)

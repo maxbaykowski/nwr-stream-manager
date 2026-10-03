@@ -79,6 +79,8 @@ if __package__:
     )
     from .dsp import (
         ComplexArray,
+        IqDcBlocker,
+        rtl_u8_to_complex64,
         DEFAULT_ALIAS_ATTENUATION_DB,
         IqChannelizer,
         complex64_to_interleaved_f32,
@@ -94,7 +96,6 @@ if __package__:
     from .rtl import (
         DEFAULT_RTL_SAMPLE_RATE,
         NWR_CENTER_FREQUENCY_HZ,
-        IqDcBlocker,
         RtlConfig,
         RtlConfigError,
         RtlCaptureSource,
@@ -103,7 +104,6 @@ if __package__:
         list_usb_rtl_devices,
         reset_usb_device_node,
         reset_usb_rtl_device,
-        rtl_u8_to_complex64,
         validate_ppm_correction,
     )
     from .same_data import lookup_event, lookup_location
@@ -211,7 +211,7 @@ else:
     NfmModulator = nfm.NfmModulator
     DEFAULT_RTL_SAMPLE_RATE = rtl.DEFAULT_RTL_SAMPLE_RATE
     NWR_CENTER_FREQUENCY_HZ = rtl.NWR_CENTER_FREQUENCY_HZ
-    IqDcBlocker = rtl.IqDcBlocker
+    IqDcBlocker = dsp.IqDcBlocker
     RtlConfig = rtl.RtlConfig
     RtlConfigError = rtl.RtlConfigError
     RtlCaptureSource = rtl.RtlCaptureSource
@@ -220,7 +220,7 @@ else:
     list_usb_rtl_devices = rtl.list_usb_rtl_devices
     reset_usb_device_node = rtl.reset_usb_device_node
     reset_usb_rtl_device = rtl.reset_usb_rtl_device
-    rtl_u8_to_complex64 = rtl.rtl_u8_to_complex64
+    rtl_u8_to_complex64 = dsp.rtl_u8_to_complex64
     validate_ppm_correction = rtl.validate_ppm_correction
     lookup_event = same_data.lookup_event
     lookup_location = same_data.lookup_location
@@ -340,7 +340,6 @@ ALIAS_FILTER_STRENGTH_MAX = 100
 ALIAS_FILTER_STRENGTH_DEFAULT = 100
 ALIAS_FILTER_MIN_ATTENUATION_DB = 20.0
 ALIAS_FILTER_MAX_TRANSITION_SCALE = 3.0
-IQ_RECORDER_RAW_QUEUE_SECONDS = 2.0
 IQ_DOWNLOAD_CHUNK_BYTES = 256 * 1024
 IQ_DOWNLOAD_YIELD_SECONDS = 0.001
 IQ_RECORDER_MODE_STREAM = "stream"
@@ -938,13 +937,6 @@ def iq_batch_byte_count(batch: RtlSampleBatch | IqSampleBatch) -> int:
     if isinstance(data, np.ndarray):
         return int(data.nbytes)
     return len(data)
-
-
-def iq_batch_sample_count(batch: RtlSampleBatch | IqSampleBatch) -> int:
-    data = batch.data
-    if isinstance(data, np.ndarray):
-        return int(data.size)
-    return len(data) // 2
 
 
 def iq_batch_sample_count_from_bytes(byte_count: int, source: Any) -> int:
@@ -3241,9 +3233,6 @@ class AccountStore:
             connection.commit()
             return self._row_to_record(row)
 
-    def verify_basic_credentials(self, username: str, password: str) -> bool:
-        return self.verify_basic_account(username, password) is not None
-
     def touch_account_access(self, account_id: int, *, minimum_interval_seconds: float = 300.0) -> None:
         with self.lock, self._connect() as connection:
             row = connection.execute(
@@ -3303,10 +3292,6 @@ class AuthSessionStore:
             for token, session in list(self.sessions.items()):
                 if session.account_id == int(account_id):
                     self.sessions.pop(token, None)
-
-    def invalidate_all(self) -> None:
-        with self.lock:
-            self.sessions.clear()
 
     def cookie_header(self, token: str) -> str:
         return (
@@ -6546,7 +6531,6 @@ class RtlControlService:
         LOG.info("removed %s EAS alerts for stream %s", len(selected), stream_id)
         return {"success": True, "count": len(selected)}
 
-
     def _stream_has_eas_alert_index(self, stream: dict[str, Any]) -> bool:
         return (
             eas_recording_settings_from_stream(stream).enabled
@@ -7192,11 +7176,6 @@ class RtlControlService:
                 LOG.warning("failed to send stream notification: %s", exc)
 
         threading.Thread(target=send, name="stream-notification-send", daemon=True).start()
-
-    def stream_test_mode_status(self) -> dict[str, Any]:
-        with self.lock:
-            self._cleanup_expired_stream_test_mode_locked(time.time())
-            return self._stream_test_mode_status_locked()
 
     def _stream_test_mode_status_locked(self) -> dict[str, Any]:
         session = self.stream_test_mode

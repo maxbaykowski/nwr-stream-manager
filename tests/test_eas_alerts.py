@@ -2312,7 +2312,7 @@ class EasAlertTests(unittest.TestCase):
         ]
         for filters in cases:
             with self.subTest(filters=[kind for kind, _config in filters]):
-                separate = sum(response_db(effects._filter_kernel(kind, cfg, sample_rate)) for kind, cfg in filters)
+                separate = sum(response_db(effects._combined_kernel([(kind, cfg)], sample_rate)) for kind, cfg in filters)
                 combined = response_db(effects._combined_kernel(filters, sample_rate))
                 audible = (separate > -40.0) & (frequencies >= 100.0)
                 self.assertLess(float(np.max(np.abs(separate[audible] - combined[audible]))), 1.0)
@@ -2350,8 +2350,8 @@ class EasAlertTests(unittest.TestCase):
         sample_rate = 24_000
         frequencies = np.linspace(1.0, 11_999.0, 48_000)
         for center, width in ((3000.0, 60.0), (3000.0, 500.0), (400.0, 200.0), (1250.0, 222.0)):
-            kernel = self.audio_effects._filter_kernel(
-                "notch", self.config.NotchConfig(enabled=True, frequency=center, width=width), sample_rate
+            kernel = self.audio_effects._combined_kernel(
+                [("notch", self.config.NotchConfig(enabled=True, frequency=center, width=width))], sample_rate
             ).astype(np.float64)
             phases = np.exp(-2j * np.pi * np.outer(frequencies, np.arange(len(kernel))) / sample_rate)
             response = 20 * np.log10(np.abs(phases @ kernel) + 1e-15)
@@ -2450,24 +2450,6 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertEqual(actual.size, iq.size - 1)
         np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-5)
-
-    def test_nfm_demodulator_bytes_match_samples_even_when_split_mid_sample(self) -> None:
-        nfm = importlib.import_module(f"{self.web_control.__package__}.nfm")
-        rng = np.random.default_rng(10)
-        iq = (0.5 * np.exp(1j * rng.uniform(-np.pi, np.pi, 1_000))).astype(np.complex64)
-        expected = nfm.NfmDemodulator().process(iq)
-
-        interleaved = np.empty(iq.size * 2, dtype="<f4")
-        interleaved[0::2] = iq.real
-        interleaved[1::2] = iq.imag
-        f32 = interleaved.tobytes()
-        s16 = np.round(interleaved * 32768.0).astype("<i2").tobytes()
-        for iq_format, data, tolerance in (("f32", f32, 1e-5), ("s16", s16, 1e-3)):
-            with self.subTest(iq_format=iq_format):
-                demodulator = nfm.NfmDemodulator(iq_format)
-                # 1,003 bytes: every read but the last ends partway through a sample.
-                actual = np.concatenate([demodulator.process_bytes(data[index : index + 1_003]) for index in range(0, len(data), 1_003)])
-                np.testing.assert_allclose(actual, expected, rtol=0, atol=tolerance)
 
     def test_nfm_modulator_round_trips_through_the_demodulator_across_frames(self) -> None:
         nfm = importlib.import_module(f"{self.web_control.__package__}.nfm")

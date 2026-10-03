@@ -72,13 +72,6 @@ class SameLiveEvent:
     sample_rate: int
     payload: dict[str, Any]
 
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), separators=(",", ":"))
-
-
-class SameLiveError(RuntimeError):
-    """Raised when live SAME processing fails."""
-
 
 def generate_same_burst(
     payload: str,

@@ -87,6 +87,57 @@ class AlsaDiscoveryTests(unittest.TestCase):
         self.assertEqual(devices[0].hw_device, "hw:2,0")
         self.assertNotIn("plughw", devices[0].hw_device)
 
+    def test_identical_cards_sharing_a_serial_are_told_apart_by_usb_port(self) -> None:
+        backend = FakeAlsaBackend(
+            self.alsa,
+            {
+                2: self.card(2, serial="0001", path="pci/usb1/1-2", usb_port_path="1-2"),
+                3: self.card(3, serial="0001", path="pci/usb1/1-3", usb_port_path="1-3"),
+            },
+            {2: [self.pcm()], 3: [self.pcm()]},
+        )
+
+        devices = self.alsa.discover_playback_devices(backend)
+
+        self.assertEqual(len({device.stable_id for device in devices}), 2)
+        for device in devices:
+            self.assertIn(":usb-path:", device.stable_id)
+            self.assertEqual(self.alsa.resolve_playback_device(device.stable_id, devices), device)
+        by_port = {device.usb_port_path: device.hw_device for device in devices}
+        self.assertEqual(by_port, {"1-2": "hw:2,0", "1-3": "hw:3,0"})
+
+    def test_cards_with_unique_serials_keep_their_serial_identity_on_any_port(self) -> None:
+        backend = FakeAlsaBackend(
+            self.alsa,
+            {2: self.card(2, serial="aaa"), 3: self.card(3, serial="bbb", path="pci/usb1/1-3", usb_port_path="1-3")},
+            {2: [self.pcm()], 3: [self.pcm()]},
+        )
+        devices = self.alsa.discover_playback_devices(backend)
+        self.assertTrue(all(":usb:" in device.stable_id and "usb-path" not in device.stable_id for device in devices))
+
+        # The same card moved to another port is still the same card.
+        here = self.alsa.playback_device_from_info(self.card(2, serial="aaa"), self.pcm())
+        moved = self.alsa.playback_device_from_info(self.card(2, serial="aaa", path="pci/usb1/1-4", usb_port_path="1-4"), self.pcm())
+        self.assertEqual(here.stable_id, moved.stable_id)
+
+    def test_card_saved_by_serial_asks_to_be_chosen_again_once_an_identical_card_appears(self) -> None:
+        saved = self.alsa.playback_device_from_info(self.card(2, serial="0001"), self.pcm()).stable_id
+        backend = FakeAlsaBackend(
+            self.alsa,
+            {
+                2: self.card(2, serial="0001", path="pci/usb1/1-2", usb_port_path="1-2"),
+                3: self.card(3, serial="0001", path="pci/usb1/1-3", usb_port_path="1-3"),
+            },
+            {2: [self.pcm()], 3: [self.pcm()]},
+        )
+        devices = self.alsa.discover_playback_devices(backend)
+
+        with self.assertRaisesRegex(self.alsa.AlsaError, "choose which one to use again"):
+            self.alsa.resolve_playback_device(saved, devices)
+        # Once the second card is unplugged again, the saved choice works as before.
+        alone = self.alsa.discover_playback_devices(FakeAlsaBackend(self.alsa, {2: backend.cards[2]}, {2: [self.pcm()]}))
+        self.assertEqual(self.alsa.resolve_playback_device(saved, alone), alone[0])
+
     def test_stable_id_survives_card_index_change_when_usb_serial_exists(self) -> None:
         first = self.alsa.playback_device_from_info(self.card(2), self.pcm())
         second = self.alsa.playback_device_from_info(self.card(5), self.pcm())
@@ -124,26 +175,6 @@ class AlsaDiscoveryTests(unittest.TestCase):
         self.assertNotEqual(first.stable_id, second.stable_id)
         self.assertEqual(first.usb_port_path, "1-2")
         self.assertEqual(second.usb_port_path, "1-3")
-
-    def test_identical_usb_devices_with_duplicate_serial_can_resolve_by_port(self) -> None:
-        first = self.alsa.playback_device_from_info(
-            self.card(2, serial="duplicate", path="pci/usb1/1-2", usb_port_path="1-2"),
-            self.pcm(),
-        )
-        second = self.alsa.playback_device_from_info(
-            self.card(3, serial="duplicate", path="pci/usb1/1-3", usb_port_path="1-3"),
-            self.pcm(),
-        )
-
-        resolved = self.alsa.resolve_playback_device_by_usb_topology(
-            vendor_id="1234",
-            product_id="5678",
-            usb_port_path="1-3",
-            pcm_device=0,
-            devices=[first, second],
-        )
-
-        self.assertEqual(resolved, second)
 
     def test_builtin_device_falls_back_to_card_and_pcm_metadata(self) -> None:
         card = self.alsa.AlsaCardInfo(
@@ -304,30 +335,22 @@ class AlsaDiscoveryTests(unittest.TestCase):
             self.alsa.AlsaSoftwareVolume(-0.1)
 
     def test_channel_conversion_duplicates_mono_to_stereo(self) -> None:
-        pcm = np.array([100, -200, 300], dtype="<i2").tobytes()
+        mono = np.array([0.1, -0.2, 0.3], dtype=np.float32)
 
-        output = self.alsa.convert_s16le_channels(
-            pcm,
-            input_channels=1,
-            output_channels=2,
-        )
-        samples = np.frombuffer(output, dtype="<i2")
+        stereo = self.alsa.convert_float32_channels(mono, input_channels=1, output_channels=2)
 
-        np.testing.assert_array_equal(
-            samples,
-            np.array([100, 100, -200, -200, 300, 300], dtype="<i2"),
-        )
+        np.testing.assert_allclose(stereo, np.array([0.1, 0.1, -0.2, -0.2, 0.3, 0.3], dtype=np.float32))
 
     def test_stereo_routing_supports_left_right_and_both(self) -> None:
-        pcm = np.array([100, -200], dtype="<i2").tobytes()
+        mono = np.array([0.1, -0.2], dtype=np.float32)
 
-        both = np.frombuffer(self.alsa.mono_s16le_to_stereo(pcm, mode="both"), dtype="<i2")
-        left = np.frombuffer(self.alsa.mono_s16le_to_stereo(pcm, mode="left"), dtype="<i2")
-        right = np.frombuffer(self.alsa.mono_s16le_to_stereo(pcm, mode="right"), dtype="<i2")
+        both = self.alsa.mono_float32_to_stereo(mono, mode="both")
+        left = self.alsa.mono_float32_to_stereo(mono, mode="left")
+        right = self.alsa.mono_float32_to_stereo(mono, mode="right")
 
-        np.testing.assert_array_equal(both, np.array([100, 100, -200, -200], dtype="<i2"))
-        np.testing.assert_array_equal(left, np.array([100, 0, -200, 0], dtype="<i2"))
-        np.testing.assert_array_equal(right, np.array([0, 100, 0, -200], dtype="<i2"))
+        np.testing.assert_allclose(both, np.array([0.1, 0.1, -0.2, -0.2], dtype=np.float32))
+        np.testing.assert_allclose(left, np.array([0.1, 0.0, -0.2, 0.0], dtype=np.float32))
+        np.testing.assert_allclose(right, np.array([0.0, 0.1, 0.0, -0.2], dtype=np.float32))
 
     def test_callback_buffer_resamples_routes_and_pads_underruns(self) -> None:
         buffer = self.alsa.AlsaPcmCallbackBuffer(
@@ -470,16 +493,11 @@ class AlsaDiscoveryTests(unittest.TestCase):
         self.assertFalse(playback.handle)
 
     def test_channel_conversion_downmixes_stereo_to_mono(self) -> None:
-        pcm = np.array([100, 300, -100, -300], dtype="<i2").tobytes()
+        stereo_pairs = np.array([0.1, 0.3, -0.1, -0.3], dtype=np.float32)
 
-        output = self.alsa.convert_s16le_channels(
-            pcm,
-            input_channels=2,
-            output_channels=1,
-        )
-        samples = np.frombuffer(output, dtype="<i2")
+        mono = self.alsa.convert_float32_channels(stereo_pairs, input_channels=2, output_channels=1)
 
-        np.testing.assert_array_equal(samples, np.array([200, -200], dtype="<i2"))
+        np.testing.assert_allclose(mono, np.array([0.2, -0.2], dtype=np.float32), atol=1e-7)
 
     def test_float_channel_conversion_keeps_stereo_and_silences_extra_channels(self) -> None:
         stereo = np.array([0.25, -0.25, 0.5, -0.5], dtype=np.float32)

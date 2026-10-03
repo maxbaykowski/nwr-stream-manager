@@ -26,12 +26,9 @@ classifiers = [
   "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
 ]
 dependencies = [
-  "json5",
   "numpy",
-  "sounddevice",
   "pyrtlsdr",
   "pyrtlsdrlib; platform_machine == 'x86_64' or platform_machine == 'AMD64'",
-  "soxr",
   "lameenc",
   "easrecorder @ git+https://github.com/maxbaykowski/easrecorder.git@main",
 ]

@@ -847,9 +847,6 @@ class IqChannelizer:
     def mode(self) -> str:
         return "integer" if self.decimator.is_integer_decimation else "fractional"
 
-    def process_u8(self, chunk: bytes | bytearray | memoryview) -> ComplexArray:
-        return self.process_complex(rtl_u8_to_complex64(chunk))
-
     def process_complex(self, samples: ComplexArray) -> ComplexArray:
         shifted = self.shifter.process(samples)
         return self.decimator.process(shifted)

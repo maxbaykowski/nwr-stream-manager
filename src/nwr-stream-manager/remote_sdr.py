@@ -982,12 +982,6 @@ def merge_announcement(
 # ---------------------------------------------------------------------------
 
 
-class RemoteIqSource(Protocol):
-    def read(self, timeout: float) -> Any | None: ...
-
-    def close(self) -> None: ...
-
-
 class RemoteSdrHostBackend(Protocol):
     """What the host server needs from the application."""
 

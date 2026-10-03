@@ -38,16 +38,13 @@ class NativeDependency:
 
 
 PYTHON_DEPENDENCIES = (
-    PythonDependency("json5", "json5"),
     PythonDependency("numpy", "numpy"),
-    PythonDependency("sounddevice", "sounddevice"),
     PythonDependency("pyrtlsdr", "rtlsdr"),
     PythonDependency(
         "pyrtlsdrlib",
         "pyrtlsdrlib",
         frozenset({"x86_64", "amd64"}),
     ),
-    PythonDependency("soxr", "soxr"),
     PythonDependency("lameenc", "lameenc"),
     PythonDependency("easrecorder", "easrecorder"),
 )
@@ -131,6 +128,12 @@ NATIVE_DEPENDENCIES = (
         "vorbisenc",
         ("libvorbisenc.so.2", "libvorbisenc.so"),
         ("vorbis_encode_init",),
+    ),
+    NativeDependency(
+        "libsoxr",
+        "soxr",
+        ("libsoxr.so.0", "libsoxr.so"),
+        ("soxr_create", "soxr_process", "soxr_delay", "soxr_delete"),
     ),
     NativeDependency(
         "liquid-dsp",

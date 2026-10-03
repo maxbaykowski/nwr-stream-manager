@@ -194,12 +194,11 @@ class SameLiveTests(unittest.TestCase):
     def test_generated_same_messages_decode_with_multimon_ng(self) -> None:
         import subprocess
 
-        eas_recording = importlib.import_module(f"{self.same_live.__package__}.eas_recording")
         sample_rate = 22_050
         header = "ZCZC-WXR-RWT-026081+0030-2211907-KGRR/NWS-"
         for label, audio in (
-            ("test mode and live SAME", self.same_live.generate_same_message(header, sample_rate)),
-            ("pipeline SAME test", eas_recording.generate_same_test_audio(sample_rate=sample_rate, header=header)),
+            ("SAME header", self.same_live.generate_same_message(header, sample_rate)),
+            ("end of message", self.same_live.generate_same_message("NNNN", sample_rate)),
         ):
             with self.subTest(label):
                 padded = np.concatenate((np.zeros(sample_rate, dtype=np.float32), audio, np.zeros(sample_rate, dtype=np.float32)))
@@ -210,9 +209,7 @@ class SameLiveTests(unittest.TestCase):
                     capture_output=True,
                     timeout=30,
                 ).stdout.decode("utf-8", "replace")
-                self.assertIn(f"EAS: {header}", decoded)
-                if label == "pipeline SAME test":
-                    self.assertIn("EAS: NNNN", decoded)
+                self.assertIn(f"EAS: {header if label == 'SAME header' else 'NNNN'}", decoded)
 
     def test_detector_identifies_same_preamble(self) -> None:
         sample_rate = 24_000

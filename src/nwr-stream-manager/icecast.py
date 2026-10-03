@@ -86,7 +86,7 @@ class IcecastSource:
             f"Host: {self.config.host}:{self.config.port}",
             f"Authorization: Basic {auth}",
             f"Content-Type: {self.content_type}",
-            f"User-Agent: rtl_weatherband/{__version__}",
+            f"User-Agent: nwr-stream-manager/{__version__}",
             "Transfer-Encoding: identity",
             "Connection: close",
             f"Ice-Public: {1 if self.config.public else 0}",

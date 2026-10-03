@@ -158,9 +158,6 @@ class ToneGeneratorBank:
             return 0.0
         return settings.amplitude / 100.0
 
-    def total_target_level(self) -> float:
-        return sum(self.target_level(name) for name in TONE_WAVEFORMS)
-
     def process(self, count: int) -> tuple[NDArray[np.float32], NDArray[np.float64]]:
         """Mixed tones, plus each sample's summed generator level (1.0 = full deviation)."""
         output = np.zeros(count, dtype=np.float32)

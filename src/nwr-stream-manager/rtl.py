@@ -17,8 +17,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from .dsp import IqDcBlocker, rtl_u8_to_complex64
-
 
 LOG = logging.getLogger(__name__)
 

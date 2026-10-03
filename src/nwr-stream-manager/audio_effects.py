@@ -192,14 +192,6 @@ def _build_eq_filter(
     return current
 
 
-def _filter_kernel(
-    kind: str,
-    config: FilterConfig | NotchConfig,
-    sample_rate: int,
-) -> NDArray[np.float32] | None:
-    return _combined_kernel([(kind, config)], sample_rate)
-
-
 def _combined_kernel(
     filters: list[tuple[str, FilterConfig | NotchConfig]],
     sample_rate: int,

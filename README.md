@@ -19,6 +19,8 @@ need:
   radio receiver
 - `liquid-dsp` runtime library for signal processing (`libliquid1` on Debian and
   Raspberry Pi OS, `liquid-dsp` on Fedora)
+- `libsoxr` runtime library for sample-rate conversion (`libsoxr0` on Debian and
+  Raspberry Pi OS, `soxr` on Fedora)
 
 On x86_64 systems, the Python dependency set may install `pyrtlsdrlib`. On ARM
 systems such as Raspberry Pi, use the distribution-provided `librtlsdr` package

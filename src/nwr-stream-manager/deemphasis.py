@@ -8,7 +8,6 @@ from numpy.typing import NDArray
 from .liquid_dsp import AudioFirFilter
 
 
-PCM_SCALE = 32768.0
 # The receive curve as levels in dB relative to 1 kHz, joined smoothly on a log-frequency axis.
 # Tune by ear here: each row is a frequency in Hz and its level in dB.
 NWR_DEEMPHASIS_VOICING: tuple[tuple[float, float], ...] = (
@@ -48,7 +47,6 @@ class DeemphasisFilter:
     tau: float
     curve: NDArray[np.float32] = field(init=False)
     _fir: AudioFirFilter | None = field(init=False, default=None)
-    _pending_byte: bytes = b""
 
     def __post_init__(self) -> None:
         self._update_curve(generate_deemphasis_curve(self.sample_rate, self.tau))
@@ -57,31 +55,12 @@ class DeemphasisFilter:
     def enabled(self) -> bool:
         return self.tau > 0
 
-    def process(self, chunk: bytes) -> bytes:
-        chunk = self._pending_byte + chunk
-        if len(chunk) % 2:
-            self._pending_byte = chunk[-1:]
-            chunk = chunk[:-1]
-        else:
-            self._pending_byte = b""
-        if not chunk:
-            return b""
-
-        samples = np.frombuffer(chunk, dtype="<i2").astype(np.float32) / PCM_SCALE
-        filtered = self._filter(samples)
-        pcm = np.clip(filtered * PCM_SCALE, -32768, 32767).astype("<i2")
-        return pcm.tobytes()
-
     def process_float(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         return self._filter(samples)
 
     def update_tau(self, tau: float) -> None:
         self.tau = float(tau)
         self._update_curve(generate_deemphasis_curve(self.sample_rate, self.tau))
-
-    def flush(self) -> bytes:
-        self._pending_byte = b""
-        return b""
 
     def _filter(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         if not self.enabled or self._fir is None:

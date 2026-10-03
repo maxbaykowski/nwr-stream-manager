@@ -10,6 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .config import IQ_SAMPLE_RATE, IcecastConfig
+from .soxr_native import SoxrStream
 
 
 class EncoderError(RuntimeError):
@@ -191,17 +192,9 @@ class PcmResampler:
         self.stream = None
         if input_rate != output_rate:
             try:
-                import soxr
-            except ImportError as exc:
-                raise EncoderError(
-                    "sample-rate conversion requires the 'soxr' Python package"
-                ) from exc
-            self.stream = soxr.ResampleStream(
-                input_rate,
-                output_rate,
-                1,
-                dtype="int16",
-            )
+                self.stream = SoxrStream(input_rate, output_rate, "int16")
+            except OSError as exc:
+                raise EncoderError(f"sample-rate conversion requires libsoxr: {exc}") from exc
 
     def process(self, pcm: bytes) -> bytes:
         if not pcm:
@@ -217,7 +210,7 @@ class PcmResampler:
 
     def _resample(self, pcm: bytes, last: bool) -> bytes:
         samples = np.frombuffer(pcm, dtype="<i2")
-        output = self.stream.resample_chunk(samples, last=last)
+        output = self.stream.process(samples, last=last)
         return output.astype("<i2", copy=False).tobytes()
 
 
@@ -415,7 +408,7 @@ class OggVorbisEncoder:
 
         self.libvorbis.vorbis_comment_init(ctypes.byref(self.vc))
         self.libvorbis.vorbis_comment_add(
-            ctypes.byref(self.vc), b"ENCODER=rtl_weatherband"
+            ctypes.byref(self.vc), b"ENCODER=nwr-stream-manager"
         )
         self.libvorbis.vorbis_analysis_init(ctypes.byref(self.vd), ctypes.byref(self.vi))
         self.libvorbis.vorbis_block_init(ctypes.byref(self.vd), ctypes.byref(self.vb))
