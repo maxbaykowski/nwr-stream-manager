@@ -90,8 +90,8 @@ if __package__:
     from .eas_recording import EasRecorderOutput
     from .encoder import PcmResampler, create_audio_encoder
     from .fallback_audio import load_fallback_audio
-    from .icecast import IcecastSource
-    from .icecastauth import IcecastSettings, normalize_server, test_mountpoint_authentication
+    from .icecast import IcecastSource, parse_icecast_address
+    from .icecastauth import IcecastSettings, test_mountpoint_authentication
     from .nfm import NfmDemodulator, NfmModulator, float_to_s16
     from .rtl import (
         DEFAULT_RTL_SAMPLE_RATE,
@@ -203,8 +203,8 @@ else:
     create_audio_encoder = encoder.create_audio_encoder
     load_fallback_audio = fallback_audio.load_fallback_audio
     IcecastSource = icecast_module.IcecastSource
+    parse_icecast_address = icecast_module.parse_icecast_address
     IcecastSettings = icecastauth_module.IcecastSettings
-    normalize_server = icecastauth_module.normalize_server
     test_mountpoint_authentication = icecastauth_module.test_mountpoint_authentication
     float_to_s16 = nfm.float_to_s16
     NfmDemodulator = nfm.NfmDemodulator
@@ -6710,13 +6710,7 @@ class RtlControlService:
         return {"success": True}
 
     def test_icecast_auth(self, icecast: dict[str, Any]) -> dict[str, Any]:
-        settings = IcecastSettings(
-            server=normalize_server(icecast["host"]),
-            port=str(icecast["port"]),
-            username=icecast["username"],
-            password=icecast["password"],
-            mountpoint=icecast["mount"],
-        )
+        settings = icecast_auth_settings(icecast)
         LOG.info(
             "testing Icecast authentication to %s@%s:%s%s as %s",
             icecast["username"],
@@ -7612,14 +7606,7 @@ class RtlControlService:
                 self._reject_duplicate_icecast_locked(icecast, ignore_output_id=output_id)
                 must_test_auth = icecast_auth_changed(output, icecast)
                 if must_test_auth:
-                    settings = IcecastSettings(
-                        server=normalize_server(icecast["host"]),
-                        port=str(icecast["port"]),
-                        username=icecast["username"],
-                        password=icecast["password"],
-                        mountpoint=icecast["mount"],
-                    )
-                    result = test_mountpoint_authentication(settings)
+                    result = test_mountpoint_authentication(icecast_auth_settings(icecast))
                     if not result.success:
                         return {
                             "success": False,
@@ -11251,6 +11238,7 @@ def public_stream_output(output: dict[str, Any]) -> dict[str, Any]:
         public["icecast"] = {
             "host": icecast.get("host", ""),
             "port": icecast.get("port", ""),
+            "tls": bool(icecast.get("tls")),
             "mount": icecast.get("mount", ""),
             "format": icecast.get("format", ""),
             "sample_rate": icecast.get("sample_rate", ""),
@@ -11292,15 +11280,41 @@ def public_active_stream_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
+def saved_icecast_address(icecast: dict[str, Any]):
+    """The clean address of saved Icecast settings, or None if they cannot be read.
+
+    Settings saved before addresses were cleaned on save can still hold a full web
+    address (http://host) in the host field; this reads both kinds.
+    """
+    try:
+        address = parse_icecast_address(icecast.get("host", ""), icecast.get("port", 8000), icecast.get("mount", ""))
+    except ValueError:
+        return None
+    if icecast.get("tls") and not address.tls:
+        address = replace(address, tls=True)
+    return address
+
+
+def icecast_auth_settings(icecast: dict[str, Any]) -> IcecastSettings:
+    address = saved_icecast_address(icecast)
+    if address is None:
+        raise ValueError("The Icecast server address is not valid")
+    return IcecastSettings(
+        server=f"{'https' if address.tls else 'http'}://{address.host}",
+        port=str(address.port),
+        username=icecast["username"],
+        password=icecast["password"],
+        mountpoint=address.mount,
+    )
+
+
 def icecast_mountpoint_url(icecast: dict[str, Any]) -> str:
-    host = str(icecast.get("host", "")).strip()
-    port = str(icecast.get("port", "")).strip()
-    mount = str(icecast.get("mount", "")).strip()
-    if mount and not mount.startswith("/"):
-        mount = f"/{mount}"
-    if not host:
-        return mount or "the configured Icecast mountpoint"
-    return f"http://{host}{':' + port if port else ''}{mount}"
+    address = saved_icecast_address(icecast)
+    if address is None:
+        host = str(icecast.get("host", "")).strip()
+        mount = str(icecast.get("mount", "")).strip()
+        return f"{host}{mount}" if host else (mount or "the configured Icecast mountpoint")
+    return f"{'https' if address.tls else 'http'}://{address.host}:{address.port}{address.mount}"
 
 
 def friendly_rtl_device_label(device: dict[str, Any]) -> str:
@@ -11531,6 +11545,7 @@ def icecast_output_signature(output: dict[str, Any]) -> str:
             "enabled": output.get("enabled", True),
             "host": icecast.get("host"),
             "port": icecast.get("port"),
+            "tls": bool(icecast.get("tls")),
             "mount": icecast.get("mount"),
             "username": icecast.get("username"),
             "password": icecast.get("password"),
@@ -11558,9 +11573,11 @@ def queue_latest(target: queue.Queue, item: Any) -> None:
 
 
 def icecast_auth_signature(icecast: dict[str, Any]) -> dict[str, Any]:
+    address = saved_icecast_address(icecast)
     return {
-        "host": icecast.get("host"),
-        "port": icecast.get("port"),
+        "host": address.host if address else icecast.get("host"),
+        "port": address.port if address else icecast.get("port"),
+        "tls": bool(address.tls) if address else bool(icecast.get("tls")),
         "username": icecast.get("username"),
         "password": icecast.get("password"),
         "mount": icecast.get("mount"),
@@ -11577,10 +11594,14 @@ def icecast_auth_changed(output: dict[str, Any], icecast: dict[str, Any]) -> boo
 
 def icecast_config_from_output(output: dict[str, Any]) -> IcecastConfig:
     icecast = output["icecast"]
+    address = saved_icecast_address(icecast)
+    if address is None:
+        raise ValueError(f"The Icecast server address {icecast.get('host', '')!r} is not valid")
     return IcecastConfig(
-        host=icecast["host"],
-        port=int(icecast["port"]),
-        mount=icecast["mount"],
+        host=address.host,
+        port=address.port,
+        mount=address.mount,
+        tls=address.tls,
         username=icecast["username"],
         password=icecast["password"],
         format=icecast["format"],
@@ -11663,30 +11684,24 @@ def validate_icecast_payload(raw: Any) -> dict[str, Any]:
         service = STREAM_SERVICE_HOSTS.get(str(raw.get("host", "")).strip().lower(), STREAM_SERVICE_CUSTOM)
     if service not in STREAM_SERVICE_NAMES:
         raise ValueError("Streaming service is not supported")
-    host = str(raw.get("host", "")).strip()
-    if not host:
-        raise ValueError("Icecast host is required")
+    # Whatever was typed (host, host:port or a full http:// or https:// address) is
+    # saved as a plain host, port and mountpoint, plus whether to use TLS.
+    address = parse_icecast_address(raw.get("host", ""), raw.get("port", 8000), raw.get("mount", ""))
+    host = address.host
+    port = address.port
     normalized_host = host.lower()
     suggested_service = STREAM_SERVICE_HOSTS.get(normalized_host)
     if service == STREAM_SERVICE_CUSTOM and suggested_service:
         raise ValueError(f"Please select {STREAM_SERVICE_NAMES[suggested_service]} instead of typing its Icecast URL in custom Icecast setup.")
-    try:
-        port = int(raw.get("port", 8000))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Icecast port must be a number") from exc
-    if port < 1 or port > 65535:
-        raise ValueError("Icecast port must be from 1 through 65535")
     username = str(raw.get("username", "")).strip()
     password = str(raw.get("password", ""))
     if not username:
         raise ValueError("Icecast username is required")
     if not password:
         raise ValueError("Icecast password is required")
-    mount = str(raw.get("mount", "")).strip()
+    mount = address.mount
     if not mount:
         raise ValueError("Icecast mountpoint is required")
-    if not mount.startswith("/"):
-        mount = f"/{mount}"
     if any(character.isspace() for character in mount):
         raise ValueError("Icecast mountpoint cannot contain whitespace")
     stream_format = str(raw.get("format", "ogg")).strip().lower()
@@ -11735,6 +11750,7 @@ def validate_icecast_payload(raw: Any) -> dict[str, Any]:
         "service": service,
         "host": host,
         "port": port,
+        "tls": address.tls,
         "username": username,
         "password": password,
         "mount": mount,
@@ -16190,7 +16206,15 @@ function streamOutputs(stream) {
 }
 
 function normalizedServiceHost(host) {
-  return String(host || "").trim().toLowerCase();
+  // Just the host name, whether it was typed bare, as host:port, or as a web address.
+  const text = String(host || "").trim().toLowerCase().replace(/^[a-z][a-z0-9+.-]*:[/][/]/, "");
+  return text.split(/[/:?#]/)[0];
+}
+
+function icecastHostForDisplay(host, tls) {
+  // Encrypted (TLS) servers are saved as a plain host plus a flag; show them as typed.
+  const text = String(host || "");
+  return tls && text && !/^https:/i.test(text) ? `https://${text}` : text;
 }
 
 function serviceForHost(host) {
@@ -16460,7 +16484,7 @@ function setSettingsIcecastForm(icecast) {
   const station = selected ? selected.stream.station : currentSettingsStream() ? currentSettingsStream().station : null;
   const preset = applyServicePresetToIcecast(icecast || {}, service, station, "settings_icecast");
   setValue("settings_icecast_service", service);
-  setValue("settings_icecast_host", preset.host || "");
+  setValue("settings_icecast_host", icecastHostForDisplay(preset.host, icecast && icecast.tls));
   setValue("settings_icecast_port", preset.port || "");
   setValue("settings_icecast_username", preset.username || "");
   setValue("settings_icecast_password", preset.password || "");

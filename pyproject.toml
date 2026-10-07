@@ -27,7 +27,7 @@ classifiers = [
 ]
 dependencies = [
   "numpy",
-  "easrecorder @ git+https://github.com/maxbaykowski/easrecorder.git@main",
+  "easrecorder @ git+https://github.com/maxbaykowski/easrecorder.git@v0.2.0",
 ]
 
 [project.optional-dependencies]
