@@ -1277,7 +1277,15 @@ class LiveAudioUpstreamStallTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.wc = load_web_control()
 
-    def run_send_loop(self, *, stall_at_frame: int | None, bad_feedback_frames: range, frames: int = 60):
+    def run_send_loop(
+        self,
+        *,
+        stall_at_frame: int | None,
+        bad_feedback_frames: range,
+        frames: int = 60,
+        frames_per_batch: int = 1,
+        bad_feedback: dict | None = None,
+    ):
         wc = self.wc
         frame_bytes = 960
         state = {"frame": 0}
@@ -1289,13 +1297,15 @@ class LiveAudioUpstreamStallTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.audio_source = types.SimpleNamespace(closed=threading.Event(), underrun_frames=0)
 
-            def read_pcm_blocking(self, timeout: float) -> bytes:
+            def read_frame(self, timeout: float) -> bytes | None:
                 state["frame"] += 1
                 if state["frame"] >= frames:
                     self.audio_source.closed.set()
                 if state["frame"] == stall_at_frame:
-                    time.sleep(0.25)  # nothing came from the SDR
-                    self.audio_source.underrun_frames += 1
+                    time.sleep(0.4)  # nothing came from the SDR
+                elif state["frame"] % frames_per_batch == 0:
+                    # The stream makes 20 ms frames, handed over a batch at a time.
+                    time.sleep(0.02 * frames_per_batch)
                 return b"\x00" * frame_bytes
 
             def is_paused(self) -> bool:
@@ -1314,7 +1324,7 @@ class LiveAudioUpstreamStallTests(unittest.TestCase):
         class Service:
             def consume_live_audio_feedback(self, client_id: str, mode: str) -> dict:
                 if state["frame"] in bad_feedback_frames:
-                    return {"media_delivery_ratio": 0.3}
+                    return bad_feedback if bad_feedback is not None else {"media_delivery_ratio": 0.3}
                 return {}
 
         writer = types.SimpleNamespace(send_json=lambda payload: None, send_audio=lambda **kwargs: 0.001)
@@ -1341,10 +1351,68 @@ class LiveAudioUpstreamStallTests(unittest.TestCase):
     def test_browser_connection_problems_still_lower_the_bitrate(self) -> None:
         self.assertEqual(self.run_send_loop(stall_at_frame=None, bad_feedback_frames=range(10, 20))[0], (10, 96))
 
+    def test_audio_handed_over_in_batches_is_not_mistaken_for_a_stall(self) -> None:
+        # Streams deliver 100 ms of audio at a time; waiting for the next batch
+        # is normal, so a slow connection still lowers the bitrate.
+        changes = self.run_send_loop(stall_at_frame=None, bad_feedback_frames=range(10, 20), frames_per_batch=5)
+        self.assertEqual(changes[0], (10, 96))
+
+    def test_silence_filling_an_sdr_outage_keeps_the_bitrate(self) -> None:
+        # Seen on a real outage: the stream filled it with silence, which Opus sends
+        # in a few bytes, and the browser reported receiving 7.5 Kbps of a 96 Kbps
+        # setting while all the audio arrived on time.
+        quiet = {"network_receive_kbps": 7.5, "media_delivery_ratio": 1.0}
+        self.assertEqual(
+            self.run_send_loop(stall_at_frame=None, bad_feedback_frames=range(5, 55), bad_feedback=quiet),
+            [],
+        )
+
     def test_feedback_after_the_hold_counts_again(self) -> None:
         # 0.3 s hold is about 15 frames; frame 45 is well past it.
         changes = self.run_send_loop(stall_at_frame=10, bad_feedback_frames=range(45, 50))
         self.assertEqual(changes[0], (45, 96))
+
+    def test_listener_is_told_when_the_server_has_no_audio_and_when_it_is_back(self) -> None:
+        # Two outages: the SDR stops, comes back, then stops again.
+        script = [b"a", None, None, None, b"b", b"c", None, b"d"]
+        sent: list = []
+
+        class Source:
+            sample_rate = 24_000
+
+            def __init__(self) -> None:
+                self.audio_source = types.SimpleNamespace(closed=threading.Event())
+
+            def read_frame(self, timeout: float) -> bytes | None:
+                item = script.pop(0)
+                if not script:
+                    self.audio_source.closed.set()
+                if item is None:
+                    time.sleep(timeout)  # nothing to send yet
+                return item
+
+            def is_paused(self) -> bool:
+                return False
+
+        writer = types.SimpleNamespace(
+            send_json=lambda payload: sent.append(payload["type"]),
+            send_audio=lambda **kwargs: sent.append(kwargs["payload"]),
+        )
+        self.wc.RtlControlHandler._stream_live_audio_websocket(
+            types.SimpleNamespace(service=types.SimpleNamespace()),
+            writer,
+            Source(),
+            None,
+            encoder=None,
+            codec="pcm",
+            mode="receiver",
+            client_id="radio",
+        )
+
+        self.assertEqual(
+            sent,
+            [b"a", "source_no_audio", "source_audio_back", b"b", b"c", "source_no_audio", "source_audio_back", b"d"],
+        )
 
 
 if __name__ == "__main__":

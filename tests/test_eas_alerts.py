@@ -1474,7 +1474,7 @@ class EasAlertTests(unittest.TestCase):
         try:
             self.assertIsNone(monitor.alert_decoder)
             monitor.push_pcm(pcm)
-            received = b"".join(monitor.read_pcm_blocking(timeout=0.05) for _ in range(10))
+            received = b"".join(monitor.read_frame(timeout=0.05) for _ in range(10))
             # The SAME burst reaches the listener as it is, not muted for regeneration.
             self.assertEqual(received, pcm)
         finally:
@@ -1495,7 +1495,8 @@ class EasAlertTests(unittest.TestCase):
             source.set_paused(True)
 
             self.assertEqual(source.get_latest_pcm(), b"\x00" * source.frame_bytes)
-            self.assertEqual(source.read_pcm_blocking(timeout=0), b"\x00" * source.frame_bytes)
+            source.push_pcm(frame)
+            self.assertEqual(source.read_frame(timeout=0), b"\x00" * source.frame_bytes)
             self.assertTrue(source.stats()["paused"])
 
             source.set_paused(False)

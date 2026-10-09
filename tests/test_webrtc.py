@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import sys
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -63,16 +65,25 @@ class WebRtcTests(unittest.TestCase):
     def test_tcp_opus_bitrate_controller_responds_to_throughput_feedback(self) -> None:
         controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=2, recovery_hold_feedbacks=0)
 
-        decision = controller.update(send_seconds=0.001, network_receive_kbps=90.0)
+        decision = controller.update(send_seconds=0.001, media_delivery_ratio=0.9)
         self.assertEqual(decision.bitrate_kbps, 128)
         self.assertEqual(decision.reason, "stable")
-        decision = controller.update(send_seconds=0.001, network_receive_kbps=90.0)
+        decision = controller.update(send_seconds=0.001, media_delivery_ratio=0.9)
         self.assertEqual(decision.bitrate_kbps, 96)
         self.assertEqual(decision.reason, "client throughput feedback")
         self.assertEqual(controller.update(send_seconds=0.001, media_delivery_ratio=0.80).bitrate_kbps, 64)
 
-        self.assertEqual(controller.update(send_seconds=0.001, network_receive_kbps=120.0, media_delivery_ratio=1.0).bitrate_kbps, 64)
-        self.assertEqual(controller.update(send_seconds=0.001, network_receive_kbps=120.0, media_delivery_ratio=1.0).bitrate_kbps, 96)
+        self.assertEqual(controller.update(send_seconds=0.001, media_delivery_ratio=1.0).bitrate_kbps, 64)
+        self.assertEqual(controller.update(send_seconds=0.001, media_delivery_ratio=1.0).bitrate_kbps, 96)
+
+    def test_tcp_opus_bitrate_controller_keeps_bitrate_when_audio_arrives_in_real_time(self) -> None:
+        # Opus spends far fewer bits than its setting on easy audio and almost none
+        # on silence, as when a stream fills an SDR outage; arriving on time is what counts.
+        controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=2, recovery_hold_feedbacks=0)
+
+        for _ in range(10):
+            decision = controller.update(send_seconds=0.0, media_delivery_ratio=1.0)
+            self.assertEqual(decision.bitrate_kbps, 128)
 
     def test_tcp_opus_bitrate_controller_ignores_single_mixed_throughput_window_after_probe(self) -> None:
         controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=1, recovery_hold_feedbacks=0)
@@ -82,26 +93,18 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(decision.bitrate_kbps, 64)
         self.assertEqual(decision.reason, "recovery probe")
 
-        decision = controller.update(
-            send_seconds=0.001,
-            network_receive_kbps=44.0,
-            media_delivery_ratio=1.0,
-        )
+        decision = controller.update(send_seconds=0.001, media_delivery_ratio=0.9)
         self.assertEqual(decision.bitrate_kbps, 64)
         self.assertEqual(decision.reason, "stable")
 
-        decision = controller.update(
-            send_seconds=0.001,
-            network_receive_kbps=44.0,
-            media_delivery_ratio=1.0,
-        )
+        decision = controller.update(send_seconds=0.001, media_delivery_ratio=0.9)
         self.assertEqual(decision.bitrate_kbps, 32)
         self.assertEqual(decision.reason, "client throughput feedback")
 
     def test_tcp_opus_bitrate_controller_reacts_immediately_to_severe_throughput_feedback(self) -> None:
         controller = self.webrtc.TcpOpusBitrateController(recovery_stable_feedbacks=2, recovery_hold_feedbacks=0)
 
-        decision = controller.update(send_seconds=0.001, network_receive_kbps=70.0)
+        decision = controller.update(send_seconds=0.001, media_delivery_ratio=0.8)
         self.assertEqual(decision.bitrate_kbps, 96)
         self.assertEqual(decision.reason, "client throughput feedback")
 
@@ -129,7 +132,6 @@ class WebRtcTests(unittest.TestCase):
             send_seconds=0.001,
             latency_drop_count=3,
             above_max_drop_count=3,
-            network_receive_kbps=20.0,
             media_delivery_ratio=0.3,
             upstream_limited=True,
         )
@@ -154,37 +156,30 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(decision.reason, "recovery probe")
 
     def test_audio_source_keeps_latest_frames_when_slow_consumer_falls_behind(self) -> None:
-        source = self.webrtc.WebRtcAudioSource(max_frames=1, prebuffer_frames=0)
+        source = self.webrtc.WebRtcAudioSource(max_frames=1)
         source.push_pcm(b"old")
         source.push_pcm(b"new")
         self.assertEqual(source.dropped_frames, 1)
         self.assertEqual(source.get_latest_pcm(), b"new" + b"\x00" * (source.frame_bytes - 3))
 
     def test_audio_source_buffer_preserves_frame_order(self) -> None:
-        def run_test():
-            source = self.webrtc.WebRtcAudioSource(max_frames=4, prebuffer_frames=2, low_water_frames=0)
-            frame_a = b"a" * source.frame_bytes
-            frame_b = b"b" * source.frame_bytes
-            source.push_pcm(frame_a)
-            source.push_pcm(frame_b)
-            first = source.read_pcm_blocking()
-            second = source.read_pcm_blocking()
-            return first, second, source.underrun_frames
+        source = self.webrtc.WebRtcAudioSource(max_frames=4)
+        frame_a = b"a" * source.frame_bytes
+        frame_b = b"b" * source.frame_bytes
+        source.push_pcm(frame_a)
+        source.push_pcm(frame_b)
 
-        first, second, underruns = run_test()
-        self.assertEqual(first, b"a" * len(first))
-        self.assertEqual(second, b"b" * len(second))
-        self.assertEqual(underruns, 0)
+        self.assertEqual(source.read_frame(), frame_a)
+        self.assertEqual(source.read_frame(), frame_b)
+        self.assertEqual(source.underrun_frames, 0)
 
     def test_audio_source_reports_buffer_stats_and_underruns(self) -> None:
-        def run_test():
-            source = self.webrtc.WebRtcAudioSource(max_frames=2, prebuffer_frames=0, low_water_frames=0)
-            source.push_pcm(b"a")
-            source.read_pcm_blocking()
-            source.read_pcm_blocking(timeout=0)
-            return source.stats()
+        source = self.webrtc.WebRtcAudioSource(max_frames=2)
+        source.push_pcm(b"a")
+        source.read_frame()
+        source.read_frame(timeout=0)
+        stats = source.stats()
 
-        stats = run_test()
         self.assertEqual(stats["pushed_frames"], 1)
         self.assertEqual(stats["read_frames"], 1)
         self.assertEqual(stats["underrun_frames"], 1)
@@ -195,16 +190,10 @@ class WebRtcTests(unittest.TestCase):
         source = self.webrtc.WebRtcAudioSource()
         stats = source.stats()
 
-        self.assertEqual(stats["prebuffer_frames"], 6)
         self.assertEqual(stats["target_latency_frames"], 6)
-        self.assertEqual(stats["low_water_frames"], 3)
         self.assertEqual(stats["latency_high_water_frames"], 14)
         self.assertEqual(stats["latency_trim_to_frames"], 8)
         self.assertEqual(stats["max_frames"], 32)
-        self.assertAlmostEqual(
-            stats["target_latency_frames"] * self.webrtc.WEBRTC_FRAME_SECONDS,
-            0.12,
-        )
 
     def test_audio_source_frame_size_uses_configured_sample_rate(self) -> None:
         source = self.webrtc.WebRtcAudioSource(sample_rate=32_000)
@@ -212,69 +201,44 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(source.frame_bytes, 1280)
         self.assertEqual(source.stats()["sample_rate"], 32_000)
 
-    def test_audio_source_blocking_reader_uses_startup_prebuffer(self) -> None:
-        source = self.webrtc.WebRtcAudioSource(
-            max_frames=4,
-            prebuffer_frames=2,
-            target_latency_frames=4,
-            low_water_frames=0,
-            prebuffer_timeout_seconds=0.2,
-        )
+    def test_audio_source_hands_over_each_frame_as_soon_as_it_arrives(self) -> None:
+        source = self.webrtc.WebRtcAudioSource(max_frames=4)
 
         def delayed_push():
-            import time
-
             time.sleep(0.03)
             source.push_pcm(b"a" * source.frame_bytes)
-            source.push_pcm(b"b" * source.frame_bytes)
 
-        thread = __import__("threading").Thread(target=delayed_push)
+        thread = threading.Thread(target=delayed_push)
         thread.start()
-        first = source.read_pcm_blocking(timeout=self.webrtc.WEBRTC_FRAME_SECONDS)
+        started = time.monotonic()
+        frame = source.read_frame(timeout=1.0)
+        waited = time.monotonic() - started
         thread.join(timeout=1.0)
 
-        self.assertEqual(first, b"a" * len(first))
-        self.assertEqual(source.stats()["underrun_frames"], 0)
+        self.assertEqual(frame, b"a" * source.frame_bytes)
+        self.assertLess(waited, 0.5)  # no prebuffer to fill first
 
-    def test_audio_source_blocking_reader_rebuffers_after_underrun(self) -> None:
-        source = self.webrtc.WebRtcAudioSource(
-            max_frames=4,
-            prebuffer_frames=2,
-            target_latency_frames=4,
-            low_water_frames=0,
-            prebuffer_timeout_seconds=0.2,
-        )
-        first = source.read_pcm_blocking(timeout=0.01)
+    def test_audio_source_never_makes_up_silence_for_late_audio(self) -> None:
+        # A late frame is waited for, not replaced: silence sent in its place
+        # would be a gap the listener hears, with the real audio piling up behind.
+        source = self.webrtc.WebRtcAudioSource(max_frames=4)
 
-        def delayed_push():
-            import time
-
-            time.sleep(0.03)
-            source.push_pcm(b"a" * source.frame_bytes)
-            source.push_pcm(b"b" * source.frame_bytes)
-
-        thread = __import__("threading").Thread(target=delayed_push)
-        thread.start()
-        second = source.read_pcm_blocking(timeout=self.webrtc.WEBRTC_FRAME_SECONDS)
-        thread.join(timeout=1.0)
-
-        self.assertEqual(first, b"\x00" * len(first))
-        self.assertEqual(second, b"a" * len(second))
-        self.assertEqual(source.stats()["underrun_frames"], 1)
+        self.assertIsNone(source.read_frame(timeout=0.01))
+        source.push_pcm(b"a" * source.frame_bytes)
+        self.assertEqual(source.read_frame(timeout=0.01), b"a" * source.frame_bytes)
+        self.assertEqual(source.stats()["read_frames"], 1)
 
     def test_audio_source_preserves_bursty_pcm_above_target_latency(self) -> None:
         def run_test():
             source = self.webrtc.WebRtcAudioSource(
                 max_frames=8,
-                prebuffer_frames=0,
                 target_latency_frames=2,
-                low_water_frames=0,
                 latency_high_water_frames=6,
                 latency_trim_to_frames=4,
             )
             for value in (b"a", b"b", b"c", b"d", b"e"):
                 source.push_pcm(value)
-            first = source.read_pcm_blocking()
+            first = source.read_frame()
             stats = source.stats()
             return first, stats, source.frame_bytes
 
@@ -287,9 +251,7 @@ class WebRtcTests(unittest.TestCase):
         def run_test():
             source = self.webrtc.WebRtcAudioSource(
                 max_frames=8,
-                prebuffer_frames=0,
                 target_latency_frames=2,
-                low_water_frames=0,
                 latency_high_water_frames=5,
                 latency_trim_to_frames=4,
             )
@@ -298,7 +260,7 @@ class WebRtcTests(unittest.TestCase):
             before = source.stats()
             source.push_pcm(b"f")
             after = source.stats()
-            first = source.read_pcm_blocking()
+            first = source.read_frame()
             return before, after, first, source.frame_bytes
 
         before, after, first, frame_bytes = run_test()
@@ -309,7 +271,7 @@ class WebRtcTests(unittest.TestCase):
         self.assertEqual(first, b"c" + b"\x00" * (frame_bytes - 1))
 
     def test_audio_source_clear_buffer_drops_queued_audio(self) -> None:
-        source = self.webrtc.WebRtcAudioSource(max_frames=4, prebuffer_frames=0, low_water_frames=0)
+        source = self.webrtc.WebRtcAudioSource(max_frames=4)
         source.push_pcm(b"a" * source.frame_bytes)
         source.push_pcm(b"b" * source.frame_bytes)
 

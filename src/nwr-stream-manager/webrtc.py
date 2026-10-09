@@ -28,8 +28,6 @@ LIVE_AUDIO_TCP_BITRATE_LADDER_KBPS = (6, 8, 12, 16, 32, 64, 96, 128)
 LIVE_AUDIO_TCP_TARGET_BITRATE_KBPS = 128
 LIVE_AUDIO_TCP_SEND_SLOW_SECONDS = 0.06
 LIVE_AUDIO_TCP_RECOVERY_STABLE_FEEDBACKS = 150
-LIVE_AUDIO_TCP_THROUGHPUT_MARGIN = 0.82
-LIVE_AUDIO_TCP_SEVERE_THROUGHPUT_MARGIN = 0.65
 LIVE_AUDIO_TCP_REALTIME_DELIVERY_FLOOR = 0.92
 LIVE_AUDIO_TCP_SEVERE_REALTIME_DELIVERY_FLOOR = 0.85
 LIVE_AUDIO_TCP_THROUGHPUT_LIMIT_FEEDBACKS = 2
@@ -37,19 +35,16 @@ LIVE_AUDIO_TCP_RECOVERY_HOLD_FEEDBACKS = 500
 # The server's own audio source running dry (the SDR is lost, or a remote
 # SDR's network link falls behind) starves the browser too, and the browser
 # reports that as slow delivery. A read that waits this long means the audio
-# was not there to send.
-LIVE_AUDIO_UPSTREAM_STALL_SECONDS = 0.1
+# was not there to send. Streams hand over audio 100 ms at a time, so normal
+# waits run just over 100 ms.
+LIVE_AUDIO_UPSTREAM_STALL_SECONDS = 0.25
 # How long browser feedback is set aside after such a stall: the browser's
 # 2 s throughput window plus the time for its report to arrive.
 LIVE_AUDIO_UPSTREAM_HOLD_SECONDS = 4.0
-WEBRTC_MONITOR_PREBUFFER_FRAMES = 6
 WEBRTC_MONITOR_TARGET_LATENCY_FRAMES = 6
-WEBRTC_MONITOR_LOW_WATER_FRAMES = 3
 WEBRTC_MONITOR_LATENCY_HIGH_WATER_FRAMES = 14
 WEBRTC_MONITOR_LATENCY_TRIM_TO_FRAMES = 8
 WEBRTC_MONITOR_MAX_BUFFER_FRAMES = 32
-WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS = 0.24
-WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS = 0.06
 
 
 @dataclass(frozen=True)
@@ -126,7 +121,6 @@ class TcpOpusBitrateController:
         send_failed: bool = False,
         latency_drop_count: int = 0,
         above_max_drop_count: int = 0,
-        network_receive_kbps: float | None = None,
         media_delivery_ratio: float | None = None,
         upstream_limited: bool = False,
     ) -> TcpOpusBitrateDecision:
@@ -149,16 +143,9 @@ class TcpOpusBitrateController:
                 return TcpOpusBitrateDecision(self.current_kbps, "send backpressure")
             return TcpOpusBitrateDecision(self.current_kbps, "upstream hold")
         latency_limited = int(latency_drop_count) > 0 or int(above_max_drop_count) > 0
-        throughput_limited = False
-        severe_throughput_limited = False
-        if network_receive_kbps is not None:
-            try:
-                receive_kbps = float(network_receive_kbps)
-                throughput_limited = receive_kbps < self.current_kbps * LIVE_AUDIO_TCP_THROUGHPUT_MARGIN
-                severe_throughput_limited = receive_kbps < self.current_kbps * LIVE_AUDIO_TCP_SEVERE_THROUGHPUT_MARGIN
-            except (TypeError, ValueError):
-                throughput_limited = False
-                severe_throughput_limited = False
+        # How much audio arrived per second of time is what shows a connection that
+        # cannot keep up. The bitrate the browser receives does not: Opus spends far
+        # fewer bits than its setting on easy audio, and almost none on silence.
         realtime_limited = False
         severe_realtime_limited = False
         if media_delivery_ratio is not None:
@@ -169,8 +156,8 @@ class TcpOpusBitrateController:
             except (TypeError, ValueError):
                 realtime_limited = False
                 severe_realtime_limited = False
-        throughput_feedback_limited = throughput_limited or realtime_limited
-        severe_feedback_limited = severe_throughput_limited or severe_realtime_limited
+        throughput_feedback_limited = realtime_limited
+        severe_feedback_limited = severe_realtime_limited
         if throughput_feedback_limited:
             self._throughput_limited_feedbacks += 1
         else:
@@ -347,20 +334,14 @@ class WebRtcAudioSource:
         self,
         *,
         max_frames: int = WEBRTC_MONITOR_MAX_BUFFER_FRAMES,
-        prebuffer_frames: int = WEBRTC_MONITOR_PREBUFFER_FRAMES,
         target_latency_frames: int = WEBRTC_MONITOR_TARGET_LATENCY_FRAMES,
-        low_water_frames: int = WEBRTC_MONITOR_LOW_WATER_FRAMES,
         latency_high_water_frames: int = WEBRTC_MONITOR_LATENCY_HIGH_WATER_FRAMES,
         latency_trim_to_frames: int = WEBRTC_MONITOR_LATENCY_TRIM_TO_FRAMES,
-        prebuffer_timeout_seconds: float = WEBRTC_MONITOR_PREBUFFER_TIMEOUT_SECONDS,
-        refill_timeout_seconds: float = WEBRTC_MONITOR_REFILL_TIMEOUT_SECONDS,
         sample_rate: int = IQ_SAMPLE_RATE,
     ) -> None:
         self.sample_rate = max(1, int(sample_rate))
         self.max_frames = max(1, int(max_frames))
-        self.prebuffer_frames = max(0, min(int(prebuffer_frames), self.max_frames))
         self.target_latency_frames = max(1, min(int(target_latency_frames), self.max_frames))
-        self.low_water_frames = max(0, min(int(low_water_frames), self.max_frames))
         self.latency_high_water_frames = max(
             self.target_latency_frames + 1,
             min(int(latency_high_water_frames), self.max_frames),
@@ -369,8 +350,6 @@ class WebRtcAudioSource:
             self.target_latency_frames,
             min(int(latency_trim_to_frames), self.latency_high_water_frames - 1),
         )
-        self.prebuffer_timeout_seconds = max(0.0, float(prebuffer_timeout_seconds))
-        self.refill_timeout_seconds = max(0.0, float(refill_timeout_seconds))
         self.frame_bytes = round(self.sample_rate * WEBRTC_FRAME_SECONDS) * 2
         self.buffer: deque[bytes] = deque()
         self.lock = threading.Lock()
@@ -383,7 +362,6 @@ class WebRtcAudioSource:
         self.max_buffered_frames = 0
         self.last_frame_at = 0.0
         self.last_underrun_log_at = 0.0
-        self._prebuffered = False
 
     def push_pcm(self, pcm_s16le: bytes) -> None:
         if self.closed.is_set():
@@ -420,27 +398,19 @@ class WebRtcAudioSource:
         self._log_underrun()
         return b"\x00" * self.frame_bytes
 
-    def read_pcm_blocking(self, timeout: float = 0.25) -> bytes:
-        if not self._prebuffered and self.prebuffer_frames:
-            self._wait_for_buffer_blocking(
-                self.prebuffer_frames,
-                max(timeout, self.prebuffer_timeout_seconds),
-            )
-            self._prebuffered = True
-        elif self.low_water_frames:
-            with self.lock:
-                buffered = len(self.buffer)
-            if 0 < buffered < self.low_water_frames:
-                self._wait_for_buffer_blocking(
-                    self.low_water_frames,
-                    max(WEBRTC_FRAME_SECONDS, self.refill_timeout_seconds),
-                )
+    def read_frame(self, timeout: float = 0.25) -> bytes | None:
+        """The next frame as soon as it arrives, or None if none came within timeout.
+
+        Live listeners are sent the audio exactly as it was made: nothing is
+        invented to cover a late frame, so the browser's own buffer rides
+        through the wait and nothing audible is lost.
+        """
         frame = self._pop_frame_blocking(timeout)
         if frame is None:
-            self.underrun_frames += 1
-            self._log_underrun()
-            self._prebuffered = False
-            return b"\x00" * self.frame_bytes
+            if not self.closed.is_set():
+                self.underrun_frames += 1
+                self._log_underrun()
+            return None
         self.read_frames += 1
         return frame
 
@@ -449,7 +419,6 @@ class WebRtcAudioSource:
             dropped = len(self.buffer)
             self.buffer.clear()
             self.stale_frames += dropped
-            self._prebuffered = True
 
     def stats(self) -> dict[str, Any]:
         with self.lock:
@@ -461,9 +430,7 @@ class WebRtcAudioSource:
                 "max_buffered_frames": self.max_buffered_frames,
                 "max_buffered_ms": round(self.max_buffered_frames * WEBRTC_FRAME_SECONDS * 1000.0, 1),
                 "max_frames": self.max_frames,
-                "prebuffer_frames": self.prebuffer_frames,
                 "target_latency_frames": self.target_latency_frames,
-                "low_water_frames": self.low_water_frames,
                 "latency_high_water_frames": self.latency_high_water_frames,
                 "latency_trim_to_frames": self.latency_trim_to_frames,
                 "sample_rate": self.sample_rate,
@@ -489,17 +456,6 @@ class WebRtcAudioSource:
             if frame:
                 frames.append(frame)
         return frames
-
-    def _wait_for_buffer_blocking(self, frame_count: int, timeout: float) -> None:
-        deadline = time.monotonic() + max(0.0, timeout)
-        while not self.closed.is_set():
-            with self.lock:
-                if len(self.buffer) >= frame_count:
-                    return
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            time.sleep(min(0.005, remaining))
 
     def _pop_frame_blocking(self, timeout: float) -> bytes | None:
         deadline = time.monotonic() + max(0.0, timeout)
@@ -527,7 +483,7 @@ class WebRtcAudioSource:
             underruns = self.underrun_frames
             last_frame_at = self.last_frame_at
         LOG.warning(
-            "live audio PCM source underrun: buffered=%s pushed=%s read=%s dropped=%s stale=%s underruns=%s last_frame_age=%.3fs",
+            "live audio source had no new audio to send: buffered=%s pushed=%s read=%s dropped=%s stale=%s underruns=%s last_frame_age=%.3fs",
             buffered,
             pushed,
             read,

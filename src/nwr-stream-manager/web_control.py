@@ -3383,8 +3383,9 @@ class LiveAudioSource:
             self.alert_decoder.process_pcm(pcm)
         self.audio_source.push_pcm(self._pause_frame(pcm))
 
-    def read_pcm_blocking(self, timeout: float = 0.25) -> bytes:
-        return self._pause_frame(self.audio_source.read_pcm_blocking(timeout=timeout))
+    def read_frame(self, timeout: float = 0.25) -> bytes | None:
+        frame = self.audio_source.read_frame(timeout=timeout)
+        return None if frame is None else self._pause_frame(frame)
 
     def get_latest_pcm(self, timeout: float = 0.02) -> bytes:
         return self._pause_frame(self.audio_source.get_latest_pcm(timeout=timeout))
@@ -8963,11 +8964,16 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         sequence = 0
         last_event_check = 0.0
         bitrate_controller = TcpOpusBitrateController() if codec == "opus" and encoder is not None else None
-        next_frame_at = time.monotonic()
-        # Stalls in this machine's own audio (SDR lost, remote SDR link
-        # behind) are not the browser's connection; see TcpOpusBitrateController.
-        upstream_underruns = int(getattr(source.audio_source, "underrun_frames", 0))
+        # Frames go out as the stream makes them; the stream itself runs in real time,
+        # and the browser's buffer smooths out any unevenness. Stalls in this machine's
+        # own audio (SDR lost, remote SDR link behind) are not the browser's
+        # connection; see TcpOpusBitrateController.
+        waiting_since: float | None = None
         upstream_hold_until = 0.0
+        # Tells the page when this machine itself has no audio to send, so it can tell
+        # that apart from audio held up on the way. The notices share the connection
+        # with the audio, so they always arrive in order with it.
+        told_no_audio = False
         shutting_down = getattr(self.service, "shutting_down", None)
         while True:
             if shutting_down is not None and shutting_down.is_set():
@@ -8986,20 +8992,29 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                     except queue.Empty:
                         break
                     writer.send_json({"type": "same_event", "event": event})
-            read_started_at = time.monotonic()
-            pcm = source.read_pcm_blocking(timeout=0.12)
-            read_finished_at = time.monotonic()
+            if waiting_since is None:
+                waiting_since = time.monotonic()
+            pcm = source.read_frame(timeout=LIVE_AUDIO_UPSTREAM_STALL_SECONDS)
+            if pcm is None:
+                if not told_no_audio and not source.audio_source.closed.is_set():
+                    writer.send_json({"type": "source_no_audio"})
+                    told_no_audio = True
+                continue
+            frame_at = time.monotonic()
+            waited_seconds = frame_at - waiting_since
+            waiting_since = None
+            if told_no_audio:
+                writer.send_json({"type": "source_audio_back", "seconds": round(waited_seconds, 3)})
+                told_no_audio = False
             source_paused = source.is_paused()
-            underruns = int(getattr(source.audio_source, "underrun_frames", 0))
-            if underruns != upstream_underruns or read_finished_at - read_started_at >= LIVE_AUDIO_UPSTREAM_STALL_SECONDS:
-                if read_finished_at >= upstream_hold_until:
+            if waited_seconds >= LIVE_AUDIO_UPSTREAM_STALL_SECONDS:
+                if frame_at >= upstream_hold_until:
                     LOG.info(
                         "live-audio WebSocket source for %s client %s stalled upstream; holding Opus bitrate",
                         mode,
                         client_id,
                     )
-                upstream_underruns = underruns
-                upstream_hold_until = read_finished_at + LIVE_AUDIO_UPSTREAM_HOLD_SECONDS
+                upstream_hold_until = frame_at + LIVE_AUDIO_UPSTREAM_HOLD_SECONDS
             if codec == "opus" and encoder is not None:
                 packets = encoder.encode(pcm)
                 if not packets:
@@ -9025,7 +9040,6 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                             send_seconds=send_seconds,
                             latency_drop_count=latency_drop_count,
                             above_max_drop_count=above_max_drop_count,
-                            network_receive_kbps=network_receive_kbps,
                             media_delivery_ratio=media_delivery_ratio,
                             upstream_limited=upstream_limited,
                         )
@@ -9056,12 +9070,6 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                     payload=pcm,
                 )
                 sequence += 1
-            next_frame_at += 0.02
-            delay = next_frame_at - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-            elif delay < -0.1:
-                next_frame_at = time.monotonic()
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -12829,6 +12837,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   </p>
   <button id="dismiss_insecure_audio_banner" type="button">Dismiss</button>
 </div>
+<div id="listening_no_audio_banner" class="global-status-banner" hidden>
+  <p>No audio is coming from the SDR right now. Listening will continue when it returns.</p>
+</div>
+<div id="listening_status_live" class="screen-reader-only" aria-live="polite" aria-atomic="true"></div>
 <div id="same_alert_flash" class="same-alert-flash" hidden></div>
 <div id="same_alert_live" class="screen-reader-only" aria-live="assertive" aria-relevant="additions text" aria-atomic="false"></div>
 <main>
@@ -14217,6 +14229,11 @@ let liveAudioScheduledTime = 0;
 let liveAudioScheduledSources = new Set();
 let liveAudioPacketCount = 0;
 let liveAudioDroppedLateFrames = 0;
+let liveAudioCatchingUp = false;
+let liveAudioRanOutCount = 0;
+let liveAudioServerHasNoAudio = false;
+let liveAudioServerGapSinceFrame = false;
+let liveAudioNoAudioBannerTimer = null;
 let liveAudioRecoveryFadePending = false;
 let liveAudioLastScheduledSample = 0;
 let liveAudioThroughputWindowStartedAt = 0;
@@ -14231,9 +14248,21 @@ let notificationSettingsSignature = "";
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
 const LIVE_AUDIO_TARGET_LATENCY_SECONDS = 0.26;
-const LIVE_AUDIO_MAX_LATENCY_SECONDS = 0.55;
-const LIVE_AUDIO_HARD_RESET_LATENCY_SECONDS = 1.2;
-const LIVE_AUDIO_RECOVERY_LATENCY_SECONDS = 0.34;
+// Above this much queued audio, skip quiet frames until back near the target.
+// Only silence is skipped, so SAME bursts and speech play untouched; speeding
+// playback up instead would distort SAME data.
+const LIVE_AUDIO_QUIET_SKIP_LATENCY_SECONDS = 0.45;
+const LIVE_AUDIO_CATCH_UP_DONE_SECONDS = LIVE_AUDIO_TARGET_LATENCY_SECONDS + 0.02;
+const LIVE_AUDIO_QUIET_FRAME_RMS = 0.015;
+// Above this, skip frames even if they are not quiet. Running dry and restarting
+// adds the target on top of the backlog that follows, so this leaves room for the
+// backlog of a stall of about 700 ms before anything audible is cut.
+const LIVE_AUDIO_MAX_LATENCY_SECONDS = 1.0;
+const LIVE_AUDIO_HARD_RESET_LATENCY_SECONDS = 1.5;
+// A stream fills an SDR outage with its own silence within about a second, so a
+// stream with fallback audio never reaches this; the receiver and streams
+// without fallback audio do.
+const LIVE_AUDIO_NO_AUDIO_BANNER_DELAY_MS = 2000;
 const LIVE_AUDIO_RECOVERY_CROSSFADE_SECONDS = 0.004;
 const LIVE_AUDIO_THROUGHPUT_REPORT_INTERVAL_MS = 2000;
 const LIVE_AUDIO_BINARY_HEADER_BYTES = 16;
@@ -14677,9 +14706,10 @@ function stopScheduledLiveAudioSources() {
   }
   liveAudioScheduledSources.clear();
   liveAudioRecoveryFadePending = false;
+  liveAudioCatchingUp = false;
   liveAudioLastScheduledSample = 0;
-  if (liveAudioContext) liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
-  else liveAudioScheduledTime = 0;
+  // The next frame starts a fresh schedule.
+  liveAudioScheduledTime = 0;
 }
 
 function applyLiveAudioVolume() {
@@ -14767,8 +14797,10 @@ function liveAudioClientIdForCurrentMode() {
   return "";
 }
 
-function resetLiveAudioThroughputWindow() {
-  liveAudioThroughputWindowStartedAt = performance.now();
+// A new connection's first window starts with its first audio, not when it opens:
+// counting the time spent connecting would make every start look like a slow link.
+function resetLiveAudioThroughputWindow(startedAt = performance.now()) {
+  liveAudioThroughputWindowStartedAt = startedAt;
   liveAudioThroughputBytes = 0;
   liveAudioThroughputMediaMs = 0;
 }
@@ -14813,35 +14845,48 @@ function applyLiveAudioRecoveryCrossfade(samples, sampleRate) {
   return output;
 }
 
+function liveAudioFrameIsQuiet(samples) {
+  let sum = 0;
+  for (let index = 0; index < samples.length; index += 1) sum += samples[index] * samples[index];
+  return Math.sqrt(sum / Math.max(1, samples.length)) < LIVE_AUDIO_QUIET_FRAME_RMS;
+}
+
 function scheduleLiveAudioSamples(samples, sampleRate) {
   if (!samples || !samples.length || !liveAudioContext) return;
   const now = liveAudioContext.currentTime;
-  if (!liveAudioScheduledTime || liveAudioScheduledTime < now + LIVE_AUDIO_TARGET_LATENCY_SECONDS * 0.5) {
+  const serverGap = liveAudioServerGapSinceFrame;
+  liveAudioServerGapSinceFrame = false;
+  if (!liveAudioScheduledTime || liveAudioScheduledTime <= now) {
+    // Only start over once the queue has truly run dry: while queued audio is still
+    // playing, the next frame goes right after it, so a late frame never opens a gap.
+    // Running dry because the server itself had no audio is logged when it says so.
+    if (liveAudioScheduledTime && !serverGap) {
+      liveAudioRanOutCount += 1;
+      logClientEvent("warning", "live-audio", "live audio ran out before more arrived", {
+        mode: liveAudioMode,
+        client_id: liveAudioClientIdForCurrentMode(),
+        ran_out_count: liveAudioRanOutCount,
+        late_seconds: Number((now - liveAudioScheduledTime).toFixed(3))
+      });
+    }
     liveAudioScheduledTime = now + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
   }
   const scheduledLead = liveAudioScheduledTime - now;
   if (scheduledLead > LIVE_AUDIO_HARD_RESET_LATENCY_SECONDS) {
     stopScheduledLiveAudioSources();
+    liveAudioScheduledTime = now + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
   } else if (scheduledLead > LIVE_AUDIO_MAX_LATENCY_SECONDS) {
+    liveAudioCatchingUp = true;
     dropLiveAudioFrameForLatency(scheduledLead, "above-max");
     return;
-  } else if (scheduledLead > LIVE_AUDIO_RECOVERY_LATENCY_SECONDS) {
-    const frameSeconds = samples.length / Math.max(1, Number(sampleRate || 1));
-    const excessSeconds = scheduledLead - LIVE_AUDIO_TARGET_LATENCY_SECONDS;
-    const recoveryDropInterval = Math.max(2, Math.ceil(LIVE_AUDIO_TARGET_LATENCY_SECONDS / Math.max(frameSeconds, excessSeconds)));
-    if (liveAudioPacketCount % recoveryDropInterval === 0) {
-      dropLiveAudioFrameForLatency(scheduledLead, "recovery");
-      return;
-    }
-  } else if (scheduledLead <= LIVE_AUDIO_TARGET_LATENCY_SECONDS * 1.15 && liveAudioDroppedLateFrames) {
+  } else if (scheduledLead > LIVE_AUDIO_QUIET_SKIP_LATENCY_SECONDS) {
+    liveAudioCatchingUp = true;
+  } else if (scheduledLead <= LIVE_AUDIO_CATCH_UP_DONE_SECONDS) {
+    liveAudioCatchingUp = false;
     liveAudioDroppedLateFrames = 0;
   }
-  if (!liveAudioScheduledTime || liveAudioScheduledTime < liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS * 0.5) {
-    liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
-  }
-  const adjustedLead = liveAudioScheduledTime - liveAudioContext.currentTime;
-  if (adjustedLead > LIVE_AUDIO_MAX_LATENCY_SECONDS) {
-    dropLiveAudioFrameForLatency(adjustedLead, "post-reset-max");
+  if (liveAudioCatchingUp && liveAudioFrameIsQuiet(samples)) {
+    dropLiveAudioFrameForLatency(scheduledLead, "quiet");
     return;
   }
   samples = applyLiveAudioRecoveryCrossfade(samples, sampleRate);
@@ -14855,6 +14900,62 @@ function scheduleLiveAudioSamples(samples, sampleRate) {
   source.addEventListener("ended", () => liveAudioScheduledSources.delete(source));
   source.start(liveAudioScheduledTime);
   liveAudioScheduledTime += samples.length / sampleRate;
+}
+
+function setListeningNoAudioBanner(show) {
+  const banner = document.getElementById("listening_no_audio_banner");
+  if (!banner || banner.hidden === !show) return;
+  banner.hidden = !show;
+  const live = document.getElementById("listening_status_live");
+  if (live) {
+    live.textContent = show
+      ? "No audio is coming from the SDR right now. Listening will continue when it returns."
+      : "Audio from the SDR is back.";
+  }
+}
+
+function resetLiveAudioServerAudioState() {
+  if (liveAudioNoAudioBannerTimer) {
+    clearTimeout(liveAudioNoAudioBannerTimer);
+    liveAudioNoAudioBannerTimer = null;
+  }
+  liveAudioServerHasNoAudio = false;
+  liveAudioServerGapSinceFrame = false;
+  const banner = document.getElementById("listening_no_audio_banner");
+  if (banner) banner.hidden = true;
+  const live = document.getElementById("listening_status_live");
+  if (live) live.textContent = "";
+}
+
+// The server ran out of audio to send: its SDR stopped, or a remote SDR fell behind.
+// Nothing about this listener's connection is wrong, so it is not treated as one.
+function handleLiveAudioServerNoAudio() {
+  liveAudioServerHasNoAudio = true;
+  liveAudioServerGapSinceFrame = true;
+  logClientEvent("info", "live-audio", "server had no audio to send", {
+    mode: liveAudioMode,
+    client_id: liveAudioClientIdForCurrentMode()
+  });
+  if (!liveAudioNoAudioBannerTimer) {
+    liveAudioNoAudioBannerTimer = setTimeout(() => {
+      liveAudioNoAudioBannerTimer = null;
+      if (liveAudioServerHasNoAudio) setListeningNoAudioBanner(true);
+    }, LIVE_AUDIO_NO_AUDIO_BANNER_DELAY_MS);
+  }
+}
+
+function handleLiveAudioServerAudioBack(seconds) {
+  liveAudioServerHasNoAudio = false;
+  if (liveAudioNoAudioBannerTimer) {
+    clearTimeout(liveAudioNoAudioBannerTimer);
+    liveAudioNoAudioBannerTimer = null;
+  }
+  setListeningNoAudioBanner(false);
+  logClientEvent("info", "live-audio", "server audio is back", {
+    mode: liveAudioMode,
+    client_id: liveAudioClientIdForCurrentMode(),
+    seconds_without_audio: Number(seconds || 0)
+  });
 }
 
 async function configureLiveAudioDecoder() {
@@ -14914,6 +15015,14 @@ async function handleLiveAudioMessage(event) {
     handleLiveSameEvent(message.event || {});
     return;
   }
+  if (message.type === "source_no_audio") {
+    handleLiveAudioServerNoAudio();
+    return;
+  }
+  if (message.type === "source_audio_back") {
+    handleLiveAudioServerAudioBack(message.seconds);
+    return;
+  }
   if (message.type !== "audio") return;
   liveAudioPacketCount += 1;
   const bytes = bytesFromBase64(message.data);
@@ -14940,7 +15049,8 @@ function closeLiveAudioSocket(expectedSocket = null) {
     liveAudioMode = "";
     closeLiveAudioDecoder();
     stopScheduledLiveAudioSources();
-    resetLiveAudioThroughputWindow();
+    resetLiveAudioThroughputWindow(0);
+    resetLiveAudioServerAudioState();
   }
   if (!socket) return;
   try {
@@ -15004,10 +15114,13 @@ async function startLiveAudioSocket(params) {
   liveAudioCodec = opus ? "opus" : "pcm";
   liveAudioPacketCount = 0;
   liveAudioDroppedLateFrames = 0;
+  liveAudioCatchingUp = false;
+  liveAudioRanOutCount = 0;
+  resetLiveAudioServerAudioState();
   liveAudioRecoveryFadePending = false;
   liveAudioLastScheduledSample = 0;
-  resetLiveAudioThroughputWindow();
-  liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
+  resetLiveAudioThroughputWindow(0);
+  liveAudioScheduledTime = 0;
   applyLiveAudioVolume();
   const socket = new WebSocket(liveAudioUrl({...params, codec: liveAudioCodec}));
   socket.binaryType = "arraybuffer";
@@ -15152,7 +15265,8 @@ async function pollMonitorPacketStats() {
         packetCount += Number(report.packetsReceived || 0);
       }
     });
-    if (packetCount > monitorLastPacketCount) {
+    // Waiting on the server's own audio is not an unstable connection.
+    if (packetCount > monitorLastPacketCount || liveAudioServerHasNoAudio) {
       markMonitorPacketProgress(packetCount);
       return;
     }
@@ -15269,7 +15383,7 @@ async function resumeStreamMonitor() {
   clearMonitorUnstableTimer();
   await startMediaSessionAnchor("monitor-resume");
   await ensureLiveAudioContext();
-  liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
+  liveAudioScheduledTime = 0;
   updateMonitorMediaSession();
   startMonitorPacketStats();
   logClientEvent("info", "monitor", "monitor resumed", {stream_id: streamId});
@@ -15392,7 +15506,8 @@ async function pollReceiverPacketStats() {
         packetCount += Number(report.packetsReceived || 0);
       }
     });
-    if (packetCount > receiverLastPacketCount) {
+    // Waiting on the server's own audio is not an unstable connection.
+    if (packetCount > receiverLastPacketCount || liveAudioServerHasNoAudio) {
       markReceiverPacketProgress(packetCount);
       return;
     }
@@ -15497,7 +15612,7 @@ async function startWeatherReceiver() {
       hideResumeListeningOffer();
       clearReceiverUnstableTimer();
       await ensureLiveAudioContext();
-      liveAudioScheduledTime = liveAudioContext.currentTime + LIVE_AUDIO_TARGET_LATENCY_SECONDS;
+      liveAudioScheduledTime = 0;
       await startMediaSessionAnchor("receiver-resume");
       startReceiverPacketStats();
       updateReceiverMediaSession();
@@ -23977,7 +24092,7 @@ function serverUnavailableModalTargets() {
   return [
     document.querySelector("header"),
     document.querySelector("main"),
-    ...document.querySelectorAll(".global-status-banner, .notice-dialog, .same-alert-flash, #same_alert_live")
+    ...document.querySelectorAll(".global-status-banner, .notice-dialog, .same-alert-flash, #same_alert_live, #listening_status_live")
   ].filter(Boolean);
 }
 
