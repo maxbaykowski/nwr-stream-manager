@@ -209,6 +209,39 @@ class LiveAudioPlaybackTests(unittest.TestCase):
         reasons = {event["details"]["reason"] for event in result["events"] if event["message"].startswith("dropped")}
         self.assertEqual(reasons, {"above-max"})
 
+    @staticmethod
+    def sdr_deliveries(seconds: float, held: tuple[float, float] | None = None) -> list[tuple[float, list[bool]]]:
+        """The SDR hands over 40 ms at a time, two 20 ms frames, as measured on a Pi 5.
+        Deliveries due while the network holds them back all arrive when it lets go."""
+        steps: list[tuple[float, list[bool]]] = []
+        for index in range(round(seconds / 0.04)):
+            at = round(index * 0.04, 6)
+            if held and held[0] <= at < held[1]:
+                at = held[1]
+            if steps and steps[-1][0] == at:
+                steps[-1][1].extend([True, True])
+            else:
+                steps.append((at, [True, True]))
+        return steps
+
+    def test_listening_stays_about_a_fifth_of_a_second_behind(self) -> None:
+        steps = self.sdr_deliveries(5.0)
+        arrivals = [at for at, frames in steps for _ in frames]
+        result = self.play(steps)
+
+        self.assertEqual(len(result["played"]), result["sent"])
+        behind = [item["at"] - arrivals[item["id"]] for item in result["played"]]
+        self.assertLessEqual(max(behind), 0.221)
+        self.assertEqual(result["events"], [])
+
+    def test_a_network_hiccup_still_plays_through_without_a_gap(self) -> None:
+        # Wi-Fi holds everything back for 160 ms, then delivers it at once.
+        result = self.play(self.sdr_deliveries(5.0, held=(2.0, 2.16)))
+
+        self.assertEqual(len(result["played"]), result["sent"])
+        self.assertEqual(self.gaps(result["played"]), [])
+        self.assertEqual(result["events"], [])
+
     def messages(self, result: dict) -> list[str]:
         return [event["message"] for event in result["events"]]
 
@@ -246,7 +279,7 @@ class LiveAudioPlaybackTests(unittest.TestCase):
 
     def test_new_connections_start_measuring_at_their_first_audio(self) -> None:
         page = load_web_control_module().INDEX_HTML
-        start = page.index("async function startLiveAudioSocket(")
+        start = page.index("async function openLiveAudioSocket(")
         self.assertIn("resetLiveAudioThroughputWindow(0);", page[start : page.index("\n}\n", start)])
 
     def test_a_long_outage_shows_the_banner_until_audio_returns(self) -> None:

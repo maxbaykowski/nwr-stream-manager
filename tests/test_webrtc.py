@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import importlib
 import sys
 import threading
@@ -295,24 +297,48 @@ class WebRtcTests(unittest.TestCase):
         finally:
             self.webrtc._OPUS_MODULE = original_module
 
-    def test_opus_encoder_encodes_20_ms_packet_when_available(self) -> None:
+    def test_opus_encoder_sends_each_20_ms_at_once_and_browsers_decode_it(self) -> None:
         try:
             encoder = self.webrtc.OpusEncoder(input_sample_rate=24_000)
         except self.webrtc.OpusSupportError as exc:
             self.skipTest(str(exc))
         try:
-            pcm = np.zeros(480, dtype="<i2").tobytes()
+            # A 1 kHz tone, 20 ms at a time, as the receiver and streams send it.
+            tone = (8000 * np.sin(2 * np.pi * 1000 * np.arange(24_000) / 24_000)).astype("<i2")
             packets = []
-            for _ in range(4):
-                packets.extend(encoder.encode(pcm))
-                if packets:
-                    break
-            self.assertEqual(len(packets), 1)
-            self.assertGreater(len(packets[0]), 0)
+            for offset in range(0, tone.size, 480):
+                frame_packets = encoder.encode(tone[offset : offset + 480].tobytes())
+                # Nothing is held back for the next frame.
+                self.assertEqual(len(frame_packets), 1)
+                packets.extend(frame_packets)
             encoder.set_bitrate(96)
             self.assertEqual(encoder.bitrate_kbps, 96)
         finally:
             encoder.close()
+
+        # Browsers decode at 48 kHz; the tone must come out intact and on pitch.
+        library = ctypes.CDLL(ctypes.util.find_library("opus") or "libopus.so.0")
+        library.opus_decoder_create.restype = ctypes.c_void_p
+        library.opus_decoder_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        library.opus_decode.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int16), ctypes.c_int, ctypes.c_int
+        ]
+        library.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
+        error = ctypes.c_int()
+        decoder = library.opus_decoder_create(48_000, 1, ctypes.byref(error))
+        self.assertEqual(error.value, 0)
+        decoded = []
+        try:
+            for packet in packets:
+                output = (ctypes.c_int16 * 960)()
+                self.assertEqual(library.opus_decode(decoder, packet, len(packet), output, 960, 0), 960)
+                decoded.append(np.frombuffer(output, dtype=np.int16).copy())
+        finally:
+            library.opus_decoder_destroy(decoder)
+        audio = np.concatenate(decoded)[4800:].astype(np.float64)
+        spectrum = np.abs(np.fft.rfft(audio * np.hanning(audio.size)))
+        self.assertAlmostEqual(float(np.fft.rfftfreq(audio.size, 1 / 48_000)[np.argmax(spectrum)]), 1000.0, delta=5.0)
+        self.assertGreater(np.sqrt(np.mean(audio**2)), 0.5 * 8000 / np.sqrt(2))
 
 
 if __name__ == "__main__":

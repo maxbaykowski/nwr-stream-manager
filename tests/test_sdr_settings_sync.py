@@ -375,6 +375,7 @@ EVENTS_FUNCTIONS = ("settingsEventsUrl", "startSettingsEvents", "scheduleSetting
 EVENTS_STATE = (
     "const SETTINGS_EVENTS_RETRY_MIN_MS",
     "const SETTINGS_EVENTS_RETRY_MAX_MS",
+    "const SERVER_SHUTDOWN_CLOSE_CODE",
     "let settingsEventsSocket",
     "let settingsEventsRetryMs",
     "let settingsChangeRefreshRunning",
@@ -395,6 +396,8 @@ function setTimeout(callback, ms) { retries.push({callback, ms}); }
 let checks = 0;
 let finishCheck = null;
 function refresh() { checks += 1; return new Promise(resolve => { finishCheck = resolve; }); }
+const unavailable = [];
+function enterServerUnavailable(reason) { unavailable.push(reason); }
 async function settle() { for (let index = 0; index < 20; index += 1) await null; }
 async function check() { const done = finishCheck; finishCheck = null; done(); await settle(); }
 const results = {};
@@ -477,6 +480,28 @@ class SettingsEventsPageTests(unittest.TestCase):
         self.assertEqual(result["after_return"], 1000)
         self.assertEqual(result["sockets"], 8)  # one at a time, never two
 
+
+    def test_a_server_shutting_down_is_shown_at_once(self) -> None:
+        # Restarts are announced, so the page need not wait to be sure it is gone.
+        result = self.run_scenario("""
+            startSettingsEvents();
+            sockets[0].emit("open");
+            await check();
+            const before = retries.length;
+            sockets[0].emit("close", {code: 1012});
+            results.unavailable = unavailable;
+            results.retried = retries.length > before;
+        """)
+        self.assertEqual(result["unavailable"], ["shutdown"])
+        self.assertFalse(result["retried"])
+
+    def test_a_dropped_connection_is_not_taken_for_a_shutdown(self) -> None:
+        result = self.run_scenario("""
+            startSettingsEvents();
+            sockets[0].emit("close", {code: 1006});
+            results.unavailable = unavailable;
+        """)
+        self.assertEqual(result["unavailable"], [])
 
 
 class SdrLooksTheSameDuringResetTests(unittest.TestCase):

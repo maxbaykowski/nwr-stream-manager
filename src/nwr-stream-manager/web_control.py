@@ -99,6 +99,7 @@ if __package__:
         RtlConfig,
         RtlConfigError,
         RtlCaptureSource,
+        RTL_ASYNC_BUFFER_SECONDS,
         RtlSampleBatch,
         list_rtl_devices,
         list_usb_rtl_devices,
@@ -210,6 +211,7 @@ else:
     NfmDemodulator = nfm.NfmDemodulator
     NfmModulator = nfm.NfmModulator
     DEFAULT_RTL_SAMPLE_RATE = rtl.DEFAULT_RTL_SAMPLE_RATE
+    RTL_ASYNC_BUFFER_SECONDS = rtl.RTL_ASYNC_BUFFER_SECONDS
     NWR_CENTER_FREQUENCY_HZ = rtl.NWR_CENTER_FREQUENCY_HZ
     IqDcBlocker = dsp.IqDcBlocker
     RtlConfig = rtl.RtlConfig
@@ -335,10 +337,10 @@ REMOTE_SDR_RESET_UNSUPPORTED_MESSAGE = (
 )
 STREAM_WORKER_RAW_QUEUE_SECONDS = 1.50
 STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS = 8
-STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 96
+STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 256
 LIVE_IQ_QUEUE_SECONDS = 0.75
-INTERMEDIATE_SOURCE_QUEUE_CHUNKS = 2
-IQ_RECORDER_QUEUE_CHUNKS = 2
+INTERMEDIATE_SOURCE_QUEUE_CHUNKS = round(0.2 / RTL_ASYNC_BUFFER_SECONDS)
+IQ_RECORDER_QUEUE_CHUNKS = round(0.2 / RTL_ASYNC_BUFFER_SECONDS)
 INTERMEDIATE_IQ_SAMPLE_RATE = 192_000
 INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ = 8_000.0
 INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB = 70.0
@@ -418,6 +420,12 @@ STREAM_TEST_MODE_TIME_LIMIT_REASON = "time limit reached"
 # WebSocket close code 1012 means the server is restarting; browsers treat it as a clean close.
 LIVE_AUDIO_SHUTDOWN_CLOSE_CODE = 1012
 LIVE_AUDIO_SHUTDOWN_NOTICE_SECONDS = 0.5
+# While there is no audio to send, the page is still sent something this often, so it
+# can tell a connection that went quiet from one lost when its device changed networks.
+LIVE_AUDIO_KEEPALIVE_SECONDS = 1.0
+# Audio a listener's device has not acknowledged for this long means it is gone (it
+# changed networks, say), so its session is ended instead of waiting many minutes.
+LIVE_AUDIO_UNACKNOWLEDGED_TIMEOUT_SECONDS = 10.0
 # A browser that went away without closing is noticed the next time one of these is sent.
 SETTINGS_EVENTS_KEEPALIVE_SECONDS = 20.0
 STREAM_TEST_MODE_DEVIATION_HZ = 5_000.0
@@ -1477,7 +1485,7 @@ class ProcessedIqFanout:
             STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS,
             min(
                 STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS,
-                int(math.ceil(max(0.0, seconds) / 0.10)),
+                int(math.ceil(max(0.0, seconds) / RTL_ASYNC_BUFFER_SECONDS)),
             ),
         )
 
@@ -3487,10 +3495,13 @@ class LiveAudioWebSocketWriter:
         connection = getattr(self.handler, "connection", None)
         if connection is None:
             return
-        for level, option, value in (
+        options = [
             (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
             (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-        ):
+        ]
+        if hasattr(socket, "TCP_USER_TIMEOUT"):
+            options.append((socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, round(LIVE_AUDIO_UNACKNOWLEDGED_TIMEOUT_SECONDS * 1000)))
+        for level, option, value in options:
             try:
                 connection.setsockopt(level, option, value)
             except OSError:
@@ -8759,6 +8770,17 @@ class RtlControlService:
                 source.close()
         return client_ids
 
+    def _live_audio_session_is_current_locked(self, mode: str, client_id: str, source: LiveAudioSource | None) -> bool:
+        if mode == "receiver":
+            worker = self.receiver_workers.get(client_id)
+            return worker is not None and worker.source is source
+        stream_id = self.monitor_streams_by_client.get(client_id, "")
+        for worker in self.stream_workers.values():
+            if worker.id == stream_id:
+                with worker.lock:
+                    return worker.monitor_sources.get(client_id) is source
+        return False
+
     def _detach_receiver_locked(self, client_id: str) -> WeatherReceiverWorker | None:
         worker = self.receiver_workers.pop(client_id, None)
         self.receiver_accounts_by_client.pop(client_id, None)
@@ -9124,6 +9146,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             detached_monitor_source = None
             try:
                 with self.service.lock:
+                    # A page that reconnects (after switching networks, say) replaces this
+                    # session with a new one; that one is left alone.
+                    if cleanup_mode and not self.service._live_audio_session_is_current_locked(cleanup_mode, client_id, source):
+                        cleanup_mode = ""
                     if cleanup_mode == "monitor":
                         self.service._ensure_webrtc_client_owner_locked(client_id, account_id, require_existing=False)
                         detached_monitor_source = self.service._remove_monitor_source_locked(client_id)
@@ -9190,6 +9216,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         # that apart from audio held up on the way. The notices share the connection
         # with the audio, so they always arrive in order with it.
         told_no_audio = False
+        last_keepalive_at = 0.0
         shutting_down = getattr(self.service, "shutting_down", None)
         while True:
             if shutting_down is not None and shutting_down.is_set():
@@ -9215,6 +9242,11 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 if not told_no_audio and not source.audio_source.closed.is_set():
                     writer.send_json({"type": "source_no_audio"})
                     told_no_audio = True
+                    last_keepalive_at = time.monotonic()
+                elif time.monotonic() - last_keepalive_at >= LIVE_AUDIO_KEEPALIVE_SECONDS:
+                    # Lets the page tell a quiet connection from one that has died.
+                    writer.send_json({"type": "keepalive"})
+                    last_keepalive_at = time.monotonic()
                 continue
             frame_at = time.monotonic()
             waited_seconds = frame_at - waiting_since
@@ -13058,6 +13090,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 <div id="listening_no_audio_banner" class="global-status-banner" hidden>
   <p>No audio is coming from the SDR right now. Listening will continue when it returns.</p>
 </div>
+<div id="listening_reconnecting_banner" class="global-status-banner" hidden>
+  <p>Lost the connection to NWR Stream Manager. Listening will continue when it's back.</p>
+</div>
 <div id="listening_status_live" class="screen-reader-only" aria-live="polite" aria-atomic="true"></div>
 <div id="same_alert_flash" class="same-alert-flash" hidden></div>
 <div id="same_alert_live" class="screen-reader-only" aria-live="assertive" aria-relevant="additions text" aria-atomic="false"></div>
@@ -14481,6 +14516,14 @@ let liveAudioLastScheduledSample = 0;
 let liveAudioThroughputWindowStartedAt = 0;
 let liveAudioThroughputBytes = 0;
 let liveAudioThroughputMediaMs = 0;
+let liveAudioSocketParams = null;
+let liveAudioLastMessageAt = 0;
+let liveAudioWatchdogTimer = null;
+let liveAudioReconnecting = false;
+let liveAudioReconnectStartedAt = 0;
+let liveAudioReconnectTimer = null;
+let liveAudioReconnectAttempt = 0;
+let liveAudioReconnectBannerTimer = null;
 let unloadLiveAudioStopSent = false;
 let mediaSessionAnchorUrl = "";
 let mediaSessionAnchorStarted = false;
@@ -14489,16 +14532,18 @@ let accountsSignature = "";
 let notificationSettingsSignature = "";
 const MONITOR_UNSTABLE_TIMEOUT_MS = 30000;
 const MONITOR_STATS_INTERVAL_MS = 5000;
-const LIVE_AUDIO_TARGET_LATENCY_SECONDS = 0.26;
+// Covers the SDR handing over 40 ms of audio at a time plus about 160 ms of
+// network hiccups.
+const LIVE_AUDIO_TARGET_LATENCY_SECONDS = 0.20;
 // Above this much queued audio, skip quiet frames until back near the target.
 // Only silence is skipped, so SAME bursts and speech play untouched; speeding
 // playback up instead would distort SAME data.
-const LIVE_AUDIO_QUIET_SKIP_LATENCY_SECONDS = 0.45;
+const LIVE_AUDIO_QUIET_SKIP_LATENCY_SECONDS = 0.39;
 const LIVE_AUDIO_CATCH_UP_DONE_SECONDS = LIVE_AUDIO_TARGET_LATENCY_SECONDS + 0.02;
 const LIVE_AUDIO_QUIET_FRAME_RMS = 0.015;
 // Above this, skip frames even if they are not quiet. Running dry and restarting
 // adds the target on top of the backlog that follows, so this leaves room for the
-// backlog of a stall of about 700 ms before anything audible is cut.
+// backlog of a stall of about 800 ms before anything audible is cut.
 const LIVE_AUDIO_MAX_LATENCY_SECONDS = 1.0;
 const LIVE_AUDIO_HARD_RESET_LATENCY_SECONDS = 1.5;
 // A stream fills an SDR outage with its own silence within about a second, so a
@@ -14506,6 +14551,16 @@ const LIVE_AUDIO_HARD_RESET_LATENCY_SECONDS = 1.5;
 // without fallback audio do.
 const LIVE_AUDIO_NO_AUDIO_BANNER_DELAY_MS = 2000;
 const LIVE_AUDIO_RECOVERY_CROSSFADE_SECONDS = 0.004;
+// The server sends audio every 20 ms, or a keepalive each second when it has none,
+// so this long without anything means the connection died (the device changed
+// networks, say) even if the browser has not noticed yet.
+const LIVE_AUDIO_SILENT_CONNECTION_MS = 4000;
+const LIVE_AUDIO_RECONNECT_FIRST_TRY_MS = 250;
+const LIVE_AUDIO_CONNECT_TIMEOUT_MS = 5000;
+// Reconnecting usually takes well under a second, even over cellular.
+const LIVE_AUDIO_RECONNECT_CONNECT_TIMEOUT_MS = 3000;
+const LIVE_AUDIO_RECONNECT_RETRY_MS = 1000;
+const LIVE_AUDIO_RECONNECT_BANNER_DELAY_MS = 2000;
 const LIVE_AUDIO_THROUGHPUT_REPORT_INTERVAL_MS = 2000;
 const LIVE_AUDIO_BINARY_HEADER_BYTES = 16;
 const LIVE_AUDIO_BINARY_MAGIC = "NWA1";
@@ -15336,6 +15391,148 @@ function isInactiveLiveAudioSessionError(error) {
   return /client session is not active|receiver is not playing|monitor is not active/i.test(String(error && error.message || error || ""));
 }
 
+function setListeningReconnectingBanner(show) {
+  const banner = document.getElementById("listening_reconnecting_banner");
+  if (!banner || banner.hidden === !show) return;
+  banner.hidden = !show;
+  const live = document.getElementById("listening_status_live");
+  if (live) {
+    live.textContent = show
+      ? "Lost the connection to NWR Stream Manager. Listening will continue when it's back."
+      : "Reconnected to NWR Stream Manager.";
+  }
+}
+
+function liveAudioConnectionHealthy() {
+  return Boolean(
+    liveAudioSocket &&
+    liveAudioSocket.readyState === WebSocket.OPEN &&
+    performance.now() - liveAudioLastMessageAt < LIVE_AUDIO_SILENT_CONNECTION_MS
+  );
+}
+
+function startLiveAudioWatchdog() {
+  if (liveAudioWatchdogTimer) return;
+  liveAudioWatchdogTimer = setInterval(() => {
+    const socket = liveAudioSocket;
+    if (!socket) return;
+    if (socket.readyState === WebSocket.OPEN && performance.now() - liveAudioLastMessageAt >= LIVE_AUDIO_SILENT_CONNECTION_MS) {
+      liveAudioConnectionLost(socket, "nothing received");
+    }
+  }, 1000);
+}
+
+// Switching between Wi-Fi and cellular drops the connection; listening picks up again
+// on its own once the device is back online instead of stopping.
+function liveAudioConnectionLost(socket, reason) {
+  if (socket !== liveAudioSocket || !liveAudioSocketParams || serverUnavailable) return;
+  liveAudioSocket = null;
+  try {
+    socket.close();
+  } catch (error) {
+    console.debug("live audio socket close failed", error);
+  }
+  if (liveAudioReconnecting) return;
+  const mode = liveAudioSocketParams.mode;
+  liveAudioReconnecting = true;
+  liveAudioReconnectStartedAt = performance.now();
+  logClientEvent("info", "live-audio", "live audio connection lost; reconnecting", {mode, client_id: liveAudioSocketParams.client_id, reason});
+  // Gives up, as before, if it cannot get back in time.
+  if (mode === "monitor") scheduleMonitorUnstableStop("live audio connection lost");
+  if (mode === "receiver") scheduleReceiverUnstableStop("live audio connection lost");
+  liveAudioReconnectBannerTimer = setTimeout(() => {
+    liveAudioReconnectBannerTimer = null;
+    if (liveAudioReconnecting) setListeningReconnectingBanner(true);
+  }, LIVE_AUDIO_RECONNECT_BANNER_DELAY_MS);
+  liveAudioReconnectTimer = setTimeout(attemptLiveAudioReconnect, LIVE_AUDIO_RECONNECT_FIRST_TRY_MS);
+}
+
+// What this page is listening to now, which may have changed since listening started
+// (a new receiver channel, say), so a reconnect picks up where the listener is.
+function currentListeningParams(mode) {
+  if (mode === "monitor") return {mode, client_id: pageMonitorClientId(), stream_id: monitorStreamId};
+  return {mode, client_id: pageReceiverClientId(), frequency_hz: currentReceiverChannel().frequency_hz};
+}
+
+async function attemptLiveAudioReconnect() {
+  liveAudioReconnectTimer = null;
+  if (!liveAudioReconnecting) return;
+  const params = currentListeningParams(liveAudioSocketParams.mode);
+  const attempt = ++liveAudioReconnectAttempt;
+  let socket;
+  try {
+    socket = await openLiveAudioSocket(params, {reconnecting: true});
+  } catch (error) {
+    // A newer attempt (started when the device came back online) takes over.
+    if (liveAudioReconnecting && attempt === liveAudioReconnectAttempt) {
+      liveAudioReconnectTimer = setTimeout(attemptLiveAudioReconnect, LIVE_AUDIO_RECONNECT_RETRY_MS);
+    }
+    return;
+  }
+  if (!liveAudioReconnecting) {
+    // Listening was stopped while this was connecting.
+    closeLiveAudioSocket(socket);
+    return;
+  }
+  const seconds = (performance.now() - liveAudioReconnectStartedAt) / 1000;
+  liveAudioReconnecting = false;
+  if (liveAudioReconnectBannerTimer) {
+    clearTimeout(liveAudioReconnectBannerTimer);
+    liveAudioReconnectBannerTimer = null;
+  }
+  setListeningReconnectingBanner(false);
+  logClientEvent("info", "live-audio", "live audio reconnected", {mode: params.mode, client_id: params.client_id, seconds: Number(seconds.toFixed(1))});
+  if (params.mode === "monitor" && monitorPeerConnection) {
+    monitorPeerConnection = liveAudioSocketPeer("monitor", socket);
+    if (monitorPaused) await resendLiveAudioPause("/api/monitor/pause", params.client_id);
+  }
+  if (params.mode === "receiver" && receiverPeerConnection) {
+    receiverPeerConnection = liveAudioSocketPeer("receiver", socket);
+    if (receiverPaused) await resendLiveAudioPause("/api/receiver/pause", params.client_id);
+  }
+}
+
+async function resendLiveAudioPause(path, clientId) {
+  // The new connection starts a new session on the server, which starts out playing.
+  try {
+    await request(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({client_id: clientId})
+    });
+  } catch (error) {
+    console.debug("could not pause the reconnected session", error);
+  }
+}
+
+// The browser says the device is online again, so an attempt made over the old
+// network is not worth waiting out.
+function retryLiveAudioReconnectNow() {
+  if (!liveAudioReconnecting) return;
+  if (liveAudioReconnectTimer) {
+    clearTimeout(liveAudioReconnectTimer);
+    liveAudioReconnectTimer = null;
+  }
+  attemptLiveAudioReconnect();
+}
+
+function cancelLiveAudioReconnect() {
+  const wasReconnecting = liveAudioReconnecting;
+  liveAudioReconnecting = false;
+  if (liveAudioReconnectTimer) {
+    clearTimeout(liveAudioReconnectTimer);
+    liveAudioReconnectTimer = null;
+  }
+  if (liveAudioReconnectBannerTimer) {
+    clearTimeout(liveAudioReconnectBannerTimer);
+    liveAudioReconnectBannerTimer = null;
+  }
+  const banner = document.getElementById("listening_reconnecting_banner");
+  if (banner) banner.hidden = true;
+  // Stop what was left playing from the lost connection.
+  if (wasReconnecting && !liveAudioSocket) closeLiveAudioSocket();
+}
+
 let insecureAudioNoticeShown = false;
 
 function noteInsecureAudioFallback(opus) {
@@ -15348,13 +15545,27 @@ function noteInsecureAudioFallback(opus) {
 }
 
 async function startLiveAudioSocket(params) {
-  await ensureLiveAudioContext();
-  const opus = await supportsWebCodecsOpusAudio();
-  noteInsecureAudioFallback(opus);
+  cancelLiveAudioReconnect();
+  return await openLiveAudioSocket(params);
+}
+
+async function openLiveAudioSocket(params, options = {}) {
+  if (options.reconnecting) {
+    // Nothing here may wait: a phone can hold back resuming audio until the next tap,
+    // and the codec this browser supports has not changed since listening started.
+    if (liveAudioContext && liveAudioContext.state === "suspended") liveAudioContext.resume().catch(() => {});
+  } else {
+    await ensureLiveAudioContext();
+    const opus = await supportsWebCodecsOpusAudio();
+    noteInsecureAudioFallback(opus);
+    liveAudioCodec = opus ? "opus" : "pcm";
+  }
   closeLiveAudioSocket();
   liveAudioMode = params.mode;
-  liveAudioCodec = opus ? "opus" : "pcm";
-  liveAudioPacketCount = 0;
+  // A reconnect continues the same listening session, so its count of audio
+  // received carries on; the checks that listening is still getting audio compare
+  // it with what they saw before the connection was lost.
+  if (!options.reconnecting) liveAudioPacketCount = 0;
   liveAudioDroppedLateFrames = 0;
   liveAudioCatchingUp = false;
   liveAudioRanOutCount = 0;
@@ -15367,23 +15578,38 @@ async function startLiveAudioSocket(params) {
   const socket = new WebSocket(liveAudioUrl({...params, codec: liveAudioCodec}));
   socket.binaryType = "arraybuffer";
   liveAudioSocket = socket;
+  liveAudioSocketParams = params;
   return await new Promise((resolve, reject) => {
     let opened = false;
+    // Connecting while a phone is between networks can hang for minutes; give up
+    // on this attempt so the next one can go out over the new network.
+    const connectTimer = setTimeout(() => {
+      if (opened) return;
+      try {
+        socket.close();
+      } catch (error) {
+        console.debug("live audio socket close failed", error);
+      }
+      if (liveAudioSocket === socket) liveAudioSocket = null;
+      reject(new Error("Live audio connection timed out."));
+    }, options.reconnecting ? LIVE_AUDIO_RECONNECT_CONNECT_TIMEOUT_MS : LIVE_AUDIO_CONNECT_TIMEOUT_MS);
     socket.addEventListener("open", () => {
+      clearTimeout(connectTimer);
       opened = true;
+      liveAudioLastMessageAt = performance.now();
+      startLiveAudioWatchdog();
       resolve(socket);
     });
     socket.addEventListener("message", event => {
+      if (socket === liveAudioSocket) liveAudioLastMessageAt = performance.now();
       handleLiveAudioMessage(event).catch(error => {
         logClientEvent("warning", "live-audio", "live audio message failed", {error: error.message});
       });
     });
     socket.addEventListener("close", () => {
-      if (liveAudioSocket === socket) {
-        if (liveAudioMode === "monitor") scheduleMonitorUnstableStop("live audio WebSocket closed");
-        if (liveAudioMode === "receiver") scheduleReceiverUnstableStop("live audio WebSocket closed");
-      }
-      if (!opened) reject(new Error("Live audio connection failed."));
+      clearTimeout(connectTimer);
+      if (opened) liveAudioConnectionLost(socket, "closed");
+      else reject(new Error("Live audio connection failed."));
     });
     socket.addEventListener("error", () => {
       if (!opened) reject(new Error("Live audio connection failed."));
@@ -15424,6 +15650,7 @@ function resetLiveAudioElement() {
 }
 
 function clearLocalStreamMonitor() {
+  if (liveAudioSocketParams && liveAudioSocketParams.mode === "monitor") cancelLiveAudioReconnect();
   const peer = monitorPeerConnection;
   monitorPeerConnection = null;
   monitorStreamId = "";
@@ -15867,11 +16094,7 @@ async function startWeatherReceiver() {
   await stopStreamMonitor({notifyServer: true});
   if (supportsWebSocketLiveAudio()) {
     const channel = currentReceiverChannel();
-    const socket = await startLiveAudioSocket({
-      mode: "receiver",
-      client_id: pageReceiverClientId(),
-      frequency_hz: channel.frequency_hz
-    });
+    const socket = await startLiveAudioSocket(currentListeningParams("receiver"));
     receiverPeerConnection = liveAudioSocketPeer("receiver", socket);
     receiverRemoteStream = {transport: "websocket"};
     receiverPlaying = true;
@@ -15911,6 +16134,7 @@ async function stopWeatherReceiver(options = {}) {
     renderReceiverControls();
     return;
   }
+  if (liveAudioSocketParams && liveAudioSocketParams.mode === "receiver") cancelLiveAudioReconnect();
   receiverPeerConnection = null;
   receiverRemoteStream = null;
   receiverPaused = false;
@@ -24387,6 +24611,8 @@ async function refresh() {
 // The server says when SDR settings change, here or on a remote SDR's host or
 // another machine using it, so they show at once instead of at the next status check.
 const SETTINGS_EVENTS_RETRY_MIN_MS = 1000;
+// The server closes with this code when it shuts down.
+const SERVER_SHUTDOWN_CLOSE_CODE = 1012;
 const SETTINGS_EVENTS_RETRY_MAX_MS = 30000;
 let settingsEventsSocket = null;
 let settingsEventsRetryMs = SETTINGS_EVENTS_RETRY_MIN_MS;
@@ -24422,8 +24648,12 @@ function startSettingsEvents() {
     }
     if (message.type === "settings_changed") refreshForSettingsChange();
   });
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", event => {
     if (settingsEventsSocket === socket) settingsEventsSocket = null;
+    if (event.code === SERVER_SHUTDOWN_CLOSE_CODE) {
+      enterServerUnavailable("shutdown");
+      return;
+    }
     scheduleSettingsEventsRetry();
   });
 }
@@ -24453,18 +24683,27 @@ async function refreshForSettingsChange() {
 }
 
 const RESUME_LISTENING_STORAGE_KEY = "nwr-stream-manager:resume-listening";
-// Status is checked every second; two misses in a row means the server is gone, not a blip.
-const SERVER_FAILURES_BEFORE_UNAVAILABLE = 2;
+// A server that is shutting down says so, and the page reacts at once. Otherwise it
+// takes this long without reaching it, so a device switching between Wi-Fi and
+// cellular rides it out instead of being told the server may be restarting.
+const SERVER_UNREACHABLE_GRACE_MS = 20000;
 const SERVER_RETURN_CHECK_MS = 1000;
 let serverUnavailable = false;
 let serverFailureCount = 0;
+let serverUnreachableSince = 0;
 let serverReturnTimer = null;
 
 function noteServerRequestFailure(error) {
   // fetch() rejects with a TypeError when it can't reach the server at all.
   if (!(error instanceof TypeError)) return;
+  // Audio still arriving means the server is there.
+  if (liveAudioConnectionHealthy()) {
+    serverFailureCount = 0;
+    return;
+  }
   serverFailureCount += 1;
-  if (serverFailureCount >= SERVER_FAILURES_BEFORE_UNAVAILABLE) enterServerUnavailable("unreachable");
+  if (serverFailureCount === 1) serverUnreachableSince = Date.now();
+  if (Date.now() - serverUnreachableSince >= SERVER_UNREACHABLE_GRACE_MS) enterServerUnavailable("unreachable");
 }
 
 function serverUnavailableModalTargets() {
@@ -24622,6 +24861,7 @@ async function resumeListening() {
   offerResumeListening();
   setInterval(refresh, 1000);
   startSettingsEvents();
+  window.addEventListener("online", retryLiveAudioReconnectNow);
   setInterval(async () => {
     try {
       const status = await request(statusRequestPath());

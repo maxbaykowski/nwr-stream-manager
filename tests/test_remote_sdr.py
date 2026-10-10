@@ -1418,6 +1418,109 @@ class RemoteSdrServiceTests(unittest.TestCase):
         self.assertEqual(opcode, 0x8)
         self.assertEqual(struct.unpack("!H", payload[:2])[0], 1012)
 
+    def live_audio_server(self, service):
+        import threading
+
+        wc = self.wc
+        service.accounts.create_admin("tester", "password123", "password123")
+        handler = type("LiveAudioTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return server
+
+    def listen(self, server, query: str):
+        """Connect the way a page does; returns a function giving each next message."""
+        import base64
+        import os
+        import socket
+        import struct
+
+        sock = socket.create_connection(server.server_address, timeout=5.0)
+        self.addCleanup(sock.close)
+        sock.sendall((
+            f"GET /api/live-audio?{query} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{server.server_address[1]}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+            f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}\r\n"
+            f"Authorization: Basic {base64.b64encode(b'tester:password123').decode()}\r\n\r\n"
+        ).encode())
+        reader = sock.makefile("rb")
+        self.assertIn(b" 101 ", reader.readline())
+        while reader.readline() not in (b"\r\n", b""):
+            pass
+
+        def next_message():
+            header = reader.read(2)
+            if len(header) < 2:
+                return None
+            opcode, length = header
+            length &= 0x7F
+            if length == 126:
+                length = struct.unpack("!H", reader.read(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", reader.read(8))[0]
+            return opcode & 0x0F, reader.read(length)
+
+        return sock, next_message
+
+    def test_a_page_that_reconnects_keeps_listening(self) -> None:
+        # A phone switching from Wi-Fi to cellular comes back on a new connection
+        # before the server has finished with the old one.
+        service = self.service("web", development=True)
+        self.synthetic_source(service)
+        service.update({"serial": "00000001"})
+        server = self.live_audio_server(service)
+        query = "mode=receiver&client_id=phone&frequency_hz=162550000&codec=pcm"
+
+        def audio_keeps_coming(next_message, seconds: float) -> int:
+            frames = 0
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                message = next_message()
+                self.assertIsNotNone(message, "the connection was closed")
+                if message[0] == 0x2:
+                    frames += 1
+            return frames
+
+        old_sock, old_next = self.listen(server, query)
+        self.assertGreater(audio_keeps_coming(old_next, 1.0), 10)
+        _new_sock, new_next = self.listen(server, query)
+        old_sock.close()
+        self.assertGreater(audio_keeps_coming(new_next, 3.0), 100)
+        self.assertIn("phone", service.receiver_workers)
+
+    def test_a_quiet_connection_still_hears_from_the_server(self) -> None:
+        import socket
+
+        service = self.service("web")
+        server = self.live_audio_server(service)
+        # No SDR: the receiver has no audio to send.
+        service._current_iq_source = lambda: object()
+        service._channel_feed = lambda frequency_hz, name: self.wc.NullIqFanout()
+        sock, next_message = self.listen(server, "mode=receiver&client_id=phone&frequency_hz=162550000&codec=pcm")
+        sock.settimeout(self.wc.LIVE_AUDIO_KEEPALIVE_SECONDS + 1.0)
+        seen = []
+        deadline = time.monotonic() + 3.5
+        while time.monotonic() < deadline:
+            try:
+                message = next_message()
+            except socket.timeout:
+                self.fail(f"nothing arrived for over {self.wc.LIVE_AUDIO_KEEPALIVE_SECONDS + 1.0} s; saw {seen}")
+            seen.append(message[1])
+        self.assertIn(b'{"type":"source_no_audio"}', seen)
+        self.assertGreaterEqual(seen.count(b'{"type":"keepalive"}'), 2)
+
+    def test_connections_to_vanished_devices_are_dropped(self) -> None:
+        import socket
+
+        options = {}
+        connection = types.SimpleNamespace(setsockopt=lambda level, option, value: options.__setitem__((level, option), value))
+        self.wc.LiveAudioWebSocketWriter(types.SimpleNamespace(connection=connection))._configure_socket()
+        if not hasattr(socket, "TCP_USER_TIMEOUT"):
+            self.skipTest("this system cannot limit unacknowledged data")
+        self.assertEqual(options[(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT)], 10_000)
+
     def test_remote_sdr_endpoints_are_reachable_over_http(self) -> None:
         import json
         import threading

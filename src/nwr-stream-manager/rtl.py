@@ -23,8 +23,11 @@ NWR_CENTER_FREQUENCY_HZ = 162_475_000
 DEFAULT_RTL_SAMPLE_RATE = 1_536_000
 DEFAULT_READ_CHUNK_BYTES = 131_072
 DEFAULT_READ_TIMEOUT_SECONDS = 5.0
-RTL_ASYNC_BUFFER_COUNT = 15
-RTL_ASYNC_BUFFER_SECONDS = 0.10
+# Each read waits for a whole buffer, so its length is added to everything heard
+# live. The buffers together still hold 1.5 s, so a brief stall loses nothing.
+RTL_ASYNC_BUFFER_SECONDS = 0.04
+RTL_ASYNC_BUFFER_COUNT = round(1.5 / RTL_ASYNC_BUFFER_SECONDS)
+RTL_OUTPUT_QUEUE_SECONDS = 3.2
 USBDEVFS_RESET = ord("U") << (4 * 2) | 20
 RTL_SAMPLE_RATE_RANGES = (
     (225_001, 300_000),
@@ -444,7 +447,7 @@ class RtlCaptureSource:
         self.sdr: RtlSdrDevice | None = None
         self.sdr_lock = threading.Lock()
         self.output_queue: queue.Queue[RtlSampleBatch | Exception | None] = queue.Queue(
-            maxsize=32
+            maxsize=round(RTL_OUTPUT_QUEUE_SECONDS / RTL_ASYNC_BUFFER_SECONDS)
         )
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None

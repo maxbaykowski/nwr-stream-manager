@@ -18,9 +18,11 @@ from .encoder import EncoderError, PcmResampler
 LOG = logging.getLogger(__name__)
 
 WEBRTC_OPUS_SAMPLE_RATE = 48_000
+# Rates libopus encodes directly; audio at any other rate is resampled to 48 kHz first.
+# Resampling holds audio back and breaks the 20 ms frames apart, delaying what is heard.
+OPUS_NATIVE_SAMPLE_RATES = (8_000, 12_000, 16_000, 24_000, 48_000)
 WEBRTC_OPUS_CHANNELS = 1
 WEBRTC_FRAME_SECONDS = 0.02
-WEBRTC_OPUS_FRAME_SAMPLES = round(WEBRTC_OPUS_SAMPLE_RATE * WEBRTC_FRAME_SECONDS)
 WEBRTC_MAX_OPUS_PACKET_BYTES = 4_000
 WEBRTC_TARGET_BITRATE_KBPS = 128
 WEBRTC_MIN_BITRATE_KBPS = 32
@@ -223,7 +225,11 @@ class OpusEncoder:
         self.opus = _load_opus_module()
         self.input_sample_rate = input_sample_rate
         self.minimum_bitrate_kbps = max(1, int(minimum_bitrate_kbps))
-        self.resampler = PcmResampler(input_sample_rate, WEBRTC_OPUS_SAMPLE_RATE)
+        self.encode_sample_rate = (
+            int(input_sample_rate) if int(input_sample_rate) in OPUS_NATIVE_SAMPLE_RATES else WEBRTC_OPUS_SAMPLE_RATE
+        )
+        self.frame_samples = round(self.encode_sample_rate * WEBRTC_FRAME_SECONDS)
+        self.resampler = PcmResampler(input_sample_rate, self.encode_sample_rate)
         self.closed = False
         self._pending_samples = np.array([], dtype=np.int16)
         self._configure_ctypes()
@@ -262,7 +268,7 @@ class OpusEncoder:
     def _create_encoder(self):
         error = ctypes.c_int()
         encoder = self.opus.opus_encoder_create(
-            WEBRTC_OPUS_SAMPLE_RATE,
+            self.encode_sample_rate,
             WEBRTC_OPUS_CHANNELS,
             self.opus.OPUS_APPLICATION_AUDIO,
             ctypes.byref(error),
@@ -289,7 +295,7 @@ class OpusEncoder:
         if len(self._pending_samples):
             samples = np.concatenate((self._pending_samples, samples))
         packets: list[bytes] = []
-        frame_samples = WEBRTC_OPUS_FRAME_SAMPLES
+        frame_samples = self.frame_samples
         for offset in range(0, len(samples) - frame_samples + 1, frame_samples):
             frame = np.ascontiguousarray(samples[offset : offset + frame_samples])
             packets.append(self._encode_frame(frame))
@@ -309,7 +315,7 @@ class OpusEncoder:
         result = self.opus.opus_encode(
             self._encoder,
             pointer,
-            WEBRTC_OPUS_FRAME_SAMPLES,
+            self.frame_samples,
             output,
             WEBRTC_MAX_OPUS_PACKET_BYTES,
         )

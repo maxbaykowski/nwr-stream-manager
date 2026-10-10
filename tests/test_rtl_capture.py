@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
 import types
 import unittest
@@ -31,12 +32,19 @@ class RtlCaptureTests(unittest.TestCase):
         self.assertLess(buffer_size, config.read_chunk_bytes)
         self.assertLessEqual(buffer_size, 49_152)
 
-    def test_async_buffer_size_is_about_one_hundred_milliseconds_at_default_sample_rate(self) -> None:
+    def test_each_read_waits_for_only_40_milliseconds_at_default_sample_rate(self) -> None:
         config = self.rtl.RtlConfig(serial="dummy")
         buffer_size = self.rtl.RtlCaptureSource._rtl_async_buffer_size(config)
         self.assertEqual(buffer_size % 512, 0)
-        self.assertGreaterEqual(buffer_size, 306_000)
-        self.assertLessEqual(buffer_size, 308_000)
+        self.assertAlmostEqual(buffer_size / (2 * config.sample_rate), 0.04, delta=0.001)
+
+    def test_smaller_reads_do_not_shorten_how_long_a_stall_is_ridden_out(self) -> None:
+        config = self.rtl.RtlConfig(serial="dummy")
+        buffer_seconds = self.rtl.RtlCaptureSource._rtl_async_buffer_size(config) / (2 * config.sample_rate)
+        # Held by the SDR's USB buffers, then waiting to be processed, as before.
+        self.assertGreaterEqual(self.rtl.RTL_ASYNC_BUFFER_COUNT * buffer_seconds, 1.5 - 0.01)
+        source = self.rtl.RtlCaptureSource(config)
+        self.assertGreaterEqual(source.output_queue.maxsize * buffer_seconds, 3.2 - 0.01)
 
     def test_async_buffer_size_scales_up_at_high_sample_rates(self) -> None:
         low_config = self.rtl.RtlConfig(serial="dummy", sample_rate=240_040)
@@ -161,3 +169,38 @@ class RtlCaptureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SdrQueuesHoldTheSameTimeTests(unittest.TestCase):
+    """Smaller reads mean more, shorter pieces; each queue must still hold as much audio as before."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.rtl = load_rtl_module()
+        spec = importlib.util.spec_from_file_location("nwr_stream_manager.web_control", PACKAGE_PATH / "web_control.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["nwr_stream_manager.web_control"] = module
+        spec.loader.exec_module(module)
+        cls.web = module
+
+    def queue_seconds(self, seconds: float) -> float:
+        source = self.rtl.RtlCaptureSource(self.rtl.RtlConfig(serial="dummy"))
+        fanout = self.web.RawRtlFanout(source)
+        chunk_seconds = source._rtl_async_buffer_size(source.config) / (2 * source.config.sample_rate)
+        return fanout.subscribe(max_seconds=seconds).maxsize * chunk_seconds
+
+    def test_queues_asked_for_a_length_of_time_get_it(self) -> None:
+        for seconds in (
+            self.web.LIVE_IQ_QUEUE_SECONDS,
+            self.web.STREAM_WORKER_RAW_QUEUE_SECONDS,
+            self.web.REMOTE_HOST_CHANNEL_QUEUE_SECONDS,
+            self.web.REMOTE_HOST_WIDEBAND_QUEUE_SECONDS,
+        ):
+            with self.subTest(seconds=seconds):
+                self.assertGreaterEqual(self.queue_seconds(seconds), seconds - 0.05)
+
+    def test_short_queues_still_hold_a_fifth_of_a_second(self) -> None:
+        chunk_seconds = self.rtl.RTL_ASYNC_BUFFER_SECONDS
+        self.assertAlmostEqual(self.web.INTERMEDIATE_SOURCE_QUEUE_CHUNKS * chunk_seconds, 0.2, delta=0.01)
+        self.assertAlmostEqual(self.web.IQ_RECORDER_QUEUE_CHUNKS * chunk_seconds, 0.2, delta=0.01)
