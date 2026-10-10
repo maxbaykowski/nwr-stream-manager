@@ -21706,8 +21706,11 @@ function remoteSdrStatusText(remote, devices) {
   if (!status.reachable && (status.connecting || !status.host_id)) return `Connecting to ${name}...`;
   if (!status.reachable) return `${name} is not reachable. Check that it is running and sharing its RTL-SDR.`;
   const sdr = status.sdr || {};
-  if (sdr.problem === "disconnected") return `Connected to ${name}, but its RTL-SDR is not connected.`;
-  if (sdr.problem) return `Connected to ${name}, but its RTL-SDR needs attention.`;
+  // A reset briefly takes the RTL-SDR off USB; the reset message says how it is going,
+  // as it does for an RTL-SDR on this machine.
+  const problem = sdr.reset && sdr.reset.state === "resetting" ? null : sdr.problem;
+  if (problem === "disconnected") return `Connected to ${name}, but its RTL-SDR is not connected.`;
+  if (problem) return `Connected to ${name}, but its RTL-SDR needs attention.`;
   return `Connected to ${name}. Using ${sdr.device_name || "its RTL-SDR"}.`;
 }
 
@@ -24626,6 +24629,9 @@ async function resumeListening() {
         setText("device-errors", "");
         return;
       }
+      // A reset briefly takes the RTL-SDR off USB; the reset message says how it is
+      // going, as it does for a remote SDR. The list is checked again once it ends.
+      if (sdrResetRequestPending || sdrResetInProgress) return;
       await loadDevices(status.settings.serial);
     } catch (error) {
       setText("device-errors", error.message);

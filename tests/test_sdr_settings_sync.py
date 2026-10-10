@@ -478,5 +478,59 @@ class SettingsEventsPageTests(unittest.TestCase):
         self.assertEqual(result["sockets"], 8)  # one at a time, never two
 
 
+
+class SdrLooksTheSameDuringResetTests(unittest.TestCase):
+    """A reset looks the same whether the RTL-SDR is on this machine or shared by another."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.node = shutil.which("node")
+        if cls.node is None:
+            raise unittest.SkipTest("node is not installed")
+        cls.page = load_web_control_module().INDEX_HTML
+
+    def remote_status_line(self, sdr: dict) -> str:
+        import json
+
+        start = self.page.index("function remoteSdrStatusText(")
+        code = self.page[start : self.page.index("\n}\n", start) + 2]
+        script = (
+            "function remoteSdrUsesRemote() { return true; }\n"
+            "function remoteDeviceName(device) { return device.name; }\n"
+            + code
+            + "const remote = {device_id: 'h', status: {host_name: 'weather-pi', host_id: 'h', reachable: true, sdr: "
+            + json.dumps(sdr)
+            + "}};\nconsole.log(remoteSdrStatusText(remote, [{id: 'h', name: 'weather-pi'}]));\n"
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "line.js"
+            path.write_text(script, encoding="utf-8")
+            result = subprocess.run([self.node, str(path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_the_remote_sdr_is_not_called_disconnected_while_it_resets(self) -> None:
+        resetting = {"id": 1, "state": "resetting", "message": "Resetting RTL-SDR..."}
+        for problem in ("disconnected", "no-data"):
+            with self.subTest(problem=problem):
+                self.assertEqual(
+                    self.remote_status_line({"device_name": "RTL-SDR Blog V4", "problem": problem, "reset": resetting}),
+                    "Connected to weather-pi. Using RTL-SDR Blog V4.",
+                )
+
+    def test_a_remote_sdr_still_missing_after_its_reset_is_reported(self) -> None:
+        failed = {"id": 1, "state": "failed", "message": "RTL-SDR serial 00000001 ... did not reappear."}
+        self.assertEqual(
+            self.remote_status_line({"device_name": "RTL-SDR Blog V4", "problem": "disconnected", "reset": failed}),
+            "Connected to weather-pi, but its RTL-SDR is not connected.",
+        )
+
+    def test_the_local_device_list_is_not_checked_while_the_sdr_resets(self) -> None:
+        # Otherwise it would briefly list the RTL-SDR as not connected.
+        start = self.page.rindex("await loadDevices(status.settings.serial);")
+        poll = self.page[self.page.rindex("setInterval(async () => {", 0, start) : start]
+        self.assertIn("if (sdrResetRequestPending || sdrResetInProgress) return;", poll)
+
+
 if __name__ == "__main__":
     unittest.main()
