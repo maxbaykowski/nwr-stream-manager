@@ -989,6 +989,9 @@ class RemoteSdrHostBackend(Protocol):
 
     def update_settings(self, changes: dict[str, Any]) -> dict[str, Any]: ...
 
+    # Optional: hosts without it tell clients the request is unknown.
+    def reset_sdr(self) -> dict[str, Any]: ...
+
     def open_channel(self, frequency_hz: int, name: str) -> Any: ...
 
     def open_wideband(self, sample_rate: int, name: str) -> Any: ...
@@ -1028,6 +1031,15 @@ class RemoteSdrServer:
         self.pairing_ended_reason = ""
         self.connections: dict[int, dict[str, Any]] = {}
         self._connection_ids = 0
+        # One per control connection; set to send that client a status at once.
+        self._status_wakeups: set[threading.Event] = set()
+
+    def notify_status_changed(self) -> None:
+        """Send every connected client a fresh status now, not at the next interval."""
+        with self.lock:
+            wakeups = list(self._status_wakeups)
+        for wakeup in wakeups:
+            wakeup.set()
 
     # -- lifecycle --------------------------------------------------------
 
@@ -1058,6 +1070,7 @@ class RemoteSdrServer:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.notify_status_changed()
         if self.discovery is not None:
             self.discovery.stop()
             self.discovery = None
@@ -1309,6 +1322,7 @@ class RemoteSdrServer:
             {"type": "welcome", "host": {"id": self.identity.fingerprint, "name": self.identity.name}}
         )
         done = threading.Event()
+        wakeup = threading.Event()
 
         def reader() -> None:
             try:
@@ -1322,6 +1336,9 @@ class RemoteSdrServer:
                         if action == "update_settings":
                             changes = message.get("changes") if isinstance(message.get("changes"), dict) else {}
                             status = self.backend.update_settings(changes)
+                        elif action == "reset_sdr" and hasattr(self.backend, "reset_sdr"):
+                            # Answers once the reset has started; how it ends comes in the status.
+                            status = self.backend.reset_sdr()
                         elif action == "status":
                             status = self.backend.status()
                         else:
@@ -1333,11 +1350,21 @@ class RemoteSdrServer:
                 pass
             finally:
                 done.set()
+                wakeup.set()
 
         threading.Thread(target=reader, name="remote-sdr-control-reader", daemon=True).start()
-        while not done.is_set() and not self.stop_event.is_set():
-            connection.send_json({"type": "status", "status": self.backend.status()})
-            done.wait(CONTROL_STATUS_INTERVAL_SECONDS)
+        with self.lock:
+            self._status_wakeups.add(wakeup)
+        try:
+            while not done.is_set() and not self.stop_event.is_set():
+                # Cleared before the status is taken, so a change made while
+                # it is being sent still wakes the next one.
+                wakeup.clear()
+                connection.send_json({"type": "status", "status": self.backend.status()})
+                wakeup.wait(CONTROL_STATUS_INTERVAL_SECONDS)
+        finally:
+            with self.lock:
+                self._status_wakeups.discard(wakeup)
 
     def _stream_iq(self, connection: FrameConnection, source: Any, *, retunable: bool) -> None:
         connection.send_json({"type": "welcome", "host": {"id": self.identity.fingerprint, "name": self.identity.name}})
@@ -1588,6 +1615,14 @@ class RemoteSdrClient:
 
     def update_settings(self, changes: dict[str, Any], timeout: float = CONTROL_REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
         status = self._request("update_settings", timeout=timeout, changes=changes)
+        with self.lock:
+            if self._accept_host_status_locked(status):
+                self.last_status_at = time.time()
+        return status
+
+    def reset_sdr(self, timeout: float = CONTROL_REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
+        """Ask the host to reset its SDR; the reply comes as soon as the reset starts."""
+        status = self._request("reset_sdr", timeout=timeout)
         with self.lock:
             if self._accept_host_status_locked(status):
                 self.last_status_at = time.time()

@@ -325,6 +325,14 @@ LIVE_AUDIO_CODEC_OPUS = 1
 LIVE_AUDIO_CODEC_PCM_S16LE = 2
 RTL_RESET_COMMAND_TIMEOUT_SECONDS = 5.0
 RTL_RESET_REAPPEAR_TIMEOUT_SECONDS = 10.0
+# Longest a reset can take: releasing the reader, the reset command, then waiting to reappear.
+RTL_RESET_TOTAL_SECONDS = 2.0 + RTL_RESET_COMMAND_TIMEOUT_SECONDS + 1.0 + RTL_RESET_REAPPEAR_TIMEOUT_SECONDS
+# How long every page keeps showing how the last SDR reset ended.
+RTL_RESET_RESULT_SHOW_SECONDS = 60.0
+RTL_RESET_STARTED_MESSAGE = "Resetting RTL-SDR..."
+REMOTE_SDR_RESET_UNSUPPORTED_MESSAGE = (
+    "The NWR Stream Manager sharing this SDR needs to be updated before its SDR can be reset from here."
+)
 STREAM_WORKER_RAW_QUEUE_SECONDS = 1.50
 STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS = 8
 STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 96
@@ -410,6 +418,8 @@ STREAM_TEST_MODE_TIME_LIMIT_REASON = "time limit reached"
 # WebSocket close code 1012 means the server is restarting; browsers treat it as a clean close.
 LIVE_AUDIO_SHUTDOWN_CLOSE_CODE = 1012
 LIVE_AUDIO_SHUTDOWN_NOTICE_SECONDS = 0.5
+# A browser that went away without closing is noticed the next time one of these is sent.
+SETTINGS_EVENTS_KEEPALIVE_SECONDS = 20.0
 STREAM_TEST_MODE_DEVIATION_HZ = 5_000.0
 STREAM_TEST_MODE_NOISE_DBFS = -68.0
 STREAM_TEST_MODE_MIN_SIGNAL_DBFS = -80.0
@@ -2213,6 +2223,10 @@ class LocalSdrRemoteBackend:
         allowed = {key: changes[key] for key in REMOTE_SDR_HOST_SETTINGS if key in changes}
         if allowed:
             self.service.update(allowed)
+        return self.service.remote_host_status()
+
+    def reset_sdr(self) -> dict[str, Any]:
+        self.service.start_sdr_reset_for_remote_client()
         return self.service.remote_host_status()
 
     def open_channel(self, frequency_hz: int, name: str) -> HostChannelSource:
@@ -5279,6 +5293,10 @@ class RtlControlService:
         # Numbers each status sent to remote clients, so they can tell one
         # taken before a settings change from one taken after it.
         self.remote_host_status_seq = 0
+        # Browsers wait on this to hear about SDR settings changes as they happen.
+        self.settings_change_condition = threading.Condition()
+        self.settings_change_count = 0
+        self.last_remote_host_settings: dict[str, Any] | None = None
         self.streams = load_streams(self.streams_directory, self.streams_state_path)
         self.fallback_settings = load_fallback_settings(self.fallback_state_path)
         self.notification_settings = load_notification_settings(self.notification_state_path)
@@ -5329,6 +5347,9 @@ class RtlControlService:
         self.soundcard_manager = SharedSoundcardOutputManager(devices_provider=self._cached_soundcards)
         self.icecast_auth_cache: dict[str, float] = {}
         self.reset_lock = threading.Lock()
+        # The latest SDR reset, shown on every page here and on remote clients.
+        self.sdr_reset: dict[str, Any] | None = None
+        self.sdr_reset_count = 0
         self.capture_error: str | None = None
         self.last_batch_at: float | None = None
         self.received_chunks = 0
@@ -5435,6 +5456,8 @@ class RtlControlService:
     def begin_shutdown(self) -> None:
         """Tell connected browsers the server is going away, before anything is stopped."""
         self.shutting_down.set()
+        with self.settings_change_condition:
+            self.settings_change_condition.notify_all()
 
     def _wait_for_live_audio_notices(self) -> None:
         deadline = time.monotonic() + LIVE_AUDIO_SHUTDOWN_NOTICE_SECONDS
@@ -5597,6 +5620,7 @@ class RtlControlService:
         self._cleanup_expired_soundcard_previews()
         with self.lock:
             self._cleanup_expired_stream_test_mode_locked(time.time())
+            sdr_reset = self._sdr_reset_status_locked()
             capture = self.capture
             settings = self._effective_settings_locked()
             active = capture is not None
@@ -5653,6 +5677,8 @@ class RtlControlService:
                     "sample_rate": remote_sdr.get("sample_rate", settings.sample_rate),
                     "center_frequency_hz": remote_sdr.get("center_frequency_hz", NWR_CENTER_FREQUENCY_HZ),
                 }
+                # A reset of the host's SDR, started there or from any machine using it.
+                sdr_reset = remote_sdr.get("reset") if remote_status.get("reachable") else None
                 if remote_status.get("reachable"):
                     capture_error = remote_sdr.get("capture_error") or None
                 elif self.remote_client is None or remote_status.get("connecting"):
@@ -5666,6 +5692,7 @@ class RtlControlService:
                 "source": source_payload,
                 "remote_sdr": {} if read_only else self._remote_sdr_status_locked(),
                 "capture_error": capture_error,
+                "sdr_reset": sdr_reset,
                 "capture_stats": capture_stats,
                 "raw_fanout_stats": fanout_stats,
                 "clean_fanout_stats": clean_stats,
@@ -5957,21 +5984,137 @@ class RtlControlService:
         }
 
     def reset_rtl_device(self, serial: str) -> dict[str, Any]:
+        with self.lock:
+            uses_remote_sdr = self.settings.uses_remote_sdr
+        if uses_remote_sdr:
+            return self._reset_remote_sdr()
+        serial = str(serial or "").strip()
+        if not serial:
+            raise ValueError("Select an RTL-SDR to reset.")
         if not self.reset_lock.acquire(blocking=False):
             raise ValueError("A USB device reset is already in progress.")
         try:
-            return self._reset_rtl_device(serial)
+            self._begin_sdr_reset(serial)
+            return self._perform_sdr_reset(serial)
         finally:
             self.reset_lock.release()
 
+    def start_sdr_reset_for_remote_client(self) -> None:
+        """Reset this machine's SDR for a remote client, without waiting for it to finish.
+
+        The client learns how it went from this machine's status, as every page here does.
+        """
+        with self.lock:
+            serial = "" if self.settings.uses_remote_sdr else str(self.settings.serial or "")
+        if not serial:
+            raise ValueError("Select an RTL-SDR to reset.")
+        if not self.reset_lock.acquire(blocking=False):
+            raise ValueError("A USB device reset is already in progress.")
+        try:
+            self._begin_sdr_reset(serial)
+        except BaseException:
+            self.reset_lock.release()
+            raise
+
+        def run() -> None:
+            try:
+                self._perform_sdr_reset(serial)
+            except Exception as exc:
+                LOG.warning("RTL-SDR reset for a remote client failed: %s", exc)
+            finally:
+                self.reset_lock.release()
+
+        threading.Thread(target=run, name=f"rtl-remote-reset-{serial}", daemon=True).start()
+
+    def _begin_sdr_reset(self, serial: str) -> None:
+        with self.lock:
+            self.sdr_reset_count += 1
+            self.sdr_reset = {
+                "id": self.sdr_reset_count,
+                "state": "resetting",
+                "message": RTL_RESET_STARTED_MESSAGE,
+                "serial": serial,
+                "finished_at": None,
+            }
+        self.announce_settings_changed()
+
+    def _finish_sdr_reset(self, succeeded: bool, message: str) -> None:
+        with self.lock:
+            if self.sdr_reset is not None:
+                self.sdr_reset.update(
+                    state="finished" if succeeded else "failed",
+                    message=message,
+                    finished_at=time.monotonic(),
+                )
+        self.announce_settings_changed()
+
+    def _perform_sdr_reset(self, serial: str) -> dict[str, Any]:
+        try:
+            result = self._reset_rtl_device(serial)
+        except Exception as exc:
+            self._finish_sdr_reset(False, str(exc))
+            raise
+        # An SDR that did not come back is not available, so the reset did not work.
+        self._finish_sdr_reset(bool(result.get("success") and result.get("reappeared")), str(result.get("message") or ""))
+        result["status"] = self.status()
+        return result
+
+    def _sdr_reset_status_locked(self) -> dict[str, Any] | None:
+        reset = self.sdr_reset
+        if reset is None:
+            return None
+        finished_at = reset.get("finished_at")
+        if finished_at is not None and time.monotonic() - finished_at > RTL_RESET_RESULT_SHOW_SECONDS:
+            return None
+        return {"id": reset["id"], "state": reset["state"], "message": reset["message"]}
+
+    def _reset_remote_sdr(self) -> dict[str, Any]:
+        """Ask the remote host to reset its SDR, then wait for it to say how that went."""
+        with self.lock:
+            client = self.remote_client
+        if client is None or not client.status().get("reachable"):
+            raise ValueError("The remote SDR is not reachable.")
+        try:
+            host_status = client.reset_sdr()
+        except RemoteSdrError as exc:
+            raise ValueError(str(exc)) from exc
+        except ValueError as exc:
+            if "unknown request" in str(exc):
+                raise ValueError(REMOTE_SDR_RESET_UNSUPPORTED_MESSAGE) from exc
+            raise
+        reset_id = (host_status.get("reset") or {}).get("id")
+        self.announce_settings_changed()
+        deadline = time.monotonic() + RTL_RESET_TOTAL_SECONDS + 5.0
+        seen = self.settings_change_count
+        while True:
+            remote_status = client.status()
+            reset = (remote_status.get("sdr") or {}).get("reset") or {}
+            if reset.get("id") == reset_id and reset.get("state") in {"finished", "failed"}:
+                return {
+                    "success": reset["state"] == "finished",
+                    "reappeared": reset["state"] == "finished",
+                    "message": reset.get("message") or "",
+                    "status": self.status(),
+                }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not remote_status.get("reachable"):
+                return {
+                    "success": False,
+                    "reappeared": False,
+                    "message": (
+                        "The remote SDR did not say whether its reset finished. "
+                        "Check the RTL-SDR on the NWR Stream Manager sharing it."
+                    ),
+                    "status": self.status(),
+                }
+            seen = self.wait_for_settings_change(seen, min(remaining, 1.0))
+
     def _reset_rtl_device(self, serial: str) -> dict[str, Any]:
-        serial = str(serial or "").strip()
         with self.lock:
             configured_serial = self.settings.serial
             should_restart_capture = bool(configured_serial and configured_serial == serial)
-            capture = self.capture if should_restart_capture else None
-        if not serial:
-            raise ValueError("Select an RTL-SDR to reset.")
+            # Only a dongle's own reader holds it; an I/Q file source has nothing to release.
+            capture = self.capture if should_restart_capture and isinstance(self.capture, RtlCaptureSource) else None
         if capture is not None:
             LOG.info("pausing RTL-SDR reader before USB reset for serial %s", serial)
             capture.restart_reader()
@@ -7060,11 +7203,13 @@ class RtlControlService:
                 device_name = f"RTL-SDR serial {serial}"
             last_batch_at = self.last_batch_at
             capture_error = self.capture_error or ""
+            sdr_reset = self._sdr_reset_status_locked()
             # Taken under the lock that settings changes hold.
             self.remote_host_status_seq += 1
             status_seq = self.remote_host_status_seq
         return {
             "status_seq": status_seq,
+            "reset": sdr_reset,
             "device_name": device_name,
             "serial": serial,
             "connected": problem is None or problem["category"] != "disconnected",
@@ -7820,8 +7965,44 @@ class RtlControlService:
             save_settings(self.state_path, self.settings)
             LOG.info("selected the only connected RTL-SDR: serial=%s", serial)
             self._start_or_update_capture_locked()
+        self.announce_settings_changed()
+
+    def announce_settings_changed(self) -> None:
+        """Tell this machine's browsers, and remote clients of its SDR, that SDR settings changed."""
+        with self.settings_change_condition:
+            self.settings_change_count += 1
+            self.settings_change_condition.notify_all()
+        server = self.remote_server
+        if server is not None:
+            server.notify_status_changed()
+
+    def wait_for_settings_change(self, seen: int, timeout: float) -> int:
+        """Wait until SDR settings change after `seen`, then return the new count."""
+        with self.settings_change_condition:
+            self.settings_change_condition.wait_for(
+                lambda: self.settings_change_count != seen or self.shutting_down.is_set(), timeout
+            )
+            return self.settings_change_count
+
+    def _on_remote_host_status(self, status: dict[str, Any]) -> None:
+        # Someone changed the remote host's SDR, there or on another machine using it.
+        host_settings = status.get("settings") if isinstance(status.get("settings"), dict) else {}
+        current = {key: host_settings.get(key) for key in REMOTE_SDR_HOST_SETTINGS}
+        current["gain_values"] = list(status.get("gain_values") or [])
+        current["reset"] = status.get("reset")
+        with self.settings_change_condition:
+            changed = current != self.last_remote_host_settings
+            self.last_remote_host_settings = current
+        if changed:
+            self.announce_settings_changed()
 
     def update(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._update_settings(payload)
+        finally:
+            self.announce_settings_changed()
+
+    def _update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
         host_changes: dict[str, Any] = {}
         with self.lock:
@@ -8120,6 +8301,7 @@ class RtlControlService:
                 client_id=self.remote_identity.fingerprint,
                 discovery_port=self.remote_sdr_discovery_port,
                 buffer_seconds=settings.remote_buffer_seconds,
+                on_status=self._on_remote_host_status,
             )
             self.remote_client.start()
         # Stopping joins threads that may be waiting on this lock, so do it
@@ -8807,6 +8989,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 "/api/eas-alert",
                 "/api/eas-alert-audio",
                 "/api/live-audio",
+                "/api/settings-events",
                 "/api/monitor/status",
                 "/api/receiver/status",
                 "/api/iq-recorder/status",
@@ -8953,6 +9136,32 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             if detached_receiver is not None:
                 detached_receiver.stop()
 
+    def _handle_settings_events_websocket(self) -> None:
+        """Tell the page each time SDR settings change, so it can show them at once."""
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self._send_json({"error": "WebSocket upgrade is required"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        writer = LiveAudioWebSocketWriter(self)
+        try:
+            seen = self.service.settings_change_count
+            writer.handshake()
+            while not self.service.shutting_down.is_set():
+                count = self.service.wait_for_settings_change(seen, SETTINGS_EVENTS_KEEPALIVE_SECONDS)
+                if self.service.shutting_down.is_set():
+                    break
+                if count != seen:
+                    seen = count
+                    writer.send_json({"type": "settings_changed"})
+                else:
+                    writer.send_json({"type": "keepalive"})
+            writer.send_close(LIVE_AUDIO_SHUTDOWN_CLOSE_CODE, "server restarting")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        except LiveAudioWebSocketError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+            LOG.debug("settings events WebSocket failed for %s: %s", self._client_address(), exc)
+
     def _change_live_audio_connections(self, delta: int) -> None:
         with self.service.lock:
             self.service.live_audio_connections = getattr(self.service, "live_audio_connections", 0) + delta
@@ -9085,6 +9294,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/live-audio":
             self._handle_live_audio_websocket(parsed)
+        elif path == "/api/settings-events":
+            self._handle_settings_events_websocket()
         elif path == "/notification":
             target = notification_next_path(parsed.query)
             account = getattr(self, "current_account", None)
@@ -12916,11 +13127,13 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </label>
         <span id="remote_sdr_device_hint" class="hint">Choose a paired NWR Stream Manager whose RTL-SDR this machine should use.</span>
         <p id="remote_sdr_status"></p>
+        <button id="reset_remote_sdr" type="button">Reset SDR</button>
         <label>Network buffer in seconds
           <input id="remote_buffer_seconds" type="number" min="0.1" max="10" step="0.1" aria-describedby="remote_buffer_seconds_hint">
         </label>
         <span id="remote_buffer_seconds_hint" class="hint">How much radio data to hold back to ride out Wi-Fi congestion and network dropouts. Higher values are more reliable on weak connections but put audio further behind real time; raising it pauses audio while the buffer fills, and lowering it skips ahead. Valid range is 0.1 through 10 seconds. This delay applies to everything using the shared RTL-SDR, including stream monitoring and the weather radio receiver, whose own playback buffering in the browser adds to it.</span>
       </div>
+      <div id="sdr-reset-status" class="message" aria-live="polite"></div>
       <div id="sdr-source-result" class="message" aria-live="polite"></div>
     </section>
     <section>
@@ -14144,6 +14357,11 @@ const SDR_SETTING_FOR_CONTROL = {
   notify_sdr_failures: "notify_sdr_failures"
 };
 const pendingSdrSettingEdits = new Map();
+// A reset can take nearly 20 seconds, and a remote SDR's host adds its round trip.
+const SDR_RESET_REQUEST_TIMEOUT_MS = 30000;
+let sdrResetRequestPending = false;
+let sdrResetInProgress = false;
+let lastSdrResetKey = "";
 let statusRequestCount = 0;
 // Status requests sent before a save finished may carry the old values.
 let sdrControlsStaleThrough = 0;
@@ -21882,6 +22100,7 @@ function applyStatus(data, options = {}) {
     setText("bytes", data.received_bytes);
     setText("last", data.last_batch_at ? `${data.last_batch_at.toFixed(3)}s` : "never");
     setText("capture-error", data.capture_error || "");
+    renderSdrReset(data);
     if (data.remote_sdr && data.remote_sdr.identity) renderRemoteSdr(data);
     renderLogs(data.logs || []);
     renderIqTestSourceStatus(data);
@@ -23171,30 +23390,58 @@ document.getElementById("rescan_devices").addEventListener("click", async () => 
   }
 });
 
-document.getElementById("reset_rtl_device").addEventListener("click", async () => {
-  const button = document.getElementById("reset_rtl_device");
+// Resets the SDR this machine uses: its own, or a remote SDR's, which the host resets.
+async function resetSdr(remote) {
   const serial = document.getElementById("serial").value;
-  if (!serial) {
-    setText("device-errors", "Select an RTL-SDR to reset.");
+  if (!remote && !serial) {
+    setMessage("sdr-reset-status", "Select an RTL-SDR to reset.", "error");
     return;
   }
-  setDisabled(button, true);
-  setText("device-errors", "Resetting RTL-SDR...");
+  sdrResetRequestPending = true;
+  setSdrResetButtonsDisabled(true);
+  setMessage("sdr-reset-status", "Resetting RTL-SDR...");
   try {
     const data = await requestWithTimeout("/api/rtl-reset", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({serial})
-    }, 15000);
-    setText("device-errors", data.message || "RTL-SDR reset finished.");
+      body: JSON.stringify(remote ? {} : {serial})
+    }, SDR_RESET_REQUEST_TIMEOUT_MS);
+    setMessage("sdr-reset-status", data.message || "RTL-SDR reset finished.", data.success && data.reappeared ? "success" : "error");
+    sdrResetRequestPending = false;
     applyStatus(data.status || await request(statusRequestPath()), {syncControls: true});
-    await loadDevices(serial);
+    if (!remote) await loadDevices(serial);
   } catch (error) {
-    setText("device-errors", error.message);
+    setMessage("sdr-reset-status", error.message, "error");
   } finally {
-    setDisabled(button, false);
+    sdrResetRequestPending = false;
+    setSdrResetButtonsDisabled(sdrResetInProgress);
   }
-});
+}
+
+function setSdrResetButtonsDisabled(disabled) {
+  setDisabled(document.getElementById("reset_rtl_device"), disabled);
+  setDisabled(document.getElementById("reset_remote_sdr"), disabled);
+}
+
+// Every page shows a reset as it happens, whoever started it and on whichever
+// machine; the page that started one shows its own result instead.
+function renderSdrReset(data) {
+  const reset = data.sdr_reset || null;
+  sdrResetInProgress = Boolean(reset && reset.state === "resetting");
+  setSdrResetButtonsDisabled(sdrResetInProgress || sdrResetRequestPending);
+  if (sdrResetRequestPending) return;
+  const key = reset ? `${reset.id}:${reset.state}` : "";
+  if (key === lastSdrResetKey) return;
+  lastSdrResetKey = key;
+  if (!reset) {
+    setMessage("sdr-reset-status", "");
+    return;
+  }
+  setMessage("sdr-reset-status", reset.message, reset.state === "finished" ? "success" : reset.state === "failed" ? "error" : "");
+}
+
+document.getElementById("reset_rtl_device").addEventListener("click", () => resetSdr(false));
+document.getElementById("reset_remote_sdr").addEventListener("click", () => resetSdr(true));
 
 document.getElementById("rescan_iq_test_sources").addEventListener("click", async () => {
   const button = document.getElementById("rescan_iq_test_sources");
@@ -24134,6 +24381,74 @@ async function refresh() {
   applyStatus(data, {syncControls: false, requestNumber});
 }
 
+// The server says when SDR settings change, here or on a remote SDR's host or
+// another machine using it, so they show at once instead of at the next status check.
+const SETTINGS_EVENTS_RETRY_MIN_MS = 1000;
+const SETTINGS_EVENTS_RETRY_MAX_MS = 30000;
+let settingsEventsSocket = null;
+let settingsEventsRetryMs = SETTINGS_EVENTS_RETRY_MIN_MS;
+let settingsChangeRefreshRunning = false;
+let settingsChangeRefreshAgain = false;
+
+function settingsEventsUrl() {
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${window.location.host}/api/settings-events`;
+}
+
+function startSettingsEvents() {
+  if (settingsEventsSocket || typeof WebSocket === "undefined") return;
+  let socket;
+  try {
+    socket = new WebSocket(settingsEventsUrl());
+  } catch (error) {
+    scheduleSettingsEventsRetry();
+    return;
+  }
+  settingsEventsSocket = socket;
+  socket.addEventListener("open", () => {
+    settingsEventsRetryMs = SETTINGS_EVENTS_RETRY_MIN_MS;
+    // Anything changed while not connected shows now.
+    refreshForSettingsChange();
+  });
+  socket.addEventListener("message", event => {
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch (error) {
+      return;
+    }
+    if (message.type === "settings_changed") refreshForSettingsChange();
+  });
+  socket.addEventListener("close", () => {
+    if (settingsEventsSocket === socket) settingsEventsSocket = null;
+    scheduleSettingsEventsRetry();
+  });
+}
+
+function scheduleSettingsEventsRetry() {
+  // Status checks every second keep the page current meanwhile.
+  const delay = settingsEventsRetryMs;
+  settingsEventsRetryMs = Math.min(SETTINGS_EVENTS_RETRY_MAX_MS, settingsEventsRetryMs * 2);
+  setTimeout(startSettingsEvents, delay);
+}
+
+async function refreshForSettingsChange() {
+  // Changes arriving while a check is under way get one more check after it.
+  if (settingsChangeRefreshRunning) {
+    settingsChangeRefreshAgain = true;
+    return;
+  }
+  settingsChangeRefreshRunning = true;
+  try {
+    do {
+      settingsChangeRefreshAgain = false;
+      await refresh().catch(() => {});
+    } while (settingsChangeRefreshAgain);
+  } finally {
+    settingsChangeRefreshRunning = false;
+  }
+}
+
 const RESUME_LISTENING_STORAGE_KEY = "nwr-stream-manager:resume-listening";
 // Status is checked every second; two misses in a row means the server is gone, not a blip.
 const SERVER_FAILURES_BEFORE_UNAVAILABLE = 2;
@@ -24303,6 +24618,7 @@ async function resumeListening() {
   }, true);
   offerResumeListening();
   setInterval(refresh, 1000);
+  startSettingsEvents();
   setInterval(async () => {
     try {
       const status = await request(statusRequestPath());

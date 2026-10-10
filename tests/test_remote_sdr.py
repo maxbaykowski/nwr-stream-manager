@@ -693,6 +693,15 @@ class RemoteSdrProtocolTests(unittest.TestCase):
             client.update_settings({"gain": 7.0})
         self.assertEqual([item["id"] for item in self.server.connected_clients()], [self.client_identity.fingerprint])
 
+    def test_a_host_that_cannot_reset_says_so_and_stays_connected(self) -> None:
+        self.pair()
+        client = self.client()
+        wait_for(lambda: client.status()["reachable"])
+
+        with self.assertRaisesRegex(ValueError, "unknown request"):
+            client.reset_sdr()
+        self.assertEqual(client.update_settings({"gain": 49.6})["settings"]["gain"], 49.6)
+
     def test_unpaired_client_is_rejected(self) -> None:
         self.hosts.add(
             self.host_identity.fingerprint, "weather-pi", token="forged" * 8, peer_token="x" * 43,
@@ -1221,6 +1230,193 @@ class RemoteSdrServiceTests(unittest.TestCase):
 
         self.assertGreater(after["status_seq"], before["status_seq"])
         self.assertEqual(after["settings"]["ppm_correction"], 7)
+
+    def paired_host_and_client(self):
+        host = self.service("host", development=True)
+        self.synthetic_source(host)
+        host.update({"serial": "00000001", "remote_access_enabled": True})
+        code = host.start_remote_sdr_pairing()["sharing"]["pairing"]["code"]
+        client = self.service("client")
+        client.pair_remote_sdr({"address": "127.0.0.1", "port": host.remote_server.port, "code": code})
+        client.update({"source_mode": "remote", "remote_host_id": host.remote_identity.fingerprint})
+        wait_for(lambda: client.status()["source"].get("reachable"), timeout=10.0)
+        return host, client
+
+    def test_sdr_settings_changes_reach_the_other_machine_at_once(self) -> None:
+        remote = sys.modules["nwr_stream_manager.remote_sdr"]
+        # With the host's regular status this rare, only an immediate one can arrive in time.
+        with unittest.mock.patch.object(remote, "CONTROL_STATUS_INTERVAL_SECONDS", 30.0):
+            host, client = self.paired_host_and_client()
+
+            seen = client.settings_change_count
+            host.update({"ppm_correction": 7})
+            wait_for(lambda: client.status()["settings"]["ppm_correction"] == 7, timeout=1.0)
+            wait_for(lambda: client.settings_change_count > seen, timeout=1.0)  # its browsers are told
+
+            seen = host.settings_change_count
+            client.update({"ppm_correction": -4})
+            self.assertEqual(host.settings.ppm_correction, -4)
+            self.assertGreater(host.settings_change_count, seen)
+
+    def fake_usb_reset(self, *, error: Exception | None = None, reappears: bool = True):
+        """Stand in for the USB reset; it finishes when the returned event is set."""
+        wc = self.wc
+        device = types.SimpleNamespace(serial="00000001", description="RTL-SDR Blog V4", vendor_id="0bda", product_id="2838")
+        release = threading.Event()
+        resets = []
+
+        def reset(serial, timeout_seconds):
+            resets.append(serial)
+            release.wait(10.0)
+            if error is not None:
+                raise error
+            return device, "usbreset"
+
+        for name, value in (
+            ("reset_usb_rtl_device", reset),
+            ("list_usb_rtl_devices", lambda: [device] if reappears and release.is_set() else []),
+            ("RTL_RESET_REAPPEAR_TIMEOUT_SECONDS", 0.5),
+        ):
+            original = getattr(wc, name)
+            setattr(wc, name, value)
+            self.addCleanup(setattr, wc, name, original)
+        return release, resets
+
+    def reset_in_background(self, service, serial=""):
+        outcome = {}
+
+        def run():
+            try:
+                outcome["result"] = service.reset_rtl_device(serial)
+            except Exception as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, outcome
+
+    @staticmethod
+    def shown_reset(service):
+        reset = service.status()["sdr_reset"]
+        return (reset["state"], reset["message"]) if reset else None
+
+    def test_a_client_resets_the_hosts_sdr_and_both_show_it(self) -> None:
+        host, client = self.paired_host_and_client()
+        release, resets = self.fake_usb_reset()
+
+        thread, outcome = self.reset_in_background(client)
+        wait_for(lambda: self.shown_reset(client) == ("resetting", "Resetting RTL-SDR..."))
+        self.assertEqual(self.shown_reset(host), ("resetting", "Resetting RTL-SDR..."))
+        self.assertEqual(resets, ["00000001"])  # the host reset its own SDR
+
+        release.set()
+        thread.join(10.0)
+        done = "RTL-SDR serial 00000001 was reset using usbreset and reappeared."
+        self.assertNotIn("error", outcome)
+        self.assertTrue(outcome["result"]["success"])
+        self.assertEqual(outcome["result"]["message"], done)
+        self.assertEqual(self.shown_reset(host), ("finished", done))
+        self.assertEqual(self.shown_reset(client), ("finished", done))
+
+    def test_a_failed_reset_on_the_host_is_reported_on_the_client(self) -> None:
+        host, client = self.paired_host_and_client()
+        release, _ = self.fake_usb_reset(error=RuntimeError("no USB device found for RTL-SDR serial 00000001"))
+        release.set()
+
+        result = client.reset_rtl_device("")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["message"], "no USB device found for RTL-SDR serial 00000001")
+        self.assertEqual(self.shown_reset(host), ("failed", result["message"]))
+        self.assertEqual(self.shown_reset(client), ("failed", result["message"]))
+
+    def test_an_sdr_that_does_not_come_back_counts_as_a_failed_reset(self) -> None:
+        host, client = self.paired_host_and_client()
+        release, _ = self.fake_usb_reset(reappears=False)
+        release.set()
+
+        result = client.reset_rtl_device("")
+        self.assertFalse(result["success"])
+        self.assertIn("did not reappear", result["message"])
+        self.assertEqual(self.shown_reset(client), ("failed", result["message"]))
+
+    def test_a_reset_started_on_the_host_shows_on_the_client(self) -> None:
+        remote = sys.modules["nwr_stream_manager.remote_sdr"]
+        # With the host's regular status this rare, only an immediate one can arrive in time.
+        patcher = unittest.mock.patch.object(remote, "CONTROL_STATUS_INTERVAL_SECONDS", 30.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        host, client = self.paired_host_and_client()
+        release, _ = self.fake_usb_reset()
+
+        seen = client.settings_change_count
+        thread, outcome = self.reset_in_background(host, "00000001")
+        wait_for(lambda: self.shown_reset(client) == ("resetting", "Resetting RTL-SDR..."), timeout=1.0)
+        wait_for(lambda: client.settings_change_count > seen, timeout=1.0)  # the client's pages are told at once
+        with self.assertRaisesRegex(ValueError, "already in progress"):
+            client.reset_rtl_device("")  # one reset at a time, from anywhere
+        release.set()
+        thread.join(10.0)
+        self.assertTrue(outcome["result"]["success"])
+        wait_for(lambda: (self.shown_reset(client) or ("",))[0] == "finished", timeout=1.0)
+
+    def test_how_a_reset_ended_stops_showing_after_a_while(self) -> None:
+        host, client = self.paired_host_and_client()
+        release, _ = self.fake_usb_reset()
+        release.set()
+        client.reset_rtl_device("")
+        self.assertIsNotNone(self.shown_reset(client))
+        with unittest.mock.patch.object(self.wc, "RTL_RESET_RESULT_SHOW_SECONDS", 0.0):
+            self.assertIsNone(self.shown_reset(host))
+            wait_for(lambda: self.shown_reset(client) is None, timeout=3.0)
+
+    def test_resetting_through_an_older_host_explains_why_it_cannot(self) -> None:
+        host, client = self.paired_host_and_client()
+        with unittest.mock.patch.object(client.remote_client, "reset_sdr", side_effect=ValueError("unknown request 'reset_sdr'")):
+            with self.assertRaisesRegex(ValueError, "needs to be updated before its SDR can be reset from here"):
+                client.reset_rtl_device("")
+
+    def test_browsers_are_told_when_sdr_settings_change(self) -> None:
+        import base64
+        import os
+        import socket
+        import struct
+        import threading
+
+        wc = self.wc
+        service = self.service("web")
+        service.accounts.create_admin("tester", "password123", "password123")
+        handler = type("SettingsEventsTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+
+        sock = socket.create_connection(server.server_address, timeout=5.0)
+        self.addCleanup(sock.close)
+        sock.sendall((
+            "GET /api/settings-events HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{server.server_address[1]}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+            f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}\r\n"
+            f"Authorization: Basic {base64.b64encode(b'tester:password123').decode()}\r\n\r\n"
+        ).encode())
+        reader = sock.makefile("rb")
+        self.assertIn(b" 101 ", reader.readline())
+        while reader.readline() not in (b"\r\n", b""):
+            pass
+
+        def next_frame():
+            opcode, length = reader.read(2)
+            length &= 0x7F
+            if length == 126:
+                length = struct.unpack("!H", reader.read(2))[0]
+            return opcode & 0x0F, reader.read(length)
+
+        service.update({"ppm_correction": 3})
+        self.assertEqual(next_frame(), (0x1, b'{"type":"settings_changed"}'))
+        service.begin_shutdown()
+        opcode, payload = next_frame()
+        self.assertEqual(opcode, 0x8)
+        self.assertEqual(struct.unpack("!H", payload[:2])[0], 1012)
 
     def test_remote_sdr_endpoints_are_reachable_over_http(self) -> None:
         import json

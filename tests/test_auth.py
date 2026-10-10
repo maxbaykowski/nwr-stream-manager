@@ -1670,6 +1670,7 @@ class AuthTests(unittest.TestCase):
         service.streams = []
         service.fallback_settings = self.web_control.WebFallbackSettings()
         service.capture_error = None
+        service.sdr_reset = None
         service.last_batch_at = None
         service.received_chunks = 0
         service.received_bytes = 0

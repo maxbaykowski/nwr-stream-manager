@@ -32,6 +32,9 @@ PAGE_FUNCTIONS = (
     "numericControlValue",
     "previousNumberValue",
     "setMessage",
+    "renderSdrReset",
+    "setSdrResetButtonsDisabled",
+    "resetSdr",
 )
 PAGE_STATE = (
     "const controls",
@@ -43,6 +46,10 @@ PAGE_STATE = (
     "let timer",
     "let gainValues",
     "let lastManualGain",
+    "const SDR_RESET_REQUEST_TIMEOUT_MS",
+    "let sdrResetRequestPending",
+    "let sdrResetInProgress",
+    "let lastSdrResetKey",
 )
 
 # Two people share one SDR. The page's own settings code runs against a pretend
@@ -81,7 +88,25 @@ function clearTimeout() { pendingTimers = []; }
 const server = {settings: {serial: "18263784", gain: 32.8, ppm_correction: 0, bias_tee: false,
   alias_filter_strength: 100, notify_sdr_failures: false}};
 const GAINS = [0.0, 20.7, 28.0, 32.8, 40.2, 49.6];
-function status() { return {settings: {...server.settings}, gain_values: GAINS}; }
+function status() { return {settings: {...server.settings}, gain_values: GAINS, sdr_reset: server.reset || null}; }
+async function requestWithTimeout(path, options) { return request(path, options); }
+async function loadDevices() {}
+function statusRequestPath() { return "/api/status"; }
+// What a screen reader would announce from the reset message.
+const announced = [];
+for (const id of ["reset_rtl_device", "reset_remote_sdr"]) elements[id] = element(id);
+elements["sdr-reset-status"] = element("sdr-reset-status");
+{
+  let text = "";
+  Object.defineProperty(elements["sdr-reset-status"], "textContent", {
+    get() { return text; },
+    set(value) { text = value; if (value) announced.push(value); }
+  });
+}
+function resetShown() {
+  return {message: elements["sdr-reset-status"].textContent, kind: elements["sdr-reset-status"].className,
+    disabled: elements.reset_rtl_device.disabled && elements.reset_remote_sdr.disabled};
+}
 const sent = [];
 var request = async function (path, options) {
   const payload = JSON.parse(options.body);
@@ -120,7 +145,7 @@ applyStatus(status());
 
 (async () => {
 SCENARIO
-console.log(JSON.stringify({results, sent, server: server.settings}));
+console.log(JSON.stringify({results, sent, server: server.settings, announced}));
 })().catch(error => { console.error(error); process.exit(1); });
 """
 
@@ -260,6 +285,68 @@ class SdrSettingsSyncTests(unittest.TestCase):
         self.assertEqual(result["results"]["error"], "The remote SDR did not respond.")
         self.assertEqual(result["results"]["error_after_next_save"], "")
 
+    def test_a_reset_started_elsewhere_shows_here_as_it_happens(self) -> None:
+        result = self.run_scenario("""
+            server.reset = {id: 4, state: "resetting", message: "Resetting RTL-SDR..."};
+            poll();
+            results.resetting = resetShown();
+            poll();
+            server.reset = {id: 4, state: "finished", message: "RTL-SDR serial 00000001 was reset using usbreset and reappeared."};
+            poll();
+            results.finished = resetShown();
+            server.reset = null;  // no longer shown after a while
+            poll();
+            results.later = resetShown();
+            server.reset = {id: 5, state: "failed", message: "no USB device found for RTL-SDR serial 00000001"};
+            poll();
+            results.failed = resetShown();
+        """)
+        shown = result["results"]
+        self.assertEqual(shown["resetting"], {"message": "Resetting RTL-SDR...", "kind": "message", "disabled": True})
+        self.assertEqual(shown["finished"]["message"], "RTL-SDR serial 00000001 was reset using usbreset and reappeared.")
+        self.assertEqual(shown["finished"]["kind"], "message success")
+        self.assertFalse(shown["finished"]["disabled"])
+        self.assertEqual(shown["later"]["message"], "")
+        self.assertEqual(shown["failed"]["kind"], "message error")
+        # Each step is announced once, however many status checks repeat it.
+        self.assertEqual(result["announced"], [
+            "Resetting RTL-SDR...",
+            "RTL-SDR serial 00000001 was reset using usbreset and reappeared.",
+            "no USB device found for RTL-SDR serial 00000001",
+        ])
+
+    def test_the_page_that_resets_a_remote_sdr_announces_each_step_once(self) -> None:
+        result = self.run_scenario("""
+            let answer;
+            request = (path, options) => { sent.push({path, body: JSON.parse(options.body)}); return new Promise(resolve => { answer = resolve; }); };
+            const resetting = resetSdr(true);
+            results.while_waiting = resetShown();
+            server.reset = {id: 9, state: "resetting", message: "Resetting RTL-SDR..."};
+            poll();
+            server.reset = {id: 9, state: "finished", message: "RTL-SDR serial 00000001 was reset using usbreset and reappeared."};
+            answer({success: true, reappeared: true, message: server.reset.message, status: status()});
+            await resetting;
+            poll();
+            results.after = resetShown();
+        """)
+        self.assertEqual(result["sent"], [{"path": "/api/rtl-reset", "body": {}}])
+        self.assertTrue(result["results"]["while_waiting"]["disabled"])
+        self.assertEqual(result["results"]["after"]["kind"], "message success")
+        self.assertFalse(result["results"]["after"]["disabled"])
+        self.assertEqual(result["announced"], [
+            "Resetting RTL-SDR...",
+            "RTL-SDR serial 00000001 was reset using usbreset and reappeared.",
+        ])
+
+    def test_a_local_reset_needs_an_sdr_chosen(self) -> None:
+        result = self.run_scenario("""
+            elements.serial.value = "";
+            await resetSdr(false);
+            results.after = resetShown();
+        """)
+        self.assertEqual(result["sent"], [])
+        self.assertEqual(result["results"]["after"]["message"], "Select an RTL-SDR to reset.")
+
     def test_a_number_being_typed_is_left_alone_while_others_still_update(self) -> None:
         result = self.run_scenario("""
             focus("ppm_correction");
@@ -281,6 +368,114 @@ class SdrSettingsSyncTests(unittest.TestCase):
             results.after = shown();
         """)
         self.assertTrue(result["results"]["after"]["automatic"])
+
+
+
+EVENTS_FUNCTIONS = ("settingsEventsUrl", "startSettingsEvents", "scheduleSettingsEventsRetry", "refreshForSettingsChange")
+EVENTS_STATE = (
+    "const SETTINGS_EVENTS_RETRY_MIN_MS",
+    "const SETTINGS_EVENTS_RETRY_MAX_MS",
+    "let settingsEventsSocket",
+    "let settingsEventsRetryMs",
+    "let settingsChangeRefreshRunning",
+    "let settingsChangeRefreshAgain",
+)
+# The page's connection to the server's settings events, against a pretend
+# WebSocket and a status check that takes as long as the scenario says.
+EVENTS_HARNESS = r"""
+const window = {location: {protocol: "https:", host: "radio.example:8080"}};
+const sockets = [];
+class WebSocket {
+  constructor(url) { this.url = url; this.listeners = {}; sockets.push(this); }
+  addEventListener(name, callback) { (this.listeners[name] ||= []).push(callback); }
+  emit(name, event = {}) { for (const callback of this.listeners[name] || []) callback(event); }
+}
+const retries = [];
+function setTimeout(callback, ms) { retries.push({callback, ms}); }
+let checks = 0;
+let finishCheck = null;
+function refresh() { checks += 1; return new Promise(resolve => { finishCheck = resolve; }); }
+async function settle() { for (let index = 0; index < 20; index += 1) await null; }
+async function check() { const done = finishCheck; finishCheck = null; done(); await settle(); }
+const results = {};
+(async () => {
+SCENARIO
+console.log(JSON.stringify(results));
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+
+
+class SettingsEventsPageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.node = shutil.which("node")
+        if cls.node is None:
+            raise unittest.SkipTest("node is not installed")
+        page = load_web_control_module().INDEX_HTML
+        parts = []
+        for start_text in EVENTS_STATE:
+            start = page.index(start_text + " ")
+            parts.append(page[start : page.index(";\n", start) + 2])
+        for name in EVENTS_FUNCTIONS:
+            start = page.index(f"function {name}(")
+            if page[start - 6 : start] == "async ":
+                start -= 6
+            parts.append(page[start : page.index("\n}\n", start) + 2])
+        cls.page_code = "\n".join(parts)
+
+    def run_scenario(self, scenario: str) -> dict:
+        import json
+
+        script = self.page_code + EVENTS_HARNESS.replace("SCENARIO", scenario)
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "events.js"
+            path.write_text(script, encoding="utf-8")
+            result = subprocess.run([self.node, str(path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_a_change_is_checked_at_once_and_a_burst_needs_only_one_more_check(self) -> None:
+        result = self.run_scenario("""
+            startSettingsEvents();
+            const socket = sockets[0];
+            results.url = socket.url;
+            socket.emit("open");  // catches up on anything missed
+            await check();
+            results.after_open = checks;
+            socket.emit("message", {data: '{"type":"keepalive"}'});
+            results.after_keepalive = checks;
+            socket.emit("message", {data: '{"type":"settings_changed"}'});
+            results.after_change = checks;
+            for (let index = 0; index < 5; index += 1) socket.emit("message", {data: '{"type":"settings_changed"}'});
+            await check();
+            await check();
+            results.after_burst = checks;
+            results.still_checking = finishCheck !== null;
+        """)
+        self.assertEqual(result["url"], "wss://radio.example:8080/api/settings-events")
+        self.assertEqual(result["after_open"], 1)
+        self.assertEqual(result["after_keepalive"], 1)
+        self.assertEqual(result["after_change"], 2)
+        self.assertEqual(result["after_burst"], 3)
+        self.assertFalse(result["still_checking"])
+
+    def test_a_lost_connection_is_retried_less_often_until_it_returns(self) -> None:
+        result = self.run_scenario("""
+            startSettingsEvents();
+            for (let index = 0; index < 7; index += 1) {
+              sockets[sockets.length - 1].emit("close");
+              retries[retries.length - 1].callback();
+            }
+            results.delays = retries.map(retry => retry.ms);
+            sockets[sockets.length - 1].emit("open");
+            await settle();
+            sockets[sockets.length - 1].emit("close");
+            results.after_return = retries[retries.length - 1].ms;
+            results.sockets = sockets.length;
+        """)
+        self.assertEqual(result["delays"], [1000, 2000, 4000, 8000, 16000, 30000, 30000])
+        self.assertEqual(result["after_return"], 1000)
+        self.assertEqual(result["sockets"], 8)  # one at a time, never two
 
 
 if __name__ == "__main__":
