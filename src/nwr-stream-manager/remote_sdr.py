@@ -1478,6 +1478,8 @@ class RemoteSdrClient:
         self.thread: threading.Thread | None = None
         self.connection: FrameConnection | None = None
         self.host_status: dict[str, Any] = {}
+        # The newest status number seen from the host on this connection.
+        self.host_status_seq: int | None = None
         self.reachable = False
         # True until the first connection attempt settles either way, so a
         # client that has only just started is not reported as unreachable.
@@ -1587,9 +1589,24 @@ class RemoteSdrClient:
     def update_settings(self, changes: dict[str, Any], timeout: float = CONTROL_REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
         status = self._request("update_settings", timeout=timeout, changes=changes)
         with self.lock:
-            self.host_status = status
-            self.last_status_at = time.time()
+            if self._accept_host_status_locked(status):
+                self.last_status_at = time.time()
         return status
+
+    def _accept_host_status_locked(self, status: dict[str, Any]) -> bool:
+        """Keep the host's status unless a newer one has already arrived.
+
+        The host's regular status can be taken just before a settings change
+        and arrive just after the reply to it; it must not put the old
+        settings back. Hosts that do not number their status are always taken.
+        """
+        seq = status.get("status_seq")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            if self.host_status_seq is not None and seq < self.host_status_seq:
+                return False
+            self.host_status_seq = seq
+        self.host_status = status
+        return True
 
     def _request(self, action: str, *, timeout: float, **payload: Any) -> dict[str, Any]:
         with self.lock:
@@ -1630,6 +1647,8 @@ class RemoteSdrClient:
                 self.connection = connection
                 self.connected_address = peer_address
                 self.error = ""
+                # A restarted host numbers its status from the start again.
+                self.host_status_seq = None
             try:
                 while not self.stop_event.is_set():
                     try:
@@ -1640,11 +1659,11 @@ class RemoteSdrClient:
                     if kind == "status":
                         status = message.get("status") if isinstance(message.get("status"), dict) else {}
                         with self.lock:
-                            self.host_status = status
+                            accepted = self._accept_host_status_locked(status)
                             self.reachable = True
                             self.connecting = False
                             self.last_status_at = time.time()
-                        if self.on_status is not None:
+                        if accepted and self.on_status is not None:
                             self.on_status(status)
                     elif kind == "response":
                         with self.pending_condition:

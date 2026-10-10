@@ -5276,6 +5276,9 @@ class RtlControlService:
         )
         self.lock = threading.RLock()
         self.settings = load_settings(state_path)
+        # Numbers each status sent to remote clients, so they can tell one
+        # taken before a settings change from one taken after it.
+        self.remote_host_status_seq = 0
         self.streams = load_streams(self.streams_directory, self.streams_state_path)
         self.fallback_settings = load_fallback_settings(self.fallback_state_path)
         self.notification_settings = load_notification_settings(self.notification_state_path)
@@ -7057,7 +7060,11 @@ class RtlControlService:
                 device_name = f"RTL-SDR serial {serial}"
             last_batch_at = self.last_batch_at
             capture_error = self.capture_error or ""
+            # Taken under the lock that settings changes hold.
+            self.remote_host_status_seq += 1
+            status_seq = self.remote_host_status_seq
         return {
+            "status_seq": status_seq,
             "device_name": device_name,
             "serial": serial,
             "connected": problem is None or problem["category"] != "disconnected",
@@ -12943,6 +12950,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div id="alias_filter_strength_hint" class="hint">
         Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.
       </div>
+      <div id="sdr-settings-result" class="message" aria-live="polite"></div>
     </section>
     <section id="sdr_sharing_section">
       <h3>Sharing</h3>
@@ -14123,6 +14131,22 @@ let timer = null;
 let gainValues = [];
 let lastManualGain = null;
 let lastControlSignature = "";
+// SDR settings are shared by everyone using this machine, and with a remote SDR, by
+// everyone using the host. Others' changes are shown in place as they arrive, except
+// for a setting changed here that the server has not confirmed yet.
+const SDR_SETTING_FOR_CONTROL = {
+  serial: "serial",
+  gain: "gain",
+  gain_auto: "gain",
+  ppm_correction: "ppm_correction",
+  bias_tee: "bias_tee",
+  alias_filter_strength: "alias_filter_strength",
+  notify_sdr_failures: "notify_sdr_failures"
+};
+const pendingSdrSettingEdits = new Map();
+let statusRequestCount = 0;
+// Status requests sent before a save finished may carry the old values.
+let sdrControlsStaleThrough = 0;
 let stationResults = [];
 let selectedStationKey = "";
 let wizardStationOverride = null;
@@ -16912,7 +16936,7 @@ function commitNumericControlElement(element, saveCallback = null) {
 
 function numericSaveCallbackForElement(element) {
   if (!element || !element.id) return null;
-  if (controls.includes(element.id)) return scheduleUpdate;
+  if (controls.includes(element.id)) return () => scheduleUpdate(element.id);
   if (["fallback_delay", "fallback_loop_delay"].includes(element.id)) return scheduleFallbackUpdate;
   if (["eas_pre_seconds", "eas_post_seconds", "eas_max_seconds"].includes(element.id)) return scheduleEasUpdate;
   if (element.id.startsWith("audio_")) return scheduleAudioEffectsUpdate;
@@ -18957,9 +18981,15 @@ function controlSignature(data) {
   });
 }
 
-function controlHasFocus() {
-  const active = document.activeElement;
-  return active && controls.includes(active.id);
+function numberFieldIsBeingTyped(element) {
+  if (!element || document.activeElement !== element) return false;
+  if (element.dataset.userEditing === "1") return true;
+  return element.dataset.previousValue !== undefined && element.value !== element.dataset.previousValue;
+}
+
+function sdrSettingIsBeingChanged(key) {
+  if (pendingSdrSettingEdits.has(key)) return true;
+  return key === "ppm_correction" && numberFieldIsBeingTyped(document.getElementById("ppm_correction"));
 }
 
 function setValue(id, value) {
@@ -21405,9 +21435,8 @@ function renderRemoteSdr(data) {
   const sharing = remoteSdr.sharing || {};
   const remote = remoteSdr.remote || {};
   const usesRemote = remoteSdrUsesRemote();
-  const sourceFocused = containsFocusedElement(document.getElementById("sdr_source_fieldset"))
-    || document.activeElement === document.getElementById("remote_sdr_device");
-  if (!sourceFocused && !remoteSdrRequestPending) {
+  // These save as soon as they change, so only a save in progress holds them back.
+  if (!remoteSdrRequestPending) {
     setChecked("sdr_source_local", !usesRemote);
     setChecked("sdr_source_remote", usesRemote);
   }
@@ -21422,19 +21451,19 @@ function renderRemoteSdr(data) {
     syncSelectOptions(select, options);
     select.dataset.signature = JSON.stringify(options);
   }
-  if (!sourceFocused && !remoteSdrRequestPending && remote.device_id) setValue("remote_sdr_device", remote.device_id);
+  if (!remoteSdrRequestPending && remote.device_id) setValue("remote_sdr_device", remote.device_id);
   setDisabled(select, !devices.length);
   setText("remote_sdr_status", remoteSdrStatusText(remote, devices));
   const buffer = document.getElementById("remote_buffer_seconds");
   const savedBuffer = data.settings && data.settings.remote_buffer_seconds;
-  if (savedBuffer !== undefined && document.activeElement !== buffer && !remoteSdrRequestPending) {
+  if (savedBuffer !== undefined && !numberFieldIsBeingTyped(buffer) && !remoteSdrRequestPending) {
     setValue("remote_buffer_seconds", savedBuffer);
   }
 
   const available = Boolean(sharing.available);
   setHidden("remote_access_unavailable", available);
   setHidden("remote_access_controls", !available);
-  if (document.activeElement !== document.getElementById("remote_access_enabled") && !remoteSdrRequestPending) {
+  if (!remoteSdrRequestPending) {
     setChecked("remote_access_enabled", Boolean(sharing.enabled));
   }
   setHidden("remote_pairing_controls", !sharing.running);
@@ -21807,21 +21836,25 @@ async function unpairRemoteDevice(deviceId, name) {
 function syncControls(data) {
   const s = data.settings;
   gainValues = data.gain_values || [];
-  setValue("serial", s.serial || "");
-  setChecked("gain_auto", s.gain === null);
+  if (!sdrSettingIsBeingChanged("serial")) setValue("serial", s.serial || "");
   const gain = document.getElementById("gain");
   setAttributeIfChanged(gain, "max", Math.max(0, gainValues.length - 1));
-  setDisabled(gain, s.gain === null || gainValues.length === 0);
-  if (s.gain !== null) rememberManualGain(s.gain);
-  const displayedGain = s.gain === null ? storedManualGain() : s.gain;
-  const gainIndex = gainIndexFor(displayedGain);
-  if (gain.value !== String(gainIndex)) gain.value = String(gainIndex);
+  if (!sdrSettingIsBeingChanged("gain")) {
+    setChecked("gain_auto", s.gain === null);
+    setDisabled(gain, s.gain === null || gainValues.length === 0);
+    if (s.gain !== null) rememberManualGain(s.gain);
+    const displayedGain = s.gain === null ? storedManualGain() : s.gain;
+    const gainIndex = gainIndexFor(displayedGain);
+    if (gain.value !== String(gainIndex)) gain.value = String(gainIndex);
+  }
   updateGainSliderText();
-  setValue("ppm_correction", s.ppm_correction);
-  setChecked("bias_tee", s.bias_tee);
-  setValue("alias_filter_strength", s.alias_filter_strength);
-  setText("alias_filter_strength_label", `${s.alias_filter_strength}%`);
-  setChecked("notify_sdr_failures", s.notify_sdr_failures);
+  if (!sdrSettingIsBeingChanged("ppm_correction")) setValue("ppm_correction", s.ppm_correction);
+  if (!sdrSettingIsBeingChanged("bias_tee")) setChecked("bias_tee", s.bias_tee);
+  if (!sdrSettingIsBeingChanged("alias_filter_strength")) {
+    setValue("alias_filter_strength", s.alias_filter_strength);
+    setText("alias_filter_strength_label", `${s.alias_filter_strength}%`);
+  }
+  if (!sdrSettingIsBeingChanged("notify_sdr_failures")) setChecked("notify_sdr_failures", s.notify_sdr_failures);
   updateRtlNotificationControlsVisibility();
   lastControlSignature = controlSignature(data);
 }
@@ -21834,10 +21867,11 @@ function applyStatus(data, options = {}) {
   try {
     if (data.account) applyAccountUi(data.account);
     const nextSignature = controlSignature(data);
+    const controlsFresh = !options.requestNumber || options.requestNumber > sdrControlsStaleThrough;
     if (
       options.syncControls ||
       lastControlSignature === "" ||
-      (nextSignature !== lastControlSignature && !controlHasFocus())
+      (nextSignature !== lastControlSignature && controlsFresh)
     ) {
       syncControls(data);
     } else {
@@ -21886,21 +21920,47 @@ function currentPayload() {
   };
 }
 
-function scheduleUpdate() {
+// Only the settings changed here are sent, so this page never puts back values
+// someone else has since changed.
+function scheduleUpdate(controlId) {
   if (applying) return;
+  const key = SDR_SETTING_FOR_CONTROL[controlId];
+  if (!key) return;
+  pendingSdrSettingEdits.set(key, (pendingSdrSettingEdits.get(key) || 0) + 1);
   clearTimeout(timer);
-  timer = setTimeout(async () => {
-    try {
-      const data = await request("/api/settings", {
-        method: "PATCH",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(currentPayload())
-      });
-      applyStatus(data, {syncControls: true});
-    } catch (error) {
-      document.getElementById("capture-error").textContent = error.message;
-    }
-  }, 250);
+  timer = setTimeout(saveSdrSettingEdits, 250);
+}
+
+function settleSdrSettingEdits(sent) {
+  for (const [key, edits] of sent) {
+    // A setting changed again while saving stays pending for the next save.
+    if (pendingSdrSettingEdits.get(key) === edits) pendingSdrSettingEdits.delete(key);
+  }
+  sdrControlsStaleThrough = statusRequestCount;
+}
+
+async function saveSdrSettingEdits() {
+  const sent = new Map(pendingSdrSettingEdits);
+  if (!sent.size) return;
+  const values = currentPayload();
+  const payload = {};
+  for (const key of sent.keys()) payload[key] = values[key];
+  try {
+    const data = await request("/api/settings", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    settleSdrSettingEdits(sent);
+    setMessage("sdr-settings-result", "");
+    applyStatus(data, {syncControls: true});
+  } catch (error) {
+    settleSdrSettingEdits(sent);
+    setMessage("sdr-settings-result", error.message, "error");
+    // Show what the SDR is really using again.
+    lastControlSignature = "";
+    await refresh().catch(() => {});
+  }
 }
 
 function scheduleFallbackUpdate() {
@@ -22308,7 +22368,7 @@ for (const id of controls) {
       if (id === "gain") rememberManualGainFromSlider();
       if (id === "gain_auto" && !event.target.checked) restoreRememberedManualGain();
       if (id === "gain" || id === "gain_auto") updateGainSliderText();
-      scheduleUpdate();
+      scheduleUpdate(id);
     }
   });
   document.addEventListener("change", event => {
@@ -22317,7 +22377,7 @@ for (const id of controls) {
       if (id === "gain") rememberManualGainFromSlider();
       if (id === "gain_auto" && !event.target.checked) restoreRememberedManualGain();
       if (id === "gain" || id === "gain_auto") updateGainSliderText();
-      scheduleUpdate();
+      scheduleUpdate(id);
     }
   });
 }
@@ -24062,6 +24122,7 @@ document.getElementById("eas_alert_audio").addEventListener("ended", async () =>
 
 async function refresh() {
   if (serverUnavailable) return;
+  const requestNumber = ++statusRequestCount;
   let data;
   try {
     data = await request(statusRequestPath());
@@ -24070,7 +24131,7 @@ async function refresh() {
     throw error;
   }
   serverFailureCount = 0;
-  applyStatus(data, {syncControls: false});
+  applyStatus(data, {syncControls: false, requestNumber});
 }
 
 const RESUME_LISTENING_STORAGE_KEY = "nwr-stream-manager:resume-listening";

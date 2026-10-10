@@ -269,6 +269,65 @@ class SilentHostTests(unittest.TestCase):
         self.assertTrue(reconnected)
 
 
+class HostStatusOrderTests(unittest.TestCase):
+    """The host's regular status and its reply to a change can cross on the way."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.remote = load_remote_sdr()
+
+    def setUp(self) -> None:
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        hosts = self.remote.PairedDeviceStore(Path(tempdir.name) / "devices.json")
+        self.seen: list[dict] = []
+        self.client = self.remote.RemoteSdrClient("host-id", hosts, client_id="client-id", on_status=self.seen.append)
+
+    @staticmethod
+    def status(seq, gain):
+        status = {"settings": {"gain": gain}}
+        if seq is not None:
+            status["status_seq"] = seq
+        return status
+
+    def receive(self, status) -> None:
+        # What the control connection does with a regular status from the host.
+        with self.client.lock:
+            accepted = self.client._accept_host_status_locked(status)
+        if accepted:
+            self.client.on_status(status)
+
+    def shown_gain(self):
+        return self.client.status()["sdr"]["settings"]["gain"]
+
+    def test_a_status_taken_before_a_change_does_not_put_the_old_value_back(self) -> None:
+        self.receive(self.status(4, 32.8))
+        with unittest.mock.patch.object(self.client, "_request", return_value=self.status(6, 49.6)):
+            self.client.update_settings({"gain": 49.6})
+        self.receive(self.status(5, 32.8))  # taken before the change, arrived after the reply
+
+        self.assertEqual(self.shown_gain(), 49.6)
+        self.assertEqual([status["status_seq"] for status in self.seen], [4])
+
+    def test_every_newer_status_is_taken(self) -> None:
+        # Someone at the host changes gain after this client's change.
+        with unittest.mock.patch.object(self.client, "_request", return_value=self.status(6, 49.6)):
+            self.client.update_settings({"gain": 49.6})
+        for seq, gain in ((7, 49.6), (8, 0.0), (9, 0.0)):
+            self.receive(self.status(seq, gain))
+
+        self.assertEqual(self.shown_gain(), 0.0)
+        self.assertEqual([status["status_seq"] for status in self.seen], [7, 8, 9])
+
+    def test_hosts_that_do_not_number_their_status_are_always_taken(self) -> None:
+        self.receive(self.status(None, 32.8))
+        self.receive(self.status(None, 49.6))
+        self.receive(self.status(None, 0.0))
+
+        self.assertEqual(self.shown_gain(), 0.0)
+        self.assertEqual(len(self.seen), 3)
+
+
 class IqJitterBufferTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -881,6 +940,41 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         self.assertEqual(batch.center_frequency_hz, 162_550_000)
 
 
+    def test_a_restarted_host_numbering_its_status_afresh_is_listened_to(self) -> None:
+        class NumberedBackend(FakeBackend):
+            def __init__(self, first_seq):
+                super().__init__()
+                self.seq = first_seq
+
+            def status(self):
+                self.seq += 1
+                return {**super().status(), "status_seq": self.seq}
+
+        self.server.stop()
+        old_host = self.remote.RemoteSdrServer(
+            self.host_identity, self.server.devices, NumberedBackend(5000),
+            bind_address="127.0.0.1", port=0, discovery_port=0,
+        )
+        old_host.start()
+        self.addCleanup(old_host.stop)
+        self.server = old_host
+        self.pair()
+        client = self.client()
+        wait_for(lambda: client.status()["sdr"].get("status_seq", 0) > 5000)
+
+        port = old_host.port
+        old_host.stop()
+        wait_for(lambda: not client.status()["reachable"], timeout=30.0)
+        restarted_backend = NumberedBackend(0)
+        restarted_backend.settings["gain"] = 49.6
+        restarted = self.remote.RemoteSdrServer(
+            self.host_identity, old_host.devices, restarted_backend,
+            bind_address="127.0.0.1", port=port, discovery_port=None,
+        )
+        restarted.start()
+        self.addCleanup(restarted.stop)
+        wait_for(lambda: client.status()["sdr"]["settings"]["gain"] == 49.6, timeout=30.0)
+
 
 def load_web_control():
     import importlib.util
@@ -1116,6 +1210,17 @@ class RemoteSdrServiceTests(unittest.TestCase):
         self.assertEqual(host.settings.ppm_correction, 5)
         self.assertFalse(host.settings.bias_tee)
         self.assertEqual(host.settings.alias_filter_strength, 100)
+
+    def test_the_host_numbers_each_status_it_sends(self) -> None:
+        # Clients rely on a status taken after a change having a higher number.
+        host = self.service("host", development=True)
+        self.synthetic_source(host)
+        before = host.remote_host_status()
+        host.update({"ppm_correction": 7})
+        after = host.remote_host_status()
+
+        self.assertGreater(after["status_seq"], before["status_seq"])
+        self.assertEqual(after["settings"]["ppm_correction"], 7)
 
     def test_remote_sdr_endpoints_are_reachable_over_http(self) -> None:
         import json
