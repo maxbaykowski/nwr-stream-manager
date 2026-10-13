@@ -2318,6 +2318,27 @@ class EasAlertTests(unittest.TestCase):
         self.web_control.migrate_stream_notch_width(stream)
         self.assertEqual(stream["audio"]["notch"], {"enabled": False, "frequency": 3000.0, "width": 230.0})
 
+    def test_volume_multiplier_is_limited_to_point_one_through_two(self) -> None:
+        for multiplier in (0.1, 1, 2):
+            payload = self._notch_audio_payload({"enabled": False})
+            payload["volume"] = {"enabled": True, "multiplier": multiplier}
+            audio = self.web_control.validate_audio_payload(payload)
+            self.assertEqual(audio["volume"]["multiplier"], float(multiplier))
+        for multiplier in (0, 0.09, 2.01, 10):
+            payload = self._notch_audio_payload({"enabled": False})
+            payload["volume"] = {"enabled": True, "multiplier": multiplier}
+            with self.assertRaisesRegex(ValueError, "multiplier must be between 0.1 and 2"):
+                self.web_control.validate_audio_payload(payload)
+
+    def test_volume_multiplier_from_older_settings_is_brought_into_range(self) -> None:
+        for saved, expected in ((5, 2.0), (0, 0.1), (1.5, 1.5)):
+            stream = {"id": "s", "audio": {"volume": {"enabled": True, "multiplier": saved}}}
+            self.web_control.migrate_stream_volume_multiplier(stream)
+            self.assertEqual(stream["audio"]["volume"]["multiplier"], expected)
+            self.assertEqual(
+                self.web_control.audio_config_from_stream(stream).volume.multiplier, expected
+            )
+
     def test_combined_eq_filter_matches_separate_filters(self) -> None:
         config = self.config
         effects = self.audio_effects

@@ -68,6 +68,8 @@ if __package__:
         EasRecordingConfig,
         IcecastConfig,
         IQ_SAMPLE_RATE,
+        VOLUME_MULTIPLIER_MAX,
+        VOLUME_MULTIPLIER_MIN,
         parse_audio_config,
         parse_notch_config,
     )
@@ -193,6 +195,8 @@ else:
     IQ_SAMPLE_RATE = config_module.IQ_SAMPLE_RATE
     parse_audio_config = config_module.parse_audio_config
     parse_notch_config = config_module.parse_notch_config
+    VOLUME_MULTIPLIER_MAX = config_module.VOLUME_MULTIPLIER_MAX
+    VOLUME_MULTIPLIER_MIN = config_module.VOLUME_MULTIPLIER_MIN
     ComplexArray = dsp.ComplexArray
     DEFAULT_ALIAS_ATTENUATION_DB = dsp.DEFAULT_ALIAS_ATTENUATION_DB
     IqChannelizer = dsp.IqChannelizer
@@ -11303,12 +11307,14 @@ def load_streams(streams_directory: Path, legacy_path: Path) -> list[dict[str, A
     if streams:
         for stream in streams:
             migrate_stream_notch_width(stream)
+            migrate_stream_volume_multiplier(stream)
         return streams
     if (streams_directory / STREAMS_DIRECTORY_MARKER_FILE_NAME).exists():
         return []
     streams = load_legacy_streams(legacy_path)
     for stream in streams:
         migrate_stream_notch_width(stream)
+        migrate_stream_volume_multiplier(stream)
     if streams:
         LOG.info("migrating %s stream configuration(s) from %s to %s", len(streams), legacy_path, streams_directory)
         save_streams(streams_directory, streams)
@@ -11325,6 +11331,19 @@ def migrate_stream_notch_width(stream: dict[str, Any]) -> None:
         audio["notch"] = asdict(parse_notch_config(notch))
     except Exception as exc:
         LOG.warning("could not convert notch settings for stream %s: %s", stream.get("id"), exc)
+
+
+def migrate_stream_volume_multiplier(stream: dict[str, Any]) -> None:
+    # The multiplier used to have no limits; bring older settings into the allowed range.
+    audio = stream.get("audio")
+    volume = audio.get("volume") if isinstance(audio, dict) else None
+    multiplier = volume.get("multiplier") if isinstance(volume, dict) else None
+    if not isinstance(multiplier, (int, float)) or isinstance(multiplier, bool) or not math.isfinite(multiplier):
+        return
+    limited = min(max(float(multiplier), VOLUME_MULTIPLIER_MIN), VOLUME_MULTIPLIER_MAX)
+    if limited != multiplier:
+        LOG.info("volume multiplier %s for stream %s is out of range; using %s", multiplier, stream.get("id"), limited)
+        volume["multiplier"] = limited
 
 
 def load_stream_configs(streams_directory: Path) -> list[dict[str, Any]]:
@@ -13878,9 +13897,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               </label>
               <span id="audio_volume_enabled_hint" class="hint">Controls the stream volume.</span>
               <label>Multiplier
-                <input id="audio_volume_multiplier" type="number" min="0" step="0.1" aria-describedby="audio_volume_multiplier_hint">
+                <input id="audio_volume_multiplier" type="number" min="0.1" max="2" step="0.1" aria-describedby="audio_volume_multiplier_hint">
               </label>
-              <span id="audio_volume_multiplier_hint" class="hint">The volume multiplier.</span>
+              <span id="audio_volume_multiplier_hint" class="hint">1 leaves the volume unchanged, 2 doubles it and 0.5 halves it. Valid range is 0.1 through 2.</span>
             </div>
             <div id="audio_effect_comfort_noise" class="audio-effect-panel" hidden>
               <h4>Comfort noise</h4>

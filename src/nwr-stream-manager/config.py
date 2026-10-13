@@ -23,6 +23,9 @@ NOTCH_MIN_WIDTH_HZ = 60.0
 NOTCH_MAX_WIDTH_HZ = 2000.0
 NOTCH_DEFAULT_WIDTH_HZ = 100.0
 AUDIO_NYQUIST_HZ = IQ_SAMPLE_RATE / 2
+# Quieter than this is close to muting the stream; louder than this clips.
+VOLUME_MULTIPLIER_MIN = 0.1
+VOLUME_MULTIPLIER_MAX = 2.0
 
 
 @dataclass(frozen=True)
@@ -221,8 +224,10 @@ def validate_deemphasis_config(config: DeemphasisConfig) -> None:
 
 
 def validate_volume_config(config: VolumeConfig) -> None:
-    if not _finite(config.multiplier) or config.multiplier < 0:
-        raise ConfigError("multiplier must be a finite number greater than or equal to 0")
+    if not _finite(config.multiplier) or not VOLUME_MULTIPLIER_MIN <= config.multiplier <= VOLUME_MULTIPLIER_MAX:
+        raise ConfigError(
+            f"multiplier must be between {VOLUME_MULTIPLIER_MIN:g} and {VOLUME_MULTIPLIER_MAX:g}"
+        )
 
 
 def validate_comfort_noise_config(config: ComfortNoiseConfig) -> None:
