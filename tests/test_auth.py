@@ -1308,6 +1308,13 @@ class AuthTests(unittest.TestCase):
         nav = self.web_control.INDEX_HTML.split('<nav aria-label="Main">', 1)[1].split("</nav>", 1)[0]
         self.assertNotIn('href="/help"', nav)
 
+    def test_page_does_not_show_file_locations_or_sdr_sample_rate(self) -> None:
+        html = self.web_control.INDEX_HTML
+
+        for hidden in ("~/.local", "index.json", "fallback.wav", "formatSdrSampleRate", "float conversion"):
+            self.assertNotIn(hidden, html)
+        self.assertIn('setText("summary_capture", data.active ? "active" : "inactive");', html)
+
     def test_version_comes_from_pyproject(self) -> None:
         import tomllib
 

@@ -13327,7 +13327,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <input id="notify_sdr_failures" type="checkbox" aria-describedby="notify_sdr_failures_hint">
         Notify when the RTL-SDR requires attention
       </label>
-      <span id="notify_sdr_failures_hint" class="hint">Send an ntfy notification when the configured RTL-SDR disconnects, cannot be opened, or stops sending I/Q data.</span>
+      <span id="notify_sdr_failures_hint" class="hint">Send an ntfy notification when the configured RTL-SDR disconnects, cannot be opened, or stops sending radio data.</span>
     </section>
     <section id="iq_test_source_section" hidden>
       <h3>I/Q test source</h3>
@@ -13445,7 +13445,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <label>Sample rate
             <select id="iq_sample_rate"></select>
           </label>
-          <div class="hint">Records spectrum I/Q centered at 162.475 MHz after RTL-SDR float conversion.</div>
+          <div class="hint">Records the radio spectrum centered at 162.475 MHz.</div>
         </div>
         <label>Stop recording after
           <input id="iq_duration_minutes" type="number" min="0" max="1440" step="1" value="0" aria-describedby="iq_duration_hint">
@@ -14026,7 +14026,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             <label><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
           </fieldset>
         </div>
-        <div class="hint" id="eas_directory_hint"></div>
         <div id="eas-result" class="message"></div>
       </div>
       <div id="panel_fallback" class="tabpanel" role="tabpanel" aria-labelledby="tab_fallback" hidden>
@@ -14046,7 +14045,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </label>
           <span id="fallback_loop_delay_hint" class="hint">How long to wait after the fallback audio finishes before starting it again. Set to 0 for a continuous loop with no gap.</span>
         </div>
-        <div class="hint">Uses the packaged default fallback.wav audio file.</div>
         <div id="fallback-result" class="message"></div>
       </div>
       <div id="panel_notifications" class="tabpanel" role="tabpanel" aria-labelledby="tab_notifications" hidden>
@@ -17801,11 +17799,9 @@ function selectAudioEffect(name, showDetail = true) {
 
 function setEasControls(stream) {
   const settings = easSettingsForStream(stream);
-  const station = stream && stream.station ? stream.station : {};
-  const directory = station.callsign ? `~/.local/state/nwr-stream-manager/streams/${station.callsign}/alerts` : "";
   const showEnabledControl = !settings.enabled || canDisableEasRecording(stream);
   const storageBlocked = storageIsCritical && settings.enabled;
-  const nextSignature = JSON.stringify({settings, directory, showEnabledControl, storageBlocked});
+  const nextSignature = JSON.stringify({settings, showEnabledControl, storageBlocked});
   if (nextSignature === easSignature) return;
   setChecked("eas_enabled", settings.enabled);
   document.getElementById("eas_enabled_label").hidden = !showEnabledControl;
@@ -17815,7 +17811,6 @@ function setEasControls(stream) {
   setValue("eas_max_seconds", settings.max_seconds);
   setChecked("eas_format_wav", settings.format !== "mp3");
   setChecked("eas_format_mp3", settings.format === "mp3");
-  setText("eas_directory_hint", directory ? `Alerts and index.json will be stored in ${directory}.` : "");
   easSignature = nextSignature;
 }
 
@@ -21447,12 +21442,6 @@ function rtlRequiresAttention(data) {
   return false;
 }
 
-function formatSdrSampleRate(rate) {
-  const value = Number(rate || 0);
-  if (!value) return "unknown";
-  return `${value.toLocaleString()} S/s`;
-}
-
 function renderDashboardSdr(data) {
   const settings = data.settings || {};
   const source = data.source || {};
@@ -21470,7 +21459,7 @@ function renderDashboardSdr(data) {
     setText("summary_gain", "not applicable");
     setText("summary_bias_tee", "not applicable");
     setText("summary_alias_filter", `${settings.alias_filter_strength ?? 100}%`);
-    setText("summary_capture", data.active ? `active, ${formatSdrSampleRate(source.sample_rate)}` : "inactive");
+    setText("summary_capture", data.active ? "active" : "inactive");
     return;
   }
 
@@ -21485,7 +21474,7 @@ function renderDashboardSdr(data) {
   setText("summary_gain", settings.gain === null ? "automatic" : `${settings.gain} dB`);
   setText("summary_bias_tee", settings.bias_tee ? "enabled" : "disabled");
   setText("summary_alias_filter", `${settings.alias_filter_strength ?? 100}%`);
-  setText("summary_capture", data.active ? `active, ${formatSdrSampleRate(source.sample_rate || settings.sample_rate)}` : "inactive");
+  setText("summary_capture", data.active ? "active" : "inactive");
 }
 
 function renderStorageSummary(storage) {
