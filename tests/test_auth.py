@@ -1294,13 +1294,40 @@ class AuthTests(unittest.TestCase):
             self.assertFalse(handler._auth_ok_or_setup_response("/help", "GET"))
             self.assertIn("<title>NWR Stream Manager Help</title>", sent["html"])
 
-    def test_help_link_sits_left_of_the_more_menu(self) -> None:
-        html = self.web_control.INDEX_HTML
-        help_link = html.index('<a id="nav_help" href="/help" target="_blank" rel="noopener">Help')
-        more_menu = html.index('<span class="nav-more">')
+    def test_help_link_is_in_the_footer_of_every_page(self) -> None:
+        for html in (
+            self.web_control.INDEX_HTML,
+            self.web_control.SETUP_HTML,
+            self.web_control.MUST_CHANGE_PASSWORD_HTML,
+        ):
+            footer = html[html.index("<footer>"):html.index("</footer>")]
+            self.assertIn('<a id="footer_help" href="/help" target="_blank" rel="noopener">Help', footer)
+            self.assertIn("(opens in a new tab)", footer)
+            self.assertLess(html.index("</main>"), html.index("<footer>"))
 
-        self.assertLess(help_link, more_menu)
-        self.assertLess(html.index('id="nav_eas_alerts"'), help_link)
+        nav = self.web_control.INDEX_HTML.split('<nav aria-label="Main">', 1)[1].split("</nav>", 1)[0]
+        self.assertNotIn('href="/help"', nav)
+
+    def test_version_comes_from_pyproject(self) -> None:
+        import tomllib
+
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        expected = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+        spec = importlib.util.spec_from_file_location("nwr_stream_manager_version", PACKAGE_PATH / "version.py")
+        assert spec is not None and spec.loader is not None
+        version = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(version)
+
+        self.assertEqual(version.package_version(), expected)
+
+    def test_footer_shows_the_running_version(self) -> None:
+        html = self.web_control.INDEX_HTML
+        footer = html[html.index("<footer>"):html.index("</footer>")]
+
+        self.assertIn(
+            f'<p id="footer_version">NWR Stream Manager version {self.web_control.APP_VERSION}</p>', footer
+        )
+        self.assertNotIn("__APP_VERSION__", html)
 
     def test_help_contents_links_all_lead_to_headings(self) -> None:
         import re

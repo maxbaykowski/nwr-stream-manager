@@ -6,6 +6,7 @@ import binascii
 import fcntl
 import functools
 import hmac
+import html
 import hashlib
 from http.cookies import SimpleCookie
 import json
@@ -41,6 +42,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
 if __package__:
+    from . import __version__ as APP_VERSION
     from .audio_effects import AudioEffectsProcessor, deemphasis_makeup_gain
     from .time_budget import TEST_MODE_TIME_FILE_NAME, TestModeTimeBudget, TestModeTimeUsedUp
     from .tone_generators import (
@@ -142,8 +144,9 @@ else:
     package_name = "nwr_stream_manager_runtime"
     package = types.ModuleType(package_name)
     package.__path__ = [str(Path(__file__).resolve().parent)]  # type: ignore[attr-defined]
-    package.__version__ = "0.0.0"  # type: ignore[attr-defined]
     sys.modules.setdefault(package_name, package)
+    APP_VERSION = importlib.import_module(f"{package_name}.version").package_version()
+    package.__version__ = APP_VERSION  # type: ignore[attr-defined]
     audio_effects = importlib.import_module(f"{package_name}.audio_effects")
     alsa_module = importlib.import_module(f"{package_name}.alsa")
     config_module = importlib.import_module(f"{package_name}.config")
@@ -12554,10 +12557,14 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .message { min-height: 1.5em; margin-top: 14px; font-weight: 700; }
 .error { color: #a61b1b; }
 .hint { color: #4b5563; }
+footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
+footer a { color: #174a98; }
+.screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (prefers-color-scheme: dark) {
   body { background: #111827; color: #f9fafb; }
   .panel, button, input { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
   .hint { color: #cbd5e1; }
+  footer a { color: #93c5fd; }
 }
 </style>
 </head>
@@ -12598,6 +12605,9 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
     </div>
   </section>
 </main>
+<footer>
+  <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
+</footer>
 <script>
 const usernamePattern = /^[A-Za-z0-9_-]{1,64}$/;
 const passwordPattern = /^[!-~]{8,256}$/;
@@ -12708,10 +12718,14 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .message { min-height: 1.5em; margin-top: 14px; font-weight: 700; }
 .error { color: #a61b1b; }
 .hint { color: #4b5563; }
+footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
+footer a { color: #174a98; }
+.screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (prefers-color-scheme: dark) {
   body { background: #111827; color: #f9fafb; }
   .panel, button, input { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
   .hint { color: #cbd5e1; }
+  footer a { color: #93c5fd; }
 }
 </style>
 </head>
@@ -12740,6 +12754,9 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
     </form>
   </section>
 </main>
+<footer>
+  <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
+</footer>
 <script>
 const passwordPattern = /^[!-~]{8,256}$/;
 const currentPassword = document.getElementById("current_password");
@@ -12808,6 +12825,9 @@ body { margin: 0; background: #f6f7f9; color: #14181f; }
 header { background: #fff; border-bottom: 1px solid #d8dde6; }
 .topbar { max-width: 980px; margin: 0 auto; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 main { max-width: 980px; margin: 0 auto; padding: 24px; }
+footer { margin: 0 max(24px, calc((100% - 932px) / 2)); padding: 16px 0 32px; border-top: 1px solid #d8dde6; }
+footer a { color: #174a98; }
+footer p { margin: 8px 0 0; color: #526070; font-size: 14px; }
 .global-status-banner { margin: 14px max(24px, calc((100% - 932px) / 2)) 0; padding: 12px 24px; border: 1px solid #2557a7; border-radius: 8px; background: #eaf1ff; color: #14181f; font-weight: 700; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .global-status-banner a { color: #174a98; }
 .insecure-audio-banner p { flex: 1 1 320px; margin: 0; font-weight: 400; }
@@ -12907,6 +12927,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 @media (prefers-color-scheme: dark) {
   body { background: #101318; color: #eef2f7; }
   header, section, select, input, button { background: #181d24; color: #eef2f7; border-color: #333b48; }
+  footer { border-color: #333b48; }
+  footer a { color: #9dc1ff; }
+  footer p { color: #9aa8ba; }
   .global-status-banner { background: #16233a; color: #eef2f7; border-color: #3f67a9; }
   .global-status-banner a { color: #9dc1ff; }
   fieldset, .metric, .stream-item, th, td { border-color: #333b48; }
@@ -12936,6 +12959,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .nav-more { display: block; min-width: 0; }
   .nav-more-menu { left: 0; right: auto; width: min(260px, calc(100vw - 32px)); }
   main { padding: 16px; }
+  footer { margin: 0 16px; padding-bottom: 24px; }
   .global-status-banner { margin: 14px 16px 0; padding: 12px 16px; }
   .effects-layout { display: block; }
   .effects-layout.effect-detail-active .effects-list { display: none; }
@@ -12968,6 +12992,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   nav a, nav button { min-height: 40px; padding: 6px 8px; text-align: center; }
   .nav-more-menu { right: 0; left: auto; }
   main { padding: 16px; }
+  footer { margin: 0 16px; padding-bottom: 24px; }
   .global-status-banner { margin: 14px 16px 0; padding: 12px 16px; }
   .desktop-volume-control { display: none; }
 }
@@ -12982,7 +13007,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <a id="nav_rtl" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
       <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
       <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" data-eas-entry="restore" hidden>EAS alerts</a>
-      <a id="nav_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
       <span class="nav-more">
         <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
         <span id="nav_more_menu" class="nav-more-menu" role="menu" hidden>
@@ -14361,6 +14385,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <audio id="stream_monitor_audio" class="media-session-audio" autoplay playsinline aria-hidden="true" tabindex="-1"></audio>
   <audio id="media_session_anchor_audio" class="media-session-audio" loop preload="auto" playsinline aria-hidden="true" tabindex="-1"></audio>
 </main>
+<footer>
+  <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
+  <p id="footer_version">NWR Stream Manager version __APP_VERSION__</p>
+</footer>
 <script>
 const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto", "alias_filter_strength", "notify_sdr_failures"];
 const DEFAULT_STREAM_SAMPLE_RATE = 24000;
@@ -24900,7 +24928,7 @@ async function resumeListening() {
 </script>
 </body>
 </html>
-"""
+""".replace("__APP_VERSION__", html.escape(APP_VERSION))
 
 
 if __name__ == "__main__":
