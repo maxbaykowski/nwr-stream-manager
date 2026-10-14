@@ -551,8 +551,51 @@ class RemoteSdrProtocolTests(unittest.TestCase):
 
     # -- discovery and pairing ----------------------------------------------
 
+    def discover(self, **kwargs) -> list:
+        return self.remote.discover_hosts(port=self.server.discovery.port, targets=["127.0.0.1"], timeout=0.5, **kwargs)
+
+    def test_host_is_hidden_until_it_shows_a_pairing_code(self) -> None:
+        self.assertEqual(self.discover(), [])
+        self.server.begin_pairing()
+        self.assertEqual([host["id"] for host in self.discover()], [self.host_identity.fingerprint])
+        self.server.cancel_pairing()
+        self.assertEqual(self.discover(), [])
+
+    def test_paired_devices_can_still_find_the_host_but_only_with_a_valid_proof(self) -> None:
+        record = self.pair()
+        host_id = self.host_identity.fingerprint
+        client_id = self.client_identity.fingerprint
+        query = self.remote.paired_discovery_query
+
+        self.assertEqual([host["id"] for host in self.discover(paired_with=query(host_id, client_id, record["token"]))], [host_id])
+        for wrong in (
+            query(host_id, client_id, "not-the-token"),
+            query(host_id, "e" * 64, record["token"]),  # not a paired device
+            query("f" * 64, client_id, record["token"]),  # asking for another host
+            {**query(host_id, client_id, record["token"]), "nonce": "replaced"},
+        ):
+            with self.subTest(query=wrong):
+                self.assertEqual(self.discover(paired_with=wrong), [])
+
+    def test_pairing_ends_when_the_page_showing_the_code_stops_checking_in(self) -> None:
+        from unittest.mock import patch
+
+        remote = self.remote
+        started = time.time()
+        with patch.object(remote.time, "time", return_value=started):
+            self.server.begin_pairing()
+        with patch.object(remote.time, "time", return_value=started + remote.PAIRING_PAGE_TIMEOUT_SECONDS - 1):
+            self.assertTrue(self.server.keep_pairing_open()["active"])
+        with patch.object(remote.time, "time", return_value=started + 2 * remote.PAIRING_PAGE_TIMEOUT_SECONDS - 2):
+            self.assertTrue(self.server.pairing_status()["active"])
+        with patch.object(remote.time, "time", return_value=started + 2 * remote.PAIRING_PAGE_TIMEOUT_SECONDS):
+            self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "page-closed"})
+            # Checking in again does not bring back a pairing that has ended.
+            self.assertFalse(self.server.keep_pairing_open()["active"])
+
     def test_discovery_finds_host_by_identity(self) -> None:
-        hosts = self.remote.discover_hosts(port=self.server.discovery.port, targets=["127.0.0.1"], timeout=1.0)
+        self.server.begin_pairing()
+        hosts = self.discover()
 
         self.assertEqual([host["id"] for host in hosts], [self.host_identity.fingerprint])
         self.assertEqual(hosts[0]["name"], "weather-pi")

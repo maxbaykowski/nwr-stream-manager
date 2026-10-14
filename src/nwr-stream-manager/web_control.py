@@ -418,6 +418,7 @@ READ_ONLY_RESTRICTED_NOTIFICATION_VIEWS = {
     "stream_output",
     "iq_recorder_start",
     "eas_alert_delete",
+    "settings",
     "accounts",
     "create_account",
     "notifications",
@@ -8227,6 +8228,13 @@ class RtlControlService:
         server.begin_pairing()
         return self.remote_sdr_status()
 
+    def keep_remote_sdr_pairing_open(self) -> dict[str, Any]:
+        with self.lock:
+            server = self.remote_server
+        if server is not None:
+            server.keep_pairing_open()
+        return self.remote_sdr_status()
+
     def cancel_remote_sdr_pairing(self) -> dict[str, Any]:
         with self.lock:
             server = self.remote_server
@@ -9526,6 +9534,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         remote_sdr_actions = {
             "/api/remote-sdr/discover": lambda payload: self.service.discover_remote_sdrs(),
             "/api/remote-sdr/pairing/start": lambda payload: self.service.start_remote_sdr_pairing(),
+            "/api/remote-sdr/pairing/keepalive": lambda payload: self.service.keep_remote_sdr_pairing_open(),
             "/api/remote-sdr/pairing/cancel": lambda payload: self.service.cancel_remote_sdr_pairing(),
             "/api/remote-sdr/pair": self.service.pair_remote_sdr,
             "/api/remote-sdr/unpair": self.service.unpair_remote_sdr_device,
@@ -12856,6 +12865,12 @@ nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #255
 .view[hidden] { display: none; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; min-width: 0; }
 .row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.sdr-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px 32px; align-items: start; }
+.sdr-setting { display: grid; gap: 6px; align-content: start; min-width: 0; }
+.sdr-setting label { margin-bottom: 0; }
+.sdr-setting .checkbox-row { margin-top: 6px; }
+.sdr-setting input[type="number"] { max-width: 12rem; }
+.sdr-value { font-weight: 600; }
 .row label { margin: 0; display: flex; align-items: center; gap: 8px; min-width: 44px; min-height: 44px; }
 .checkbox-row { display: flex; align-items: center; gap: 8px; min-height: 44px; margin-top: 14px; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -12901,6 +12916,15 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .effects-list button { text-align: left; }
 .effects-list button[aria-current="true"] { border-color: #2557a7; box-shadow: inset 3px 0 0 #2557a7; }
 .effects-detail { min-width: 0; }
+.settings-layout { display: grid; grid-template-columns: minmax(180px, 240px) minmax(0, 1fr); gap: 24px; align-items: start; }
+.settings-list { display: grid; gap: 8px; }
+.settings-list button { text-align: left; }
+.settings-list button[aria-selected="true"] { border-color: #2557a7; box-shadow: inset 3px 0 0 #2557a7; }
+.settings-detail { min-width: 0; }
+.settings-detail h3 { margin-top: 0; }
+.settings-back { display: none; }
+.settings-group { border-top: 1px solid #d8dde6; margin-top: 20px; padding-top: 4px; }
+.settings-group h4 { font-size: 15px; margin: 14px 0 10px; }
 .audio-effect-panel[hidden] { display: none; }
 .test-tone-panel[hidden] { display: none; }
 .test-tones-mute { margin-bottom: 18px; }
@@ -12926,8 +12950,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 .media-session-audio { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 @media (prefers-color-scheme: dark) {
   body { background: #101318; color: #eef2f7; }
-  header, section, select, input, button { background: #181d24; color: #eef2f7; border-color: #333b48; }
+  header, section, select, input, button, nav a { background: #181d24; color: #eef2f7; border-color: #333b48; }
+  nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #6f9be0; box-shadow: inset 0 -2px 0 #6f9be0; }
   footer { border-color: #333b48; }
+  .settings-group { border-color: #333b48; }
   footer a { color: #9dc1ff; }
   footer p { color: #9aa8ba; }
   .global-status-banner { background: #16233a; color: #eef2f7; border-color: #3f67a9; }
@@ -12978,14 +13004,26 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .responsive-table td:not([data-label]) { display: block; }
   .responsive-table td[data-label]::before { content: attr(data-label); content: attr(data-label) / ""; color: #526070; font-size: 12px; font-weight: 700; text-transform: uppercase; }
   .responsive-table .menu-cell .stream-actions-menu { right: 12px; }
-  #remote_pair_section #remote_pair_panel { display: none; }
+}
+@media (max-width: 680px), (max-width: 900px) and (orientation: landscape), (orientation: landscape) and (max-height: 500px) {
+  .settings-layout { display: block; }
+  .settings-layout.settings-detail-active .settings-list { display: none; }
+  .settings-layout:not(.settings-detail-active) .settings-detail { display: none; }
+  .settings-list { gap: 0; border: 1px solid #d8dde6; border-radius: 8px; overflow: hidden; }
+  .settings-list button { display: flex; justify-content: space-between; align-items: center; min-height: 48px; padding: 12px 14px; border: 0; border-radius: 0; border-bottom: 1px solid #d8dde6; }
+  .settings-list button:last-child { border-bottom: 0; }
+  .settings-list button::after { content: "\\203A"; content: "\\203A" / ""; font-size: 22px; line-height: 1; color: #526070; }
+  .settings-back { display: inline-block; margin-bottom: 12px; }
+}
+@media (max-width: 680px) and (prefers-color-scheme: dark), (max-width: 900px) and (orientation: landscape) and (prefers-color-scheme: dark), (orientation: landscape) and (max-height: 500px) and (prefers-color-scheme: dark) {
+  .settings-list, .settings-list button { border-color: #333b48; }
+  .settings-list button::after { color: #9aa8ba; }
 }
 @media (max-width: 680px) and (prefers-color-scheme: dark) {
   .responsive-table tr { border-color: #333b48; }
   .responsive-table td[data-label]::before { color: #9aa8ba; }
 }
 @media (max-width: 900px) and (orientation: landscape) {
-  #remote_pair_section #remote_pair_panel { display: none; }
   .topbar { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 14px; padding: 10px 16px; }
   .topbar h1 { font-size: 20px; max-width: 9rem; }
   nav { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; width: 100%; }
@@ -13012,9 +13050,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <span id="nav_more_menu" class="nav-more-menu" role="menu" hidden>
           <a id="nav_receiver" href="/?view=receiver" data-view="receiver" role="menuitem">Weather Radio Receiver</a>
           <a id="nav_iq_recorder" href="/?view=iq_recorder" data-view="iq_recorder" role="menuitem">I/Q Recorder</a>
-          <a id="nav_notifications" href="/?view=notifications" data-view="notifications" role="menuitem">Notification settings</a>
           <a id="nav_logs" href="/?view=logs" data-view="logs" role="menuitem">Logs</a>
-          <a id="nav_accounts" href="/?view=accounts" data-view="accounts" role="menuitem">Manage accounts</a>
+          <a id="nav_settings" href="/?view=settings" data-view="settings" role="menuitem" hidden>Settings</a>
           <a id="nav_change_password" href="/?view=change_password" data-view="change_password" role="menuitem" hidden>Change account password</a>
         </span>
       </span>
@@ -13069,12 +13106,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div class="actions">
     <button id="copy_account_secret" type="button">Copy to clipboard</button>
     <button id="dismiss_account_secret" type="button">Dismiss</button>
-  </div>
-</div>
-<div id="remote_pairing_dialog" class="fullscreen-dialog" role="dialog" aria-modal="true" aria-labelledby="remote_pairing_dialog_title" hidden>
-  <div class="fullscreen-dialog-panel">
-    <h2 id="remote_pairing_dialog_title"></h2>
-    <div id="remote_pairing_dialog_body"></div>
   </div>
 </div>
 <div id="same_test_warning_dialog" class="fullscreen-dialog" role="dialog" aria-modal="true" aria-labelledby="same_test_warning_title" hidden>
@@ -13179,33 +13210,18 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div id="view_rtl" class="view" hidden>
     <section>
       <h2>Configure RTL-SDR</h2>
-      <fieldset id="sdr_source_fieldset">
-        <legend>SDR source</legend>
-        <label class="checkbox-row">
-          <input id="sdr_source_local" name="sdr_source" type="radio" value="local">
-          RTL-SDR connected to this machine
-        </label>
-        <label class="checkbox-row">
-          <input id="sdr_source_remote" name="sdr_source" type="radio" value="remote">
-          RTL-SDR shared by another NWR Stream Manager
-        </label>
-      </fieldset>
-      <div id="local_sdr_controls">
-        <label>Active SDR
-          <select id="serial" aria-describedby="serial_hint"></select>
-        </label>
-        <span id="serial_hint" class="hint">Select the SDR dongle by serial number.</span>
+      <label>Active SDR
+        <select id="serial" aria-describedby="serial_hint"></select>
+      </label>
+      <span id="serial_hint" class="hint">Choose an RTL-SDR connected to this machine, or one shared over the network by a paired NWR Stream Manager. To add a shared one, pair with it in Settings, under SDR sharing.</span>
+      <div class="actions">
         <button id="rescan_devices" type="button">Rescan</button>
         <button id="reset_rtl_device" type="button">Reset SDR</button>
-        <div id="device-errors" class="error"></div>
+        <button id="reset_remote_sdr" type="button" hidden>Reset SDR</button>
       </div>
+      <div id="device-errors" class="error"></div>
       <div id="remote_sdr_controls" hidden>
-        <label>Shared SDR
-          <select id="remote_sdr_device" aria-describedby="remote_sdr_device_hint"></select>
-        </label>
-        <span id="remote_sdr_device_hint" class="hint">Choose a paired NWR Stream Manager whose RTL-SDR this machine should use.</span>
         <p id="remote_sdr_status"></p>
-        <button id="reset_remote_sdr" type="button">Reset SDR</button>
         <label>Network buffer in seconds
           <input id="remote_buffer_seconds" type="number" min="0.1" max="10" step="0.1" aria-describedby="remote_buffer_seconds_hint">
         </label>
@@ -13215,111 +13231,32 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div id="sdr-source-result" class="message" aria-live="polite"></div>
     </section>
     <section>
-      <div class="grid">
-        <div>
+      <div class="sdr-settings">
+        <div class="sdr-setting">
           <label for="gain">Gain</label>
           <input id="gain" type="range" min="0" max="0" step="1" value="0" disabled aria-describedby="gain_hint">
-          <span id="gain_label" class="hint">Automatic</span>
+          <span id="gain_label" class="sdr-value">Automatic</span>
           <span id="gain_hint" class="hint">Controls how strongly the SDR amplifies received signals. Generally this should be kept around 30-35 dB. Setting gain too high can cause interference, setting it too low can significantly degrade reception.</span>
-          <label><input id="gain_auto" type="checkbox" aria-describedby="gain_auto_hint"> Automatic gain control</label>
+          <label class="checkbox-row"><input id="gain_auto" type="checkbox" aria-describedby="gain_auto_hint"> Automatic gain control</label>
           <span id="gain_auto_hint" class="hint">Automatically adjusts the tuner gain based on signal strength. It is best to keep this setting switched off as it can increase the gain too high, causing interference.</span>
         </div>
-        <label>PPM Correction
+        <div class="sdr-setting">
+          <label for="ppm_correction">PPM correction</label>
           <input id="ppm_correction" type="number" min="-200" max="200" step="1" aria-describedby="ppm_correction_hint">
-        </label>
-        <span id="ppm_correction_hint" class="hint">Controls hardware frequency correction for dongles that experience frequency drift.</span>
-        <div>
+          <span id="ppm_correction_hint" class="hint">Controls hardware frequency correction for dongles that experience frequency drift.</span>
+        </div>
+        <div class="sdr-setting">
           <label for="alias_filter_strength">Alias filter strength</label>
           <input id="alias_filter_strength" type="range" min="0" max="100" step="1" value="100" aria-describedby="alias_filter_strength_hint">
-          <span id="alias_filter_strength_label" class="hint" aria-hidden="true">100%</span>
+          <span id="alias_filter_strength_label" class="sdr-value" aria-hidden="true">100%</span>
+          <span id="alias_filter_strength_hint" class="hint">Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.</span>
         </div>
-        <div class="row">
-          <label><input id="bias_tee" type="checkbox" aria-describedby="bias_tee_hint"> Bias tee</label>
+        <div class="sdr-setting">
+          <label class="checkbox-row"><input id="bias_tee" type="checkbox" aria-describedby="bias_tee_hint"> Bias tee</label>
           <span id="bias_tee_hint" class="hint">Enable the RTL-SDR bias tee. Only enable this if attached hardware expects DC power.</span>
         </div>
       </div>
-      <div id="alias_filter_strength_hint" class="hint">
-        Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.
-      </div>
       <div id="sdr-settings-result" class="message" aria-live="polite"></div>
-    </section>
-    <section id="sdr_sharing_section">
-      <h3>Sharing</h3>
-      <p id="remote_access_unavailable" class="hint" hidden>Sharing is available while an RTL-SDR connected to this machine is selected.</p>
-      <div id="remote_access_controls">
-        <label class="checkbox-row">
-          <input id="remote_access_enabled" type="checkbox" aria-describedby="remote_access_hint">
-          Share this RTL-SDR with paired devices
-        </label>
-        <span id="remote_access_hint" class="hint">Paired NWR Stream Manager devices on your network can use this RTL-SDR for their streams, weather radio receiver and I/Q recordings. To pair a device, select Pair a device here and enter the code it shows on the other device. Sharing uses TCP port 47432 and UDP port 47433.</span>
-        <div id="remote_pairing_controls" hidden>
-          <div class="actions">
-            <button id="start_remote_pairing" type="button">Pair a device</button>
-          </div>
-          <div id="remote_pairing_panel" hidden>
-            <div class="grid">
-              <label>Pairing code
-                <input id="remote_pairing_code" type="text" readonly autocomplete="off" spellcheck="false" aria-describedby="remote_pairing_code_hint">
-              </label>
-            </div>
-            <div class="actions">
-              <button id="copy_remote_pairing_code" type="button">Copy pairing code</button>
-            </div>
-            <span id="remote_pairing_code_hint" class="hint"></span>
-            <div id="remote-pairing-copy-result" class="message" aria-live="polite"></div>
-            <div class="actions">
-              <button id="cancel_remote_pairing" type="button">Stop pairing</button>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div id="remote-sharing-result" class="message" aria-live="polite"></div>
-    </section>
-    <section id="remote_pair_section">
-      <h3>Pair with another NWR Stream Manager</h3>
-      <p class="hint">Pair once and either device can use the other's RTL-SDR. On the device you are pairing with, turn on sharing and select Pair a device to show a pairing code.</p>
-      <div class="actions">
-        <button id="find_remote_devices" type="button">Find devices</button>
-      </div>
-      <div id="remote-pair-outcome" class="message" aria-live="polite"></div>
-      <div id="remote_pair_panel">
-      <div class="grid">
-        <label>Device
-          <select id="remote_pair_device"></select>
-        </label>
-        <label id="remote_pair_address_label" hidden>Address
-          <input id="remote_pair_address" type="text" autocomplete="off" spellcheck="false" aria-describedby="remote_pair_address_hint">
-        </label>
-        <span id="remote_pair_address_hint" class="hint" hidden>The IP address or host name of the other NWR Stream Manager.</span>
-        <label>Pairing code
-          <input id="remote_pair_code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" aria-describedby="remote_pair_code_hint">
-        </label>
-        <span id="remote_pair_code_hint" class="hint">The 6-digit code shown on the other device.</span>
-      </div>
-      <div class="actions">
-        <button id="pair_remote_device" type="button">Pair</button>
-        <button id="close_remote_pair_dialog" type="button" hidden>Close</button>
-      </div>
-      <div id="remote-pair-result" class="message" aria-live="polite"></div>
-      </div>
-    </section>
-    <section id="paired_devices_section">
-      <h3>Paired devices</h3>
-      <table class="responsive-table" role="table" aria-label="Paired devices">
-        <thead role="rowgroup">
-          <tr role="row">
-            <th role="columnheader">Name</th>
-            <th role="columnheader">Status</th>
-            <th role="columnheader">Actions</th>
-          </tr>
-        </thead>
-        <tbody id="paired-devices-body" role="rowgroup" aria-live="off">
-          <tr data-row-key="empty" role="row">
-            <td colspan="3" class="hint" role="cell">No paired devices.</td>
-          </tr>
-        </tbody>
-      </table>
-      <div id="paired-devices-result" class="message" aria-live="polite"></div>
     </section>
     <section id="rtl_notifications_section" hidden>
       <h3>Notifications</h3>
@@ -13478,111 +13415,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_notifications" class="view" hidden>
-    <section>
-      <h2>Notification settings</h2>
-      <div id="notification-result" class="message" aria-live="polite"></div>
-      <div id="notification_intro">
-        <p>Get notifications on your computer or phone when a stream goes down, a sound card isn't working, or the RTL-SDR needs attention.</p>
-        <div class="actions">
-          <button id="start_notification_setup" type="button">Set up</button>
-        </div>
-      </div>
-      <div id="notification_configured" hidden>
-        <label>ntfy server
-          <select id="notification_server_mode" aria-describedby="notification_server_mode_hint">
-            <option value="ntfy.sh">ntfy.sh</option>
-            <option value="self-hosted">Self-hosted instance</option>
-          </select>
-        </label>
-        <span id="notification_server_mode_hint" class="hint">The ntfy server notifications are sent through. After changing it, subscribe to the topic on the new server in the ntfy app.</span>
-        <label id="notification_configured_server_url_label" hidden>Server URL
-          <input id="notification_configured_server_url" type="url" autocomplete="url" placeholder="https://ntfy.example.com" aria-describedby="notification_configured_server_url_hint">
-        </label>
-        <span id="notification_configured_server_url_hint" class="hint" hidden>The URL of your self-hosted ntfy server, starting with http:// or https://.</span>
-        <label>Topic secret
-          <input id="notification_configured_topic_secret" type="text" readonly aria-describedby="notification_configured_topic_hint">
-        </label>
-        <span id="notification_configured_topic_hint" class="hint">Subscribe to this topic in the ntfy app to receive notifications.</span>
-        <div class="actions">
-          <button id="copy_configured_notification_topic" type="button">Copy to clipboard</button>
-          <button id="regenerate_notification_topic" type="button" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</button>
-        </div>
-        <span id="regenerate_notification_topic_hint" class="hint">Regenerate the topic secret if someone has figured out the current one.</span>
-        <label>Open NWR Stream Manager from notifications
-          <select id="notification_access_url_mode" aria-describedby="notification_access_url_hint"></select>
-        </label>
-        <span id="notification_access_url_hint" class="hint">The address your devices open when you select a notification. Choose one they can reach, such as a Tailscale address for devices away from home.</span>
-        <label id="notification_custom_access_url_label" hidden>Custom URL
-          <input id="notification_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_custom_access_url_hint">
-        </label>
-        <span id="notification_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
-        <div class="actions">
-          <button id="configured_test_notifications" type="button">Send test notification</button>
-        </div>
-      </div>
-      <div id="notification_wizard" hidden>
-        <div id="notification_step_server_choice" class="wizard-step">
-          <p>Let's get notifications set up! NWR Stream Manager sends notifications through ntfy, a free, open-source notification service. You install the ntfy app on your phone or computer and subscribe to a private topic, and NWR Stream Manager sends a notification to that topic when something needs your attention, such as a stream going down or the RTL-SDR disconnecting.</p>
-          <p>Most people use the public ntfy.sh server, which is free and doesn't need an account. If you run your own ntfy server, you can use it instead.</p>
-          <fieldset>
-            <legend>Do you have your own self-hosted ntfy server?</legend>
-            <label class="checkbox-row"><input id="notification_self_hosted_no" name="notification_self_hosted" type="radio" value="no" checked> No, use ntfy.sh</label>
-            <label class="checkbox-row"><input id="notification_self_hosted_yes" name="notification_self_hosted" type="radio" value="yes"> Yes</label>
-          </fieldset>
-        </div>
-        <div id="notification_step_server_url" class="wizard-step" hidden>
-          <p>Enter the URL of your self-hosted ntfy server.</p>
-          <label>ntfy server URL
-            <input id="notification_server_url" type="url" placeholder="https://ntfy.example.com" autocomplete="url" aria-describedby="notification_server_url_hint">
-          </label>
-          <span id="notification_server_url_hint" class="hint">Starts with http:// or https://.</span>
-        </div>
-        <div id="notification_step_app_install" class="wizard-step" hidden>
-          <p>Download the ntfy app on your device, or use the ntfy web app.</p>
-          <ul>
-            <li><a href="https://apps.apple.com/us/app/ntfy/id1625396347" target="_blank" rel="noopener noreferrer">Download ntfy from the Apple App Store</a></li>
-            <li><a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy" target="_blank" rel="noopener noreferrer">Download ntfy from Google Play</a></li>
-            <li><a id="notification_web_app_link" href="https://ntfy.sh/app" target="_blank" rel="noopener noreferrer">Open the ntfy web app</a></li>
-          </ul>
-        </div>
-        <div id="notification_step_topic" class="wizard-step" hidden>
-          <p>To receive notifications, subscribe to the NWR Stream Manager topic in the ntfy app. Copy the topic secret below, then paste it into the topic name field in the ntfy app. You can subscribe on as many devices as you want; notifications are sent to all of them.</p>
-          <label>Topic secret
-            <input id="notification_topic_secret" type="text" readonly aria-describedby="notification_topic_secret_hint">
-          </label>
-          <span id="notification_topic_secret_hint" class="hint">Anyone who knows the topic secret can see and send notifications on it. If you ever receive notifications that didn't come from NWR Stream Manager, regenerate the topic secret in the notification settings.</span>
-          <div class="actions">
-            <button id="copy_notification_topic" type="button">Copy to clipboard</button>
-          </div>
-        </div>
-        <div id="notification_step_access_url" class="wizard-step" hidden>
-          <p>Selecting a notification can open NWR Stream Manager. Choose the address your devices should use to reach it.</p>
-          <label>Open NWR Stream Manager from notifications
-            <select id="notification_wizard_access_url_mode" aria-describedby="notification_wizard_access_url_hint"></select>
-          </label>
-          <span id="notification_wizard_access_url_hint" class="hint">Choose an address your devices can reach, such as a Tailscale address for devices away from home.</span>
-          <label id="notification_wizard_custom_access_url_label" hidden>Custom URL
-            <input id="notification_wizard_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_wizard_custom_access_url_hint">
-          </label>
-          <span id="notification_wizard_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
-        </div>
-        <div id="notification_step_test" class="wizard-step" hidden>
-          <p>Send a test notification to make sure notifications from NWR Stream Manager reach your devices, then select Finish.</p>
-          <div class="actions">
-            <button id="wizard_test_notifications" type="button">Send test notification</button>
-          </div>
-        </div>
-        <div class="actions">
-          <button id="notification_cancel" type="button">Cancel</button>
-          <button id="notification_back" type="button" hidden>Back</button>
-          <button id="notification_next" type="button">Next</button>
-          <button id="notification_finish" type="button" hidden>Finish</button>
-        </div>
-      </div>
-    </section>
-  </div>
-
   <div id="view_logs" class="view" hidden>
     <section>
       <h2>Logs</h2>
@@ -13597,40 +13429,244 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_accounts" class="view" hidden>
+  <div id="view_settings" class="view" hidden>
     <section>
-      <h2>Manage Accounts</h2>
-      <div id="account-result" class="message"></div>
-      <div class="actions">
-        <button id="open_create_account" type="button">Create account</button>
-      </div>
-      <table class="responsive-table" role="table" aria-label="Accounts">
-        <thead role="rowgroup">
-          <tr role="row">
-            <th role="columnheader">Username</th>
-            <th role="columnheader">Account type</th>
-            <th role="columnheader">Last accessed</th>
-            <th role="columnheader">Actions</th>
-          </tr>
-        </thead>
-        <tbody id="accounts-body" role="rowgroup" aria-live="off">
-          <tr data-row-key="empty" role="row"><td colspan="4" class="hint" role="cell">No accounts.</td></tr>
-        </tbody>
-      </table>
-    </section>
-  </div>
-
-  <div id="view_create_account" class="view" hidden>
-    <section>
-      <h2>Create Account</h2>
-      <div id="create-account-result" class="message"></div>
-      <label>Username
-        <input id="new_account_username" autocomplete="off" pattern="[A-Za-z0-9_-]{1,64}">
-      </label>
-      <label><input id="new_account_read_only" type="checkbox"> Read-only account</label>
-      <div class="actions">
-        <button id="create_account" type="button">Create account</button>
-        <button id="cancel_create_account" type="button">Cancel</button>
+      <h2>Settings</h2>
+      <div id="settings_layout" class="settings-layout">
+        <div id="settings_list" class="settings-list" role="tablist" aria-orientation="vertical" aria-label="Settings">
+          <button id="settings_tab_accounts" type="button" role="tab" data-settings-section="accounts" aria-controls="settings_panel_accounts" aria-selected="false" tabindex="-1" hidden>Accounts</button>
+          <button id="settings_tab_account" type="button" role="tab" data-settings-section="account" aria-controls="settings_panel_account" aria-selected="false" tabindex="-1" hidden>Account</button>
+          <button id="settings_tab_sdr_sharing" type="button" role="tab" data-settings-section="sdr_sharing" aria-controls="settings_panel_sdr_sharing" aria-selected="false" tabindex="-1">SDR sharing</button>
+          <button id="settings_tab_notifications" type="button" role="tab" data-settings-section="notifications" aria-controls="settings_panel_notifications" aria-selected="false" tabindex="-1">Notifications</button>
+        </div>
+        <div class="settings-detail">
+          <button id="settings_back" class="settings-back" type="button">Back to settings</button>
+          <div id="settings_panel_accounts" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_accounts" hidden>
+            <div id="settings_accounts_page">
+              <h3>Accounts</h3>
+              <div id="account-result" class="message"></div>
+              <div class="actions">
+                <button id="open_create_account" type="button">Create account</button>
+              </div>
+              <table class="responsive-table" role="table" aria-label="Accounts">
+                <thead role="rowgroup">
+                  <tr role="row">
+                    <th role="columnheader">Username</th>
+                    <th role="columnheader">Account type</th>
+                    <th role="columnheader">Last accessed</th>
+                    <th role="columnheader">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="accounts-body" role="rowgroup" aria-live="off">
+                  <tr data-row-key="empty" role="row"><td colspan="4" class="hint" role="cell">No accounts.</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div id="settings_create_account_page" hidden>
+              <h3>Create account</h3>
+              <div id="create-account-result" class="message"></div>
+              <label>Username
+                <input id="new_account_username" autocomplete="off" pattern="[A-Za-z0-9_-]{1,64}">
+              </label>
+              <label><input id="new_account_read_only" type="checkbox"> Read-only account</label>
+              <div class="actions">
+                <button id="create_account" type="button">Create account</button>
+                <button id="cancel_create_account" type="button">Cancel</button>
+              </div>
+            </div>
+            <div id="settings_owner_password_page" hidden>
+              <h3>Change account password</h3>
+            </div>
+          </div>
+          <div id="settings_panel_account" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_account" hidden>
+            <h3>Account</h3>
+          </div>
+          <div id="settings_panel_sdr_sharing" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_sdr_sharing" hidden>
+            <div id="settings_sdr_sharing_page">
+              <h3>SDR sharing</h3>
+              <div id="sdr_sharing_section" class="settings-group">
+                <h4>Sharing</h4>
+                <p id="remote_access_unavailable" class="hint" hidden>Sharing is available while an RTL-SDR connected to this machine is selected.</p>
+                <div id="remote_access_controls">
+                  <label class="checkbox-row">
+                    <input id="remote_access_enabled" type="checkbox" aria-describedby="remote_access_hint">
+                    Share this RTL-SDR with paired devices
+                  </label>
+                  <span id="remote_access_hint" class="hint">Paired NWR Stream Manager devices on your network can use this RTL-SDR for their streams, weather radio receiver and I/Q recordings. To pair a device, select Pair a device to show a pairing code, then enter it on the other device. Sharing uses TCP port 47432 and UDP port 47433.</span>
+                  <div id="remote_pairing_controls" class="actions" hidden>
+                    <button id="start_remote_pairing" type="button">Pair a device</button>
+                  </div>
+                </div>
+                <div id="remote-sharing-result" class="message" aria-live="polite"></div>
+              </div>
+              <div id="remote_pair_section" class="settings-group">
+                <h4>Pair with another NWR Stream Manager</h4>
+                <p class="hint">Pair once and either device can use the other's RTL-SDR. On the device you are pairing with, turn on sharing and select Pair a device to show a pairing code, then select Find devices here.</p>
+                <div class="actions">
+                  <button id="find_remote_devices" type="button">Find devices</button>
+                </div>
+                <div id="remote-pair-outcome" class="message" aria-live="polite"></div>
+              </div>
+              <div id="paired_devices_section" class="settings-group">
+                <h4>Paired devices</h4>
+                <table class="responsive-table" role="table" aria-label="Paired devices">
+                  <thead role="rowgroup">
+                    <tr role="row">
+                      <th role="columnheader">Name</th>
+                      <th role="columnheader">Status</th>
+                      <th role="columnheader">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="paired-devices-body" role="rowgroup" aria-live="off">
+                    <tr data-row-key="empty" role="row">
+                      <td colspan="3" class="hint" role="cell">No paired devices.</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div id="paired-devices-result" class="message" aria-live="polite"></div>
+              </div>
+            </div>
+            <div id="settings_pair_device_page" hidden>
+              <h3>Pair a device</h3>
+              <p class="hint">On the other NWR Stream Manager, open Settings, then SDR sharing, select Find devices, choose this device and enter this code. Other devices can find this one only while this page is open, and pairing stops when you leave it.</p>
+              <label>Pairing code
+                <input id="remote_pairing_code" type="text" readonly autocomplete="off" spellcheck="false" aria-describedby="remote_pairing_code_hint">
+              </label>
+              <span id="remote_pairing_code_hint" class="hint"></span>
+              <div class="actions">
+                <button id="copy_remote_pairing_code" type="button">Copy pairing code</button>
+                <button id="cancel_remote_pairing" type="button">Stop pairing</button>
+              </div>
+              <div id="remote-pairing-copy-result" class="message" aria-live="polite"></div>
+              <div id="remote-pairing-status" class="message" aria-live="polite"></div>
+            </div>
+            <div id="settings_find_devices_page" hidden>
+              <h3>Find devices</h3>
+              <p class="hint">On the device you are pairing with, open Settings, then SDR sharing, turn on sharing and select Pair a device. It appears here once it shows a pairing code. Searching continues until you pair or leave this page.</p>
+              <p id="remote_pair_search_status" class="hint" aria-live="polite"></p>
+              <div class="grid">
+                <label>Device
+                  <select id="remote_pair_device"></select>
+                </label>
+                <label id="remote_pair_address_label" hidden>Address
+                  <input id="remote_pair_address" type="text" autocomplete="off" spellcheck="false" aria-describedby="remote_pair_address_hint">
+                </label>
+                <span id="remote_pair_address_hint" class="hint" hidden>The IP address or host name of the other NWR Stream Manager.</span>
+                <label>Pairing code
+                  <input id="remote_pair_code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" aria-describedby="remote_pair_code_hint">
+                </label>
+                <span id="remote_pair_code_hint" class="hint">The 6-digit code shown on the other device.</span>
+              </div>
+              <div class="actions">
+                <button id="pair_remote_device" type="button">Pair</button>
+                <button id="cancel_find_devices" type="button">Cancel</button>
+              </div>
+              <div id="remote-pair-result" class="message" aria-live="polite"></div>
+            </div>
+          </div>
+          <div id="settings_panel_notifications" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_notifications" hidden>
+            <h3>Notifications</h3>
+            <div id="notification-result" class="message" aria-live="polite"></div>
+            <div id="notification_intro">
+              <p>Get notifications on your computer or phone when a stream goes down, a sound card isn't working, or the RTL-SDR needs attention.</p>
+              <div class="actions">
+                <button id="start_notification_setup" type="button">Set up</button>
+              </div>
+            </div>
+            <div id="notification_configured" hidden>
+              <label>ntfy server
+                <select id="notification_server_mode" aria-describedby="notification_server_mode_hint">
+                  <option value="ntfy.sh">ntfy.sh</option>
+                  <option value="self-hosted">Self-hosted instance</option>
+                </select>
+              </label>
+              <span id="notification_server_mode_hint" class="hint">The ntfy server notifications are sent through. After changing it, subscribe to the topic on the new server in the ntfy app.</span>
+              <label id="notification_configured_server_url_label" hidden>Server URL
+                <input id="notification_configured_server_url" type="url" autocomplete="url" placeholder="https://ntfy.example.com" aria-describedby="notification_configured_server_url_hint">
+              </label>
+              <span id="notification_configured_server_url_hint" class="hint" hidden>The URL of your self-hosted ntfy server, starting with http:// or https://.</span>
+              <label>Topic secret
+                <input id="notification_configured_topic_secret" type="text" readonly aria-describedby="notification_configured_topic_hint">
+              </label>
+              <span id="notification_configured_topic_hint" class="hint">Subscribe to this topic in the ntfy app to receive notifications.</span>
+              <div class="actions">
+                <button id="copy_configured_notification_topic" type="button">Copy to clipboard</button>
+                <button id="regenerate_notification_topic" type="button" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</button>
+              </div>
+              <span id="regenerate_notification_topic_hint" class="hint">Regenerate the topic secret if someone has figured out the current one.</span>
+              <label>Open NWR Stream Manager from notifications
+                <select id="notification_access_url_mode" aria-describedby="notification_access_url_hint"></select>
+              </label>
+              <span id="notification_access_url_hint" class="hint">The address your devices open when you select a notification. Choose one they can reach, such as a Tailscale address for devices away from home.</span>
+              <label id="notification_custom_access_url_label" hidden>Custom URL
+                <input id="notification_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_custom_access_url_hint">
+              </label>
+              <span id="notification_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
+              <div class="actions">
+                <button id="configured_test_notifications" type="button">Send test notification</button>
+              </div>
+            </div>
+            <div id="notification_wizard" hidden>
+              <div id="notification_step_server_choice" class="wizard-step">
+                <p>Let's get notifications set up! NWR Stream Manager sends notifications through ntfy, a free, open-source notification service. You install the ntfy app on your phone or computer and subscribe to a private topic, and NWR Stream Manager sends a notification to that topic when something needs your attention, such as a stream going down or the RTL-SDR disconnecting.</p>
+                <p>Most people use the public ntfy.sh server, which is free and doesn't need an account. If you run your own ntfy server, you can use it instead.</p>
+                <fieldset>
+                  <legend>Do you have your own self-hosted ntfy server?</legend>
+                  <label class="checkbox-row"><input id="notification_self_hosted_no" name="notification_self_hosted" type="radio" value="no" checked> No, use ntfy.sh</label>
+                  <label class="checkbox-row"><input id="notification_self_hosted_yes" name="notification_self_hosted" type="radio" value="yes"> Yes</label>
+                </fieldset>
+              </div>
+              <div id="notification_step_server_url" class="wizard-step" hidden>
+                <p>Enter the URL of your self-hosted ntfy server.</p>
+                <label>ntfy server URL
+                  <input id="notification_server_url" type="url" placeholder="https://ntfy.example.com" autocomplete="url" aria-describedby="notification_server_url_hint">
+                </label>
+                <span id="notification_server_url_hint" class="hint">Starts with http:// or https://.</span>
+              </div>
+              <div id="notification_step_app_install" class="wizard-step" hidden>
+                <p>Download the ntfy app on your device, or use the ntfy web app.</p>
+                <ul>
+                  <li><a href="https://apps.apple.com/us/app/ntfy/id1625396347" target="_blank" rel="noopener noreferrer">Download ntfy from the Apple App Store</a></li>
+                  <li><a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy" target="_blank" rel="noopener noreferrer">Download ntfy from Google Play</a></li>
+                  <li><a id="notification_web_app_link" href="https://ntfy.sh/app" target="_blank" rel="noopener noreferrer">Open the ntfy web app</a></li>
+                </ul>
+              </div>
+              <div id="notification_step_topic" class="wizard-step" hidden>
+                <p>To receive notifications, subscribe to the NWR Stream Manager topic in the ntfy app. Copy the topic secret below, then paste it into the topic name field in the ntfy app. You can subscribe on as many devices as you want; notifications are sent to all of them.</p>
+                <label>Topic secret
+                  <input id="notification_topic_secret" type="text" readonly aria-describedby="notification_topic_secret_hint">
+                </label>
+                <span id="notification_topic_secret_hint" class="hint">Anyone who knows the topic secret can see and send notifications on it. If you ever receive notifications that didn't come from NWR Stream Manager, regenerate the topic secret in the notification settings.</span>
+                <div class="actions">
+                  <button id="copy_notification_topic" type="button">Copy to clipboard</button>
+                </div>
+              </div>
+              <div id="notification_step_access_url" class="wizard-step" hidden>
+                <p>Selecting a notification can open NWR Stream Manager. Choose the address your devices should use to reach it.</p>
+                <label>Open NWR Stream Manager from notifications
+                  <select id="notification_wizard_access_url_mode" aria-describedby="notification_wizard_access_url_hint"></select>
+                </label>
+                <span id="notification_wizard_access_url_hint" class="hint">Choose an address your devices can reach, such as a Tailscale address for devices away from home.</span>
+                <label id="notification_wizard_custom_access_url_label" hidden>Custom URL
+                  <input id="notification_wizard_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_wizard_custom_access_url_hint">
+                </label>
+                <span id="notification_wizard_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
+              </div>
+              <div id="notification_step_test" class="wizard-step" hidden>
+                <p>Send a test notification to make sure notifications from NWR Stream Manager reach your devices, then select Finish.</p>
+                <div class="actions">
+                  <button id="wizard_test_notifications" type="button">Send test notification</button>
+                </div>
+              </div>
+              <div class="actions">
+                <button id="notification_cancel" type="button">Cancel</button>
+                <button id="notification_back" type="button" hidden>Back</button>
+                <button id="notification_next" type="button">Next</button>
+                <button id="notification_finish" type="button" hidden>Finish</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
   </div>
@@ -13638,19 +13674,21 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <div id="view_change_password" class="view" hidden>
     <section>
       <h2>Change Account Password</h2>
-      <div id="change-password-result" class="message"></div>
-      <label>Current password
-        <input id="account_current_password" type="password" autocomplete="current-password">
-      </label>
-      <label>New password
-        <input id="account_new_password" type="password" autocomplete="new-password">
-      </label>
-      <label>Confirm new password
-        <input id="account_confirm_password" type="password" autocomplete="new-password">
-      </label>
-      <div class="actions">
-        <button id="change_account_password" type="button">Change password</button>
-        <button id="cancel_change_password" type="button">Cancel</button>
+      <div id="change_password_form">
+        <div id="change-password-result" class="message"></div>
+        <label>Current password
+          <input id="account_current_password" type="password" autocomplete="current-password">
+        </label>
+        <label>New password
+          <input id="account_new_password" type="password" autocomplete="new-password">
+        </label>
+        <label>Confirm new password
+          <input id="account_confirm_password" type="password" autocomplete="new-password">
+        </label>
+        <div class="actions">
+          <button id="change_account_password" type="button">Change password</button>
+          <button id="cancel_change_password" type="button">Cancel</button>
+        </div>
       </div>
     </section>
   </div>
@@ -16407,35 +16445,70 @@ function updateSettingsSoundcardResetButton() {
   button.hidden = accountIsReadOnly() || outputFormMode !== "edit_soundcard" || !output || !device || device.bus !== "usb";
 }
 
+// The Active SDR list holds this machine's RTL-SDRs and, after them, the ones
+// paired NWR Stream Managers share over the network ("remote:" and their id).
+const REMOTE_SDR_CHOICE_PREFIX = "remote:";
+let localSdrDevices = [];
+let configuredLocalSerial = "";
+
+function renderActiveSdrChoices() {
+  const select = document.getElementById("serial");
+  const usesRemote = remoteSdrUsesRemote();
+  const paired = remoteSdr.devices || [];
+  const configured = configuredLocalSerial;
+  const configuredMissing = configured && !localSdrDevices.some(device => device.serial === configured);
+  const choices = [];
+  if (!usesRemote && configuredMissing) {
+    choices.push({value: configured, label: configuredDeviceLabel(configured)});
+  } else if (!usesRemote && !configured && localSdrDevices.length !== 1) {
+    choices.push({
+      value: "",
+      label: localSdrDevices.length === 0 && paired.length === 0 ? "No RTL-SDR devices found" : "Select an RTL-SDR..."
+    });
+  }
+  for (const device of localSdrDevices) {
+    choices.push({value: device.serial, label: deviceLabel(device)});
+  }
+  for (const device of paired) {
+    choices.push({value: `${REMOTE_SDR_CHOICE_PREFIX}${device.id}`, label: `Shared by ${remoteDeviceName(device)} over the network`});
+  }
+  const signature = JSON.stringify(choices);
+  if (select.dataset.signature !== signature) {
+    syncSelectOptions(select, choices);
+    select.dataset.signature = signature;
+  }
+  if (!sdrSettingIsBeingChanged("serial") && !remoteSdrRequestPending) {
+    const remoteId = (remoteSdr.remote || {}).device_id;
+    const fallback = !configured && localSdrDevices.length === 1 ? localSdrDevices[0].serial : "";
+    setValue("serial", usesRemote ? `${REMOTE_SDR_CHOICE_PREFIX}${remoteId}` : configured || fallback);
+  }
+  const showRemote = document.getElementById("serial").value.startsWith(REMOTE_SDR_CHOICE_PREFIX);
+  setHidden("reset_rtl_device", showRemote);
+  setHidden("reset_remote_sdr", !showRemote);
+  setHidden("remote_sdr_controls", !showRemote);
+}
+
+async function chooseActiveSdr(value) {
+  if (value.startsWith(REMOTE_SDR_CHOICE_PREFIX)) {
+    const id = value.slice(REMOTE_SDR_CHOICE_PREFIX.length);
+    const device = (remoteSdr.devices || []).find(item => item.id === id);
+    await saveSdrSource({source_mode: "remote", remote_host_id: id}, `Using the RTL-SDR shared by ${remoteDeviceName(device)}.`);
+    return;
+  }
+  if (remoteSdrUsesRemote()) {
+    await saveSdrSource({source_mode: "local", serial: value}, "Using the RTL-SDR connected to this machine.");
+    return;
+  }
+  scheduleUpdate("serial");
+}
+
 async function loadDevices(selected, options = {}) {
   const data = await request("/api/devices");
   soundcardDevices = Array.isArray(data.soundcards) ? data.soundcards : [];
-  const select = document.getElementById("serial");
-  const selectedDevice = data.devices.find(device => device.serial === selected);
-  const optionSignature = data.devices.map(device => [device.serial, deviceLabel(device)]);
-  if (selected && !selectedDevice) {
-    optionSignature.unshift([selected, configuredDeviceLabel(selected)]);
-  }
-  const needsChoice = !selected && data.devices.length !== 1;
-  const signature = JSON.stringify({options: optionSignature, needsChoice});
-  if (options.force || select.dataset.signature !== signature) {
-    const selectOptions = [];
-    if (selected && !selectedDevice) {
-      selectOptions.push({value: selected, label: configuredDeviceLabel(selected)});
-    } else if (needsChoice) {
-      selectOptions.push({
-        value: "",
-        label: data.devices.length === 0 ? "No RTL-SDR devices found" : "Select an RTL-SDR..."
-      });
-    }
-    for (const device of data.devices) {
-      selectOptions.push({value: device.serial, label: deviceLabel(device)});
-    }
-    syncSelectOptions(select, selectOptions);
-    select.dataset.signature = signature;
-  }
-  const fallback = !selected && data.devices.length === 1 ? data.devices[0].serial : "";
-  setValue("serial", selected || fallback);
+  localSdrDevices = Array.isArray(data.devices) ? data.devices : [];
+  configuredLocalSerial = selected || "";
+  if (options.force) document.getElementById("serial").dataset.signature = "";
+  renderActiveSdrChoices();
   setText("device-errors", data.errors.join(" | "));
   renderWizardSoundcardDevices();
   if (outputFormMode === "edit_soundcard") {
@@ -19654,7 +19727,7 @@ function notificationPayload() {
 function setNotificationSettings(settings = {}) {
   const signature = JSON.stringify(settings || {});
   if (signature === notificationSettingsSignature) return;
-  const panel = document.getElementById("view_notifications");
+  const panel = document.getElementById("settings_panel_notifications");
   if (panel && containsFocusedElement(panel) && notificationWizardActive) return;
   notificationSettingsSignature = signature;
   notificationSettings = Object.assign({}, settings || {});
@@ -20058,9 +20131,12 @@ function applyAccountUi(account) {
   currentAccount = account || currentAccount;
   const owner = accountIsOwner();
   const readOnly = accountIsReadOnly();
-  setHidden("nav_accounts", !owner);
-  setHidden("nav_change_password", owner);
-  setHidden("nav_notifications", readOnly);
+  const roleChanged = previousRole !== (currentAccount ? currentAccount.role : "") || previousReadOnly !== readOnly;
+  setHidden("nav_settings", readOnly);
+  setHidden("nav_change_password", !readOnly);
+  setHidden("settings_tab_accounts", !owner);
+  setHidden("settings_tab_account", owner || readOnly);
+  placeChangePasswordForm();
   setHidden("nav_rtl", readOnly);
   setHidden("dashboard_configure_sdr", readOnly);
   setHidden("open_add_stream", readOnly);
@@ -20070,7 +20146,7 @@ function applyAccountUi(account) {
   setHidden("eas_delete_alerts", readOnly);
   setHidden("remove_eas_alert", readOnly);
   updateRtlNotificationControlsVisibility();
-  if (previousRole !== (currentAccount ? currentAccount.role : "") || previousReadOnly !== readOnly) {
+  if (roleChanged) {
     activeStreamsSignature = "";
     icecastOutputTableSignature = "";
     soundcardOutputTableSignature = "";
@@ -20085,13 +20161,14 @@ function applyAccountUi(account) {
   if (readOnly && isReadOnlyRestrictedView(currentViewName())) {
     navigateTo("dashboard", {}, true, true);
   }
-  if (!owner && currentViewName() === "accounts") {
-    navigateTo("change_password", {}, true, true);
+  if (roleChanged && ["settings", "change_password"].includes(currentViewName())) {
+    // Which settings this account has depends on its role.
+    navigateTo(currentViewName(), currentRouteParams(), true, true);
   }
 }
 
 function isReadOnlyRestrictedView(view) {
-  return ["rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "accounts", "create_account", "notifications"].includes(view);
+  return ["rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "settings", "accounts", "create_account", "notifications"].includes(view);
 }
 
 function accountsTableSignature(accounts) {
@@ -20242,7 +20319,7 @@ async function createAccountFromForm() {
   setChecked("new_account_read_only", false);
   showAccountSecret(data.secret || "");
   await loadAccounts();
-  navigateTo("accounts", {}, false, true);
+  leaveSettingsSubpage();
   setAccountResult("Account created.", "success");
 }
 
@@ -21006,10 +21083,8 @@ function defaultViewTitle(name) {
     iq_recorder: "I/Q Recorder",
     iq_recorder_start: "New I/Q Recording",
     iq_recording_download: "Download I/Q Recording",
-    notifications: "Notification Settings",
     logs: "Logs",
-    accounts: "Manage Accounts",
-    create_account: "Create Account",
+    settings: "Settings",
     change_password: "Change Account Password",
     streams: "Manage Streams",
     add_stream: "Add Stream",
@@ -21043,7 +21118,7 @@ function focusViewHeading(name) {
   });
 }
 
-function showView(name) {
+function showView(name, options = {}) {
   if (name !== "stream_settings" && activeTestModeBelongsToThisPage()) {
     stopStreamTestMode({beacon: true});
   }
@@ -21051,19 +21126,15 @@ function showView(name) {
     view.hidden = view.id !== `view_${name}`;
   }
   setPageTitle(defaultViewTitle(name));
-  if (name === "notifications") {
-    renderNotificationSettings();
-  }
-  focusViewHeading(name);
+  if (name !== "settings") syncRemotePairingPage("");
+  if (options.focus !== false) focusViewHeading(name);
   const moreButton = document.getElementById("nav_more_button");
   for (const item of document.querySelectorAll("nav [data-view]")) {
     if (
       item.dataset.view === name ||
       (item.dataset.view === "streams" && ["add_stream", "stream_settings", "stream_output"].includes(name)) ||
       (item.dataset.view === "iq_recorder" && ["iq_recorder_start", "iq_recording_download"].includes(name)) ||
-      (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name)) ||
-      item.dataset.view === "accounts" && ["accounts", "create_account"].includes(name) ||
-      item.dataset.view === "change_password" && name === "change_password"
+      (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name))
     ) {
       item.setAttribute("aria-current", "page");
     } else {
@@ -21071,7 +21142,7 @@ function showView(name) {
     }
   }
   if (moreButton) {
-    if (["receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "notifications", "logs", "accounts", "create_account", "change_password"].includes(name)) {
+    if (["receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "settings", "change_password"].includes(name)) {
       moreButton.setAttribute("aria-current", "page");
     } else {
       moreButton.removeAttribute("aria-current");
@@ -21122,10 +21193,11 @@ function routeForView(name, params = {}) {
     query.set("view", "iq_recording_download");
     if (params.recordingId) query.set("recording", params.recordingId);
   }
-  if (name === "notifications") query.set("view", "notifications");
   if (name === "logs") query.set("view", "logs");
-  if (name === "accounts") query.set("view", "accounts");
-  if (name === "create_account") query.set("view", "create_account");
+  if (name === "settings") {
+    query.set("view", "settings");
+    if (params.section) query.set("section", params.section);
+  }
   if (name === "change_password") query.set("view", "change_password");
   if (name === "streams") query.set("view", "streams");
   if (name === "add_stream") {
@@ -21166,10 +21238,17 @@ function routeForView(name, params = {}) {
   return text ? `/?${text}` : "/";
 }
 
+// Pages that are now sections of Settings, so older links and bookmarks still work.
+const SETTINGS_SECTIONS_FROM_OLD_VIEWS = {notifications: "notifications", accounts: "accounts", create_account: "create_account"};
+
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
-  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "notifications", "logs", "accounts", "create_account", "change_password", "streams", "add_stream", "stream_settings", "stream_output", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
+  if (SETTINGS_SECTIONS_FROM_OLD_VIEWS[view]) {
+    return routeState("settings", {section: SETTINGS_SECTIONS_FROM_OLD_VIEWS[view]});
+  }
+  if (view === "settings") return routeState("settings", {section: query.get("section") || ""});
+  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "change_password", "streams", "add_stream", "stream_settings", "stream_output", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
     return {
       view,
       streamId: query.get("stream") || "",
@@ -21189,7 +21268,10 @@ function routeState(view, params = {}) {
     outputId: params.outputId || "",
     alertId: params.alertId || "",
     recordingId: params.recordingId || "",
-    page: Math.max(1, Number(params.page || 1))
+    page: Math.max(1, Number(params.page || 1)),
+    section: params.section || "",
+    // The settings page this one was opened from, so Back can return to it.
+    openedFrom: typeof params.openedFrom === "string" ? params.openedFrom : null
   };
 }
 
@@ -21202,6 +21284,20 @@ function applyRoute(route) {
     replaceCurrentRoute("dashboard");
     showView("dashboard");
     return;
+  }
+  if (route.view === "change_password" && !accountIsReadOnly()) {
+    // Other accounts change their password in Settings.
+    route = routeState("settings", {section: "account"});
+    replaceCurrentRoute("settings", route);
+  }
+  if (route.view === "settings") {
+    settingsStreamId = "";
+    applySettingsRoute(route);
+    return;
+  }
+  if (route.view === "change_password") {
+    placeChangePasswordForm();
+    setChangePasswordResult("");
   }
   if (route.view === "add_stream") {
     if (route.streamId) {
@@ -21327,20 +21423,226 @@ function applyRoute(route) {
       .then(() => renderIqDownloadPage())
       .catch(error => setIqDownloadResult(error.message, "error"));
   }
-  if (route.view === "accounts") {
-    loadAccounts().catch(error => setAccountResult(error.message, "error"));
+  showView(route.view);
+}
+
+// Settings shows its list beside the selected setting on wider screens. On phones,
+// in either orientation, it shows the list, then one setting at a time with a
+// way back, the way phone settings apps do.
+const SETTINGS_SINGLE_PANE_QUERY = "(max-width: 680px), (max-width: 900px) and (orientation: landscape), (orientation: landscape) and (max-height: 500px)";
+const SETTINGS_SECTION_TITLES = {
+  accounts: "Accounts",
+  create_account: "Create account",
+  account: "Account",
+  sdr_sharing: "SDR sharing",
+  pair_device: "Pair a device",
+  find_devices: "Find devices",
+  notifications: "Notifications"
+};
+// How "Back to ..." names the page a sub-page belongs to.
+const SETTINGS_BACK_NAMES = {accounts: "accounts", sdr_sharing: "SDR sharing"};
+let settingsSection = "";
+let settingsOpenedFrom = null;
+
+function settingsSinglePane() {
+  return window.matchMedia(SETTINGS_SINGLE_PANE_QUERY).matches;
+}
+
+function settingsTabs() {
+  return Array.from(document.querySelectorAll("#settings_list [data-settings-section]"));
+}
+
+function availableSettingsTabs() {
+  return settingsTabs().filter(tab => !tab.hidden);
+}
+
+function settingsSectionsForAccount() {
+  if (accountIsReadOnly()) return [];
+  if (accountIsOwner()) return ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications"];
+  return ["account", "sdr_sharing", "pair_device", "find_devices", "notifications"];
+}
+
+function normalizeSettingsSection(section) {
+  const sections = settingsSectionsForAccount();
+  if (!section || !sections.length) return "";
+  // Only the owner manages accounts; everyone else has their own account.
+  if (!accountIsOwner() && ["accounts", "create_account"].includes(section)) return "account";
+  return sections.includes(section) ? section : "";
+}
+
+// The entry in the list that a page of Settings belongs to. The owner's own
+// password and new accounts are pages within Accounts.
+function settingsTabSection(section) {
+  if (section === "create_account") return "accounts";
+  if (section === "pair_device" || section === "find_devices") return "sdr_sharing";
+  if (section === "account" && accountIsOwner()) return "accounts";
+  return section;
+}
+
+// Where Back goes from a page of Settings: "" is the list itself.
+function settingsParentSection(section) {
+  const tabSection = settingsTabSection(section);
+  return tabSection !== section ? tabSection : "";
+}
+
+function defaultSettingsSection() {
+  const first = availableSettingsTabs()[0];
+  return first ? first.dataset.settingsSection : "";
+}
+
+function placeChangePasswordForm() {
+  // One password form serves the read-only page, an administrator's Account
+  // setting and the owner's page within Accounts.
+  const form = document.getElementById("change_password_form");
+  if (!form) return;
+  let home = document.getElementById("settings_panel_account");
+  if (accountIsReadOnly()) home = document.querySelector("#view_change_password section");
+  else if (accountIsOwner()) home = document.getElementById("settings_owner_password_page");
+  if (home && form.parentNode !== home) home.appendChild(form);
+}
+
+function renderSettingsSection() {
+  const section = settingsSection;
+  const tabSection = settingsTabSection(section);
+  const singlePane = settingsSinglePane();
+  const list = document.getElementById("settings_list");
+  placeChangePasswordForm();
+  // On wider screens the list is a set of tabs: Tab reaches the selected one, the
+  // arrow keys move between them, and Tab again goes into that setting. On phones
+  // each entry is a button that opens its setting.
+  if (singlePane) {
+    list.setAttribute("role", "group");
+    list.removeAttribute("aria-orientation");
+  } else {
+    list.setAttribute("role", "tablist");
+    list.setAttribute("aria-orientation", "vertical");
   }
-  if (route.view === "create_account") {
-    if (!accountIsOwner()) {
-      replaceCurrentRoute("change_password");
-      showView("change_password");
-      return;
+  for (const tab of settingsTabs()) {
+    const name = tab.dataset.settingsSection;
+    const selected = name === tabSection;
+    if (singlePane) {
+      tab.removeAttribute("role");
+      tab.removeAttribute("aria-selected");
+      tab.removeAttribute("aria-controls");
+      tab.tabIndex = 0;
+    } else {
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+      tab.setAttribute("aria-controls", `settings_panel_${name}`);
+      tab.tabIndex = selected ? 0 : -1;
     }
-    setCreateAccountResult("");
-    showView("create_account");
+  }
+  for (const panel of document.querySelectorAll(".settings-panel")) {
+    const name = panel.id.replace(/^settings_panel_/, "");
+    panel.hidden = name !== tabSection;
+    if (singlePane) {
+      panel.removeAttribute("role");
+      panel.removeAttribute("aria-labelledby");
+    } else {
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", `settings_tab_${name}`);
+    }
+  }
+  setHidden("settings_accounts_page", section !== "accounts");
+  setHidden("settings_create_account_page", section !== "create_account");
+  setHidden("settings_owner_password_page", !(section === "account" && accountIsOwner()));
+  setHidden("settings_sdr_sharing_page", section !== "sdr_sharing");
+  setHidden("settings_pair_device_page", section !== "pair_device");
+  setHidden("settings_find_devices_page", section !== "find_devices");
+  document.getElementById("settings_layout").classList.toggle("settings-detail-active", Boolean(section));
+  const parent = settingsParentSection(section);
+  setText("settings_back", parent ? `Back to ${SETTINGS_BACK_NAMES[parent]}` : "Back to settings");
+  setPageTitle(section ? `${SETTINGS_SECTION_TITLES[section]} - Settings` : "Settings");
+  if (tabSection === "notifications") renderNotificationSettings();
+  if (section === "accounts") loadAccounts().catch(error => setAccountResult(error.message, "error"));
+  if (section === "create_account") setCreateAccountResult("");
+  syncRemotePairingPage(section);
+}
+
+function settingsPageHeading() {
+  if (!settingsSection) return null;
+  const panel = document.getElementById(`settings_panel_${settingsTabSection(settingsSection)}`);
+  if (!panel) return null;
+  return Array.from(panel.querySelectorAll("h3")).find(heading => heading.getClientRects().length) || null;
+}
+
+function focusSettingsElement(element) {
+  if (!element) return;
+  if (element.tagName === "H3" && !element.hasAttribute("tabindex")) element.setAttribute("tabindex", "-1");
+  window.requestAnimationFrame(() => {
+    try {
+      element.focus({preventScroll: false});
+    } catch (error) {
+      element.focus();
+    }
+  });
+}
+
+function applySettingsRoute(route) {
+  const wasShowing = currentViewName() === "settings";
+  const previous = settingsSection;
+  let section = normalizeSettingsSection(route.section);
+  if (!section && !settingsSinglePane()) section = defaultSettingsSection();
+  settingsSection = section;
+  settingsOpenedFrom = section === route.section ? route.openedFrom : null;
+  if (section !== route.section) {
+    replaceCurrentRoute("settings", {section, openedFrom: settingsOpenedFrom});
+  }
+  // Arriving at Settings goes to its heading, like any other page. Moving around
+  // within Settings goes to the page that opened, or back to the entry in the
+  // list that was left.
+  const focusPage = Boolean(section) && (wasShowing ? section !== previous : settingsSinglePane() && Boolean(route.section));
+  showView("settings", {focus: !wasShowing && !focusPage});
+  renderSettingsSection();
+  if (focusPage) {
+    focusSettingsElement(settingsPageHeading());
+  } else if (wasShowing && !section && previous) {
+    focusSettingsElement(document.getElementById(`settings_tab_${settingsTabSection(previous)}`));
+  }
+}
+
+function selectSettingsTab(section) {
+  // Moving through the tabs on wider screens shows each setting without adding
+  // every one to the browser history.
+  if (section !== settingsSection && !confirmLeavingRemotePairing()) {
+    const current = document.getElementById(`settings_tab_${settingsTabSection(settingsSection)}`);
+    if (current) current.focus();
     return;
   }
-  showView(route.view);
+  settingsSection = section;
+  settingsOpenedFrom = null;
+  replaceCurrentRoute("settings", {section});
+  renderSettingsSection();
+}
+
+function openSettingsSection(section) {
+  if (settingsSinglePane()) {
+    navigateTo("settings", {section, openedFrom: ""});
+  } else {
+    selectSettingsTab(section);
+  }
+}
+
+function leaveSettingsSubpage() {
+  const parent = settingsParentSection(settingsSection);
+  if (settingsOpenedFrom === parent && history.state && history.state.view === "settings") {
+    history.back();
+    return;
+  }
+  navigateTo("settings", {section: parent}, true, true);
+}
+
+function settingsLayoutChanged() {
+  if (currentViewName() !== "settings") return;
+  const hadFocus = document.activeElement;
+  if (!settingsSection && !settingsSinglePane()) {
+    selectSettingsTab(defaultSettingsSection());
+  } else {
+    renderSettingsSection();
+  }
+  if (hadFocus && hadFocus !== document.body && !hadFocus.getClientRects().length) {
+    focusSettingsElement(settingsPageHeading() || document.querySelector("#view_settings h2"));
+  }
 }
 
 function outputFormHasUnsavedChanges() {
@@ -21352,10 +21654,11 @@ function wizardHasUnsavedChanges() {
 }
 
 function hasUnsavedNavigationState() {
-  return Boolean(wizardHasUnsavedChanges() || outputFormHasUnsavedChanges());
+  return Boolean(wizardHasUnsavedChanges() || outputFormHasUnsavedChanges() || remotePairingPage);
 }
 
 function confirmDiscardNavigation() {
+  if (remotePairingPage) return confirmLeavingRemotePairing();
   if (!hasUnsavedNavigationState()) return true;
   return window.confirm("Discard the current setup changes?");
 }
@@ -21420,6 +21723,7 @@ function currentRouteParams() {
   if (view === "eas_alert_export" || view === "eas_alert_delete") return {streamId: easAlertStreamId, page: easAlertPage};
   if (view === "eas_alert_detail") return {streamId: easAlertStreamId, alertId: easAlertDetailId, page: easAlertReturnPage};
   if (view === "iq_recording_download") return {recordingId: selectedIqRecordingId};
+  if (view === "settings") return {section: settingsSection, openedFrom: settingsOpenedFrom};
   return {};
 }
 
@@ -21884,6 +22188,14 @@ let remoteDiscoveredDevices = [];
 let remoteSdrRequestPending = false;
 let remotePairingWasActive = false;
 let remotePairingDeviceIds = [];
+// While "Pair a device" (this machine shows a code) or "Find devices" (this
+// machine looks for one to pair with) is open. Pairing lasts only that long.
+const REMOTE_PAIRING_KEEPALIVE_MS = 3000;
+const REMOTE_DEVICE_SEARCH_PAUSE_MS = 1000;
+let remotePairingPage = "";
+let remotePairingKeepaliveTimer = null;
+let remoteDeviceSearchGeneration = 0;
+let remotePairDeviceChosen = false;
 
 function setMessage(id, message, kind = "") {
   const element = document.getElementById(id);
@@ -21912,25 +22224,7 @@ function renderRemoteSdr(data) {
   const devices = remoteSdr.devices || [];
   const sharing = remoteSdr.sharing || {};
   const remote = remoteSdr.remote || {};
-  const usesRemote = remoteSdrUsesRemote();
-  // These save as soon as they change, so only a save in progress holds them back.
-  if (!remoteSdrRequestPending) {
-    setChecked("sdr_source_local", !usesRemote);
-    setChecked("sdr_source_remote", usesRemote);
-  }
-  const showRemote = document.getElementById("sdr_source_remote").checked;
-  setHidden("local_sdr_controls", showRemote);
-  setHidden("remote_sdr_controls", !showRemote);
-
-  const select = document.getElementById("remote_sdr_device");
-  const options = devices.map(device => ({value: device.id, label: remoteDeviceName(device)}));
-  if (!options.length) options.push({value: "", label: "No paired devices"});
-  if (select.dataset.signature !== JSON.stringify(options)) {
-    syncSelectOptions(select, options);
-    select.dataset.signature = JSON.stringify(options);
-  }
-  if (!remoteSdrRequestPending && remote.device_id) setValue("remote_sdr_device", remote.device_id);
-  setDisabled(select, !devices.length);
+  renderActiveSdrChoices();
   setText("remote_sdr_status", remoteSdrStatusText(remote, devices));
   const buffer = document.getElementById("remote_buffer_seconds");
   const savedBuffer = data.settings && data.settings.remote_buffer_seconds;
@@ -21950,15 +22244,11 @@ function renderRemoteSdr(data) {
   // the code. Entering a code here while sharing would be backwards.
   const sharingThisSdr = Boolean(sharing.enabled && available);
   setHidden("remote_pair_section", sharingThisSdr);
-  if (sharingThisSdr && remotePairingDialogState && remotePairingDialogState.kind === "client") {
-    closeRemotePairingDialog({restoreFocus: false});
-  }
   if (sharing.error) setMessage("remote-sharing-result", sharing.error, "error");
   renderPairedDevices(devices, remote);
 }
 
 function remoteSdrStatusText(remote, devices) {
-  if (!devices.length) return "Pair with another NWR Stream Manager below to use its RTL-SDR.";
   if (!remoteSdrUsesRemote()) return "";
   const status = remote.status || {};
   const device = devices.find(item => item.id === remote.device_id) || {};
@@ -21977,90 +22267,118 @@ function remoteSdrStatusText(remote, devices) {
 function renderRemotePairing(sharing, devices) {
   const pairing = sharing.pairing || {};
   const active = Boolean(pairing.active && sharing.running);
-  const panel = document.getElementById("remote_pairing_panel");
-  const panelHadFocus = containsFocusedElement(panel);
-  setHidden("start_remote_pairing", active);
   setValue("remote_pairing_code", active ? String(pairing.code || "") : "");
   setText(
     "remote_pairing_code_hint",
-    active ? `Enter this code on the other NWR Stream Manager before ${formatClockTime(pairing.expires_at)}. Pairing mode ends when a device pairs.` : ""
+    active ? `Enter this code on the other NWR Stream Manager before ${formatClockTime(pairing.expires_at)}. It works for one device.` : ""
   );
-  if (!active && remotePairingDialogState && remotePairingDialogState.kind === "host") {
-    closeRemotePairingDialog();
-  }
-  setHidden("remote_pairing_panel", !active);
   if (!active) setMessage("remote-pairing-copy-result", "");
-  if (panelHadFocus && !active && !remotePairingDialogState) {
-    document.getElementById("start_remote_pairing").focus();
-  }
   if (remotePairingWasActive && !active) {
     const added = devices.filter(device => !remotePairingDeviceIds.includes(device.id));
+    let message = "Pairing stopped.";
+    let kind = "";
     if (pairing.ended_reason === "paired" && added.length) {
-      setMessage("remote-sharing-result", `Paired with ${sentenceList(added.map(remoteDeviceName))}. Pairing mode has ended.`, "success");
+      message = `Paired with ${sentenceList(added.map(remoteDeviceName))}. Either device can now use the other's shared RTL-SDR.`;
+      kind = "success";
     } else if (pairing.ended_reason === "expired") {
-      setMessage("remote-sharing-result", "The pairing code expired. Select Pair a device to get a new one.");
+      message = "The pairing code expired. Select Pair a device to get a new one.";
     } else if (pairing.ended_reason === "too-many-attempts") {
-      setMessage("remote-sharing-result", "Pairing mode ended after too many incorrect pairing codes. Select Pair a device to start again.", "error");
+      message = "Pairing stopped after too many incorrect pairing codes. Select Pair a device to start again.";
+      kind = "error";
+    } else if (pairing.ended_reason === "page-closed") {
+      message = "Pairing stopped because the page showing the pairing code was closed or lost its connection.";
+    }
+    setMessage("remote-sharing-result", message, kind);
+    if (remotePairingPage === "pair_device") {
+      // Pairing is over, so this page has nothing left to show.
+      endRemotePairingPage();
+      leaveSettingsSubpage();
     }
   }
   if (!remotePairingWasActive && active) remotePairingDeviceIds = devices.map(device => device.id);
   remotePairingWasActive = active;
 }
 
-const PHONE_LAYOUT_QUERY = "(max-width: 680px), (max-width: 900px) and (orientation: landscape)";
-let remotePairingDialogState = null;
-
-function isPhoneLayout() {
-  return window.matchMedia(PHONE_LAYOUT_QUERY).matches;
+function syncRemotePairingPage(section) {
+  const page = ["pair_device", "find_devices"].includes(section) ? section : "";
+  if (page === remotePairingPage) return;
+  endRemotePairingPage();
+  remotePairingPage = page;
+  if (page === "pair_device") startShowingPairingCode();
+  if (page === "find_devices") searchForRemoteDevices();
 }
 
-function setRemotePairingModalOpen(open) {
-  for (const element of sameTestWarningModalTargets()) {
-    if ("inert" in element) element.inert = open;
-    if (open) element.setAttribute("aria-hidden", "true");
-    else element.removeAttribute("aria-hidden");
+function endRemotePairingPage() {
+  const page = remotePairingPage;
+  remotePairingPage = "";
+  if (remotePairingKeepaliveTimer) clearInterval(remotePairingKeepaliveTimer);
+  remotePairingKeepaliveTimer = null;
+  remoteDeviceSearchGeneration += 1;
+  if (page === "pair_device") {
+    remoteSdrAction("/api/remote-sdr/pairing/cancel").catch(error => setMessage("remote-sharing-result", error.message, "error"));
   }
 }
 
-function openRemotePairingDialog(kind, title, panelId, opener, focusId) {
-  // On phones the pairing controls get the whole screen. The panel itself is
-  // moved into the dialog (and back afterwards), so there is one set of
-  // controls and the rest of the page can be made inert.
-  if (remotePairingDialogState) closeRemotePairingDialog({restoreFocus: false});
-  const panel = document.getElementById(panelId);
-  const placeholder = document.createComment(`${panelId} home`);
-  panel.parentNode.insertBefore(placeholder, panel);
-  document.getElementById("remote_pairing_dialog_body").appendChild(panel);
-  setText("remote_pairing_dialog_title", title);
-  setHidden("close_remote_pair_dialog", kind !== "client");
-  remotePairingDialogState = {kind, panel, placeholder, opener};
-  setRemotePairingModalOpen(true);
-  document.getElementById("remote_pairing_dialog").hidden = false;
-  const target = document.getElementById(focusId);
-  if (target) target.focus();
+function confirmLeavingRemotePairing() {
+  if (!remotePairingPage) return true;
+  if (!window.confirm("Leave this page? Pairing will stop.")) return false;
+  endRemotePairingPage();
+  return true;
 }
 
-function closeRemotePairingDialog(options = {}) {
-  const state = remotePairingDialogState;
-  if (!state) return;
-  remotePairingDialogState = null;
-  state.placeholder.parentNode.insertBefore(state.panel, state.placeholder);
-  state.placeholder.remove();
-  document.getElementById("remote_pairing_dialog").hidden = true;
-  setHidden("close_remote_pair_dialog", true);
-  setRemotePairingModalOpen(false);
-  const opener = state.opener;
-  if (options.restoreFocus !== false && opener && !opener.hidden && !opener.disabled && opener.getClientRects().length) {
-    opener.focus();
+async function startShowingPairingCode() {
+  setMessage("remote-sharing-result", "");
+  setMessage("remote-pairing-status", "Getting a pairing code...");
+  setMessage("remote-pairing-copy-result", "");
+  try {
+    await remoteSdrAction("/api/remote-sdr/pairing/start");
+  } catch (error) {
+    if (remotePairingPage === "pair_device") setMessage("remote-pairing-status", error.message, "error");
+    return;
+  }
+  if (remotePairingPage !== "pair_device") {
+    // Left the page while the code was on its way.
+    remoteSdrAction("/api/remote-sdr/pairing/cancel").catch(() => {});
+    return;
+  }
+  setMessage("remote-pairing-status", "");
+  // Pairing ends soon after these stop, such as when the tab is closed.
+  remotePairingKeepaliveTimer = setInterval(() => {
+    remoteSdrAction("/api/remote-sdr/pairing/keepalive").catch(() => {});
+  }, REMOTE_PAIRING_KEEPALIVE_MS);
+}
+
+async function searchForRemoteDevices() {
+  const generation = ++remoteDeviceSearchGeneration;
+  remoteDiscoveredDevices = [];
+  remotePairDeviceChosen = false;
+  setValue("remote_pair_code", "");
+  setValue("remote_pair_address", "");
+  setMessage("remote-pair-result", "");
+  setMessage("remote-pair-outcome", "");
+  renderRemotePairDeviceOptions();
+  setText("remote_pair_search_status", "Searching for devices that are ready to pair...");
+  while (generation === remoteDeviceSearchGeneration) {
+    try {
+      const data = await request("/api/remote-sdr/discover", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+      if (generation !== remoteDeviceSearchGeneration) return;
+      remoteDiscoveredDevices = data.hosts || [];
+      renderRemotePairDeviceOptions();
+      const count = remoteDiscoveredDevices.length;
+      setText(
+        "remote_pair_search_status",
+        count
+          ? `Found ${pluralize(count, "device")} ready to pair. Still searching.`
+          : "No devices are ready to pair yet. Still searching."
+      );
+    } catch (error) {
+      if (generation !== remoteDeviceSearchGeneration) return;
+      setText("remote_pair_search_status", `Searching failed: ${error.message} Trying again.`);
+    }
+    await new Promise(resolve => setTimeout(resolve, REMOTE_DEVICE_SEARCH_PAUSE_MS));
   }
 }
 
-function remotePairingDialogFocusable() {
-  const dialog = document.getElementById("remote_pairing_dialog");
-  if (!dialog || dialog.hidden) return [];
-  return Array.from(dialog.querySelectorAll("a[href], button, input, select, textarea, [tabindex]:not([tabindex='-1'])"))
-    .filter(element => !element.disabled && !element.hidden && element.getClientRects().length > 0);
-}
 
 async function copyRemotePairingCode() {
   const input = document.getElementById("remote_pairing_code");
@@ -22138,26 +22456,6 @@ async function saveSdrSource(payload, successMessage) {
   }
 }
 
-async function selectSdrSource(mode) {
-  if (mode === "local") {
-    await saveSdrSource({source_mode: "local"}, "Using the RTL-SDR connected to this machine.");
-    return;
-  }
-  const devices = remoteSdr.devices || [];
-  if (!devices.length) {
-    setHidden("local_sdr_controls", true);
-    setHidden("remote_sdr_controls", false);
-    setMessage("sdr-source-result", "Pair with another NWR Stream Manager first, then choose it as the shared SDR.", "error");
-    return;
-  }
-  const deviceId = document.getElementById("remote_sdr_device").value || devices[0].id;
-  const device = devices.find(item => item.id === deviceId) || devices[0];
-  await saveSdrSource(
-    {source_mode: "remote", remote_host_id: device.id},
-    `Using the RTL-SDR shared by ${remoteDeviceName(device)}.`
-  );
-}
-
 async function saveRemoteBufferSeconds() {
   const input = document.getElementById("remote_buffer_seconds");
   const seconds = Number(input.value);
@@ -22203,9 +22501,15 @@ function renderRemotePairDeviceOptions() {
     label: `${remoteDeviceName(device)} (${device.via === "tailscale" ? "Tailscale" : "local network"})${device.paired ? ", already paired" : ""}`
   }));
   options.push({value: "manual", label: "Enter an address"});
+  const previous = select.value;
   syncSelectOptions(select, options);
-  const firstUnpaired = remoteDiscoveredDevices.find(device => !device.paired);
-  setValue("remote_pair_device", firstUnpaired ? firstUnpaired.id : options[0].value);
+  // Searching goes on while someone picks a device; keep their choice.
+  if (remotePairDeviceChosen && options.some(option => option.value === previous)) {
+    setValue("remote_pair_device", previous);
+  } else {
+    const firstUnpaired = remoteDiscoveredDevices.find(device => !device.paired);
+    setValue("remote_pair_device", firstUnpaired ? firstUnpaired.id : options[0].value);
+  }
   updateRemotePairAddressVisibility();
 }
 
@@ -22213,46 +22517,6 @@ function updateRemotePairAddressVisibility() {
   const manual = document.getElementById("remote_pair_device").value === "manual";
   setHidden("remote_pair_address_label", !manual);
   setHidden("remote_pair_address_hint", !manual);
-}
-
-async function openRemotePairFlow() {
-  setMessage("remote-pair-outcome", "");
-  if (isPhoneLayout()) {
-    openRemotePairingDialog(
-      "client",
-      "Pair with another NWR Stream Manager",
-      "remote_pair_panel",
-      document.getElementById("find_remote_devices"),
-      "remote_pair_device"
-    );
-  }
-  await findRemoteDevices();
-}
-
-async function findRemoteDevices() {
-  const button = document.getElementById("find_remote_devices");
-  const hadFocus = document.activeElement === button;
-  setDisabled(button, true);
-  setMessage("remote-pair-result", "Searching the network...");
-  try {
-    const data = await request("/api/remote-sdr/discover", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
-    remoteDiscoveredDevices = data.hosts || [];
-    renderRemotePairDeviceOptions();
-    const count = remoteDiscoveredDevices.length;
-    setMessage(
-      "remote-pair-result",
-      count
-        ? `Found ${pluralize(count, "device")} sharing an RTL-SDR.`
-        : "No devices sharing an RTL-SDR were found. Turn on sharing on the other device, or enter its address.",
-      count ? "success" : ""
-    );
-  } catch (error) {
-    setMessage("remote-pair-result", error.message, "error");
-  } finally {
-    setDisabled(button, false);
-    // Disabling the button drops keyboard focus to the page; put it back.
-    if (hadFocus && (document.activeElement === document.body || !document.activeElement)) button.focus();
-  }
 }
 
 function remotePairTarget() {
@@ -22287,16 +22551,12 @@ async function pairRemoteDevice() {
     const data = await remoteSdrAction("/api/remote-sdr/pair", {...target, code});
     const added = (data.devices || []).find(device => !before.includes(device.id));
     setValue("remote_pair_code", "");
-    remoteDiscoveredDevices = remoteDiscoveredDevices.map(device => added && device.id === added.id ? {...device, paired: true} : device);
-    renderRemotePairDeviceOptions();
-    const success = `Paired with ${remoteDeviceName(added)}. Either device can now use the other's shared RTL-SDR.`;
-    if (remotePairingDialogState && remotePairingDialogState.kind === "client") {
-      setMessage("remote-pair-result", "");
-      closeRemotePairingDialog();
-      setMessage("remote-pair-outcome", success, "success");
-    } else {
-      setMessage("remote-pair-result", success, "success");
+    setMessage("remote-pair-result", "");
+    if (remotePairingPage === "find_devices") {
+      endRemotePairingPage();
+      leaveSettingsSubpage();
     }
+    setMessage("remote-pair-outcome", `Paired with ${remoteDeviceName(added)}. Either device can now use the other's shared RTL-SDR.`, "success");
   } catch (error) {
     setMessage("remote-pair-result", error.message, "error");
   } finally {
@@ -22317,7 +22577,8 @@ async function unpairRemoteDevice(deviceId, name) {
 function syncControls(data) {
   const s = data.settings;
   gainValues = data.gain_values || [];
-  if (!sdrSettingIsBeingChanged("serial")) setValue("serial", s.serial || "");
+  configuredLocalSerial = s.serial || "";
+  renderActiveSdrChoices();
   const gain = document.getElementById("gain");
   setAttributeIfChanged(gain, "max", Math.max(0, gainValues.length - 1));
   if (!sdrSettingIsBeingChanged("gain")) {
@@ -22750,13 +23011,8 @@ function scheduleStreamTestModeSignalUpdate() {
   }, 150);
 }
 
-for (const radio of document.querySelectorAll("input[name='sdr_source']")) {
-  radio.addEventListener("change", event => {
-    if (event.target.checked) selectSdrSource(event.target.value);
-  });
-}
-document.getElementById("remote_sdr_device").addEventListener("change", () => {
-  if (document.getElementById("sdr_source_remote").checked) selectSdrSource("remote");
+document.getElementById("serial").addEventListener("change", event => {
+  chooseActiveSdr(event.target.value);
 });
 document.getElementById("remote_buffer_seconds").addEventListener("change", saveRemoteBufferSeconds);
 document.getElementById("remote_buffer_seconds").addEventListener("keydown", event => {
@@ -22768,65 +23024,25 @@ document.getElementById("remote_buffer_seconds").addEventListener("keydown", eve
 document.getElementById("remote_access_enabled").addEventListener("change", event => {
   setRemoteAccessEnabled(event.target.checked);
 });
-document.getElementById("start_remote_pairing").addEventListener("click", async () => {
-  const opener = document.getElementById("start_remote_pairing");
-  try {
-    setMessage("remote-sharing-result", "");
-    await remoteSdrAction("/api/remote-sdr/pairing/start");
-    if (isPhoneLayout()) {
-      openRemotePairingDialog("host", "Pair a device", "remote_pairing_panel", opener, "remote_pairing_code");
-    } else {
-      document.getElementById("remote_pairing_code").focus();
-    }
-  } catch (error) {
-    setMessage("remote-sharing-result", error.message, "error");
-  }
+document.getElementById("start_remote_pairing").addEventListener("click", () => {
+  navigateTo("settings", {section: "pair_device", openedFrom: "sdr_sharing"});
 });
-async function stopRemotePairing() {
-  try {
-    await remoteSdrAction("/api/remote-sdr/pairing/cancel");
-    setMessage("remote-sharing-result", "Pairing stopped.");
-    closeRemotePairingDialog();
-    const start = document.getElementById("start_remote_pairing");
-    if (!start.hidden) start.focus();
-  } catch (error) {
-    setMessage("remote-sharing-result", error.message, "error");
-  }
-}
-document.getElementById("cancel_remote_pairing").addEventListener("click", stopRemotePairing);
+document.getElementById("cancel_remote_pairing").addEventListener("click", () => {
+  endRemotePairingPage();
+  leaveSettingsSubpage();
+});
 document.getElementById("copy_remote_pairing_code").addEventListener("click", copyRemotePairingCode);
-document.getElementById("close_remote_pair_dialog").addEventListener("click", () => closeRemotePairingDialog());
-document.getElementById("remote_pairing_dialog").addEventListener("keydown", event => {
-  if (event.key === "Escape") {
-    event.preventDefault();
-    if (remotePairingDialogState && remotePairingDialogState.kind === "host") stopRemotePairing();
-    else closeRemotePairingDialog();
-    return;
-  }
-  if (event.key !== "Tab") return;
-  const focusable = remotePairingDialogFocusable();
-  if (!focusable.length) {
-    event.preventDefault();
-    return;
-  }
-  const first = focusable[0];
-  const last = focusable[focusable.length - 1];
-  if (event.shiftKey && document.activeElement === first) {
-    event.preventDefault();
-    last.focus();
-  } else if (!event.shiftKey && document.activeElement === last) {
-    event.preventDefault();
-    first.focus();
-  }
+document.getElementById("find_remote_devices").addEventListener("click", () => {
+  navigateTo("settings", {section: "find_devices", openedFrom: "sdr_sharing"});
 });
-document.addEventListener("focusin", event => {
-  const dialog = document.getElementById("remote_pairing_dialog");
-  if (!remotePairingDialogState || dialog.hidden || dialog.contains(event.target)) return;
-  const focusable = remotePairingDialogFocusable();
-  if (focusable.length) focusable[0].focus();
+document.getElementById("cancel_find_devices").addEventListener("click", () => {
+  endRemotePairingPage();
+  leaveSettingsSubpage();
 });
-document.getElementById("find_remote_devices").addEventListener("click", openRemotePairFlow);
-document.getElementById("remote_pair_device").addEventListener("change", updateRemotePairAddressVisibility);
+document.getElementById("remote_pair_device").addEventListener("change", () => {
+  remotePairDeviceChosen = true;
+  updateRemotePairAddressVisibility();
+});
 document.getElementById("pair_remote_device").addEventListener("click", pairRemoteDevice);
 document.getElementById("remote_pair_code").addEventListener("keydown", event => {
   if (event.key === "Enter") {
@@ -22841,6 +23057,7 @@ document.getElementById("paired-devices-body").addEventListener("click", event =
 renderRemotePairDeviceOptions();
 
 for (const id of controls) {
+  if (id === "serial") continue;
   document.addEventListener("input", event => {
     if (event.target && event.target.id === id) {
       if (isNumericControl(event.target) && isTextEditingInputEvent(event)) {
@@ -23137,10 +23354,10 @@ document.getElementById("open_create_account").addEventListener("click", () => {
   showAccountSecret("");
   setValue("new_account_username", "");
   setChecked("new_account_read_only", false);
-  navigateTo("create_account");
+  navigateTo("settings", {section: "create_account", openedFrom: "accounts"});
 });
 document.getElementById("cancel_create_account").addEventListener("click", () => {
-  navigateTo("accounts", {}, true, true);
+  leaveSettingsSubpage();
 });
 document.getElementById("create_account").addEventListener("click", async () => {
   try {
@@ -23157,7 +23374,13 @@ document.getElementById("change_account_password").addEventListener("click", asy
   }
 });
 document.getElementById("cancel_change_password").addEventListener("click", () => {
-  navigateTo("dashboard", {}, true, true);
+  for (const id of ["account_current_password", "account_new_password", "account_confirm_password"]) setValue(id, "");
+  setChangePasswordResult("");
+  if (currentViewName() === "change_password") {
+    navigateTo("dashboard", {}, true, true);
+  } else if (accountIsOwner() || settingsSinglePane()) {
+    leaveSettingsSubpage();
+  }
 });
 document.getElementById("accounts-body").addEventListener("click", async event => {
   const target = event.target;
@@ -23176,7 +23399,7 @@ document.getElementById("accounts-body").addEventListener("click", async event =
   try {
     if (target.dataset.action === "change-own-password") {
       closeStreamActionMenus();
-      navigateTo("change_password");
+      navigateTo("settings", {section: "account", openedFrom: "accounts"});
       return;
     }
     if (target.dataset.action === "reset-account-password") {
@@ -23492,6 +23715,34 @@ for (const name of TEST_TONE_NAMES) {
     });
   }
 }
+
+document.getElementById("settings_list").addEventListener("click", event => {
+  const tab = event.target && event.target.closest ? event.target.closest("[data-settings-section]") : null;
+  if (!tab) return;
+  openSettingsSection(tab.dataset.settingsSection);
+});
+
+document.getElementById("settings_list").addEventListener("keydown", event => {
+  const tabs = availableSettingsTabs();
+  const index = tabs.indexOf(event.target);
+  if (index < 0) return;
+  let nextIndex = index;
+  if (event.key === "ArrowDown" || event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
+  else if (event.key === "ArrowUp" || event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
+  else if (event.key === "Home") nextIndex = 0;
+  else if (event.key === "End") nextIndex = tabs.length - 1;
+  else return;
+  event.preventDefault();
+  tabs[nextIndex].focus();
+  if (!settingsSinglePane()) selectSettingsTab(tabs[nextIndex].dataset.settingsSection);
+});
+
+document.getElementById("settings_back").addEventListener("click", () => {
+  endRemotePairingPage();
+  leaveSettingsSubpage();
+});
+
+window.matchMedia(SETTINGS_SINGLE_PANE_QUERY).addEventListener("change", settingsLayoutChanged);
 
 document.getElementById("audio_effects_back").addEventListener("click", () => {
   document.getElementById("audio_effects_layout").classList.remove("effect-detail-active");
@@ -24455,6 +24706,9 @@ function sendLiveAudioStopBeacon(options = {}) {
 
 window.addEventListener("pagehide", event => {
   if (event.persisted) return;
+  if (remotePairingPage === "pair_device" && navigator.sendBeacon) {
+    navigator.sendBeacon("/api/remote-sdr/pairing/cancel", new Blob(["{}"], {type: "application/json"}));
+  }
   sendWizardSoundcardPreviewDiscardBeacon();
   if (document.visibilityState === "hidden") return;
   sendLiveAudioStopBeacon();
@@ -24892,7 +25146,8 @@ async function resumeListening() {
     outputId: initialRoute.outputId,
     alertId: initialRoute.alertId,
     recordingId: initialRoute.recordingId,
-    page: initialRoute.page
+    page: initialRoute.page,
+    section: initialRoute.section
   }, true);
   offerResumeListening();
   setInterval(refresh, 1000);

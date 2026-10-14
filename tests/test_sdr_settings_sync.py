@@ -35,6 +35,13 @@ PAGE_FUNCTIONS = (
     "renderSdrReset",
     "setSdrResetButtonsDisabled",
     "resetSdr",
+    "renderActiveSdrChoices",
+    "remoteSdrUsesRemote",
+    "remoteDeviceName",
+    "deviceLabel",
+    "configuredDeviceLabel",
+    "chooseActiveSdr",
+    "saveSdrSource",
 )
 PAGE_STATE = (
     "const controls",
@@ -50,6 +57,11 @@ PAGE_STATE = (
     "let sdrResetRequestPending",
     "let sdrResetInProgress",
     "let lastSdrResetKey",
+    "const REMOTE_SDR_CHOICE_PREFIX",
+    "let localSdrDevices",
+    "let configuredLocalSerial",
+    "let remoteSdr",
+    "let remoteSdrRequestPending",
 )
 
 # Two people share one SDR. The page's own settings code runs against a pretend
@@ -67,6 +79,8 @@ const applyAccountUi = noop, renderRemoteSdr = noop, renderLogs = noop, renderIq
   updateRtlNotificationControlsVisibility = noop;
 function currentViewName() { return "rtl"; }
 function setText(id, value) { document.getElementById(id).textContent = String(value); }
+function setHidden(id, hidden) { document.getElementById(id).hidden = Boolean(hidden); }
+function syncSelectOptions(select, options) { select.options = options; }
 
 function element(id, extra = {}) {
   return {id, value: "", checked: false, disabled: false, textContent: "", dataset: {}, attributes: {},
@@ -559,3 +573,58 @@ class SdrLooksTheSameDuringResetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActiveSdrListTests(unittest.TestCase):
+    """One list holds this machine's RTL-SDRs and the ones paired devices share."""
+
+    setUpClass = SdrSettingsSyncTests.__dict__["setUpClass"]
+    run_scenario = SdrSettingsSyncTests.run_scenario
+
+    SETUP = """
+        localSdrDevices = [{serial: "18263784", vendor: "Nooelec", name: "NESDR SMArt v5"}];
+        remoteSdr = {devices: [{id: "pi", name: "weather-pi"}], remote: {source_mode: "local", device_id: ""}};
+        configuredLocalSerial = "18263784";
+        renderActiveSdrChoices();
+        function list() {
+          return {choices: elements.serial.options.map(option => option.label), selected: elements.serial.value,
+            network_controls: !elements.remote_sdr_controls.hidden, local_reset: !elements.reset_rtl_device.hidden,
+            network_reset: !elements.reset_remote_sdr.hidden};
+        }
+    """
+
+    def test_local_and_network_sdrs_are_in_one_list(self) -> None:
+        result = self.run_scenario(self.SETUP + """
+            results.local = list();
+            remoteSdr = {devices: remoteSdr.devices, remote: {source_mode: "remote", device_id: "pi"}};
+            renderActiveSdrChoices();
+            results.network = list();
+        """)["results"]
+
+        self.assertEqual(result["local"]["choices"], ["Nooelec, NESDR SMArt v5, serial 18263784", "Shared by weather-pi over the network"])
+        self.assertEqual(result["local"]["selected"], "18263784")
+        self.assertEqual(
+            (result["local"]["network_controls"], result["local"]["local_reset"], result["local"]["network_reset"]), (False, True, False)
+        )
+        self.assertEqual(result["network"]["selected"], "remote:pi")
+        self.assertEqual(
+            (result["network"]["network_controls"], result["network"]["local_reset"], result["network"]["network_reset"]), (True, False, True)
+        )
+
+    def test_choosing_from_the_list_switches_between_local_and_network(self) -> None:
+        result = self.run_scenario(self.SETUP + """
+            await chooseActiveSdr("remote:pi");
+            remoteSdr = {devices: remoteSdr.devices, remote: {source_mode: "remote", device_id: "pi"}};
+            await chooseActiveSdr("18263784");
+        """)
+
+        self.assertEqual(result["sent"], [{"source_mode": "remote", "remote_host_id": "pi"}, {"source_mode": "local", "serial": "18263784"}])
+
+    def test_choosing_another_local_sdr_sends_only_the_serial(self) -> None:
+        result = self.run_scenario(self.SETUP + """
+            elements.serial.value = "00000001";
+            await chooseActiveSdr("00000001");
+            await saveNow();
+        """)
+
+        self.assertEqual(result["sent"], [{"serial": "00000001"}])

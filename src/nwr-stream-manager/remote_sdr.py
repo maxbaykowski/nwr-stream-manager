@@ -14,8 +14,10 @@ Transport
 Discovery
     UDP broadcast on REMOTE_SDR_DISCOVERY_PORT. Clients broadcast a query and
     hosts with remote access enabled answer with their identity, name, TCP
-    port and a short SDR summary. A paired host whose address changed is found
-    again by identity.
+    port and a short SDR summary. A host answers anyone only while it is in
+    pairing mode; otherwise it answers only devices already paired with it,
+    which prove it with their token (see discovery_proof). A paired host whose
+    address changed is found again that way, by identity.
 
 Pairing
     The host shows a short numeric code. The client proves knowledge of it with
@@ -125,6 +127,9 @@ PAIRING_CODE_DIGITS = 6
 # incorrect codes, whichever comes first.
 PAIRING_CODE_TTL_SECONDS = 300.0
 PAIRING_MAX_ATTEMPTS = 5
+# Pairing mode lasts only while the page showing the code is open: the page
+# checks in every few seconds, and pairing ends once it stops.
+PAIRING_PAGE_TIMEOUT_SECONDS = 10.0
 SRP_IDENTITY = b"nwr-stream-manager"
 
 # RFC 3526 / RFC 5054 2048-bit safe prime group, generator 2.
@@ -788,6 +793,21 @@ def discovery_targets() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def discovery_proof(host_id: str, token: str, nonce: str) -> str:
+    """Proves to a host that the asker is paired with it, without sending the token.
+
+    The host keeps only the SHA-256 of the token it issued, so the proof is keyed
+    by that hash; it is bound to the host and a fresh nonce from the asker.
+    """
+    key = hashlib.sha256(str(token).encode("ascii", "replace")).hexdigest().encode("ascii")
+    return hmac.new(key, f"{host_id}:{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def paired_discovery_query(host_id: str, client_id: str, token: str) -> dict[str, Any]:
+    nonce = secrets.token_hex(16)
+    return {"for": host_id, "client": client_id, "nonce": nonce, "proof": discovery_proof(host_id, token, nonce)}
+
+
 class DiscoveryResponder:
     """Answers LAN discovery queries while remote access is enabled."""
 
@@ -799,10 +819,12 @@ class DiscoveryResponder:
         *,
         port: int = REMOTE_SDR_DISCOVERY_PORT,
         bind_address: str = "",
+        may_answer: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
         self.identity = identity
         self.tcp_port = tcp_port
         self.summary_provider = summary_provider
+        self.may_answer = may_answer
         self.port = port
         self.bind_address = bind_address
         self.stop_event = threading.Event()
@@ -869,6 +891,8 @@ class DiscoveryResponder:
                 continue
             if message.get("type") != "discover":
                 continue
+            if self.may_answer is not None and not self.may_answer(message):
+                continue
             try:
                 self.sock.sendto(json.dumps(self.announcement()).encode("utf-8"), address)
             except OSError as exc:
@@ -881,15 +905,19 @@ def discover_hosts(
     port: int = REMOTE_SDR_DISCOVERY_PORT,
     targets: list[str] | None = None,
     exclude_id: str = "",
+    paired_with: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Find hosts sharing an SDR on the LAN and over Tailscale.
+
+    Without `paired_with`, only hosts in pairing mode answer. With it (from
+    paired_discovery_query), the paired host it names answers too.
 
     Each host appears once however many ways it answered. Its addresses are
     ordered Tailscale first, then LAN: the Tailscale address also works away
     from home, so it is the one to remember.
     """
     query = json.dumps(
-        {"magic": REMOTE_SDR_DISCOVERY_MAGIC, "type": "discover", "v": REMOTE_SDR_PROTOCOL_VERSION}
+        {"magic": REMOTE_SDR_DISCOVERY_MAGIC, "type": "discover", "v": REMOTE_SDR_PROTOCOL_VERSION, **(paired_with or {})}
     ).encode("utf-8")
     if targets is None:
         targets = discovery_targets()
@@ -1002,6 +1030,7 @@ class _PairingWindow:
     code: str
     expires_at: float
     attempts: int = 0
+    page_seen_at: float = 0.0
 
 
 class RemoteSdrServer:
@@ -1060,6 +1089,7 @@ class RemoteSdrServer:
                 self.port,
                 self._discovery_summary,
                 port=self.discovery_port,
+                may_answer=self._may_answer_discovery,
             )
             try:
                 self.discovery.start()
@@ -1092,11 +1122,22 @@ class RemoteSdrServer:
     def begin_pairing(self) -> dict[str, Any]:
         """Enter pairing mode, keeping the current code if it is already on."""
         with self.lock:
+            now = time.time()
             if self._active_pairing_locked() is None:
                 code = "".join(secrets.choice("0123456789") for _ in range(PAIRING_CODE_DIGITS))
-                self.pairing = _PairingWindow(code=code, expires_at=time.time() + PAIRING_CODE_TTL_SECONDS)
+                self.pairing = _PairingWindow(code=code, expires_at=now + PAIRING_CODE_TTL_SECONDS)
                 self.pairing_ended_reason = ""
                 LOG.info("remote SDR pairing mode started for %.0f seconds", PAIRING_CODE_TTL_SECONDS)
+            assert self.pairing is not None
+            self.pairing.page_seen_at = now
+        return self.pairing_status()
+
+    def keep_pairing_open(self) -> dict[str, Any]:
+        """The page showing the code is still open; does not restart pairing that has ended."""
+        with self.lock:
+            window = self._active_pairing_locked()
+            if window is not None:
+                window.page_seen_at = time.time()
         return self.pairing_status()
 
     def cancel_pairing(self) -> None:
@@ -1119,10 +1160,31 @@ class RemoteSdrServer:
             }
 
     def _active_pairing_locked(self) -> _PairingWindow | None:
-        if self.pairing is not None and time.time() >= self.pairing.expires_at:
+        now = time.time()
+        if self.pairing is not None and now >= self.pairing.expires_at:
             self.pairing = None
             self.pairing_ended_reason = "expired"
+        elif self.pairing is not None and now - self.pairing.page_seen_at > PAIRING_PAGE_TIMEOUT_SECONDS:
+            LOG.info("remote SDR pairing mode stopped: the page showing the code was closed")
+            self.pairing = None
+            self.pairing_ended_reason = "page-closed"
         return self.pairing
+
+    def _may_answer_discovery(self, message: dict[str, Any]) -> bool:
+        # Anyone may find this host while it shows a pairing code; otherwise only
+        # the devices already paired with it, so it stays hidden from the rest.
+        with self.lock:
+            if self._active_pairing_locked() is not None:
+                return True
+        if message.get("for") != self.identity.fingerprint:
+            return False
+        record = self.devices.get(str(message.get("client", "")))
+        nonce = str(message.get("nonce", ""))
+        if record is None or not nonce:
+            return False
+        key = str(record.get("peer_token_sha256", "")).encode("ascii")
+        expected = hmac.new(key, f"{self.identity.fingerprint}:{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, str(message.get("proof", "")))
 
     def unpair(self, client_id: str) -> bool:
         removed = self.devices.remove(client_id)
@@ -1607,7 +1669,11 @@ class RemoteSdrClient:
                 # The host may have a new address; find it by identity.
                 attempts = [
                     (address, int(host["port"]))
-                    for host in discover_hosts(port=self.discovery_port, targets=self.discovery_targets)
+                    for host in discover_hosts(
+                        port=self.discovery_port,
+                        targets=self.discovery_targets,
+                        paired_with=paired_discovery_query(self.host_id, self.client_id, str(record.get("token", ""))),
+                    )
                     if host["id"] == self.host_id
                     for address in usable(host["addresses"])
                 ]

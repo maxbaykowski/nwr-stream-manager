@@ -78,7 +78,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li><a href="#what-is-an-sdr">What is an SDR?</a></li>
     <li><a href="#what-you-need">What you need</a></li>
     <li><a href="#first-run">First run and creating your account</a></li>
-    <li><a href="#dashboard">The dashboard</a></li>
+    <li><a href="#dashboard">The dashboard</a>
+      <ol>
+        <li><a href="#settings">Settings</a></li>
+      </ol>
+    </li>
     <li><a href="#configure-rtl-sdr">Configuring the RTL-SDR</a>
       <ol>
         <li><a href="#gain">Gain</a></li>
@@ -199,13 +203,16 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <dt>Storage</dt>
     <dd>How much disk space is left, and how much you've gobbled up with saved EAS alert recordings and I/Q recordings. A warning appears if space is running low.</dd>
   </dl>
-  <p>The bar across the top of every page takes you to the main areas: <strong>Dashboard</strong>, <strong>Configure RTL-SDR</strong>, <strong>Manage Streams</strong>, <strong>EAS alerts</strong> (once alerts have been recorded), <strong>Help</strong>, and <strong>More</strong>, which holds everything else.</p>
+  <p>The bar across the top of every page takes you to the main areas: <strong>Dashboard</strong>, <strong>Configure RTL-SDR</strong>, <strong>Manage Streams</strong>, <strong>EAS alerts</strong> (once alerts have been recorded), and <strong>More</strong>, which holds everything else, including <a href="#settings">Settings</a>. Help is linked at the bottom of every page.</p>
+  <h3 id="settings">Settings</h3>
+  <p>Settings holds the settings that aren't about one stream or the RTL-SDR itself: your account or, for the owner, everyone's accounts, <a href="#remote-sdr">SDR sharing</a> and <a href="#notifications">notifications</a>. Open it from <strong>More</strong>, then <strong>Settings</strong>. Read-only accounts don't have Settings; they change their password from <strong>More</strong>, then <strong>Change account password</strong>.</p>
+  <p>On a computer or tablet, the list of settings is on the left and the selected setting is on the right. With a screen reader or keyboard, press Tab to reach the list, use the arrow keys to move through it, then press Tab to go into the selected setting. On a phone, the list fills the screen; select a setting to open it, and select <strong>Back to settings</strong> to return to the list.</p>
 </section>
 
 <section aria-labelledby="configure-rtl-sdr">
   <h2 id="configure-rtl-sdr">Configuring the RTL-SDR</h2>
   <p>Plug your RTL-SDR into the computer running NWR Stream Manager and connect your antenna to it. Then open <strong>Configure RTL-SDR</strong> from the bar at the top.</p>
-  <p>Under <strong>SDR source</strong>, choose <strong>RTL-SDR connected to this machine</strong>. Then pick your dongle from <strong>Active SDR</strong>. Dongles are listed by serial number. If yours isn't listed, check that it's plugged in and select <strong>Rescan</strong>.</p>
+  <p>Pick your dongle from <strong>Active SDR</strong>. Dongles plugged into this machine are listed first, by serial number, followed by any RTL-SDRs that <a href="#remote-sdr">paired NWR Stream Managers share over the network</a>. If yours isn't listed, check that it's plugged in and select <strong>Rescan</strong>.</p>
   <p>Changes on this page take effect right away. You don't have to remember to click the save button.</p>
 
   <h3 id="gain">Gain</h3>
@@ -506,7 +513,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>Notifications are sent through <a href="https://ntfy.sh/">ntfy</a>, a free notification service. You install the ntfy app and subscribe to a private "topic", which is like a private channel only you know the name of. NWR Stream Manager then sends its notifications to that topic.</p>
   <h3 id="notifications-setup">Setting up notifications</h3>
   <ol>
-    <li>Open <strong>More</strong>, then <strong>Notification settings</strong>, and select <strong>Set up</strong>.</li>
+    <li>Open <strong>More</strong>, then <strong>Settings</strong>, then <strong>Notifications</strong>, and select <strong>Set up</strong>.</li>
     <li>Choose whether you have your own ntfy server. Most people should choose <strong>No, use ntfy.sh</strong>, the free public server, which doesn't need an account.</li>
     <li>Install the ntfy app. There are links for the Apple App Store and Google Play, or you can use the ntfy web app in your browser.</li>
     <li>Copy the <strong>topic secret</strong> that NWR Stream Manager shows. In the ntfy app, add a subscription and paste the topic secret as the topic name. You can subscribe on as many devices as you like.</li>
@@ -514,7 +521,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li>Select <strong>Send test notification</strong> to make sure it arrives, then select <strong>Finish</strong>.</li>
   </ol>
   <div class="note">
-    <p>Keep your topic secret private. Anyone who knows it can see your notifications and send their own. If you ever get notifications that didn't come from NWR Stream Manager, select <strong>Regenerate topic secret</strong> in Notification settings, and subscribe to the new topic in the ntfy app.</p>
+    <p>Keep your topic secret private. Anyone who knows it can see your notifications and send their own. If you ever get notifications that didn't come from NWR Stream Manager, select <strong>Regenerate topic secret</strong> in Settings, under Notifications, and subscribe to the new topic in the ntfy app.</p>
   </div>
   <h3 id="notifications-choose">Choosing what you're notified about</h3>
   <p>After setup, choose what you want notifications for:</p>
@@ -533,11 +540,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <h3 id="remote-sdr-pairing">Pairing two NWR Stream Managers</h3>
   <p>Both computers need to be on the same network, or connected through <a href="#tailscale">Tailscale</a>. You only have to pair them once, and after that either one can use the other's RTL-SDR.</p>
   <ol>
-    <li>On the computer <strong>with</strong> the RTL-SDR, open <strong>Configure RTL-SDR</strong>. Under <strong>Sharing</strong>, turn on <strong>Share this RTL-SDR with paired devices</strong>, then select <strong>Pair a device</strong>. A 6-digit pairing code appears. It lasts for 5 minutes, so make sure you pair the two devices before it expires.</li>
-    <li>On the <strong>other</strong> computer, open <strong>Configure RTL-SDR</strong>. Under <strong>Pair with another NWR Stream Manager</strong>, select <strong>Find devices</strong>, choose the other computer from the list, enter the pairing code, and select <strong>Pair</strong>. If it isn't in the list, you can enter its IP address instead if you know it.</li>
-    <li>Still on the second computer, under <strong>SDR source</strong>, choose <strong>RTL-SDR shared by another NWR Stream Manager</strong>, then choose the paired computer under <strong>Shared SDR</strong>.</li>
+    <li>On the computer <strong>with</strong> the RTL-SDR, open <strong>More</strong>, then <strong>Settings</strong>, then <strong>SDR sharing</strong>. Under <strong>Sharing</strong>, turn on <strong>Share this RTL-SDR with paired devices</strong>, then select <strong>Pair a device</strong>. A screen with a 6-digit pairing code appears. Keep it open: the code lasts for 5 minutes, and pairing stops as soon as you leave this screen or close the tab. If you try to leave while pairing, NWR Stream Manager asks you to confirm first.</li>
+    <li>On the <strong>other</strong> computer, open <strong>Settings</strong>, then <strong>SDR sharing</strong>. Under <strong>Pair with another NWR Stream Manager</strong>, select <strong>Find devices</strong>. A screen opens that keeps searching for NWR Stream Managers showing a pairing code, so the other computer appears as soon as it's ready. Choose it from the list, enter the pairing code, and select <strong>Pair</strong>. If it doesn't appear, you can choose <strong>Enter an address</strong> and type its IP address instead, if you know it.</li>
+    <li>Still on the second computer, open <strong>Configure RTL-SDR</strong>, and choose <strong>Shared by</strong> the paired computer <strong>over the network</strong> from <strong>Active SDR</strong>. To go back to an RTL-SDR plugged into this computer, choose it from the same list.</li>
   </ol>
-  <p>Paired computers are listed under <strong>Paired devices</strong>, where you can also remove them.</p>
+  <p>Paired computers are listed in SDR sharing under <strong>Paired devices</strong>, where you can also remove them.</p>
+  <p>A computer sharing its RTL-SDR can only be found by computers it hasn't paired with yet while it's showing a pairing code. The rest of the time, only the computers already paired with it can find it, so it stays hidden from everyone else on the network.</p>
   <h3 id="remote-sdr-buffer">Network buffer</h3>
   <p>When using a shared RTL-SDR, network inconsistencies and dropouts have to be taken into account. When using an RTL-SDR connected directly over USB, there isn't much latency. However, the same can't be said for transmitting SDR data over the network. The <strong>Network buffer</strong> setting holds back a little radio data to ride out Wi-Fi hiccups and brief network dropouts. A bigger buffer is more reliable on a weak connection, but puts your audio a bit further behind real time. The delay applies to everything using the shared RTL-SDR, including monitoring and the Weather Radio Receiver. The buffer can be set between 0 and 10 seconds. You'll probably notice the delay the most when using the weather radio receiver, as depending on what the buffer is set to there will be a noticeable delay before the weather radio receiver plays audio or switches channels.</p>
   <div class="note">
@@ -608,7 +616,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li>Open that <code>https://</code> address on any device signed in to your Tailscale account. Only your own Tailscale devices can reach it; it isn't put on the public internet.</li>
   </ol>
   <p>Serve keeps running in the background and comes back on its own after the computer restarts.</p>
-  <p>If you use <a href="#notifications">notifications</a>, NWR Stream Manager notices the secure address within a minute and lists it as <strong>Tailscale Serve</strong> under <strong>Open NWR Stream Manager from notifications</strong> in Notification settings. If that setting is on <strong>Automatic</strong>, notifications start opening the secure address on their own; you don't need to change anything.</p>
+  <p>If you use <a href="#notifications">notifications</a>, NWR Stream Manager notices the secure address within a minute and lists it as <strong>Tailscale Serve</strong> under <strong>Open NWR Stream Manager from notifications</strong> in Settings, under Notifications. If that setting is on <strong>Automatic</strong>, notifications start opening the secure address on their own; you don't need to change anything.</p>
   <p>To stop serving the secure address, run:</p>
   <div class="command"><code>sudo tailscale serve reset</code><button type="button" class="copy-button" hidden>Copy</button></div>
   <h3 id="secure-address-other">Other ways to get a secure address</h3>
@@ -628,15 +636,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   </dl>
   <h3 id="accounts-create">Creating accounts for other people</h3>
   <ol>
-    <li>Signed in as the owner, open <strong>More</strong>, then <strong>Manage accounts</strong>, and select <strong>Create account</strong>.</li>
+    <li>Signed in as the owner, open <strong>More</strong>, then <strong>Settings</strong>, then <strong>Accounts</strong>, and select <strong>Create account</strong>.</li>
     <li>Enter a username. Check <strong>Read-only account</strong> if the person should only be able to look and listen; otherwise they'll be an administrator.</li>
     <li>Select <strong>Create account</strong>. A temporary password appears. Copy it and give it to the person. It's only shown once, so be sure to send it to the person right away.</li>
   </ol>
   <p>The first time they sign in, they'll be asked to choose their own password.</p>
   <h3 id="accounts-passwords">Passwords</h3>
   <ul>
-    <li>To change your own password, open <strong>More</strong>, then <strong>Change account password</strong>. The owner does this from <strong>Manage accounts</strong> instead, by choosing <strong>Change account password</strong> from their own account's <strong>More actions</strong> menu.</li>
-    <li>If someone forgets their password, the owner can open <strong>Manage accounts</strong> and choose <strong>Reset password</strong> from that account's <strong>More actions</strong> menu. This gives them a new temporary password.</li>
+    <li>To change your own password as an administrator, open <strong>More</strong>, then <strong>Settings</strong>, then <strong>Account</strong>. Read-only accounts open <strong>More</strong>, then <strong>Change account password</strong>. The owner does this from <strong>Accounts</strong> in Settings instead, by choosing <strong>Change account password</strong> from their own account's <strong>More actions</strong> menu.</li>
+    <li>If someone forgets their password, the owner can open <strong>Accounts</strong> in Settings and choose <strong>Reset password</strong> from that account's <strong>More actions</strong> menu. This gives them a new temporary password.</li>
     <li>If the owner password is lost, NWR Stream Manager has to be stopped and its account database (the <code>accounts.db</code> file in its settings folder) deleted. The setup page then appears again so a new owner account can be created. Your streams and settings are kept. Starting to get the memo yet? Don't forget your password!</li>
   </ul>
 </section>
