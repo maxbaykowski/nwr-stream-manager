@@ -180,6 +180,14 @@ class CustomFallbackAudioServiceTests(unittest.TestCase):
         playing = service.fallback_audio_snapshot()
         self.assertEqual((playing.sample_rate, playing.source), (24_000, "custom announcement"))
 
+    def test_replacing_the_announcement_changes_its_id_so_open_pages_notice(self) -> None:
+        self.assertEqual(self.service._fallback_settings_public_locked()["custom_audio_id"], "")
+        first = self.service.save_custom_fallback_audio(wav_bytes(tone(5.0)))["fallback"]["custom_audio_id"]
+        second = self.service.save_custom_fallback_audio(wav_bytes(tone(5.0, frequency=600.0)))["fallback"]["custom_audio_id"]
+
+        self.assertEqual(len(first), 16)
+        self.assertNotEqual(first, second)
+
     def test_a_refused_announcement_changes_nothing(self) -> None:
         with self.assertRaises(self.custom.CustomFallbackAudioError):
             self.service.save_custom_fallback_audio(b"not audio")

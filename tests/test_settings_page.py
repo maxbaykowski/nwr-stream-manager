@@ -146,6 +146,11 @@ class SdrPairingPageTests(unittest.TestCase):
         self.assertIn('if (name !== "settings") stopAnnouncementPlaybackOffPage(name, null);', self.html)
         self.assertIn("stopAnnouncementPlaybackOffPage(currentViewName(), section);", self.html)
 
+    def test_changes_made_on_another_page_show_without_losing_typing_or_playing_the_wrong_announcement(self) -> None:
+        self.assertIn('if (!numberFieldIsBeingTyped(document.getElementById("fallback_loop_delay"))) {', self.html)
+        self.assertIn('if (!numberFieldIsBeingTyped(document.getElementById("stream_fallback_delay"))) {', self.html)
+        self.assertIn('setFallbackAudioResult("Playback stopped because the announcement was changed.");', self.html)
+
     def test_the_recording_page_has_cancel_instead_of_back_or_discard(self) -> None:
         self.assertIn('<button id="fallback_recording_cancel" type="button">Cancel</button>', self.html)
         self.assertIn('setHidden("settings_back", section === "record_announcement");', self.html)

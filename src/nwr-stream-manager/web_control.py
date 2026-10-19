@@ -7126,6 +7126,8 @@ class RtlControlService:
             "audio": settings.audio,
             "custom_audio_available": custom is not None,
             "custom_audio_seconds": round(custom.duration_seconds, 1) if custom is not None else None,
+            # Changes when the custom announcement is replaced, so other open pages notice.
+            "custom_audio_id": settings.custom_audio_sha256[:16] if custom is not None else "",
             "custom_audio_problem": self.custom_fallback_audio_problem,
         }
 
@@ -18822,9 +18824,21 @@ function setFallbackControls(fallback) {
   if (!fallback) return;
   const nextSignature = JSON.stringify(fallback);
   if (nextSignature === fallbackSignature) return;
-  setValue("fallback_loop_delay", fallback.loop_delay_seconds);
+  // A number being typed here isn't replaced by a change made elsewhere.
+  if (!numberFieldIsBeingTyped(document.getElementById("fallback_loop_delay"))) {
+    setValue("fallback_loop_delay", fallback.loop_delay_seconds);
+  }
   fallbackSignature = nextSignature;
+  const previous = fallbackAudioState;
   fallbackAudioState = fallback;
+  // The play button plays the chosen announcement, so it stops if that changes
+  // elsewhere, such as on another page.
+  const announcementChanged = previous.audio !== fallback.audio
+    || (fallback.audio === "custom" && previous.custom_audio_id !== fallback.custom_audio_id);
+  if (announcementChanged && announcementPlayerButton === "fallback_play") {
+    stopAnnouncementPlayback();
+    setFallbackAudioResult("Playback stopped because the announcement was changed.");
+  }
   if (fallback.custom_audio_available || fallback.audio === "custom") fallbackCustomChosenWithoutAudio = false;
   renderFallbackAnnouncement();
 }
@@ -18879,7 +18893,9 @@ function setStreamFallbackActionControls(stream) {
   for (const value of STREAM_FALLBACK_ACTION_VALUES) {
     setChecked(`stream_fallback_action_${value}`, settings.action === value);
   }
-  setValue("stream_fallback_delay", settings.delay_seconds);
+  if (!numberFieldIsBeingTyped(document.getElementById("stream_fallback_delay"))) {
+    setValue("stream_fallback_delay", settings.delay_seconds);
+  }
   updateStreamFallbackDelayVisibility();
   streamFallbackActionSignature = nextSignature;
 }
