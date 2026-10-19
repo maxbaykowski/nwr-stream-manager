@@ -12,7 +12,7 @@ from test_auth import load_web_control_module
 
 
 def view_markup(html: str, view: str) -> str:
-    start = html.index(f'<div id="view_{view}" class="view"')
+    start = html.index(f'<div id="view_{view}" class="view')
     end = html.index('\n  <div id="view_', start + 1)
     return html[start:end]
 
@@ -26,7 +26,7 @@ class SettingsPageMarkupTests(unittest.TestCase):
     def test_more_menu_has_settings_and_a_password_page_for_read_only_accounts(self) -> None:
         menu = self.html[self.html.index('<span id="nav_more_menu"'):self.html.index("</nav>")]
 
-        self.assertIn('<a id="nav_settings" href="/?view=settings" data-view="settings" role="menuitem" hidden>Settings</a>', menu)
+        self.assertIn('<a id="nav_settings" href="/?view=settings" data-view="settings" hidden>Settings</a>', menu)
         self.assertIn('id="nav_change_password"', menu)
         for old in ("nav_notifications", "nav_accounts", "view=notifications", "view=accounts"):
             self.assertNotIn(old, menu)

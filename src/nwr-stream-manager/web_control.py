@@ -103,6 +103,7 @@ if __package__:
         read_custom_fallback_audio,
     )
     from .packaged_audio import read_packaged_audio
+    from . import page_rendering
     from .icecast import IcecastSource, parse_icecast_address
     from .icecastauth import IcecastSettings, test_mountpoint_authentication
     from .nfm import NfmDemodulator, NfmModulator, float_to_s16
@@ -167,6 +168,7 @@ else:
     fallback_audio = importlib.import_module(f"{package_name}.fallback_audio")
     custom_fallback_audio_module = importlib.import_module(f"{package_name}.custom_fallback_audio")
     packaged_audio = importlib.import_module(f"{package_name}.packaged_audio")
+    page_rendering = importlib.import_module(f"{package_name}.page_rendering")
     icecast_module = importlib.import_module(f"{package_name}.icecast")
     icecastauth_module = importlib.import_module(f"{package_name}.icecastauth")
     nfm = importlib.import_module(f"{package_name}.nfm")
@@ -475,6 +477,42 @@ STREAM_TEST_MODE_PRE_EOM_SILENCE_SECONDS = 2.0
 STREAM_TEST_MODE_AUDIO = "test_mode.wav"
 HELP_PATH = "/help"
 HELP_FILE_NAME = "help.html"
+# Forms that work without the page script submit to these.
+SETUP_FORM_PATH = "/setup"
+CHANGE_PASSWORD_FORM_PATH = "/change-password"
+# The page's titles and which menu item each view is under, as the page script has them.
+VIEW_TITLES = {
+    "dashboard": "Dashboard",
+    "rtl": "Configure RTL-SDR",
+    "receiver": "Weather Radio Receiver",
+    "iq_recorder": "I/Q Recorder",
+    "iq_recorder_start": "New I/Q Recording",
+    "iq_recording_download": "Download I/Q Recording",
+    "logs": "Logs",
+    "settings": "Settings",
+    "change_password": "Change Account Password",
+    "streams": "Manage Streams",
+    "add_stream": "Add Stream",
+    "stream_settings": "Stream Settings",
+    "stream_output": "Icecast Output",
+    "eas_alerts": "EAS Alerts",
+    "eas_alert_export": "Export Alerts",
+    "eas_alert_delete": "Delete Alerts",
+    "eas_alert_detail": "EAS Alert Details",
+}
+VIEW_NAV_ITEMS = {
+    "add_stream": "streams",
+    "stream_settings": "streams",
+    "stream_output": "streams",
+    "iq_recorder_start": "iq_recorder",
+    "iq_recording_download": "iq_recorder",
+    "eas_alert_export": "eas_alerts",
+    "eas_alert_delete": "eas_alerts",
+    "eas_alert_detail": "eas_alerts",
+}
+READ_ONLY_RESTRICTED_VIEWS = {
+    "rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "settings",
+}
 STREAM_TEST_MODE_SAME_AUDIO = "same_test.wav"
 STREAM_TEST_MODE_SAME_LOCATION = "999000"
 STREAM_TEST_MODE_SAME_SENDER_ID = "NWRSTMGR"
@@ -9159,6 +9197,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def _auth_ok_or_setup_response(self, path: str, method: str) -> bool:
         self.current_account = None
+        # One connection can carry several requests.
+        self._new_form_token = ""
         if path == HELP_PATH and method == "GET":
             # Help holds nothing private, and people need it before and during setup too.
             self._send_help()
@@ -9169,14 +9209,20 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return False
         if not has_account:
             if method == "GET":
-                self._send_html(SETUP_HTML)
+                step = parse_qs(urlparse(self.path).query).get("step", [""])[0]
+                self._send_page(render_setup_page("account" if step == "account" else "welcome", self._form_token()))
                 return False
-            if method == "POST" and path == "/api/setup-account":
+            if method == "POST" and path in {"/api/setup-account", SETUP_FORM_PATH}:
                 return True
             self._send_json({"error": "administrator account setup is required"}, status=HTTPStatus.FORBIDDEN)
             return False
         if path == "/api/setup-account":
             self.send_error(HTTPStatus.NOT_FOUND)
+            return False
+        if path == SETUP_FORM_PATH:
+            # Setup is already done, for example if the form was sent twice.
+            self._discard_request_body()
+            self._send_redirect("/")
             return False
         if path == "/notification":
             return self._notification_auth_ok_or_response(path, method)
@@ -9228,9 +9274,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
     def _account_authorized_or_response(self, path: str, method: str, account: AccountRecord) -> bool:
         if account.must_change_password:
             if method == "GET" and path == "/":
-                self._send_html(MUST_CHANGE_PASSWORD_HTML)
+                self._send_page(render_change_password_page(self._form_token()))
                 return False
-            if path in {"/api/account/me", "/api/account/password", "/api/client-log"}:
+            if path in {"/api/account/me", "/api/account/password", "/api/client-log", CHANGE_PASSWORD_FORM_PATH}:
                 return True
             self._send_json({"error": "password change is required"}, status=HTTPStatus.FORBIDDEN)
             return False
@@ -9239,7 +9285,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "owner account is required"}, status=HTTPStatus.FORBIDDEN)
                 return False
             return True
-        if path == "/api/account/password":
+        if path in {"/api/account/password", CHANGE_PASSWORD_FORM_PATH}:
             return True
         if account.is_read_only and not self._read_only_request_allowed(path, method):
             self._send_json({"error": "this account is read-only"}, status=HTTPStatus.FORBIDDEN)
@@ -9322,9 +9368,16 @@ class RtlControlHandler(BaseHTTPRequestHandler):
 
     def _send_auth_required(self) -> None:
         payload = b'{"error":"authentication required"}'
+        content_type = "application/json"
+        if not urlparse(self.path).path.startswith("/api/"):
+            # Shown if the sign-in prompt is cancelled.
+            payload = SIGN_IN_REQUIRED_HTML.encode("utf-8")
+            content_type = "text/html; charset=utf-8"
+        # Any request body is left unread, so the connection can't be used again.
+        self.close_connection = True
         self.send_response(HTTPStatus.UNAUTHORIZED)
         self.send_header("WWW-Authenticate", f'Basic realm="{AUTH_REALM}", charset="UTF-8"')
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Set-Cookie", f"{AUTH_SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
         self.send_header("Content-Length", str(len(payload)))
@@ -9613,7 +9666,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_pending_auth_session_cookie()
             self.end_headers()
         elif path == "/":
-            self._send_html(INDEX_HTML)
+            self._send_index_page(parsed)
         elif path == "/api/status":
             query = parse_qs(parsed.query)
             account = getattr(self, "current_account", None)
@@ -9815,6 +9868,12 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == "/api/fallback-audio":
             self._handle_custom_fallback_audio_upload()
             return
+        if path == SETUP_FORM_PATH:
+            self._handle_setup_form()
+            return
+        if path == CHANGE_PASSWORD_FORM_PATH:
+            self._handle_change_password_form()
+            return
         if path == "/api/setup-account":
             try:
                 payload = self._read_json()
@@ -9835,26 +9894,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 if not isinstance(account, AccountRecord):
                     raise ValueError("authentication is required")
                 payload = self._read_json()
-                updated = self.service.accounts.change_password(
-                    account.id,
+                updated = self._change_own_password(
+                    account,
                     str(payload.get("current_password", "")),
                     str(payload.get("new_password", "")),
                     str(payload.get("confirm_password", "")),
                 )
-                self.service.auth_sessions.invalidate_account(account.id)
-                self.service.revoke_account_long_lived_resources(
-                    account.id,
-                    stop_webrtc=True,
-                    abort_downloads=True,
-                    stop_iq_recording=True,
-                )
-                self._pending_auth_session_cookie = (
-                    f"{AUTH_SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
-                )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
-            LOG.info("changed password for account %s", updated.get("username", ""))
             self._send_json({"success": True, "account": updated})
             return
         if path == "/api/accounts":
@@ -10433,13 +10481,14 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return
         self._send_html(content)
 
-    def _send_html(self, content: str) -> None:
+    def _send_html(self, content: str, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = content.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self._send_pending_auth_session_cookie()
+        self._send_new_form_token_cookie()
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -10571,6 +10620,162 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if cookie:
             self.send_header("Set-Cookie", cookie)
             self._pending_auth_session_cookie = ""
+
+    def _change_own_password(self, account: AccountRecord, current: str, new: str, confirm: str) -> dict[str, Any]:
+        updated = self.service.accounts.change_password(account.id, current, new, confirm)
+        # Signed in everywhere with the old password no longer.
+        self.service.auth_sessions.invalidate_account(account.id)
+        self.service.revoke_account_long_lived_resources(
+            account.id,
+            stop_webrtc=True,
+            abort_downloads=True,
+            stop_iq_recording=True,
+        )
+        self._pending_auth_session_cookie = f"{AUTH_SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
+        LOG.info("changed password for account %s", updated.get("username", ""))
+        return updated
+
+    def _handle_setup_form(self) -> None:
+        form: dict[str, str] = {}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            self.service.accounts.create_admin(
+                form.get("username", ""),
+                form.get("password", ""),
+                form.get("confirm_password", ""),
+            )
+        except Exception as exc:
+            page = render_setup_page("account", self._form_token(), form_message(str(exc)), form.get("username", ""))
+            self._send_page(page, HTTPStatus.BAD_REQUEST)
+            return
+        LOG.info("created NWR Stream Manager administrator account")
+        self._send_page(render_setup_page("done", self._form_token()))
+
+    def _handle_change_password_form(self) -> None:
+        account = getattr(self, "current_account", None)
+        if not isinstance(account, AccountRecord):
+            self._send_auth_required()
+            return
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            self._change_own_password(
+                account,
+                form.get("current_password", ""),
+                form.get("new_password", ""),
+                form.get("confirm_password", ""),
+            )
+        except Exception as exc:
+            if account.must_change_password:
+                self._send_page(render_change_password_page(self._form_token(), form_message(str(exc))), HTTPStatus.BAD_REQUEST)
+            else:
+                self._send_redirect("/?view=change_password")
+            return
+        # The browser is asked to sign in again, with the new password.
+        self._send_redirect("/")
+
+    def _cookie_value(self, name: str) -> str:
+        try:
+            morsel = SimpleCookie(self.headers.get("Cookie", "")).get(name)
+        except Exception:
+            return ""
+        return morsel.value if morsel is not None else ""
+
+    def _form_token(self) -> str:
+        """The token this browser's forms carry, giving it one if it has none yet."""
+        token = self._cookie_value(page_rendering.FORM_TOKEN_COOKIE_NAME) or getattr(self, "_new_form_token", "")
+        if not token:
+            token = page_rendering.new_form_token()
+            self._new_form_token = token
+        return token
+
+    def _send_new_form_token_cookie(self) -> None:
+        token = getattr(self, "_new_form_token", "")
+        if token:
+            self.send_header("Set-Cookie", page_rendering.form_token_cookie_header(token))
+            self._new_form_token = ""
+
+    def _read_form(self) -> dict[str, str]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length header") from exc
+        if length > page_rendering.MAX_FORM_REQUEST_BYTES:
+            raise ValueError("request body is too large")
+        return page_rendering.parse_form(self.rfile.read(length) if length > 0 else b"")
+
+    def _form_token_ok(self, form: dict[str, str]) -> bool:
+        return page_rendering.form_token_valid(
+            self._cookie_value(page_rendering.FORM_TOKEN_COOKIE_NAME),
+            form.get(page_rendering.FORM_TOKEN_FIELD, ""),
+        )
+
+    def _discard_request_body(self) -> None:
+        # Left unread, it would be taken for the connection's next request.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if 0 <= length <= page_rendering.MAX_FORM_REQUEST_BYTES:
+            self.rfile.read(length)
+        else:
+            self.close_connection = True
+
+    def _send_redirect(self, location: str) -> None:
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self._send_pending_auth_session_cookie()
+        self.end_headers()
+
+    def _send_page(self, page: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        """Sends a page the server filled in, adjusted for this browser."""
+        if page_rendering.old_internet_explorer(self.headers.get("User-Agent", "")):
+            page = page_rendering.mark_hidden_for_old_internet_explorer(page)
+        self._send_html(page, status)
+
+    def _send_index_page(self, parsed) -> None:
+        """The main page, showing the view asked for, filled in for browsers without the page script."""
+        account = getattr(self, "current_account", None)
+        read_only = isinstance(account, AccountRecord) and account.is_read_only
+        view = parse_qs(parsed.query).get("view", [""])[0] or "dashboard"
+        if view not in INDEX_VIEWS or (read_only and view in READ_ONLY_RESTRICTED_VIEWS):
+            view = "dashboard"
+        page = page_rendering.show_view(INDEX_HTML, view)
+        page = page_rendering.set_hidden(page, "baseline_unavailable", not page_rendering.view_needs_app(page, view))
+        page = page_rendering.set_title(page, f"{VIEW_TITLES.get(view, 'Dashboard')} - NWR Stream Manager")
+        page = page_rendering.set_hidden(page, "nav_rtl", read_only)
+        page = page_rendering.set_hidden(page, "nav_settings", read_only)
+        page = page_rendering.set_hidden(page, "nav_change_password", not read_only)
+        current = VIEW_NAV_ITEMS.get(view, view)
+        for item in ("dashboard", "rtl", "streams", "eas_alerts", "receiver", "iq_recorder", "logs", "settings", "change_password"):
+            page = page_rendering.set_attribute(page, f"nav_{item}", "aria-current", "page" if item == current else None)
+        if view == "logs":
+            page = self._fill_logs_view(page, read_only)
+        self._send_page(page)
+
+    def _fill_logs_view(self, page: str, read_only: bool) -> str:
+        status = self.service.status(read_only=read_only)
+        # Keyed as the page script keys them, so it keeps these lines rather than replacing them.
+        rows = []
+        seen: dict[str, int] = {}
+        for line in status.get("logs") or []:
+            line = str(line)
+            count = seen.get(line, 0)
+            seen[line] = count + 1
+            key = f"{line}#{count}" if count else line
+            rows.append(f'<span data-row-key="{html.escape(key)}">{html.escape(line)}\n</span>')
+        page = page_rendering.set_content(page, "logs", "".join(rows))
+        last = status.get("last_batch_at")
+        page = page_rendering.set_text(page, "active", "active" if status.get("active") else "inactive")
+        page = page_rendering.set_text(page, "chunks", str(status.get("received_chunks", 0)))
+        page = page_rendering.set_text(page, "bytes", str(status.get("received_bytes", 0)))
+        page = page_rendering.set_text(page, "last", f"{last:.3f}s" if isinstance(last, (int, float)) else "never")
+        return page_rendering.set_text(page, "capture-error", str(status.get("capture_error") or ""))
 
 
 def default_state_path() -> Path:
@@ -12920,13 +13125,31 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+SIGN_IN_REQUIRED_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in required - NWR Stream Manager</title>
+</head>
+<body>
+<h1>Sign in required</h1>
+<p>Sign in with your NWR Stream Manager username and password to continue. <a href="/">Try again</a></p>
+<p><a href="/help">Help</a></p>
+</body>
+</html>
+"""
+
+
 SETUP_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NWR Stream Manager Setup</title>
+__PAGE_SCRIPT_LOADER__
 <style>
+__BASE_PAGE_STYLES__
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
 body { margin: 0; background: #f6f7f9; color: #14181f; }
 main { max-width: 720px; margin: 0 auto; padding: 32px 24px; }
@@ -12958,15 +13181,19 @@ footer a { color: #174a98; }
     <h1 id="setup_title">NWR Stream Manager Setup</h1>
     <div id="setup_welcome">
       <p>Welcome to NWR Stream Manager, an all new tool for streaming NOAA Weather Radio to online services! To ensure no one else on the network tampers with your streams, please set up an account. Press the next button to continue.</p>
-      <div class="actions">
-        <button id="welcome_next" class="primary" type="button">Next</button>
-      </div>
+      <form id="welcome_form" method="get" action="/">
+        <input type="hidden" name="step" value="account">
+        <div class="actions">
+          <button id="welcome_next" class="primary" type="submit">Next</button>
+        </div>
+      </form>
     </div>
-    <form id="setup_form" hidden>
+    <form id="setup_form" method="post" action="/setup" hidden>
+      __FORM_TOKEN_INPUT__
       <p class="hint">Create the administrator account for this NWR Stream Manager.</p>
       <label>
         Username
-        <input id="setup_username" name="username" autocomplete="username" required pattern="[A-Za-z0-9_-]{1,64}">
+        <input id="setup_username" name="username" autocomplete="username" required pattern="[A-Za-z0-9_-]{1,64}" autofocus>
       </label>
       <label>
         Password
@@ -12977,22 +13204,22 @@ footer a { color: #174a98; }
         <input id="setup_confirm_password" name="confirm_password" type="password" autocomplete="new-password" required minlength="8">
       </label>
       <div class="actions">
-        <button id="setup_next" class="primary" type="submit" disabled>Next</button>
+        <button id="setup_next" class="primary" type="submit">Next</button>
       </div>
       <div id="setup_message" class="message" aria-live="polite"></div>
     </form>
-    <div id="setup_done" hidden>
+    <form id="setup_done" method="get" action="/" hidden>
       <p>You're all set up! Click the finish button to log in.</p>
       <div class="actions">
-        <button id="setup_finish" class="primary" type="button">Finish</button>
+        <button id="setup_finish" class="primary" type="submit">Finish</button>
       </div>
-    </div>
+    </form>
   </section>
 </main>
 <footer>
   <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
 </footer>
-<script>
+<script type="text/x-nwr-app">
 const usernamePattern = /^[A-Za-z0-9_-]{1,64}$/;
 const passwordPattern = /^[!-~]{8,256}$/;
 const welcome = document.getElementById("setup_welcome");
@@ -13034,7 +13261,8 @@ function validateSetupForm() {
   }
 }
 
-document.getElementById("welcome_next").addEventListener("click", () => {
+document.getElementById("welcome_form").addEventListener("submit", event => {
+  event.preventDefault();
   welcome.hidden = true;
   form.hidden = false;
   username.focus();
@@ -13071,15 +13299,20 @@ form.addEventListener("submit", async event => {
   }
 });
 
-document.getElementById("setup_finish").addEventListener("click", () => {
+done.addEventListener("submit", event => {
+  event.preventDefault();
   window.location.replace("/");
 });
+validateSetupForm();
 window.addEventListener("pageshow", redirectIfSetupComplete);
 redirectIfSetupComplete();
 </script>
+__PAGE_SCRIPT_STARTER__
 </body>
 </html>
-"""
+""".replace("__PAGE_SCRIPT_LOADER__", page_rendering.PAGE_SCRIPT_LOADER).replace(
+    "__PAGE_SCRIPT_STARTER__", page_rendering.PAGE_SCRIPT_STARTER
+).replace("__BASE_PAGE_STYLES__", page_rendering.BASE_PAGE_STYLES)
 
 
 MUST_CHANGE_PASSWORD_HTML = """<!doctype html>
@@ -13088,7 +13321,9 @@ MUST_CHANGE_PASSWORD_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Change Account Password</title>
+__PAGE_SCRIPT_LOADER__
 <style>
+__BASE_PAGE_STYLES__
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
 body { margin: 0; background: #f6f7f9; color: #14181f; }
 main { max-width: 720px; margin: 0 auto; padding: 32px 24px; }
@@ -13119,10 +13354,11 @@ footer a { color: #174a98; }
   <section class="panel" aria-labelledby="password_title">
     <h1 id="password_title">Change Account Password</h1>
     <p class="hint">You must change your password to continue.</p>
-    <form id="password_form">
+    <form id="password_form" method="post" action="/change-password">
+      __FORM_TOKEN_INPUT__
       <label>
         Current password
-        <input id="current_password" name="current_password" type="password" autocomplete="current-password" required>
+        <input id="current_password" name="current_password" type="password" autocomplete="current-password" required autofocus>
       </label>
       <label>
         New password
@@ -13133,7 +13369,7 @@ footer a { color: #174a98; }
         <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required minlength="8">
       </label>
       <div class="actions">
-        <button id="change_password" class="primary" type="submit" disabled>Change password</button>
+        <button id="change_password" class="primary" type="submit">Change password</button>
       </div>
       <div id="password_message" class="message" aria-live="polite"></div>
     </form>
@@ -13142,7 +13378,7 @@ footer a { color: #174a98; }
 <footer>
   <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
 </footer>
-<script>
+<script type="text/x-nwr-app">
 const passwordPattern = /^[!-~]{8,256}$/;
 const currentPassword = document.getElementById("current_password");
 const newPassword = document.getElementById("new_password");
@@ -13162,6 +13398,7 @@ function validatePasswordForm() {
 for (const input of [currentPassword, newPassword, confirmPassword]) {
   input.addEventListener("input", validatePasswordForm);
 }
+validatePasswordForm();
 document.getElementById("password_form").addEventListener("submit", async event => {
   event.preventDefault();
   validatePasswordForm();
@@ -13192,9 +13429,51 @@ document.getElementById("password_form").addEventListener("submit", async event 
   }
 });
 </script>
+__PAGE_SCRIPT_STARTER__
 </body>
 </html>
-"""
+""".replace("__PAGE_SCRIPT_LOADER__", page_rendering.PAGE_SCRIPT_LOADER).replace(
+    "__PAGE_SCRIPT_STARTER__", page_rendering.PAGE_SCRIPT_STARTER
+).replace("__BASE_PAGE_STYLES__", page_rendering.BASE_PAGE_STYLES)
+
+
+def form_message(message: str) -> str:
+    """An error from the server, written as a sentence for showing on a page."""
+    text = str(message).strip()
+    if not text:
+        return text
+    text = text[0].upper() + text[1:]
+    return text if text[-1] in ".!?" else f"{text}."
+
+
+def show_form_error(page: str, message_id: str, message: str, title: str) -> str:
+    # In the page title too, so it's the first thing read when the page loads.
+    page = page_rendering.set_text(page, message_id, message)
+    page = page_rendering.set_attribute(page, message_id, "class", "message error")
+    page = page_rendering.set_attribute(page, message_id, "role", "alert")
+    return page_rendering.set_title(page, f"Error: {message} - {title}")
+
+
+def render_setup_page(step: str, form_token: str, message: str = "", username: str = "") -> str:
+    page = SETUP_HTML.replace("__FORM_TOKEN_INPUT__", page_rendering.form_token_input(form_token))
+    page = page_rendering.set_hidden(page, "setup_welcome", step != "welcome")
+    page = page_rendering.set_hidden(page, "setup_form", step != "account")
+    page = page_rendering.set_hidden(page, "setup_done", step != "done")
+    if username:
+        page = page_rendering.set_attribute(page, "setup_username", "value", username)
+    if message:
+        page = show_form_error(page, "setup_message", message, "NWR Stream Manager Setup")
+    return page
+
+
+def render_change_password_page(form_token: str, message: str = "") -> str:
+    page = MUST_CHANGE_PASSWORD_HTML.replace("__FORM_TOKEN_INPUT__", page_rendering.form_token_input(form_token))
+    if message:
+        page = show_form_error(page, "password_message", message, "Change Account Password")
+    return page
+
+
+FORM_EXPIRED_MESSAGE = "This page had expired, so nothing was changed. Please try again."
 
 
 INDEX_HTML = """<!doctype html>
@@ -13203,7 +13482,9 @@ INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NWR Stream Manager</title>
+__PAGE_SCRIPT_LOADER__
 <style>
+__BASE_PAGE_STYLES__
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
 *, *::before, *::after { box-sizing: border-box; }
 body { margin: 0; background: #f6f7f9; color: #14181f; }
@@ -13235,10 +13516,13 @@ button:disabled { cursor: default; opacity: 0.65; }
 nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 nav a { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; text-decoration: none; }
 nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #2557a7; box-shadow: inset 0 -2px 0 #2557a7; }
-.nav-more { position: relative; }
-.nav-more-menu { position: absolute; right: 0; z-index: 15; display: grid; gap: 4px; min-width: 230px; margin-top: 6px; padding: 6px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; box-shadow: 0 8px 18px rgb(20 24 31 / 18%); }
-.nav-more-menu[hidden] { display: none; }
-.nav-more-menu a { border: 0; border-radius: 4px; }
+.logs-refresh { margin-top: 12px; }
+/* Without the page script the More links sit in the bar with the others; with it they're a menu. */
+.nav-more, .nav-more-menu { display: contents; }
+.js-app .nav-more { display: inline; position: relative; }
+.js-app .nav-more-menu { position: absolute; right: 0; z-index: 15; display: grid; gap: 4px; min-width: 230px; margin-top: 6px; padding: 6px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; box-shadow: 0 8px 18px rgb(20 24 31 / 18%); }
+.js-app .nav-more-menu[hidden] { display: none; }
+.js-app .nav-more-menu a { border: 0; border-radius: 4px; }
 .view[hidden] { display: none; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; min-width: 0; }
 .row { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -13359,7 +13643,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .signal-poor, .signal-no_signal { color: #ff6b7a; }
   .success { color: #5fd27a; }
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
-  .nav-more-menu { background: #181d24; border-color: #333b48; }
+  .js-app .nav-more-menu { background: #181d24; border-color: #333b48; }
   .tabs { border-color: #333b48; }
   .tabs button[aria-selected="true"] { border-bottom-color: #181d24; }
   .notice-dialog { background: #181d24; border-color: #333b48; }
@@ -13372,8 +13656,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .topbar h1 { font-size: 24px; }
   nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; width: 100%; align-items: stretch; }
   nav a, nav button { width: 100%; min-height: 44px; text-align: center; }
-  .nav-more { display: block; min-width: 0; }
-  .nav-more-menu { left: 0; right: auto; width: min(260px, calc(100vw - 32px)); }
+  .js-app .nav-more { display: block; min-width: 0; }
+  .js-app .nav-more-menu { left: 0; right: auto; width: min(260px, calc(100vw - 32px)); }
   main { padding: 16px; }
   footer { margin: 0 16px; padding-bottom: 24px; }
   .global-status-banner { margin: 14px 16px 0; padding: 12px 16px; }
@@ -13418,7 +13702,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .topbar h1 { font-size: 20px; max-width: 9rem; }
   nav { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; width: 100%; }
   nav a, nav button { min-height: 40px; padding: 6px 8px; text-align: center; }
-  .nav-more-menu { right: 0; left: auto; }
+  .js-app .nav-more-menu { right: 0; left: auto; }
   main { padding: 16px; }
   footer { margin: 0 16px; padding-bottom: 24px; }
   .global-status-banner { margin: 14px 16px 0; padding: 12px 16px; }
@@ -13436,13 +13720,13 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
       <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" data-eas-entry="restore" hidden>EAS alerts</a>
       <span class="nav-more">
-        <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false">More</button>
-        <span id="nav_more_menu" class="nav-more-menu" role="menu" hidden>
-          <a id="nav_receiver" href="/?view=receiver" data-view="receiver" role="menuitem">Weather Radio Receiver</a>
-          <a id="nav_iq_recorder" href="/?view=iq_recorder" data-view="iq_recorder" role="menuitem">I/Q Recorder</a>
-          <a id="nav_logs" href="/?view=logs" data-view="logs" role="menuitem">Logs</a>
-          <a id="nav_settings" href="/?view=settings" data-view="settings" role="menuitem" hidden>Settings</a>
-          <a id="nav_change_password" href="/?view=change_password" data-view="change_password" role="menuitem" hidden>Change account password</a>
+        <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false" hidden>More</button>
+        <span id="nav_more_menu" class="nav-more-menu">
+          <a id="nav_receiver" href="/?view=receiver" data-view="receiver">Weather Radio Receiver</a>
+          <a id="nav_iq_recorder" href="/?view=iq_recorder" data-view="iq_recorder">I/Q Recorder</a>
+          <a id="nav_logs" href="/?view=logs" data-view="logs">Logs</a>
+          <a id="nav_settings" href="/?view=settings" data-view="settings" hidden>Settings</a>
+          <a id="nav_change_password" href="/?view=change_password" data-view="change_password" hidden>Change account password</a>
         </span>
       </span>
     </nav>
@@ -13561,7 +13845,11 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 <div id="same_alert_flash" class="same-alert-flash" hidden></div>
 <div id="same_alert_live" class="screen-reader-only" aria-live="assertive" aria-relevant="additions text" aria-atomic="false"></div>
 <main>
-  <div id="view_dashboard" class="view">
+  <section id="baseline_unavailable" class="baseline-only" hidden>
+    <h2>This page doesn't work in this browser yet</h2>
+    <p>These pages work in every browser: <a href="/?view=logs">Logs</a> and <a href="/help">Help</a>.</p>
+  </section>
+  <div id="view_dashboard" class="view needs-app">
     <section id="dashboard_sdr_section">
       <h2>Configured SDR</h2>
       <p id="dashboard_sdr_attention" class="status-text status-needs-attention" hidden>RTL-SDR requires attention. Check the SDR immediately.</p>
@@ -13597,7 +13885,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_rtl" class="view" hidden>
+  <div id="view_rtl" class="view needs-app" hidden>
     <section>
       <h2>Configure RTL-SDR</h2>
       <label>Active SDR
@@ -13685,7 +13973,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_receiver" class="view" hidden>
+  <div id="view_receiver" class="view needs-app" hidden>
     <section>
       <h2>Weather Radio Receiver</h2>
       <p>Freely tune around the NWR band and listen right in your browser.</p>
@@ -13711,7 +13999,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_iq_recorder" class="view" hidden>
+  <div id="view_iq_recorder" class="view needs-app" hidden>
     <section>
       <h2>I/Q Recorder</h2>
       <div id="iq-recorder-result" class="message"></div>
@@ -13752,7 +14040,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_iq_recorder_start" class="view" hidden>
+  <div id="view_iq_recorder_start" class="view needs-app" hidden>
     <section>
       <h2>New I/Q Recording</h2>
       <div id="iq-start-result" class="message"></div>
@@ -13786,7 +14074,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_iq_recording_download" class="view" hidden>
+  <div id="view_iq_recording_download" class="view needs-app" hidden>
     <section>
       <h2>Download I/Q Recording</h2>
       <p id="iq_download_recording_label" class="hint"></p>
@@ -13816,10 +14104,14 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       </div>
       <p id="capture-error" class="error"></p>
       <pre id="logs" aria-live="off" aria-label="Server log output"></pre>
+      <form class="baseline-only logs-refresh" method="get" action="/">
+        <input type="hidden" name="view" value="logs">
+        <button type="submit">Refresh</button>
+      </form>
     </section>
   </div>
 
-  <div id="view_settings" class="view" hidden>
+  <div id="view_settings" class="view needs-app" hidden>
     <section>
       <h2>Settings</h2>
       <div id="settings_layout" class="settings-layout">
@@ -14120,7 +14412,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_change_password" class="view" hidden>
+  <div id="view_change_password" class="view needs-app" hidden>
     <section>
       <h2>Change Account Password</h2>
       <div id="change_password_form">
@@ -14142,7 +14434,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_streams" class="view" hidden>
+  <div id="view_streams" class="view needs-app" hidden>
     <section>
       <h2>Manage Streams</h2>
       <div class="actions">
@@ -14169,7 +14461,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_add_stream" class="view" hidden>
+  <div id="view_add_stream" class="view needs-app" hidden>
     <section>
       <h2 id="stream_wizard_title">Add Stream</h2>
       <div id="wizard_step_station" class="wizard-step">
@@ -14311,7 +14603,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_stream_settings" class="view" hidden>
+  <div id="view_stream_settings" class="view needs-app" hidden>
     <section>
       <h2 id="stream_settings_title">Stream Settings</h2>
       <div id="stream_settings_station" class="hint"></div>
@@ -14663,7 +14955,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_stream_output" class="view" hidden>
+  <div id="view_stream_output" class="view needs-app" hidden>
     <section>
       <div id="output_form_panel">
           <h2 id="output_form_title">Add output</h2>
@@ -14773,7 +15065,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_eas_alerts" class="view" hidden>
+  <div id="view_eas_alerts" class="view needs-app" hidden>
     <section>
       <h2>EAS alerts</h2>
       <p>View and manage recorded EAS alerts.</p>
@@ -14794,7 +15086,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_eas_alert_export" class="view" hidden>
+  <div id="view_eas_alert_export" class="view needs-app" hidden>
     <section>
       <h2>Export alerts</h2>
       <p id="eas_export_stream_label" class="hint"></p>
@@ -14811,7 +15103,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_eas_alert_delete" class="view" hidden>
+  <div id="view_eas_alert_delete" class="view needs-app" hidden>
     <section>
       <h2>Delete alerts</h2>
       <p id="eas_delete_stream_label" class="hint"></p>
@@ -14828,7 +15120,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_eas_alert_detail" class="view" hidden>
+  <div id="view_eas_alert_detail" class="view needs-app" hidden>
     <section>
       <h2 id="eas_alert_detail_title">EAS alert</h2>
       <dl class="details-list">
@@ -14870,7 +15162,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
   <p id="footer_version">NWR Stream Manager version __APP_VERSION__</p>
 </footer>
-<script>
+<script type="text/x-nwr-app">
 const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto", "alias_filter_strength", "notify_sdr_failures"];
 const DEFAULT_STREAM_SAMPLE_RATE = 24000;
 const DEFAULT_STREAM_BITRATES = {mp3: 64, ogg: 48};
@@ -24396,6 +24688,15 @@ document.addEventListener("click", event => {
   navigateTo(targetView, targetParams, replace);
 });
 
+// The page comes with the More links listed in the bar, for browsers that don't
+// run this script; here they become a menu.
+(() => {
+  const menu = document.getElementById("nav_more_menu");
+  menu.setAttribute("role", "menu");
+  for (const item of menu.querySelectorAll("a")) item.setAttribute("role", "menuitem");
+  menu.hidden = true;
+  document.getElementById("nav_more_button").hidden = false;
+})();
 document.getElementById("nav_more_button").addEventListener("click", () => {
   toggleNavMoreMenu();
 });
@@ -26251,9 +26552,15 @@ async function resumeListening() {
   }, 5000);
 })();
 </script>
+__PAGE_SCRIPT_STARTER__
 </body>
 </html>
-""".replace("__APP_VERSION__", html.escape(APP_VERSION))
+""".replace("__APP_VERSION__", html.escape(APP_VERSION)).replace(
+    "__PAGE_SCRIPT_LOADER__", page_rendering.PAGE_SCRIPT_LOADER
+).replace("__PAGE_SCRIPT_STARTER__", page_rendering.PAGE_SCRIPT_STARTER).replace(
+    "__BASE_PAGE_STYLES__", page_rendering.BASE_PAGE_STYLES
+)
+INDEX_VIEWS = page_rendering.page_views(INDEX_HTML)
 
 
 if __name__ == "__main__":

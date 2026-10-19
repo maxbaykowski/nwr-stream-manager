@@ -4,7 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NWR Stream Manager Help</title>
+<!--[if lt IE 9]><script>
+(function () {
+  var names = ["header", "nav", "main", "section", "footer"];
+  for (var i = 0; i < names.length; i++) document.createElement(names[i]);
+})();
+</script><![endif]-->
 <style>
+header, nav, main, section, footer { display: block; }
+[hidden] { display: none; }
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
 *, *::before, *::after { box-sizing: border-box; }
 body { margin: 0; background: #f6f7f9; color: #14181f; line-height: 1.55; }
@@ -128,6 +136,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li><a href="#iq-recorder">I/Q Recorder</a></li>
     <li><a href="#logs">Logs</a></li>
     <li><a href="#storage">Storage</a></li>
+    <li><a href="#older-browsers">Older browsers</a></li>
   </ol>
 </nav>
 
@@ -695,30 +704,89 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>If the disk gets nearly full, NWR Stream Manager pauses EAS recording and stops any I/Q recording, so the computer doesn't run out of space completely. Delete old alerts in <a href="#eas-alerts">EAS alerts</a> or old I/Q recordings to free up space; recording resumes once there's room again.</p>
 </section>
 
+<section aria-labelledby="older-browsers">
+  <h2 id="older-browsers">Older browsers</h2>
+  <p>When a page opens, NWR Stream Manager checks what your browser can do. In an up-to-date browser, pages update by themselves and you can listen to streams. In an older browser, such as Internet Explorer, or with JavaScript turned off, pages work as plain pages instead: forms save when you submit them, and Refresh shows the latest information.</p>
+  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, changing a temporary password, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
+</section>
+
 </main>
 <div id="copy-status" class="screen-reader-only" aria-live="polite"></div>
 <script>
-// Copy buttons for commands; they stay hidden if the page is viewed without scripts.
-for (const button of document.querySelectorAll(".copy-button")) {
-  const command = button.previousElementSibling.textContent;
-  button.hidden = false;
-  button.setAttribute("aria-label", `Copy command: ${command}`);
-  button.addEventListener("click", async () => {
-    const status = document.getElementById("copy-status");
+// Copy buttons for commands. They stay hidden without scripts, and in browsers
+// that can't copy. Written so that older browsers can run it too.
+(function () {
+  var d = document;
+  var nav = window.navigator;
+  var clipboard = !!(nav.clipboard && nav.clipboard.writeText && window.isSecureContext);
+  var copyCommand = false;
+  try {
+    copyCommand = !!(d.queryCommandSupported && d.queryCommandSupported("copy"));
+  } catch (error) {
+  }
+  if (!clipboard && !copyCommand) return;
+  var status = d.getElementById("copy-status");
+
+  function textOf(element) {
+    return element.textContent !== undefined ? element.textContent : element.innerText;
+  }
+
+  function setText(element, text) {
+    if (element.textContent !== undefined) element.textContent = text;
+    else element.innerText = text;
+  }
+
+  // The older way: copy from a selected, off-screen copy of the text, then put
+  // focus back on the button.
+  function copyBySelecting(text, button) {
+    var area = d.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "absolute";
+    area.style.left = "-9999px";
+    d.body.appendChild(area);
+    area.select();
+    var copied = false;
     try {
-      await navigator.clipboard.writeText(command);
-      button.textContent = "Copied";
-      status.textContent = "Command copied to the clipboard.";
+      copied = d.execCommand("copy");
     } catch (error) {
-      button.textContent = "Copy failed";
-      status.textContent = "Couldn't copy the command. Select it and copy it instead.";
     }
-    setTimeout(() => {
-      button.textContent = "Copy";
-      status.textContent = "";
+    d.body.removeChild(area);
+    button.focus();
+    return copied;
+  }
+
+  function finished(button, copied) {
+    setText(button, copied ? "Copied" : "Copy failed");
+    setText(status, copied ? "Command copied to the clipboard." : "Couldn't copy the command. Select it and copy it instead.");
+    setTimeout(function () {
+      setText(button, "Copy");
+      setText(status, "");
     }, 2000);
-  });
-}
+  }
+
+  function connect(button) {
+    var command = textOf(button.parentNode.getElementsByTagName("code")[0]);
+    button.removeAttribute("hidden");
+    button.setAttribute("aria-label", "Copy command: " + command);
+    button.onclick = function () {
+      if (clipboard) {
+        nav.clipboard.writeText(command).then(function () {
+          finished(button, true);
+        }, function () {
+          finished(button, copyCommand && copyBySelecting(command, button));
+        });
+      } else {
+        finished(button, copyBySelecting(command, button));
+      }
+    };
+  }
+
+  var buttons = d.getElementsByTagName("button");
+  for (var i = 0; i < buttons.length; i++) {
+    if ((" " + buttons[i].className + " ").indexOf(" copy-button ") >= 0) connect(buttons[i]);
+  }
+})();
 </script>
 </body>
 </html>
