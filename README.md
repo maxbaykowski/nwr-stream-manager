@@ -24,6 +24,8 @@ need:
   Raspberry Pi OS, `liquid-dsp` on Fedora)
 - `libsoxr` runtime library for sample-rate conversion (`libsoxr0` on Debian and
   Raspberry Pi OS, `soxr` on Fedora)
+- `libsndfile` runtime library for custom fallback announcements (`libsndfile1`
+  on Debian and Raspberry Pi OS, `libsndfile` on Fedora)
 
 Then install the Python package directly from GitHub:
 

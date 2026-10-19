@@ -75,13 +75,10 @@ class EasAlertTests(unittest.TestCase):
     def test_seconds_settings_require_whole_numbers(self) -> None:
         web_control = self.web_control
 
-        fallback = web_control.validate_fallback_settings_payload({
-            "enabled": True,
-            "silence_timeout_seconds": 30.0,
-            "loop_delay_seconds": 5,
-        })
-        self.assertEqual(fallback.silence_timeout_seconds, 30)
+        fallback = web_control.validate_fallback_settings_payload({"loop_delay_seconds": 5.0})
         self.assertEqual(fallback.loop_delay_seconds, 5)
+        action = web_control.validate_stream_fallback_action_payload({"action": "play_fallback_audio", "delay_seconds": 30.0})
+        self.assertEqual(action.delay_seconds, 30)
 
         eas = web_control.validate_eas_recording_payload({
             "enabled": True,
@@ -95,10 +92,7 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(eas.max_seconds, 120)
 
         with self.assertRaisesRegex(ValueError, "Fallback delay must be a whole number of seconds"):
-            web_control.validate_fallback_settings_payload({
-                "silence_timeout_seconds": 30.5,
-                "loop_delay_seconds": 5,
-            })
+            web_control.validate_stream_fallback_action_payload({"action": "play_fallback_audio", "delay_seconds": 30.5})
         with self.assertRaisesRegex(ValueError, "Pre-recording time must be a whole number of seconds"):
             web_control.validate_eas_recording_payload({
                 "pre_seconds": 2.5,
@@ -1129,6 +1123,8 @@ class EasAlertTests(unittest.TestCase):
         worker.soundcard_taps = {}
         worker.eas_recorder = None
         worker.lock = self.web_control.threading.Lock()
+        worker.outputs = {}
+        worker.icecast_disconnected = self.web_control.threading.Event()
         worker.stream = {"station": {"callsign": "WXN99"}}
         tap = Tap()
 
@@ -1438,6 +1434,8 @@ class EasAlertTests(unittest.TestCase):
         worker.soundcard_taps = {}
         worker.eas_recorder = object()
         worker.lock = self.web_control.threading.Lock()
+        worker.outputs = {}
+        worker.icecast_disconnected = self.web_control.threading.Event()
 
         self.assertTrue(worker._has_connected_outputs())
         self.assertFalse(hasattr(self.web_control, "EasStreamWorker"))

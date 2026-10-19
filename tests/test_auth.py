@@ -727,9 +727,7 @@ class AuthTests(unittest.TestCase):
         )
         segments = {kind: audio for kind, audio, _protected in first}
         expected_message = web_control.shape_test_mode_program_audio(
-            web_control.load_mono_wav_float(
-                web_control.asset_path(web_control.STREAM_TEST_MODE_SAME_AUDIO), web_control.IQ_SAMPLE_RATE
-            ),
+            web_control.load_packaged_wav_float(web_control.STREAM_TEST_MODE_SAME_AUDIO, web_control.IQ_SAMPLE_RATE),
             web_control.IQ_SAMPLE_RATE,
         )
         np.testing.assert_array_equal(segments["message"], expected_message)
@@ -1703,6 +1701,8 @@ class AuthTests(unittest.TestCase):
         service.iq_file_source_config = None
         service.streams = []
         service.fallback_settings = self.web_control.WebFallbackSettings()
+        service.custom_fallback_audio = None
+        service.custom_fallback_audio_problem = ""
         service.capture_error = None
         service.sdr_reset = None
         service.last_batch_at = None

@@ -6,6 +6,7 @@ import binascii
 import fcntl
 import functools
 import hmac
+import io
 import html
 import hashlib
 from http.cookies import SimpleCookie
@@ -93,7 +94,15 @@ if __package__:
     )
     from .eas_recording import EasRecorderOutput
     from .encoder import PcmResampler, create_audio_encoder
-    from .fallback_audio import load_fallback_audio
+    from .fallback_audio import DEFAULT_FALLBACK_AUDIO, FallbackAudio, load_fallback_audio, load_fallback_wave_bytes
+    from .custom_fallback_audio import (
+        MAX_CUSTOM_FALLBACK_BYTES,
+        CustomFallbackAudioError,
+        custom_fallback_audio_sha256,
+        prepare_custom_fallback_audio,
+        read_custom_fallback_audio,
+    )
+    from .packaged_audio import read_packaged_audio
     from .icecast import IcecastSource, parse_icecast_address
     from .icecastauth import IcecastSettings, test_mountpoint_authentication
     from .nfm import NfmDemodulator, NfmModulator, float_to_s16
@@ -156,6 +165,8 @@ else:
     eas_recording = importlib.import_module(f"{package_name}.eas_recording")
     encoder = importlib.import_module(f"{package_name}.encoder")
     fallback_audio = importlib.import_module(f"{package_name}.fallback_audio")
+    custom_fallback_audio_module = importlib.import_module(f"{package_name}.custom_fallback_audio")
+    packaged_audio = importlib.import_module(f"{package_name}.packaged_audio")
     icecast_module = importlib.import_module(f"{package_name}.icecast")
     icecastauth_module = importlib.import_module(f"{package_name}.icecastauth")
     nfm = importlib.import_module(f"{package_name}.nfm")
@@ -209,7 +220,16 @@ else:
     EasRecorderOutput = eas_recording.EasRecorderOutput
     PcmResampler = encoder.PcmResampler
     create_audio_encoder = encoder.create_audio_encoder
+    FallbackAudio = fallback_audio.FallbackAudio
     load_fallback_audio = fallback_audio.load_fallback_audio
+    load_fallback_wave_bytes = fallback_audio.load_fallback_wave_bytes
+    DEFAULT_FALLBACK_AUDIO = fallback_audio.DEFAULT_FALLBACK_AUDIO
+    MAX_CUSTOM_FALLBACK_BYTES = custom_fallback_audio_module.MAX_CUSTOM_FALLBACK_BYTES
+    CustomFallbackAudioError = custom_fallback_audio_module.CustomFallbackAudioError
+    custom_fallback_audio_sha256 = custom_fallback_audio_module.custom_fallback_audio_sha256
+    prepare_custom_fallback_audio = custom_fallback_audio_module.prepare_custom_fallback_audio
+    read_custom_fallback_audio = custom_fallback_audio_module.read_custom_fallback_audio
+    read_packaged_audio = packaged_audio.read_packaged_audio
     IcecastSource = icecast_module.IcecastSource
     parse_icecast_address = icecast_module.parse_icecast_address
     IcecastSettings = icecastauth_module.IcecastSettings
@@ -405,6 +425,7 @@ RECEIVER_AUDIO_CONFIG = parse_audio_config(
     }
 )
 FALLBACK_STATE_FILE_NAME = "fallback.json"
+CUSTOM_FALLBACK_AUDIO_FILE_NAME = "fallback_custom.wav"
 NOTIFICATION_STATE_FILE_NAME = "notifications.json"
 SOUNDCARD_DEVICE_NAMES_FILE_NAME = "soundcard-devices.json"
 STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS = 30.0
@@ -518,11 +539,37 @@ class RtlControlSettings:
         )
 
 
+# Which announcement fallback audio plays.
+FALLBACK_AUDIO_DEFAULT = "default"
+FALLBACK_AUDIO_CUSTOM = "custom"
+FALLBACK_AUDIO_CHOICES = (FALLBACK_AUDIO_DEFAULT, FALLBACK_AUDIO_CUSTOM)
+
+
 @dataclass(frozen=True)
 class WebFallbackSettings:
-    enabled: bool = True
-    silence_timeout_seconds: float = 30.0
+    """Fallback audio settings shared by every stream that plays it."""
+
     loop_delay_seconds: float = 5.0
+    audio: str = FALLBACK_AUDIO_DEFAULT
+    # The custom announcement as it was checked and stored. Only the server sets
+    # this, and the file is not played if it no longer matches.
+    custom_audio_sha256: str = ""
+
+
+# What a stream does once it has had no radio audio, or no usable signal, for its
+# fallback delay. It undoes it as soon as the station is back.
+STREAM_FALLBACK_NONE = "none"
+STREAM_FALLBACK_DISCONNECT_ICECAST = "disconnect_icecast"
+STREAM_FALLBACK_PLAY_AUDIO = "play_fallback_audio"
+STREAM_FALLBACK_ACTIONS = (STREAM_FALLBACK_NONE, STREAM_FALLBACK_DISCONNECT_ICECAST, STREAM_FALLBACK_PLAY_AUDIO)
+STREAM_FALLBACK_MIN_DELAY_SECONDS = 30
+STREAM_FALLBACK_MAX_DELAY_SECONDS = 120
+
+
+@dataclass(frozen=True)
+class WebStreamFallbackAction:
+    action: str = STREAM_FALLBACK_PLAY_AUDIO
+    delay_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -2329,15 +2376,16 @@ def asset_path(name: str) -> Path:
     return Path(__file__).resolve().parent / "assets" / name
 
 
-def load_mono_wav_float(path: Path, sample_rate: int) -> np.ndarray:
-    with wave.open(str(path), "rb") as wav:
+def load_packaged_wav_float(name: str, sample_rate: int) -> np.ndarray:
+    # Only the sound shipped with NWR Stream Manager is played; see packaged_audio.
+    with wave.open(io.BytesIO(read_packaged_audio(name)), "rb") as wav:
         channels = wav.getnchannels()
         sample_width = wav.getsampwidth()
         rate = wav.getframerate()
         frame_count = wav.getnframes()
         compression = wav.getcomptype()
         if sample_width != 2 or compression != "NONE":
-            raise ValueError(f"{path.name} must be PCM S16_LE WAV")
+            raise ValueError(f"{name} must be PCM S16_LE WAV")
         raw = wav.readframes(frame_count)
     samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
     if channels > 1:
@@ -2440,7 +2488,7 @@ def _read_only(audio: np.ndarray) -> np.ndarray:
 # mode stream; only the header, which carries the time, is built for each test.
 @functools.lru_cache(maxsize=4)
 def _test_mode_same_message_audio(sample_rate: int) -> np.ndarray:
-    message = load_mono_wav_float(asset_path(STREAM_TEST_MODE_SAME_AUDIO), sample_rate)
+    message = load_packaged_wav_float(STREAM_TEST_MODE_SAME_AUDIO, sample_rate)
     return _read_only(shape_test_mode_program_audio(message, sample_rate))
 
 
@@ -2543,7 +2591,7 @@ class SyntheticNwrTestModeSource:
         return self._fm_modulate(audio, signal_start_dbfs, signal_end_dbfs)
 
     def _build_loop_audio(self) -> np.ndarray:
-        audio = load_mono_wav_float(asset_path(STREAM_TEST_MODE_AUDIO), self.sample_rate)
+        audio = load_packaged_wav_float(STREAM_TEST_MODE_AUDIO, self.sample_rate)
         audio = shape_test_mode_program_audio(audio, self.sample_rate)
         period_samples = max(round(STREAM_TEST_MODE_LOOP_PERIOD_SECONDS * self.sample_rate), int(audio.size))
         if audio.size < period_samples:
@@ -2840,7 +2888,13 @@ class ComplexFrameBuffer:
 
 
 def load_web_fallback_audio(sample_rate: int = IQ_SAMPLE_RATE):
-    audio = load_fallback_audio(None)
+    try:
+        audio = load_fallback_audio(None)
+    except ValueError as exc:
+        # Listeners hear silence rather than a sound that is not the one shipped,
+        # and the stream keeps running.
+        LOG.error("fallback audio will be silent: %s", exc)
+        return FallbackAudio(sample_rate=sample_rate, pcm=b"", duration_seconds=0.0, source="silence")
     if audio.sample_rate == sample_rate:
         return audio
     resampler = PcmResampler(audio.sample_rate, sample_rate)
@@ -3640,6 +3694,7 @@ class IcecastStreamWorker:
         fallback_settings_provider,
         alias_filter_strength_provider,
         state_directory: Path,
+        fallback_audio_provider=None,
         gain_provider=lambda: None,
         soundcard_devices_provider=None,
         soundcard_manager: SharedSoundcardOutputManager | None = None,
@@ -3648,6 +3703,7 @@ class IcecastStreamWorker:
         self.stream = stream
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
+        self.fallback_audio_provider = fallback_audio_provider
         self.alias_filter_strength_provider = alias_filter_strength_provider
         self.gain_provider = gain_provider
         self._soundcard_devices_provider = soundcard_devices_provider or discover_playback_devices
@@ -3691,6 +3747,8 @@ class IcecastStreamWorker:
             alias_filter_transition_hz(CHANNEL_IQ_ALIAS_TRANSITION_HZ, self.alias_filter_strength_provider())
         )
         self._soundcard_owner = object()
+        # Set while this stream's fallback action has its Icecast outputs disconnected.
+        self.icecast_disconnected = threading.Event()
         self.lock = threading.Lock()
 
     @property
@@ -3703,6 +3761,7 @@ class IcecastStreamWorker:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.icecast_disconnected.clear()
         self.fanout.unsubscribe(self.queue)
         wake_queue(self.queue)
         outputs = list(self.outputs.values())
@@ -3755,6 +3814,27 @@ class IcecastStreamWorker:
         with self.lock:
             stream = self.stream
         return audio_config_from_stream(stream)
+
+    def fallback_action(self) -> WebStreamFallbackAction:
+        with self.lock:
+            stream = self.stream
+        return stream_fallback_action_from_stream(stream)
+
+    def _begin_fallback_action(self, action: str, seconds: float, reason: str) -> None:
+        callsign = self.stream.get("station", {}).get("callsign")
+        if action == STREAM_FALLBACK_DISCONNECT_ICECAST:
+            LOG.info("disconnecting Icecast outputs for %s after %.1f seconds %s", callsign, seconds, reason)
+            self.icecast_disconnected.set()
+        else:
+            LOG.info("starting fallback audio for %s after %.1f seconds %s", callsign, seconds, reason)
+
+    def _end_fallback_action(self, action: str) -> None:
+        callsign = self.stream.get("station", {}).get("callsign")
+        if action == STREAM_FALLBACK_DISCONNECT_ICECAST:
+            LOG.info("reconnecting Icecast outputs for %s", callsign)
+            self.icecast_disconnected.clear()
+        else:
+            LOG.info("stopping fallback audio for %s", callsign)
 
     def snapshots(self) -> list[dict[str, Any]]:
         snapshots = [output.snapshot() for output in list(self.outputs.values())]
@@ -4000,8 +4080,32 @@ class IcecastStreamWorker:
         audio_config = self.audio_config()
         effects = AudioEffectsProcessor(audio_config)
         frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
-        fallback = load_web_fallback_audio()
+        fallback_audio_provider = self.fallback_audio_provider
+        if fallback_audio_provider is None:
+            packaged_fallback = load_web_fallback_audio()
+            fallback_audio_provider = lambda: packaged_fallback
+        fallback = fallback_audio_provider()
         fallback_state = WebFallbackPlaybackState()
+
+        def next_fallback_frame(loop_delay_seconds: float) -> bytes:
+            nonlocal fallback
+            latest = fallback_audio_provider()
+            if latest is not fallback:
+                # A different announcement was chosen: play it from the start.
+                fallback = latest
+                fallback_state.position = 0
+                fallback_state.delay_samples_remaining = 0
+            return next_web_fallback_frame(fallback, fallback_state, loop_delay_seconds)
+        # Whether this stream's fallback action is in effect, and which one.
+        fallback_engaged = False
+        fallback_engaged_as = STREAM_FALLBACK_NONE
+
+        def end_fallback() -> None:
+            nonlocal fallback_engaged
+            if fallback_engaged:
+                self._end_fallback_action(fallback_engaged_as)
+                fallback_engaged = False
+            fallback_state.reset()
         last_real_audio = time.monotonic()
         # When the current fallback condition began: the SDR delivering no IQ,
         # the station having no signal, or one handing over to the other. It is
@@ -4146,7 +4250,7 @@ class IcecastStreamWorker:
                     self.queue.get(timeout=0.5)
                 except queue.Empty:
                     pass
-                fallback_state.reset()
+                end_fallback()
                 fallback_since = None
                 frame_buffer.clear()
                 idle_next_frame_at = None
@@ -4163,7 +4267,7 @@ class IcecastStreamWorker:
                     test_frame_buffer.clear()
                     real_test_iq_frame_buffer.clear()
                     real_test_iq_frames.clear()
-                    fallback_state.reset()
+                    end_fallback()
                     fallback_since = None
                     idle_next_frame_at = None
                     test_mode_next_frame_at = time.monotonic()
@@ -4189,7 +4293,7 @@ class IcecastStreamWorker:
                 if len(audio) == 0:
                     continue
                 last_real_audio = time.monotonic()
-                fallback_state.reset()
+                end_fallback()
                 with self.lock:
                     self.last_audio_at = time.time()
                     station = self.stream.get("station", {})
@@ -4247,29 +4351,33 @@ class IcecastStreamWorker:
                 frames_due = max(1, int((now - idle_next_frame_at) / STREAM_FRAME_SECONDS) + 1)
                 frames_due = min(frames_due, 8)
                 fallback_settings = self.fallback_settings_provider()
+                fallback_action = self.fallback_action()
+                if fallback_engaged and fallback_engaged_as != fallback_action.action:
+                    # The action was changed while it was in effect.
+                    self._end_fallback_action(fallback_engaged_as)
+                    fallback_engaged = False
+                    fallback_state.reset()
                 if fallback_since is None:
                     fallback_since = last_real_audio
                 idle_seconds = time.monotonic() - fallback_since
-                if not fallback_settings.enabled:
+                if fallback_action.action == STREAM_FALLBACK_NONE:
                     fallback_state.reset()
                     idle_next_frame_at = None
                     continue
                 for _ in range(frames_due):
-                    if not fallback_state.active and idle_seconds < fallback_settings.silence_timeout_seconds:
+                    if not fallback_engaged and idle_seconds < fallback_action.delay_seconds:
                         fallback_state.reset()
                         self._write_pcm(STREAM_SILENCE_FRAME, STREAM_SILENCE_FLOAT_FRAME)
                     else:
-                        if not fallback_state.active:
-                            fallback_state.active = True
-                            with self.lock:
-                                fallback_station = self.stream.get("station", {})
-                            LOG.info(
-                                "starting fallback audio for %s after %.1f seconds without IQ or a usable signal",
-                                fallback_station.get("callsign"),
-                                idle_seconds,
-                            )
-                        fallback_pcm = next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds)
-                        self._write_pcm(fallback_pcm, pcm_s16le_to_float32(fallback_pcm))
+                        if not fallback_engaged:
+                            fallback_engaged = True
+                            fallback_engaged_as = fallback_action.action
+                            self._begin_fallback_action(fallback_engaged_as, idle_seconds, "without IQ or a usable signal")
+                        if fallback_engaged_as == STREAM_FALLBACK_PLAY_AUDIO:
+                            fallback_pcm = next_fallback_frame(fallback_settings.loop_delay_seconds)
+                            self._write_pcm(fallback_pcm, pcm_s16le_to_float32(fallback_pcm))
+                        else:
+                            self._write_pcm(STREAM_SILENCE_FRAME, STREAM_SILENCE_FLOAT_FRAME)
                     idle_next_frame_at += STREAM_FRAME_SECONDS
                 if idle_next_frame_at < now - 0.25:
                     idle_next_frame_at = now + STREAM_FRAME_SECONDS
@@ -4323,7 +4431,7 @@ class IcecastStreamWorker:
                     # history no longer applies.
                     self.signal_meter.reset()
                     self.signal_presence.reset()
-                    fallback_state.reset()
+                    end_fallback()
                     fallback_since = None
                 channelizer = IqChannelizer(
                     input_rate=batch.sample_rate,
@@ -4353,7 +4461,7 @@ class IcecastStreamWorker:
                     demodulator.reset()
                     self.signal_meter.reset()
                     self.signal_presence.reset()
-                    fallback_state.reset()
+                    end_fallback()
                     fallback_since = None
             current_gain = self.gain_provider()
             if current_gain != signal_meter_gain:
@@ -4383,21 +4491,24 @@ class IcecastStreamWorker:
             now = time.monotonic()
             last_real_audio = now
             fallback_settings = self.fallback_settings_provider()
-            if fallback_settings.enabled and self.signal_presence.lost:
-                # Keep demodulating so the meter sees the signal return, but
-                # after the fallback delay play fallback audio instead of static.
+            fallback_action = self.fallback_action()
+            if fallback_engaged and fallback_engaged_as != fallback_action.action:
+                self._end_fallback_action(fallback_engaged_as)
+                fallback_engaged = False
+                fallback_state.reset()
+            if fallback_action.action != STREAM_FALLBACK_NONE and self.signal_presence.lost:
+                # Keep demodulating so the meter sees the signal return, but after
+                # the fallback delay take the stream's fallback action.
                 if fallback_since is None:
                     fallback_since = now
-                if not fallback_state.active and now - fallback_since >= fallback_settings.silence_timeout_seconds:
-                    fallback_state.active = True
-                    LOG.info(
-                        "starting fallback audio for %s after %.1f seconds without a usable signal",
-                        station.get("callsign"),
-                        now - fallback_since,
-                    )
+                if not fallback_engaged and now - fallback_since >= fallback_action.delay_seconds:
+                    fallback_engaged = True
+                    fallback_engaged_as = fallback_action.action
+                    self._begin_fallback_action(fallback_engaged_as, now - fallback_since, "without a usable signal")
             else:
-                if fallback_state.active:
-                    LOG.info("stopping fallback audio for %s", station.get("callsign"))
+                if fallback_engaged:
+                    self._end_fallback_action(fallback_engaged_as)
+                    fallback_engaged = False
                 fallback_state.reset()
                 fallback_since = None
             with self.lock:
@@ -4413,8 +4524,8 @@ class IcecastStreamWorker:
                         ", ".join(changed_effects) or "none",
                     )
                 processed_frame = effects.process(frame)
-                if fallback_state.active:
-                    fallback_pcm = next_web_fallback_frame(fallback, fallback_state, fallback_settings.loop_delay_seconds)
+                if fallback_engaged and fallback_engaged_as == STREAM_FALLBACK_PLAY_AUDIO:
+                    fallback_pcm = next_fallback_frame(fallback_settings.loop_delay_seconds)
                     self._write_pcm(fallback_pcm, pcm_s16le_to_float32(fallback_pcm))
                 else:
                     self._write_pcm(float_to_s16(processed_frame), processed_frame)
@@ -4495,6 +4606,9 @@ class IcecastStreamWorker:
     def _has_connected_outputs(self) -> bool:
         return (
             any(encoder_group.has_outputs() for encoder_group in list(self.encoder_groups.values()))
+            # Icecast outputs held off by the fallback action still count, or the
+            # stream would stop listening for the station to come back.
+            or (self.icecast_disconnected.is_set() and bool(self.outputs))
             or self.has_monitor_sources()
             or self.has_soundcard_taps()
             or self.has_eas_recorder()
@@ -5018,7 +5132,14 @@ class IcecastOutputWriter:
                 self.started_at = time.time()
 
     def _run(self) -> None:
+        disconnected = getattr(self.runtime, "icecast_disconnected", None)
         while not self.stop_event.is_set():
+            if disconnected is not None and disconnected.is_set():
+                # The stream's fallback action: stay off the Icecast server until
+                # the station is back, rather than retrying as after a failure.
+                self._set_status("standby")
+                self.stop_event.wait(0.5)
+                continue
             source = None
             sink = None
             encoder_group = None
@@ -5034,6 +5155,9 @@ class IcecastOutputWriter:
                 encoder_group.add_output(self)
                 self._set_status("enabled")
                 while not self.stop_event.is_set():
+                    if disconnected is not None and disconnected.is_set():
+                        LOG.info("disconnected Icecast output %s until station audio returns", self.output.get("id"))
+                        break
                     try:
                         encoded = self.encoded_queue.get(timeout=0.5)
                     except queue.Empty:
@@ -5288,6 +5412,9 @@ class RtlControlService:
         self.web_host = "0.0.0.0"
         self.web_port = 8080
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
+        self.custom_fallback_audio_path = state_path.with_name(CUSTOM_FALLBACK_AUDIO_FILE_NAME)
+        # One custom announcement is checked and stored at a time.
+        self.custom_fallback_audio_lock = threading.Lock()
         self.notification_state_path = state_path.with_name(NOTIFICATION_STATE_FILE_NAME)
         self.test_mode_time = TestModeTimeBudget(state_path.with_name(TEST_MODE_TIME_FILE_NAME))
         self.soundcard_names_path = state_path.with_name(SOUNDCARD_DEVICE_NAMES_FILE_NAME)
@@ -5317,7 +5444,12 @@ class RtlControlService:
         self.settings_change_count = 0
         self.last_remote_host_settings: dict[str, Any] | None = None
         self.streams = load_streams(self.streams_directory, self.streams_state_path)
+        self._migrate_stream_fallback_actions()
         self.fallback_settings = load_fallback_settings(self.fallback_state_path)
+        self.default_fallback_audio = load_web_fallback_audio()
+        self.custom_fallback_audio: FallbackAudio | None = None
+        self.custom_fallback_audio_problem = ""
+        self._load_custom_fallback_audio()
         self.notification_settings = load_notification_settings(self.notification_state_path)
         self.stations = load_station_database()
         self.capture: RtlCaptureSource | IqFileCaptureSource | None = None
@@ -5720,7 +5852,7 @@ class RtlControlService:
                 "received_chunks": self.received_chunks,
                 "received_bytes": self.received_bytes,
                 "center_frequency_hz": NWR_CENTER_FREQUENCY_HZ,
-                "fallback": asdict(self.fallback_settings),
+                "fallback": self._fallback_settings_public_locked(),
                 "notifications": notifications,
                 "streams": streams,
                 "active_streams": active_streams,
@@ -6795,6 +6927,7 @@ class RtlControlService:
             "station": station,
             "outputs": [output],
             "audio": asdict(AudioConfig()),
+            "fallback_action": asdict(WebStreamFallbackAction()),
             "created_at": time.time(),
             "updated_at": time.time(),
         }
@@ -6834,6 +6967,7 @@ class RtlControlService:
                         }
                     ],
                     "audio": asdict(AudioConfig()),
+                    "fallback_action": asdict(WebStreamFallbackAction()),
                     "created_at": time.time(),
                     "updated_at": time.time(),
                     "heartbeat_at": time.time(),
@@ -6899,17 +7033,137 @@ class RtlControlService:
         return self.test_icecast_auth(icecast)
 
     def update_fallback_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        settings = validate_fallback_settings_payload(payload)
-        with self.lock:
-            self.fallback_settings = settings
-            save_fallback_settings(self.fallback_state_path, settings)
+        if not isinstance(payload, dict):
+            raise ValueError("fallback audio settings are required")
+        with self.custom_fallback_audio_lock:
+            with self.lock:
+                current = self.fallback_settings
+                has_custom = self.custom_fallback_audio is not None
+            # Only what the page may change; the custom announcement's checksum
+            # is the server's.
+            changes = {key: payload[key] for key in ("loop_delay_seconds", "audio") if key in payload}
+            settings = validate_fallback_settings_payload({**asdict(current), **changes})
+            if settings.audio == FALLBACK_AUDIO_CUSTOM and current.audio != FALLBACK_AUDIO_CUSTOM and not has_custom:
+                raise ValueError("Upload or record a custom announcement first.")
+            with self.lock:
+                self.fallback_settings = settings
+                save_fallback_settings(self.fallback_state_path, settings)
         LOG.info(
-            "updated fallback audio settings: enabled=%s delay=%.1fs loop_delay=%.1fs",
-            settings.enabled,
-            settings.silence_timeout_seconds,
+            "updated fallback audio settings: announcement=%s loop_delay=%.1fs",
+            settings.audio,
             settings.loop_delay_seconds,
         )
         return self.status()
+
+    def _load_custom_fallback_audio(self) -> None:
+        settings = self.fallback_settings
+        audio = None
+        problem = ""
+        if settings.custom_audio_sha256:
+            try:
+                data = read_custom_fallback_audio(self.custom_fallback_audio_path, settings.custom_audio_sha256)
+                audio = load_fallback_wave_bytes(data, "custom announcement")
+            except ValueError as exc:
+                problem = str(exc)
+                if settings.audio == FALLBACK_AUDIO_CUSTOM:
+                    LOG.error("fallback audio will play the default announcement: %s", problem)
+                else:
+                    LOG.warning("custom fallback announcement is unavailable: %s", problem)
+        with self.lock:
+            self.custom_fallback_audio = audio
+            self.custom_fallback_audio_problem = problem
+
+    def save_custom_fallback_audio(self, data: bytes) -> dict[str, Any]:
+        """Check an uploaded or recorded announcement, store it and start using it."""
+        with self.custom_fallback_audio_lock:
+            try:
+                wav = prepare_custom_fallback_audio(data)
+            except CustomFallbackAudioError as exc:
+                LOG.warning("refused a custom fallback announcement: %s", exc)
+                raise
+            audio = load_fallback_wave_bytes(wav, "custom announcement")
+            temporary = self.custom_fallback_audio_path.with_name(f".{CUSTOM_FALLBACK_AUDIO_FILE_NAME}.tmp")
+            temporary.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_bytes(wav)
+            os.replace(temporary, self.custom_fallback_audio_path)
+            with self.lock:
+                settings = replace(
+                    self.fallback_settings,
+                    audio=FALLBACK_AUDIO_CUSTOM,
+                    custom_audio_sha256=custom_fallback_audio_sha256(wav),
+                )
+                save_fallback_settings(self.fallback_state_path, settings)
+                self.fallback_settings = settings
+                self.custom_fallback_audio = audio
+                self.custom_fallback_audio_problem = ""
+        LOG.info("saved a custom fallback announcement (%.1f seconds)", audio.duration_seconds)
+        return self.status()
+
+    def fallback_announcement_wav(self, announcement: str) -> bytes:
+        """An announcement's audio, for listening to it on the page."""
+        if announcement == FALLBACK_AUDIO_DEFAULT:
+            return read_packaged_audio(DEFAULT_FALLBACK_AUDIO)
+        if announcement == FALLBACK_AUDIO_CUSTOM:
+            with self.lock:
+                expected = self.fallback_settings.custom_audio_sha256
+            if not expected:
+                raise ValueError("There is no custom announcement yet.")
+            return read_custom_fallback_audio(self.custom_fallback_audio_path, expected)
+        raise ValueError("Choose the default announcement or the custom announcement")
+
+    def fallback_audio_snapshot(self) -> FallbackAudio:
+        """The announcement streams play as fallback audio."""
+        with self.lock:
+            if self.fallback_settings.audio == FALLBACK_AUDIO_CUSTOM and self.custom_fallback_audio is not None:
+                return self.custom_fallback_audio
+            return self.default_fallback_audio
+
+    def _fallback_settings_public_locked(self) -> dict[str, Any]:
+        settings = self.fallback_settings
+        custom = self.custom_fallback_audio
+        return {
+            "loop_delay_seconds": settings.loop_delay_seconds,
+            "audio": settings.audio,
+            "custom_audio_available": custom is not None,
+            "custom_audio_seconds": round(custom.duration_seconds, 1) if custom is not None else None,
+            "custom_audio_problem": self.custom_fallback_audio_problem,
+        }
+
+    def _migrate_stream_fallback_actions(self) -> None:
+        # Streams saved before each had a fallback action keep doing what the old
+        # shared setting did.
+        legacy = legacy_stream_fallback_action(self.fallback_state_path)
+        migrated = [stream for stream in self.streams if not isinstance(stream.get("fallback_action"), dict)]
+        if not migrated:
+            return
+        for stream in migrated:
+            stream["fallback_action"] = asdict(legacy)
+        save_streams(self.streams_directory, self.streams)
+        LOG.info(
+            "set the fallback action of %s stream(s) to %s after %.0f seconds, from the earlier fallback audio setting",
+            len(migrated),
+            legacy.action,
+            legacy.delay_seconds,
+        )
+
+    def update_stream_fallback_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        stream_id = str(payload.get("stream_id", "")).strip()
+        settings = validate_stream_fallback_action_payload(payload.get("fallback_action", payload))
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+            stream["fallback_action"] = asdict(settings)
+            stream["updated_at"] = time.time()
+            save_streams(self.streams_directory, self.streams)
+            worker = self.stream_workers.get(stream_worker_key(stream))
+            if worker is not None:
+                worker.sync_stream(stream)
+        LOG.info(
+            "updated fallback action for stream %s: %s after %.0f seconds",
+            stream_id,
+            settings.action,
+            settings.delay_seconds,
+        )
+        return self.stream_status()
 
     def fallback_settings_snapshot(self) -> WebFallbackSettings:
         with self.lock:
@@ -8708,6 +8962,7 @@ class RtlControlService:
                 stream=stream,
                 fanout=self._channel_feed(frequency_hz, f"stream:{station.get('callsign') or stream.get('id', 'stream')}"),
                 fallback_settings_provider=self.fallback_settings_snapshot,
+                fallback_audio_provider=self.fallback_audio_snapshot,
                 alias_filter_strength_provider=self._alias_filter_strength,
                 gain_provider=self._gain_signature,
                 soundcard_devices_provider=self._cached_soundcards,
@@ -9386,6 +9641,14 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_json(self.service.devices())
         elif path == "/api/notification-settings":
             self._send_json({"notifications": self.service.notification_settings_snapshot().public_dict()})
+        elif path == "/api/fallback-audio":
+            announcement = parse_qs(parsed.query).get("announcement", [""])[0]
+            try:
+                data = self.service.fallback_announcement_wav(announcement)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_audio(data, "audio/wav")
         elif path == "/api/remote-sdr":
             self._send_json(self.service.remote_sdr_status())
         elif path == "/api/notification-access-urls":
@@ -9546,6 +9809,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(response)
+            return
+        if path == "/api/fallback-audio":
+            self._handle_custom_fallback_audio_upload()
             return
         if path == "/api/setup-account":
             try:
@@ -10037,6 +10303,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(response)
             return
+        if path == "/api/stream-fallback-action":
+            try:
+                payload = self._read_json()
+                response = self.service.update_stream_fallback_action(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(response)
+            return
         if path == "/api/eas-recording":
             try:
                 payload = self._read_json()
@@ -10103,6 +10378,49 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError, OSError):
             LOG.debug("client disconnected before JSON response could be written")
+
+    def _handle_custom_fallback_audio_upload(self) -> None:
+        # The page sends the file as it is. Requiring this type also means another
+        # site cannot send one with a plain form.
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/octet-stream":
+            self.close_connection = True
+            self._send_json({"error": "the announcement must be sent as application/octet-stream"}, status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self.close_connection = True
+            self._send_json({"error": "the announcement's size is missing"}, status=HTTPStatus.LENGTH_REQUIRED)
+            return
+        if length >= MAX_CUSTOM_FALLBACK_BYTES:
+            # Not read at all, so the connection cannot be reused.
+            self.close_connection = True
+            self._send_json({"error": "The file is 10 MB or larger. Choose a file under 10 MB."}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+        data = self.rfile.read(length) if length > 0 else b""
+        if len(data) != length:
+            self.close_connection = True
+            self._send_json({"error": "the announcement did not arrive completely"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            response = self.service.save_custom_fallback_audio(data)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json(response)
+
+    def _send_audio(self, data: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self._send_pending_auth_session_cookie()
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            LOG.debug("client disconnected before audio response could be written")
 
     def _send_help(self) -> None:
         # Read on each request so edits to the help file show up without a restart.
@@ -11069,18 +11387,72 @@ def validate_iq_recording_sample_rate(raw: Any) -> int:
 def validate_fallback_settings_payload(raw: Any) -> WebFallbackSettings:
     if not isinstance(raw, dict):
         raise ValueError("fallback audio settings are required")
-    enabled = bool(raw.get("enabled", False))
-    silence_timeout_seconds = whole_seconds(raw.get("silence_timeout_seconds", 30), "Fallback delay")
     loop_delay_seconds = whole_seconds(raw.get("loop_delay_seconds", 5), "Seconds before restart")
-    if not 30 <= silence_timeout_seconds <= 120:
-        raise ValueError("Fallback delay must be from 30 through 120 seconds")
     if not 0 <= loop_delay_seconds <= 10:
         raise ValueError("Seconds before restart must be from 0 through 10 seconds")
+    audio = str(raw.get("audio", FALLBACK_AUDIO_DEFAULT)).strip()
+    if audio not in FALLBACK_AUDIO_CHOICES:
+        raise ValueError("Choose the default announcement or a custom announcement")
+    custom_audio_sha256 = str(raw.get("custom_audio_sha256", "")).strip().lower()
+    if custom_audio_sha256 and not re.fullmatch(r"[0-9a-f]{64}", custom_audio_sha256):
+        raise ValueError("the custom announcement's checksum is not valid")
     return WebFallbackSettings(
-        enabled=enabled,
-        silence_timeout_seconds=silence_timeout_seconds,
         loop_delay_seconds=loop_delay_seconds,
+        audio=audio,
+        custom_audio_sha256=custom_audio_sha256,
     )
+
+
+def validate_stream_fallback_action_payload(raw: Any) -> WebStreamFallbackAction:
+    if not isinstance(raw, dict):
+        raise ValueError("fallback action settings are required")
+    action = str(raw.get("action", "")).strip()
+    if action not in STREAM_FALLBACK_ACTIONS:
+        raise ValueError("Choose what the stream should do when it has a problem")
+    delay_seconds = whole_seconds(raw.get("delay_seconds", 30), "Fallback delay")
+    if not STREAM_FALLBACK_MIN_DELAY_SECONDS <= delay_seconds <= STREAM_FALLBACK_MAX_DELAY_SECONDS:
+        raise ValueError(
+            f"Fallback delay must be from {STREAM_FALLBACK_MIN_DELAY_SECONDS} through {STREAM_FALLBACK_MAX_DELAY_SECONDS} seconds"
+        )
+    return WebStreamFallbackAction(action=action, delay_seconds=delay_seconds)
+
+
+def stream_fallback_action_from_stream(stream: dict[str, Any]) -> WebStreamFallbackAction:
+    raw = stream.get("fallback_action")
+    if not isinstance(raw, dict):
+        return WebStreamFallbackAction()
+    action = str(raw.get("action", ""))
+    try:
+        delay_seconds = float(raw.get("delay_seconds", 30))
+    except (TypeError, ValueError):
+        delay_seconds = 30.0
+    if action not in STREAM_FALLBACK_ACTIONS:
+        return WebStreamFallbackAction()
+    return WebStreamFallbackAction(action=action, delay_seconds=max(0.0, delay_seconds))
+
+
+def legacy_stream_fallback_action(path: Path) -> WebStreamFallbackAction:
+    """What streams did before each had its own fallback action.
+
+    Fallback audio used to be on or off for every stream at once, with one delay,
+    in the same file that now holds only the shared fallback audio settings.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return WebStreamFallbackAction()
+    except Exception:
+        return WebStreamFallbackAction()
+    if not isinstance(raw, dict) or "enabled" not in raw:
+        return WebStreamFallbackAction()
+    try:
+        delay_seconds = whole_seconds(raw.get("silence_timeout_seconds", 30), "Fallback delay")
+    except ValueError:
+        delay_seconds = 30
+    if not STREAM_FALLBACK_MIN_DELAY_SECONDS <= delay_seconds <= STREAM_FALLBACK_MAX_DELAY_SECONDS:
+        delay_seconds = 30
+    action = STREAM_FALLBACK_PLAY_AUDIO if raw.get("enabled") else STREAM_FALLBACK_NONE
+    return WebStreamFallbackAction(action=action, delay_seconds=delay_seconds)
 
 
 def stream_notification_settings_from_stream(stream: dict[str, Any]) -> WebStreamNotificationSettings:
@@ -12570,6 +12942,7 @@ footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
 footer a { color: #174a98; }
 .screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (prefers-color-scheme: dark) {
+  .error { color: #ff8a8a; }
   body { background: #111827; color: #f9fafb; }
   .panel, button, input { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
   .hint { color: #cbd5e1; }
@@ -12731,6 +13104,7 @@ footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
 footer a { color: #174a98; }
 .screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (prefers-color-scheme: dark) {
+  .error { color: #ff8a8a; }
   body { background: #111827; color: #f9fafb; }
   .panel, button, input { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
   .hint { color: #cbd5e1; }
@@ -12853,6 +13227,7 @@ input[type="checkbox"], input[type="radio"] { width: auto; min-width: 13px; }
 input[type="range"] { min-height: 40px; }
 fieldset { border: 1px solid #d8dde6; border-radius: 6px; margin: 16px 0 0; padding: 14px; }
 legend { font-weight: 700; padding: 0 6px; }
+fieldset + .hint { margin-top: 10px; }
 button { cursor: pointer; }
 button:disabled { cursor: default; opacity: 0.65; }
 nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -12923,8 +13298,19 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .settings-detail { min-width: 0; }
 .settings-detail h3 { margin-top: 0; }
 .settings-back { display: none; }
+/* A page within a setting, such as Pair a device, has a way back at any width. */
+.settings-subpage-active .settings-back { display: inline-block; margin-bottom: 12px; }
 .settings-group { border-top: 1px solid #d8dde6; margin-top: 20px; padding-top: 4px; }
 .settings-group h4 { font-size: 15px; margin: 14px 0 10px; }
+#fallback_custom_controls[hidden] { display: none; }
+#settings_fallback_audio_page fieldset .checkbox-row { margin-top: 0; }
+#fallback_play { margin-top: 10px; }
+#fallback_custom_status { margin: 8px 0 0; }
+.record-time { align-self: center; font-variant-numeric: tabular-nums; }
+#fallback_custom_controls .actions, #settings_record_announcement_page .actions { margin: 10px 0; }
+#fallback_custom_controls .fallback-same-note { margin-top: 16px; }
+.fallback-loop-delay { margin-top: 18px; }
+#fallback-audio-result { margin-top: 10px; }
 .audio-effect-panel[hidden] { display: none; }
 .test-tone-panel[hidden] { display: none; }
 .test-tones-mute { margin-bottom: 18px; }
@@ -12949,6 +13335,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 .screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .media-session-audio { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 @media (prefers-color-scheme: dark) {
+  .error { color: #ff8a8a; }
   body { background: #101318; color: #eef2f7; }
   header, section, select, input, button, nav a { background: #181d24; color: #eef2f7; border-color: #333b48; }
   nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #6f9be0; box-shadow: inset 0 -2px 0 #6f9be0; }
@@ -12958,6 +13345,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   footer p { color: #9aa8ba; }
   .global-status-banner { background: #16233a; color: #eef2f7; border-color: #3f67a9; }
   .global-status-banner a { color: #9dc1ff; }
+  #fallback_record_insecure a { color: #9dc1ff; }
   fieldset, .metric, .stream-item, th, td { border-color: #333b48; }
   .metric b, .hint, th { color: #9aa8ba; }
   .status-enabled { color: #5fd27a; }
@@ -13438,6 +13826,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <button id="settings_tab_account" type="button" role="tab" data-settings-section="account" aria-controls="settings_panel_account" aria-selected="false" tabindex="-1" hidden>Account</button>
           <button id="settings_tab_sdr_sharing" type="button" role="tab" data-settings-section="sdr_sharing" aria-controls="settings_panel_sdr_sharing" aria-selected="false" tabindex="-1">SDR sharing</button>
           <button id="settings_tab_notifications" type="button" role="tab" data-settings-section="notifications" aria-controls="settings_panel_notifications" aria-selected="false" tabindex="-1">Notifications</button>
+          <button id="settings_tab_fallback_audio" type="button" role="tab" data-settings-section="fallback_audio" aria-controls="settings_panel_fallback_audio" aria-selected="false" tabindex="-1">Fallback audio</button>
         </div>
         <div class="settings-detail">
           <button id="settings_back" class="settings-back" type="button">Back to settings</button>
@@ -13562,6 +13951,64 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 <button id="cancel_find_devices" type="button">Cancel</button>
               </div>
               <div id="remote-pair-result" class="message" aria-live="polite"></div>
+            </div>
+          </div>
+          <div id="settings_panel_fallback_audio" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_fallback_audio" hidden>
+            <div id="settings_fallback_audio_page">
+            <h3>Fallback audio</h3>
+            <p class="hint">Fallback audio plays on streams whose fallback action is Play fallback audio. Choose each stream's fallback action in its stream settings. These settings apply to every stream that plays fallback audio.</p>
+            <fieldset>
+              <legend>Announcement</legend>
+              <label class="checkbox-row"><input id="fallback_audio_default" name="fallback_audio" type="radio" value="default"> Default</label>
+              <label class="checkbox-row"><input id="fallback_audio_custom" name="fallback_audio" type="radio" value="custom"> Custom</label>
+              <button id="fallback_play" type="button">Play announcement</button>
+              <p id="fallback_custom_status" class="hint"></p>
+            </fieldset>
+            <label class="fallback-loop-delay">Seconds before restart
+              <input id="fallback_loop_delay" type="number" min="0" max="10" step="1" aria-describedby="fallback_loop_delay_hint">
+            </label>
+            <span id="fallback_loop_delay_hint" class="hint">How long to wait after the fallback audio finishes before starting it again. Set to 0 for a continuous loop with no gap.</span>
+            <div id="fallback-result" class="message" aria-live="polite"></div>
+            <div id="fallback_custom_controls" hidden>
+              <div class="settings-group">
+                <h4>Upload an announcement</h4>
+                <span id="fallback_audio_file_hint" class="hint">An MP3, OGG or WAV file, one minute or shorter and under 10 MB.</span>
+                <div class="actions">
+                  <button id="fallback_upload" type="button" aria-describedby="fallback_audio_file_hint">Upload announcement</button>
+                </div>
+                <!-- Opened by Upload announcement, so there's only one control to reach. -->
+                <input id="fallback_audio_file" type="file" accept=".mp3,.ogg,.wav,audio/mpeg,audio/ogg,audio/wav,audio/x-wav,audio/wave" hidden>
+              </div>
+              <div class="settings-group">
+                <h4>Record an announcement</h4>
+                <p id="fallback_record_insecure" class="message error" hidden>Recording isn't available because this page isn't in a secure context. To record, set up Tailscale Serve to give NWR Stream Manager a secure address. You can still upload a file. <a href="/help#secure-address" target="_blank" rel="noopener">Learn how to set up Tailscale Serve<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
+                <p id="fallback_record_unsupported" class="message error" hidden>This browser can't record audio. You can still upload a file.</p>
+                <div id="fallback_record_controls">
+                  <p class="hint">Record up to one minute from your microphone, then listen to it before saving it.</p>
+                  <div class="actions">
+                    <button id="open_fallback_recording" type="button">Record an announcement</button>
+                  </div>
+                </div>
+              </div>
+              <p class="hint fallback-same-note">Announcements are checked for SAME tones, the data bursts that set off weather radios. Announcements that contain them can't be used.</p>
+            </div>
+            <div id="fallback-audio-result" class="message" aria-live="polite"></div>
+            </div>
+            <div id="settings_record_announcement_page" hidden>
+              <h3>Record an announcement</h3>
+              <p class="hint">Select Start recording when you're ready, and Stop recording when you've finished. Recording stops by itself after one minute. Wearing headphones keeps your screen reader and other sounds out of the recording.</p>
+              <div class="actions">
+                <button id="fallback_record" type="button">Start recording</button>
+                <span id="fallback_record_time" class="record-time" role="timer" hidden></span>
+              </div>
+              <div id="fallback_recording_review" class="actions" hidden>
+                <button id="fallback_recording_play" type="button">Play recording</button>
+                <button id="fallback_recording_save" type="button">Save recording</button>
+              </div>
+              <div class="actions">
+                <button id="fallback_recording_cancel" type="button">Cancel</button>
+              </div>
+              <div id="fallback-recording-result" class="message" aria-live="polite"></div>
             </div>
           </div>
           <div id="settings_panel_notifications" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_notifications" hidden>
@@ -13883,7 +14330,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
         <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
         <button id="tab_eas" type="button" role="tab" aria-selected="false" aria-controls="panel_eas" tabindex="-1">EAS Recording</button>
-        <button id="tab_fallback" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback" tabindex="-1">Fallback Audio</button>
+        <button id="tab_fallback_action" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback_action" tabindex="-1">Fallback Action</button>
         <button id="tab_audio" type="button" role="tab" aria-selected="false" aria-controls="panel_audio" tabindex="-1">Audio Effects</button>
         <button id="tab_notifications" type="button" role="tab" aria-selected="false" aria-controls="panel_notifications" tabindex="-1" hidden>Notifications</button>
         <button id="tab_test_mode" type="button" role="tab" aria-selected="false" aria-controls="panel_test_mode" tabindex="-1">Test Mode</button>
@@ -14066,24 +14513,20 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </div>
         <div id="eas-result" class="message"></div>
       </div>
-      <div id="panel_fallback" class="tabpanel" role="tabpanel" aria-labelledby="tab_fallback" hidden>
-        <h3>Fallback audio</h3>
-        <div class="grid">
-          <label class="checkbox-row">
-            <input id="fallback_enabled" type="checkbox" aria-describedby="fallback_enabled_hint">
-            Enable fallback audio
-          </label>
-          <span id="fallback_enabled_hint" class="hint">Fallback audio is played when the stream stops receiving radio audio so listeners are not left with silence.</span>
-          <label>Fallback delay in seconds
-            <input id="fallback_delay" type="number" min="30" max="120" step="1" aria-describedby="fallback_delay_hint">
-          </label>
-          <span id="fallback_delay_hint" class="hint">The time, in seconds, to wait before fallback audio starts playing. Valid range is 30 through 120 seconds.</span>
-          <label>Seconds before restart
-            <input id="fallback_loop_delay" type="number" min="0" max="10" step="1" aria-describedby="fallback_loop_delay_hint">
-          </label>
-          <span id="fallback_loop_delay_hint" class="hint">How long to wait after the fallback audio finishes before starting it again. Set to 0 for a continuous loop with no gap.</span>
-        </div>
-        <div id="fallback-result" class="message"></div>
+      <div id="panel_fallback_action" class="tabpanel" role="tabpanel" aria-labelledby="tab_fallback_action" hidden>
+        <h3>Fallback action</h3>
+        <fieldset>
+          <legend>When this stream stops receiving radio audio or loses the station's signal</legend>
+          <label class="checkbox-row"><input id="stream_fallback_action_none" name="stream_fallback_action" type="radio" value="none"> Do nothing</label>
+          <label class="checkbox-row"><input id="stream_fallback_action_disconnect_icecast" name="stream_fallback_action" type="radio" value="disconnect_icecast"> Disconnect from Icecast outputs</label>
+          <label class="checkbox-row"><input id="stream_fallback_action_play_fallback_audio" name="stream_fallback_action" type="radio" value="play_fallback_audio"> Play fallback audio</label>
+        </fieldset>
+        <p class="hint">Do nothing leaves the stream as it is. Disconnect from Icecast outputs disconnects this stream from all of its Icecast servers, so listeners are not left listening to dead air, and reconnects when the station returns; sound card outputs keep playing. Play fallback audio plays the fallback announcement until the station returns.</p>
+        <label id="stream_fallback_delay_label">Fallback delay in seconds
+          <input id="stream_fallback_delay" type="number" min="30" max="120" step="1" aria-describedby="stream_fallback_delay_hint">
+        </label>
+        <span id="stream_fallback_delay_hint" class="hint">How long to wait before the fallback action happens. Valid range is 30 through 120 seconds.</span>
+        <div id="stream-fallback-action-result" class="message" aria-live="polite"></div>
       </div>
       <div id="panel_notifications" class="tabpanel" role="tabpanel" aria-labelledby="tab_notifications" hidden>
         <h3>Notifications</h3>
@@ -14507,6 +14950,8 @@ let audioEffectsSignature = "";
 let audioEffectsUpdateTimer = null;
 let streamNotificationsSignature = "";
 let streamNotificationsUpdateTimer = null;
+let streamFallbackActionSignature = "";
+let streamFallbackActionUpdateTimer = null;
 let streamTestMode = {active: false};
 let streamTestModeSignature = "";
 let streamTestModeClientId = "";
@@ -16837,7 +17282,7 @@ function streamLabel(stream) {
 
 function normalizeStreamStatus(status) {
   const normalized = String(status || "disabled").toLowerCase().replace(/_/g, "-");
-  if (normalized === "enabled" || normalized === "needs-attention" || normalized === "disabled") {
+  if (normalized === "enabled" || normalized === "needs-attention" || normalized === "disabled" || normalized === "standby") {
     return normalized;
   }
   return "disabled";
@@ -16847,6 +17292,7 @@ function streamStatusLabel(status) {
   const normalized = normalizeStreamStatus(status);
   if (normalized === "enabled") return "Enabled";
   if (normalized === "needs-attention") return "Needs attention";
+  if (normalized === "standby") return "Disconnected (no station audio)";
   return "Disabled";
 }
 
@@ -17280,6 +17726,494 @@ function resetSettingsForService(service) {
   updateOutputFormButtons();
 }
 
+// Which announcement fallback audio plays, as the server last reported it.
+let fallbackAudioState = {audio: "default", custom_audio_available: false, custom_audio_seconds: null, custom_audio_problem: ""};
+// Custom was chosen before there was a custom announcement to switch to.
+let fallbackCustomChosenWithoutAudio = false;
+let announcementPlayer = null;
+let fallbackRecorder = null;
+let fallbackRecording = null;
+const FALLBACK_AUDIO_MAX_BYTES = 10 * 1024 * 1024;
+const FALLBACK_RECORDING_MAX_SECONDS = 60;
+const FALLBACK_RECORDER_WORKLET = `
+class AnnouncementRecorder extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input.length) {
+      const mono = new Float32Array(input[0].length);
+      for (const channel of input) {
+        for (let i = 0; i < mono.length; i++) mono[i] += channel[i] / input.length;
+      }
+      this.port.postMessage(mono, [mono.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor("announcement-recorder", AnnouncementRecorder);
+`;
+
+function setFallbackAudioResult(message, kind = "") {
+  setMessage("fallback-audio-result", message, kind);
+}
+
+function fallbackCustomSelected() {
+  return document.getElementById("fallback_audio_custom").checked;
+}
+
+function renderFallbackAnnouncement() {
+  const state = fallbackAudioState;
+  const custom = fallbackCustomChosenWithoutAudio || state.audio === "custom";
+  setChecked("fallback_audio_default", !custom);
+  setChecked("fallback_audio_custom", custom);
+  // Plays whichever announcement is chosen, so it goes when there's nothing to play.
+  setHidden("fallback_play", custom && !state.custom_audio_available);
+  setHidden("fallback_custom_controls", !custom);
+  const status = document.getElementById("fallback_custom_status");
+  let text = "";
+  if (state.custom_audio_problem) {
+    text = state.audio === "custom"
+      ? `${state.custom_audio_problem} The default announcement is playing instead. Upload or record a new custom announcement.`
+      : state.custom_audio_problem;
+  } else if (state.custom_audio_available) {
+    text = `The custom announcement is ${formatDuration(state.custom_audio_seconds)} long.`;
+  } else if (custom) {
+    text = "There's no custom announcement yet. Upload a file or record one below.";
+  }
+  const className = state.custom_audio_problem ? "message error" : "hint";
+  if (status.className !== className) status.className = className;
+  if (status.textContent !== text) status.textContent = text;
+  status.hidden = !text;
+}
+
+async function saveFallbackAnnouncementChoice(audio) {
+  try {
+    const data = await request("/api/fallback-settings", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({audio})
+    });
+    applyStatus(data, {syncControls: false});
+    setFallbackControls(data.fallback);
+    setFallbackAudioResult(
+      audio === "custom" ? "Fallback audio now plays the custom announcement." : "Fallback audio now plays the default announcement.",
+      "success"
+    );
+  } catch (error) {
+    setFallbackAudioResult(error.message, "error");
+    fallbackSignature = "";
+    await refresh().catch(() => {});
+  }
+}
+
+function chooseFallbackAnnouncement(audio) {
+  if (audio === "custom" && !fallbackAudioState.custom_audio_available) {
+    // Nothing to switch to yet; show how to add one.
+    stopAnnouncementPlayback();
+    fallbackCustomChosenWithoutAudio = true;
+    renderFallbackAnnouncement();
+    setFallbackAudioResult("");
+    return;
+  }
+  fallbackCustomChosenWithoutAudio = false;
+  if (audio === fallbackAudioState.audio) {
+    renderFallbackAnnouncement();
+    return;
+  }
+  // The play button now plays the other announcement, from its start.
+  stopAnnouncementPlayback();
+  // Show the choice straight away; the reply confirms it, or a refresh undoes it.
+  fallbackAudioState = {...fallbackAudioState, audio};
+  renderFallbackAnnouncement();
+  saveFallbackAnnouncementChoice(audio);
+}
+
+// Each play button pauses what it's playing, and keeps focus while its label changes.
+const ANNOUNCEMENT_BUTTONS = {
+  fallback_play: {play: "Play announcement", pause: "Pause announcement", page: "fallback_audio", setResult: message => setFallbackAudioResult(message, "error")},
+  fallback_recording_play: {play: "Play recording", pause: "Pause recording", page: "record_announcement", setResult: message => setFallbackRecordingResult(message, "error")}
+};
+let announcementPlayerButton = "";
+
+function renderAnnouncementButtons() {
+  for (const [id, button] of Object.entries(ANNOUNCEMENT_BUTTONS)) {
+    const playing = announcementPlayerButton === id && announcementPlayer && !announcementPlayer.paused;
+    setText(id, playing ? button.pause : button.play);
+  }
+}
+
+function stopAnnouncementPlayback() {
+  if (announcementPlayer) {
+    announcementPlayer.pause();
+    announcementPlayer.removeAttribute("src");
+    announcementPlayer.load();
+  }
+  announcementPlayer = null;
+  announcementPlayerButton = "";
+  renderAnnouncementButtons();
+}
+
+// Announcements only play on the page they were started from.
+function stopAnnouncementPlaybackOffPage(view, section) {
+  if (!announcementPlayerButton) return;
+  if (view !== "settings" || section !== ANNOUNCEMENT_BUTTONS[announcementPlayerButton].page) stopAnnouncementPlayback();
+}
+
+function resumeAnnouncement(player, buttonId) {
+  player.play().catch(error => {
+    if (announcementPlayer !== player) return;
+    stopAnnouncementPlayback();
+    ANNOUNCEMENT_BUTTONS[buttonId].setResult(`The announcement couldn't be played: ${error.message}`);
+  });
+}
+
+function toggleAnnouncement(buttonId, url) {
+  if (announcementPlayer && announcementPlayerButton === buttonId) {
+    if (announcementPlayer.paused) resumeAnnouncement(announcementPlayer, buttonId);
+    else announcementPlayer.pause();
+    return;
+  }
+  stopAnnouncementPlayback();
+  const player = new Audio(url);
+  announcementPlayer = player;
+  announcementPlayerButton = buttonId;
+  player.addEventListener("play", renderAnnouncementButtons);
+  player.addEventListener("pause", renderAnnouncementButtons);
+  // Finished, so the next Play starts from the beginning.
+  player.addEventListener("ended", () => {
+    if (announcementPlayer === player) stopAnnouncementPlayback();
+  });
+  player.addEventListener("error", () => {
+    if (announcementPlayer !== player) return;
+    stopAnnouncementPlayback();
+    ANNOUNCEMENT_BUTTONS[buttonId].setResult("The announcement couldn't be played.");
+  });
+  resumeAnnouncement(player, buttonId);
+}
+
+// An announcement on its way to be checked. Buttons stay enabled while it is,
+// so they keep focus; this stops it being sent twice.
+let fallbackAnnouncementSending = false;
+
+async function sendFallbackAnnouncement(blob, setResult) {
+  if (blob.size >= FALLBACK_AUDIO_MAX_BYTES) {
+    throw new Error("The file is 10 MB or larger. Choose a file under 10 MB.");
+  }
+  fallbackAnnouncementSending = true;
+  setResult("Checking the announcement...");
+  try {
+    const data = await request("/api/fallback-audio", {
+      method: "POST",
+      headers: {"Content-Type": "application/octet-stream"},
+      body: blob
+    });
+    fallbackCustomChosenWithoutAudio = false;
+    // The custom announcement may have just been replaced.
+    if (announcementPlayerButton === "fallback_play") stopAnnouncementPlayback();
+    applyStatus(data, {syncControls: false});
+    setFallbackControls(data.fallback);
+    return data;
+  } finally {
+    fallbackAnnouncementSending = false;
+  }
+}
+
+function chooseFallbackAnnouncementFile() {
+  if (fallbackAnnouncementSending) return;
+  const input = document.getElementById("fallback_audio_file");
+  // Cleared first, so choosing the same file again still uploads it.
+  input.value = "";
+  input.click();
+}
+
+async function uploadFallbackAnnouncementFile() {
+  const input = document.getElementById("fallback_audio_file");
+  const file = input.files && input.files[0];
+  if (!file || fallbackAnnouncementSending) return;
+  try {
+    await sendFallbackAnnouncement(file, setFallbackAudioResult);
+    setFallbackAudioResult("Announcement uploaded. Fallback audio now plays the custom announcement.", "success");
+  } catch (error) {
+    setFallbackAudioResult(error.message, "error");
+  }
+}
+
+function microphoneErrorMessage(error) {
+  const name = error && error.name;
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return "Microphone access was blocked. To record, allow this site to use your microphone in your browser's site settings, then select Start recording.";
+  }
+  if (name === "NotFoundError" || name === "OverconstrainedError") {
+    return "No microphone was found. Connect a microphone, then select Start recording.";
+  }
+  if (name === "NotReadableError" || name === "AbortError") {
+    return "Your microphone couldn't be used. Another app may be using it.";
+  }
+  return `The microphone couldn't be used: ${error && error.message ? error.message : error}`;
+}
+
+// Some browsers report a blocked microphone as another kind of error.
+async function microphoneBlocked() {
+  try {
+    const permission = await navigator.permissions.query({name: "microphone"});
+    return permission.state === "denied";
+  } catch (error) {
+    return false;
+  }
+}
+
+function renderFallbackRecordingAvailability() {
+  // Browsers only allow microphone access in a secure context.
+  const insecure = !window.isSecureContext;
+  const unsupported = !insecure && (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.AudioContext || !window.AudioWorkletNode);
+  setHidden("fallback_record_insecure", !insecure);
+  setHidden("fallback_record_unsupported", !unsupported);
+  setHidden("fallback_record_controls", insecure || unsupported);
+}
+
+function setFallbackRecordingResult(message, kind = "") {
+  setMessage("fallback-recording-result", message, kind);
+}
+
+// The recording screen holds the microphone from when it opens, so the browser
+// asks for it then, and recording starts only when Start recording is selected.
+let fallbackRecordingPageOpen = false;
+let fallbackMicrophone = null;
+let fallbackMicrophoneRequest = null;
+let fallbackRecorderStarting = false;
+
+function fallbackRecordingUnsaved() {
+  return Boolean(fallbackRecorder || fallbackRecording);
+}
+
+function confirmLeavingFallbackRecording() {
+  if (!fallbackRecordingUnsaved()) return true;
+  if (!window.confirm("Leave this page? Your recording hasn't been saved.")) return false;
+  endFallbackRecordingPage();
+  return true;
+}
+
+function syncFallbackRecordingPage(section) {
+  const open = section === "record_announcement";
+  if (open === fallbackRecordingPageOpen) return;
+  if (!open) {
+    endFallbackRecordingPage();
+    return;
+  }
+  fallbackRecordingPageOpen = true;
+  renderFallbackRecordButton();
+  setFallbackRecordingResult("");
+  requestFallbackMicrophone().catch(() => {});
+}
+
+function endFallbackRecordingPage() {
+  fallbackRecordingPageOpen = false;
+  if (fallbackRecorder) {
+    const recorder = fallbackRecorder;
+    fallbackRecorder = null;
+    releaseFallbackRecorder(recorder);
+  }
+  discardFallbackRecording();
+  releaseFallbackMicrophone();
+  renderFallbackRecordButton();
+}
+
+function releaseFallbackMicrophone() {
+  if (fallbackMicrophone) {
+    for (const track of fallbackMicrophone.getTracks()) track.stop();
+  }
+  fallbackMicrophone = null;
+}
+
+// The microphone, asking for it if this screen doesn't have it yet.
+function requestFallbackMicrophone() {
+  if (fallbackMicrophone && fallbackMicrophone.getAudioTracks().some(track => track.readyState === "live")) {
+    return Promise.resolve(fallbackMicrophone);
+  }
+  if (fallbackMicrophoneRequest) return fallbackMicrophoneRequest;
+  fallbackMicrophoneRequest = (async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false}});
+      if (!fallbackRecordingPageOpen) {
+        // Left the screen while the browser was asking.
+        for (const track of stream.getTracks()) track.stop();
+        throw new Error("The recording screen was closed.");
+      }
+      fallbackMicrophone = stream;
+      if (!fallbackRecorder && !fallbackRecording) {
+        setFallbackRecordingResult("Your microphone is ready. Select Start recording when you're ready to speak.");
+      }
+      return stream;
+    } catch (error) {
+      if (fallbackRecordingPageOpen) {
+        setFallbackRecordingResult(microphoneErrorMessage(await microphoneBlocked() ? {name: "NotAllowedError"} : error), "error");
+      }
+      throw error;
+    } finally {
+      fallbackMicrophoneRequest = null;
+    }
+  })();
+  return fallbackMicrophoneRequest;
+}
+
+// One button starts, stops and records again, so it keeps focus throughout.
+function renderFallbackRecordButton() {
+  const text = fallbackRecorder ? "Stop recording" : fallbackRecording ? "Record again" : "Start recording";
+  setText("fallback_record", text);
+  setHidden("fallback_record_time", !fallbackRecorder);
+  setHidden("fallback_recording_review", !fallbackRecording || Boolean(fallbackRecorder));
+}
+
+function updateFallbackRecordTime() {
+  const recorder = fallbackRecorder;
+  if (!recorder) return;
+  setText("fallback_record_time", `${formatDuration(recorder.samples / recorder.sampleRate)} of ${formatDuration(FALLBACK_RECORDING_MAX_SECONDS)}`);
+}
+
+function releaseFallbackRecorder(recorder) {
+  clearInterval(recorder.timer);
+  recorder.node.port.onmessage = null;
+  recorder.context.close().catch(() => {});
+}
+
+function discardFallbackRecording() {
+  if (fallbackRecording) {
+    if (announcementPlayerButton === "fallback_recording_play") stopAnnouncementPlayback();
+    URL.revokeObjectURL(fallbackRecording.url);
+  }
+  fallbackRecording = null;
+}
+
+async function startFallbackRecording() {
+  if (fallbackRecorder || fallbackRecorderStarting) return;
+  fallbackRecorderStarting = true;
+  try {
+    stopAnnouncementPlayback();
+    let stream;
+    try {
+      stream = await requestFallbackMicrophone();
+    } catch (error) {
+      return;
+    }
+    const context = new AudioContext();
+    try {
+      const moduleUrl = URL.createObjectURL(new Blob([FALLBACK_RECORDER_WORKLET], {type: "application/javascript"}));
+      try {
+        await context.audioWorklet.addModule(moduleUrl);
+      } finally {
+        URL.revokeObjectURL(moduleUrl);
+      }
+      const source = context.createMediaStreamSource(stream);
+      const node = new AudioWorkletNode(context, "announcement-recorder");
+      // Connected to the speakers at zero volume so the browser keeps it running.
+      const silent = context.createGain();
+      silent.gain.value = 0;
+      source.connect(node);
+      node.connect(silent);
+      silent.connect(context.destination);
+      const recorder = {
+        context,
+        node,
+        chunks: [],
+        samples: 0,
+        sampleRate: context.sampleRate,
+        maxSamples: Math.round(FALLBACK_RECORDING_MAX_SECONDS * context.sampleRate),
+        timer: null
+      };
+      node.port.onmessage = event => {
+        if (fallbackRecorder !== recorder) return;
+        const room = recorder.maxSamples - recorder.samples;
+        const chunk = event.data.length > room ? event.data.subarray(0, room) : event.data;
+        recorder.chunks.push(chunk);
+        recorder.samples += chunk.length;
+        if (recorder.samples >= recorder.maxSamples) stopFallbackRecording(true);
+      };
+      if (context.state === "suspended") await context.resume();
+      if (!fallbackRecordingPageOpen) {
+        context.close().catch(() => {});
+        return;
+      }
+      // Recording again replaces the last recording.
+      discardFallbackRecording();
+      fallbackRecorder = recorder;
+      recorder.timer = setInterval(updateFallbackRecordTime, 250);
+      updateFallbackRecordTime();
+      renderFallbackRecordButton();
+      setFallbackRecordingResult("Recording. Select Stop recording when you've finished. Recording stops by itself after one minute.");
+    } catch (error) {
+      context.close().catch(() => {});
+      setFallbackRecordingResult(`Recording couldn't start: ${error.message}`, "error");
+    }
+  } finally {
+    fallbackRecorderStarting = false;
+  }
+}
+
+function encodeMonoWav(chunks, sampleCount, sampleRate) {
+  const buffer = new ArrayBuffer(44 + sampleCount * 2);
+  const view = new DataView(buffer);
+  const text = (offset, value) => {
+    for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+  };
+  text(0, "RIFF");
+  view.setUint32(4, 36 + sampleCount * 2, true);
+  text(8, "WAVE");
+  text(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  text(36, "data");
+  view.setUint32(40, sampleCount * 2, true);
+  let offset = 44;
+  for (const chunk of chunks) {
+    for (let i = 0; i < chunk.length; i++) {
+      const sample = Math.max(-1, Math.min(1, chunk[i]));
+      view.setInt16(offset, Math.round(sample * 32767), true);
+      offset += 2;
+    }
+  }
+  return new Blob([buffer], {type: "audio/wav"});
+}
+
+function stopFallbackRecording(reachedLimit = false) {
+  const recorder = fallbackRecorder;
+  if (!recorder) return;
+  fallbackRecorder = null;
+  releaseFallbackRecorder(recorder);
+  const seconds = recorder.samples / recorder.sampleRate;
+  if (seconds < 0.5) {
+    renderFallbackRecordButton();
+    setFallbackRecordingResult("The recording was too short. Select Start recording to try again.", "error");
+    return;
+  }
+  const blob = encodeMonoWav(recorder.chunks, recorder.samples, recorder.sampleRate);
+  fallbackRecording = {blob, url: URL.createObjectURL(blob), seconds};
+  renderFallbackRecordButton();
+  setFallbackRecordingResult(
+    `${reachedLimit ? "Recording stopped at the one minute limit. " : ""}Recorded ${formatDuration(seconds)}. `
+    + "Select Play recording to listen to it, then Save recording to use it. Record again replaces it."
+  );
+}
+
+async function saveFallbackRecording() {
+  if (!fallbackRecording || fallbackAnnouncementSending) return;
+  stopAnnouncementPlayback();
+  try {
+    await sendFallbackAnnouncement(fallbackRecording.blob, setFallbackRecordingResult);
+  } catch (error) {
+    setFallbackRecordingResult(error.message, "error");
+    return;
+  }
+  // Saved, so there is nothing left to lose by leaving.
+  endFallbackRecordingPage();
+  leaveSettingsSubpage();
+  // Once Fallback audio is showing again, so it is read out there.
+  setTimeout(() => setFallbackAudioResult("Recording saved. Fallback audio now plays the custom announcement.", "success"), 300);
+}
+
 function setFallbackResult(message, kind = "") {
   const element = document.getElementById("fallback-result");
   const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
@@ -17321,11 +18255,7 @@ function setTestModeResult(message, kind = "") {
 }
 
 function fallbackPayload() {
-  return {
-    enabled: document.getElementById("fallback_enabled").checked,
-    silence_timeout_seconds: numericControlValue("fallback_delay"),
-    loop_delay_seconds: numericControlValue("fallback_loop_delay")
-  };
+  return {loop_delay_seconds: numericControlValue("fallback_loop_delay")};
 }
 
 function filterPayload(name) {
@@ -17497,7 +18427,8 @@ function commitNumericControlElement(element, saveCallback = null) {
 function numericSaveCallbackForElement(element) {
   if (!element || !element.id) return null;
   if (controls.includes(element.id)) return () => scheduleUpdate(element.id);
-  if (["fallback_delay", "fallback_loop_delay"].includes(element.id)) return scheduleFallbackUpdate;
+  if (element.id === "fallback_loop_delay") return scheduleFallbackUpdate;
+  if (element.id === "stream_fallback_delay") return scheduleStreamFallbackActionUpdate;
   if (["eas_pre_seconds", "eas_post_seconds", "eas_max_seconds"].includes(element.id)) return scheduleEasUpdate;
   if (element.id.startsWith("audio_")) return scheduleAudioEffectsUpdate;
   if (element.id.startsWith("test_tone")) return scheduleTestTonesUpdate;
@@ -17891,10 +18822,11 @@ function setFallbackControls(fallback) {
   if (!fallback) return;
   const nextSignature = JSON.stringify(fallback);
   if (nextSignature === fallbackSignature) return;
-  setChecked("fallback_enabled", fallback.enabled);
-  setValue("fallback_delay", fallback.silence_timeout_seconds);
   setValue("fallback_loop_delay", fallback.loop_delay_seconds);
   fallbackSignature = nextSignature;
+  fallbackAudioState = fallback;
+  if (fallback.custom_audio_available || fallback.audio === "custom") fallbackCustomChosenWithoutAudio = false;
+  renderFallbackAnnouncement();
 }
 
 function setStreamNotificationControls(stream) {
@@ -17918,11 +18850,73 @@ function setStreamNotificationControls(stream) {
   streamNotificationsSignature = nextSignature;
 }
 
+const STREAM_FALLBACK_ACTION_VALUES = ["none", "disconnect_icecast", "play_fallback_audio"];
+
+function streamFallbackActionForStream(stream) {
+  const raw = stream && stream.fallback_action ? stream.fallback_action : {};
+  return {
+    action: STREAM_FALLBACK_ACTION_VALUES.includes(raw.action) ? raw.action : "play_fallback_audio",
+    delay_seconds: Number.isFinite(Number(raw.delay_seconds)) ? Number(raw.delay_seconds) : 30
+  };
+}
+
+function selectedStreamFallbackAction() {
+  const checked = document.querySelector("input[name='stream_fallback_action']:checked");
+  return checked ? checked.value : "play_fallback_audio";
+}
+
+function updateStreamFallbackDelayVisibility() {
+  // "Do nothing" has nothing to wait for.
+  const none = selectedStreamFallbackAction() === "none";
+  setHidden("stream_fallback_delay_label", none);
+  setHidden("stream_fallback_delay_hint", none);
+}
+
+function setStreamFallbackActionControls(stream) {
+  const settings = streamFallbackActionForStream(stream);
+  const nextSignature = JSON.stringify(settings);
+  if (nextSignature === streamFallbackActionSignature) return;
+  for (const value of STREAM_FALLBACK_ACTION_VALUES) {
+    setChecked(`stream_fallback_action_${value}`, settings.action === value);
+  }
+  setValue("stream_fallback_delay", settings.delay_seconds);
+  updateStreamFallbackDelayVisibility();
+  streamFallbackActionSignature = nextSignature;
+}
+
+function setStreamFallbackActionResult(message, kind = "") {
+  setMessage("stream-fallback-action-result", message, kind);
+}
+
+function scheduleStreamFallbackActionUpdate() {
+  if (applying || !settingsStreamId || accountIsReadOnly()) return;
+  clearTimeout(streamFallbackActionUpdateTimer);
+  streamFallbackActionUpdateTimer = setTimeout(async () => {
+    try {
+      const data = await request("/api/stream-fallback-action", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          stream_id: settingsStreamId,
+          fallback_action: {
+            action: selectedStreamFallbackAction(),
+            delay_seconds: numericControlValue("stream_fallback_delay")
+          }
+        })
+      });
+      renderStreams(data.streams || []);
+      setStreamFallbackActionResult("Fallback action saved.", "success");
+    } catch (error) {
+      setStreamFallbackActionResult(error.message, "error");
+    }
+  }, 250);
+}
+
 function activeSettingsTab() {
   if (document.getElementById("tab_test_mode").getAttribute("aria-selected") === "true") return "test_mode";
   if (document.getElementById("tab_notifications").getAttribute("aria-selected") === "true") return "notifications";
-  if (document.getElementById("tab_fallback").getAttribute("aria-selected") === "true") return "fallback";
   if (document.getElementById("tab_eas").getAttribute("aria-selected") === "true") return "eas";
+  if (document.getElementById("tab_fallback_action").getAttribute("aria-selected") === "true") return "fallback_action";
   if (document.getElementById("tab_audio").getAttribute("aria-selected") === "true") return "audio";
   return "outputs";
 }
@@ -17931,7 +18925,7 @@ function streamSettingsTabs() {
   return [
     {name: "outputs", button: "tab_outputs", panel: "panel_outputs"},
     {name: "eas", button: "tab_eas", panel: "panel_eas"},
-    {name: "fallback", button: "tab_fallback", panel: "panel_fallback"},
+    {name: "fallback_action", button: "tab_fallback_action", panel: "panel_fallback_action"},
     {name: "audio", button: "tab_audio", panel: "panel_audio"},
     {name: "notifications", button: "tab_notifications", panel: "panel_notifications"},
     {name: "test_mode", button: "tab_test_mode", panel: "panel_test_mode"}
@@ -18492,6 +19486,7 @@ function showStreamSettings(streamId) {
   easSignature = "";
   audioEffectsSignature = "";
   streamNotificationsSignature = "";
+  streamFallbackActionSignature = "";
   streamTestModeSignature = "";
   selectAudioEffect(selectedAudioEffect, false);
   selectTestTone(selectedTestTone, false);
@@ -18520,6 +19515,7 @@ function renderStreamSettings() {
   setAudioEffectsControls(stream);
   setEasControls(stream);
   setStreamNotificationControls(stream);
+  setStreamFallbackActionControls(stream);
   renderStreamSettingsSignal(stream);
   setTestModeControls();
   renderOutputPanels();
@@ -18535,12 +19531,14 @@ function outputStatusFor(stream, output) {
   );
   const status = normalizeStreamStatus(active ? active.status : "");
   if (status === "enabled") return "connected";
+  if (status === "standby") return "standby";
   return "needs-attention";
 }
 
 function outputStatusLabel(status) {
   if (status === "connected") return "Connected";
   if (status === "needs-attention") return "Needs attention";
+  if (status === "standby") return "Disconnected (no station audio)";
   return "Disabled";
 }
 
@@ -18772,7 +19770,10 @@ function activeStreamRows(activeStreams, configured = configuredStreams) {
     if (activeItems.length) {
       const statuses = activeItems.map(item => normalizeStreamStatus(item.status));
       if (streamReceptionProblem(signal)) statuses.push("needs-attention");
-      const status = statuses.includes("needs-attention") ? "needs-attention" : statuses.includes("enabled") ? "enabled" : "disabled";
+      const status = statuses.includes("needs-attention") ? "needs-attention"
+        : statuses.includes("enabled") ? "enabled"
+        : statuses.includes("standby") ? "standby"
+        : "disabled";
       rows.push({
         id: stream.id,
         enabled: streamIsEnabled(stream),
@@ -19300,7 +20301,7 @@ function configuredStreamsRefreshSignature(streams) {
       soundcard: output.soundcard || null
     })),
     eas_recording: stream.eas_recording || {},
-    fallback: stream.fallback || {},
+    fallback_action: stream.fallback_action || {},
     audio_effects: stream.audio_effects || {},
     notifications: stream.notifications || {}
   })));
@@ -21127,6 +22128,7 @@ function showView(name, options = {}) {
   }
   setPageTitle(defaultViewTitle(name));
   if (name !== "settings") syncRemotePairingPage("");
+  if (name !== "settings") stopAnnouncementPlaybackOffPage(name, null);
   if (options.focus !== false) focusViewHeading(name);
   const moreButton = document.getElementById("nav_more_button");
   for (const item of document.querySelectorAll("nav [data-view]")) {
@@ -21328,6 +22330,8 @@ function applyRoute(route) {
       easSignature = "";
       audioEffectsSignature = "";
       streamNotificationsSignature = "";
+      streamFallbackActionSignature = "";
+  streamFallbackActionSignature = "";
       streamTestModeSignature = "";
       closeOutputForm();
       const station = stream.station || {};
@@ -21437,10 +22441,12 @@ const SETTINGS_SECTION_TITLES = {
   sdr_sharing: "SDR sharing",
   pair_device: "Pair a device",
   find_devices: "Find devices",
-  notifications: "Notifications"
+  notifications: "Notifications",
+  fallback_audio: "Fallback audio",
+  record_announcement: "Record an announcement"
 };
 // How "Back to ..." names the page a sub-page belongs to.
-const SETTINGS_BACK_NAMES = {accounts: "accounts", sdr_sharing: "SDR sharing"};
+const SETTINGS_BACK_NAMES = {accounts: "accounts", sdr_sharing: "SDR sharing", fallback_audio: "fallback audio"};
 let settingsSection = "";
 let settingsOpenedFrom = null;
 
@@ -21458,8 +22464,8 @@ function availableSettingsTabs() {
 
 function settingsSectionsForAccount() {
   if (accountIsReadOnly()) return [];
-  if (accountIsOwner()) return ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications"];
-  return ["account", "sdr_sharing", "pair_device", "find_devices", "notifications"];
+  if (accountIsOwner()) return ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"];
+  return ["account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"];
 }
 
 function normalizeSettingsSection(section) {
@@ -21475,6 +22481,7 @@ function normalizeSettingsSection(section) {
 function settingsTabSection(section) {
   if (section === "create_account") return "accounts";
   if (section === "pair_device" || section === "find_devices") return "sdr_sharing";
+  if (section === "record_announcement") return "fallback_audio";
   if (section === "account" && accountIsOwner()) return "accounts";
   return section;
 }
@@ -21549,14 +22556,21 @@ function renderSettingsSection() {
   setHidden("settings_sdr_sharing_page", section !== "sdr_sharing");
   setHidden("settings_pair_device_page", section !== "pair_device");
   setHidden("settings_find_devices_page", section !== "find_devices");
+  setHidden("settings_fallback_audio_page", section !== "fallback_audio");
+  setHidden("settings_record_announcement_page", section !== "record_announcement");
   document.getElementById("settings_layout").classList.toggle("settings-detail-active", Boolean(section));
   const parent = settingsParentSection(section);
+  document.getElementById("settings_layout").classList.toggle("settings-subpage-active", Boolean(parent));
   setText("settings_back", parent ? `Back to ${SETTINGS_BACK_NAMES[parent]}` : "Back to settings");
+  // The recording page has its own Cancel button instead.
+  setHidden("settings_back", section === "record_announcement");
   setPageTitle(section ? `${SETTINGS_SECTION_TITLES[section]} - Settings` : "Settings");
   if (tabSection === "notifications") renderNotificationSettings();
   if (section === "accounts") loadAccounts().catch(error => setAccountResult(error.message, "error"));
   if (section === "create_account") setCreateAccountResult("");
   syncRemotePairingPage(section);
+  syncFallbackRecordingPage(section);
+  stopAnnouncementPlaybackOffPage(currentViewName(), section);
 }
 
 function settingsPageHeading() {
@@ -21604,7 +22618,7 @@ function applySettingsRoute(route) {
 function selectSettingsTab(section) {
   // Moving through the tabs on wider screens shows each setting without adding
   // every one to the browser history.
-  if (section !== settingsSection && !confirmLeavingRemotePairing()) {
+  if (section !== settingsSection && (!confirmLeavingRemotePairing() || !confirmLeavingFallbackRecording())) {
     const current = document.getElementById(`settings_tab_${settingsTabSection(settingsSection)}`);
     if (current) current.focus();
     return;
@@ -21654,11 +22668,12 @@ function wizardHasUnsavedChanges() {
 }
 
 function hasUnsavedNavigationState() {
-  return Boolean(wizardHasUnsavedChanges() || outputFormHasUnsavedChanges() || remotePairingPage);
+  return Boolean(wizardHasUnsavedChanges() || outputFormHasUnsavedChanges() || remotePairingPage || fallbackRecordingUnsaved());
 }
 
 function confirmDiscardNavigation() {
   if (remotePairingPage) return confirmLeavingRemotePairing();
+  if (fallbackRecordingUnsaved()) return confirmLeavingFallbackRecording();
   if (!hasUnsavedNavigationState()) return true;
   return window.confirm("Discard the current setup changes?");
 }
@@ -23081,7 +24096,56 @@ for (const id of controls) {
   });
 }
 
-for (const id of ["fallback_enabled", "fallback_delay", "fallback_loop_delay"]) {
+for (const radio of document.querySelectorAll("input[name='stream_fallback_action']")) {
+  radio.addEventListener("change", () => {
+    updateStreamFallbackDelayVisibility();
+    scheduleStreamFallbackActionUpdate();
+  });
+}
+document.addEventListener("input", event => {
+  if (!event.target || event.target.id !== "stream_fallback_delay") return;
+  if (isNumericControl(event.target) && isTextEditingInputEvent(event)) {
+    beginNumericTextEdit(event.target);
+    return;
+  }
+  scheduleStreamFallbackActionUpdate();
+});
+document.addEventListener("change", event => {
+  if (!event.target || event.target.id !== "stream_fallback_delay") return;
+  commitNumericControlElement(event.target, null);
+  scheduleStreamFallbackActionUpdate();
+});
+
+for (const radio of document.querySelectorAll("input[name='fallback_audio']")) {
+  radio.addEventListener("change", () => {
+    if (radio.checked) chooseFallbackAnnouncement(radio.value);
+  });
+}
+document.getElementById("fallback_play").addEventListener("click", () => {
+  const announcement = fallbackCustomSelected() ? "custom" : "default";
+  toggleAnnouncement("fallback_play", `/api/fallback-audio?announcement=${announcement}&t=${Date.now()}`);
+});
+document.getElementById("fallback_recording_play").addEventListener("click", () => {
+  if (fallbackRecording) toggleAnnouncement("fallback_recording_play", fallbackRecording.url);
+});
+document.getElementById("fallback_upload").addEventListener("click", chooseFallbackAnnouncementFile);
+document.getElementById("fallback_audio_file").addEventListener("change", uploadFallbackAnnouncementFile);
+document.getElementById("open_fallback_recording").addEventListener("click", () => {
+  navigateTo("settings", {section: "record_announcement", openedFrom: "fallback_audio"});
+});
+document.getElementById("fallback_record").addEventListener("click", () => {
+  if (fallbackRecorder) stopFallbackRecording();
+  else startFallbackRecording();
+});
+document.getElementById("fallback_recording_save").addEventListener("click", saveFallbackRecording);
+// Cancel is a deliberate choice to throw the recording away, so it doesn't ask.
+document.getElementById("fallback_recording_cancel").addEventListener("click", () => {
+  endFallbackRecordingPage();
+  leaveSettingsSubpage();
+});
+renderFallbackRecordingAvailability();
+
+for (const id of ["fallback_loop_delay"]) {
   document.addEventListener("input", event => {
     if (event.target && event.target.id === id) {
       if (isNumericControl(event.target) && isTextEditingInputEvent(event)) {
@@ -23590,8 +24654,8 @@ document.getElementById("iq-recordings-body").addEventListener("keydown", event 
 document.getElementById("tab_outputs").addEventListener("click", () => showSettingsTab("outputs"));
 document.getElementById("tab_audio").addEventListener("click", () => showSettingsTab("audio"));
 document.getElementById("tab_eas").addEventListener("click", () => showSettingsTab("eas"));
-document.getElementById("tab_fallback").addEventListener("click", () => showSettingsTab("fallback"));
 document.getElementById("tab_notifications").addEventListener("click", () => showSettingsTab("notifications"));
+document.getElementById("tab_fallback_action").addEventListener("click", () => showSettingsTab("fallback_action"));
 document.getElementById("tab_test_mode").addEventListener("click", () => showSettingsTab("test_mode"));
 document.querySelector(".tabs").addEventListener("keydown", event => {
   const tabs = streamSettingsTabs()
@@ -23738,6 +24802,7 @@ document.getElementById("settings_list").addEventListener("keydown", event => {
 });
 
 document.getElementById("settings_back").addEventListener("click", () => {
+  if (!confirmLeavingFallbackRecording()) return;
   endRemotePairingPage();
   leaveSettingsSubpage();
 });

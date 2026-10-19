@@ -55,13 +55,24 @@ class SettingsPageMarkupTests(unittest.TestCase):
 
         self.assertIn('role="tablist" aria-orientation="vertical" aria-label="Settings"', settings)
         tabs = re.findall(r'<button id="settings_tab_(\w+)" type="button" role="tab" data-settings-section="(\w+)" aria-controls="settings_panel_(\w+)"', settings)
-        self.assertEqual([tab[0] for tab in tabs], ["accounts", "account", "sdr_sharing", "notifications"])
+        self.assertEqual([tab[0] for tab in tabs], ["accounts", "account", "sdr_sharing", "notifications", "fallback_audio"])
         for name, section, panel in tabs:
             self.assertEqual(name, section)
             self.assertEqual(name, panel)
             self.assertIn(f'<div id="settings_panel_{name}" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_{name}" hidden>', settings)
         # Only one entry in the list is reached with Tab; the arrow keys reach the rest.
-        self.assertEqual(settings.count('tabindex="-1"'), 4)
+        self.assertEqual(settings.count('tabindex="-1"'), 5)
+
+    def test_fallback_audio_is_set_once_in_settings_not_in_each_stream(self) -> None:
+        settings = view_markup(self.html, "settings")
+        stream_settings = view_markup(self.html, "stream_settings")
+
+        for element in ("fallback_loop_delay", "fallback-result"):
+            self.assertIn(f'id="{element}"', settings)
+            self.assertNotIn(f'id="{element}"', stream_settings)
+        for element in ("fallback_enabled", "fallback_delay"):
+            self.assertNotIn(f'id="{element}"', self.html)
+        self.assertIn("These settings apply to every stream that plays fallback audio.", settings)
 
     def test_settings_has_its_own_heading_and_each_setting_a_heading_below_it(self) -> None:
         settings = view_markup(self.html, "settings")
@@ -69,11 +80,11 @@ class SettingsPageMarkupTests(unittest.TestCase):
         self.assertEqual(re.findall(r"<h2>([^<]+)</h2>", settings), ["Settings"])
         self.assertEqual(
             re.findall(r"<h3>([^<]+)</h3>", settings),
-            ["Accounts", "Create account", "Change account password", "Account", "SDR sharing", "Pair a device", "Find devices", "Notifications"],
+            ["Accounts", "Create account", "Change account password", "Account", "SDR sharing", "Pair a device", "Find devices", "Fallback audio", "Record an announcement", "Notifications"],
         )
         self.assertEqual(
             re.findall(r"<h4>([^<]+)</h4>", settings),
-            ["Sharing", "Pair with another NWR Stream Manager", "Paired devices"],
+            ["Sharing", "Pair with another NWR Stream Manager", "Paired devices", "Upload an announcement", "Record an announcement"],
         )
 
     def test_dark_mode_includes_the_top_bar(self) -> None:
@@ -113,10 +124,32 @@ class SdrPairingPageTests(unittest.TestCase):
         self.assertNotIn("remote_pairing_dialog", self.html)
 
     def test_leaving_or_closing_the_tab_while_pairing_asks_first_and_stops_pairing(self) -> None:
-        self.assertIn("return Boolean(wizardHasUnsavedChanges() || outputFormHasUnsavedChanges() || remotePairingPage);", self.html)
+        self.assertIn("return Boolean(wizardHasUnsavedChanges() || outputFormHasUnsavedChanges() || remotePairingPage || fallbackRecordingUnsaved());", self.html)
         self.assertIn('if (!window.confirm("Leave this page? Pairing will stop.")) return false;', self.html)
         self.assertIn('navigator.sendBeacon("/api/remote-sdr/pairing/cancel"', self.html)
         self.assertIn('remoteSdrAction("/api/remote-sdr/pairing/keepalive")', self.html)
+
+    def test_leaving_the_recording_page_with_an_unsaved_recording_asks_first(self) -> None:
+        self.assertIn('if (!window.confirm("Leave this page? Your recording hasn\'t been saved.")) return false;', self.html)
+        self.assertIn("if (fallbackRecordingUnsaved()) return confirmLeavingFallbackRecording();", self.html)
+
+    def test_uploading_an_announcement_is_one_button_that_opens_the_file_dialog(self) -> None:
+        self.assertIn('<button id="fallback_upload" type="button" aria-describedby="fallback_audio_file_hint">Upload announcement</button>', self.html)
+        self.assertRegex(self.html, r'<input id="fallback_audio_file" type="file" [^>]*hidden>')
+        self.assertIn('document.getElementById("fallback_audio_file").addEventListener("change", uploadFallbackAnnouncementFile);', self.html)
+
+    def test_one_button_plays_and_pauses_the_chosen_announcement_on_its_page_only(self) -> None:
+        self.assertIn('<button id="fallback_play" type="button">Play announcement</button>', self.html)
+        self.assertNotIn("fallback_play_default", self.html)
+        self.assertNotIn("fallback_play_custom", self.html)
+        self.assertIn('fallback_play: {play: "Play announcement", pause: "Pause announcement", page: "fallback_audio"', self.html)
+        self.assertIn('if (name !== "settings") stopAnnouncementPlaybackOffPage(name, null);', self.html)
+        self.assertIn("stopAnnouncementPlaybackOffPage(currentViewName(), section);", self.html)
+
+    def test_the_recording_page_has_cancel_instead_of_back_or_discard(self) -> None:
+        self.assertIn('<button id="fallback_recording_cancel" type="button">Cancel</button>', self.html)
+        self.assertIn('setHidden("settings_back", section === "record_announcement");', self.html)
+        self.assertNotIn("fallback_recording_discard", self.html)
 
 
 class SettingsPermissionTests(unittest.TestCase):
@@ -247,9 +280,12 @@ class SettingsPageRulesTests(unittest.TestCase):
     def test_the_owner_has_accounts_and_the_others_have_their_own_account(self) -> None:
         self.assertEqual(
             self.results["owner"]["sections"],
-            ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications"],
+            ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"],
         )
-        self.assertEqual(self.results["administrator"]["sections"], ["account", "sdr_sharing", "pair_device", "find_devices", "notifications"])
+        self.assertEqual(
+            self.results["administrator"]["sections"],
+            ["account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"],
+        )
         self.assertEqual(self.results["read_only"]["sections"], [])
 
     def test_administrators_asking_for_accounts_get_their_own_account(self) -> None:

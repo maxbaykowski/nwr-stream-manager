@@ -81,6 +81,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li><a href="#dashboard">The dashboard</a>
       <ol>
         <li><a href="#settings">Settings</a></li>
+        <li><a href="#fallback-audio">Fallback audio</a></li>
       </ol>
     </li>
     <li><a href="#configure-rtl-sdr">Configuring the RTL-SDR</a>
@@ -110,7 +111,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
         <li><a href="#stream-settings-top">Enabling, monitoring and signal</a></li>
         <li><a href="#outputs-tab">Outputs</a></li>
         <li><a href="#eas-recording">EAS recording</a></li>
-        <li><a href="#fallback-audio">Fallback audio</a></li>
+        <li><a href="#fallback-action">Fallback action</a></li>
         <li><a href="#audio-effects">Audio effects</a></li>
         <li><a href="#stream-notifications">Stream notifications</a></li>
         <li><a href="#test-mode">Test mode</a></li>
@@ -205,8 +206,27 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   </dl>
   <p>The bar across the top of every page takes you to the main areas: <strong>Dashboard</strong>, <strong>Configure RTL-SDR</strong>, <strong>Manage Streams</strong>, <strong>EAS alerts</strong> (once alerts have been recorded), and <strong>More</strong>, which holds everything else, including <a href="#settings">Settings</a>. Help is linked at the bottom of every page.</p>
   <h3 id="settings">Settings</h3>
-  <p>Settings holds the settings that aren't about one stream or the RTL-SDR itself: your account or, for the owner, everyone's accounts, <a href="#remote-sdr">SDR sharing</a> and <a href="#notifications">notifications</a>. Open it from <strong>More</strong>, then <strong>Settings</strong>. Read-only accounts don't have Settings; they change their password from <strong>More</strong>, then <strong>Change account password</strong>.</p>
+  <p>Settings holds the settings that aren't about one stream or the RTL-SDR itself: your account or, for the owner, everyone's accounts, <a href="#remote-sdr">SDR sharing</a>, <a href="#notifications">notifications</a> and <a href="#fallback-audio">fallback audio</a>. Open it from <strong>More</strong>, then <strong>Settings</strong>. Read-only accounts don't have Settings; they change their password from <strong>More</strong>, then <strong>Change account password</strong>.</p>
   <p>On a computer or tablet, the list of settings is on the left and the selected setting is on the right. With a screen reader or keyboard, press Tab to reach the list, use the arrow keys to move through it, then press Tab to go into the selected setting. On a phone, the list fills the screen; select a setting to open it, and select <strong>Back to settings</strong> to return to the list.</p>
+
+  <h3 id="fallback-audio">Fallback audio</h3>
+  <p>Fallback audio is a voice announcement that streams can play instead of static or dead air when they have a problem. Whether a stream plays it is that stream's <a href="#fallback-action">fallback action</a>.</p>
+  <p>To set it up, open <strong>More</strong>, then <strong>Settings</strong>, then <strong>Fallback audio</strong>. This applies to every stream that plays fallback audio.</p>
+  <dl>
+    <dt>Announcement</dt>
+    <dd><strong>Default</strong> plays the announcement that comes with NWR Stream Manager, a recording of the VoiceText Paul voice saying: &quot;This weather radio stream is currently experiencing technical difficulties. Please check back later.&quot; <strong>Custom</strong> plays your own announcement, which you upload or record. Select <strong>Play announcement</strong> to listen to the one that's chosen. The same button, now called <strong>Pause announcement</strong>, pauses it, and selecting it again carries on from where it paused. Playback stops if you choose the other announcement or go to another page. If you switch back to Default, your custom announcement is kept, so you can switch to it again later.</dd>
+    <dt>Seconds before restart</dt>
+    <dd>The fallback audio plays in a loop. This setting controls the pause before the audio repeats. Set it to 0 to repeat it without a gap.</dd>
+  </dl>
+
+  <h4 id="custom-announcement">Custom announcements</h4>
+  <p>Choose <strong>Custom</strong> to add your own announcement. A new announcement replaces the previous custom one and starts playing on streams right away, from the beginning.</p>
+  <ul>
+    <li><strong>Upload an announcement:</strong> select <strong>Upload announcement</strong>, then choose an MP3, OGG or WAV file that is one minute or shorter and under 10 MB. It's uploaded and checked as soon as you choose it.</li>
+    <li><strong>Record an announcement:</strong> select <strong>Record an announcement</strong> to open the recording page. Your browser asks to use your microphone when the page opens, but nothing is recorded until you select <strong>Start recording</strong>. Speak into your microphone, then select the same button again, now called <strong>Stop recording</strong>. Recording stops by itself after one minute. Select <strong>Play recording</strong> to listen to it (the same button pauses it), then <strong>Save recording</strong> to use it. To try again, select <strong>Record again</strong>, which replaces the recording. Select <strong>Cancel</strong> to go back to Fallback audio without saving. Nothing is sent to NWR Stream Manager until you save it, and if you leave the page some other way with a recording you haven't saved, you're asked first. Headphones stop your screen reader or other sounds from being recorded too.</li>
+  </ul>
+  <p>Every announcement is checked before it is used. Files that aren't MP3, OGG or WAV audio, that are damaged or incomplete, or that are silent are refused. Announcements that contain SAME tones, the data bursts that set off weather radios and emergency alert equipment, are refused too, so fallback audio can never trigger an alert for people listening to your streams. Announcements are stored the same way as the default one, and if the stored file is changed outside NWR Stream Manager, the default announcement plays instead.</p>
+  <p>Browsers only allow microphone access on pages opened with a secure <code>https://</code> address. To record an announcement, <a href="#secure-address">set up Tailscale Serve</a> to give NWR Stream Manager a secure address. Until then, recording isn't available and the page says so, but you can still upload a file. If you decline the browser's request to use your microphone, allow it in your browser's site settings and select <strong>Record</strong> again.</p>
 </section>
 
 <section aria-labelledby="configure-rtl-sdr">
@@ -364,7 +384,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
       <tr><td class="signal-good">Good</td><td>A solid signal with little noise.</td></tr>
       <tr><td class="signal-fair">Fair</td><td>The stream is usable, but has some background hiss.</td></tr>
       <tr><td class="signal-poor">Poor</td><td>This is the point where EAS decoding fails and listeners complain. When it gets bad enough to be unusable, the stream is marked as having bad reception.</td></tr>
-      <tr><td>No signal</td><td>Only static is being received. If it reaches this point, fallback audio will play if you have it enabled for the stream.</td></tr>
+      <tr><td>No signal</td><td>Only static is being received. If it reaches this point, the stream's <a href="#fallback-action">fallback action</a> happens.</td></tr>
     </tbody>
   </table>
   <p>The rating is followed by a number in dB SNR (signal-to-noise ratio). Higher numbers are better. Generally this number should stay above 8 dB; anywhere below that number is the point where EAS equipment starts to fail and the stream sounds deplorable. If a station's signal is poor, the best improvements usually come from a better antenna, placing it higher up or outdoors, and checking the <a href="#gain">gain</a>.</p>
@@ -411,15 +431,19 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   </dl>
   <p>If the computer runs low on storage, recording is paused automatically so the disk doesn't fill up completely.</p>
 
-  <h3 id="fallback-audio">Fallback audio</h3>
-  <p>If a stream stops getting audio from the radio, or if there's no signal from the station, you can optionally enable fallback audio. When fallback audio is on, a voice announcement will play instead of listeners hearing static or dead air. The voice announcement is a prerecorded audio file of the VoiceText Paul voice, and it says the following: &quot;This weather radio stream is currently experiencing technical difficulties. Please check back later.&quot;</p>
+  <h3 id="fallback-action">Fallback action</h3>
+  <p>The Fallback Action tab chooses what this stream does when it stops getting audio from the radio, or when there's no signal from the station.</p>
   <dl>
+    <dt>Do nothing</dt>
+    <dd>The stream carries on as it is, so listeners hear whatever comes through, such as static.</dd>
+    <dt>Disconnect from Icecast outputs</dt>
+    <dd>The stream disconnects from all of its Icecast servers, so it drops off the streaming services instead of sending dead air. Its outputs show as <strong>Disconnected (no station audio)</strong>, which doesn't count as a problem and doesn't send notifications. Sound card outputs keep playing.</dd>
+    <dt>Play fallback audio</dt>
+    <dd>The stream plays the <a href="#fallback-audio">fallback audio</a> announcement in place of the station.</dd>
     <dt>Fallback delay</dt>
-    <dd>How long to wait after the station audio stops before fallback audio kicks in, from 30 to 120 seconds.</dd>
-    <dt>Seconds before restart</dt>
-    <dd>The fallback audio plays in a loop. This setting controls the pause before the audio repeats. Set it to 0 to repeat it without a gap.</dd>
+    <dd>For Disconnect from Icecast outputs and Play fallback audio, how long to wait after the station audio stops before the action happens, from 30 to 120 seconds.</dd>
   </dl>
-  <p>As soon as radio audio comes back, the station plays again.</p>
+  <p>As soon as the station is back, the stream plays it again, and disconnected Icecast outputs reconnect.</p>
 
   <h3 id="audio-effects">Audio effects</h3>
   <p>Audio effects shape how the stream sounds. Choose an effect from the list to see its settings.</p>
@@ -585,12 +609,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 <section aria-labelledby="secure-address">
   <h2 id="secure-address">Using a secure (https) address with Tailscale Serve</h2>
   <h3 id="secure-address-why">What http and https mean</h3>
-  <p>Every website you visit starts with either <code>http://</code> ot <code>https://</code> before the web address. Most addresses you visit start with <code>https://</code>. Both are ways for your browser to talk to a website, and the difference is the "s", which stands for secure:</p>
+  <p>Every website you visit starts with either <code>http://</code> or <code>https://</code> before the web address. Most addresses you visit start with <code>https://</code>. Both are ways for your browser to talk to a website, and the difference is the "s", which stands for secure:</p>
   <ul>
     <li><strong>http</strong> sends everything as is. Anyone who can see the traffic along the way can read it, including bad actors.</li>
     <li><strong>https</strong> scrambles (encrypts) everything between your browser and the website, so only the two of them can read it. It also proves the website is really the one you meant to visit. Most browsers show a padlock next to https addresses.</li>
   </ul>
-  <p>If you haven't noticed by now, when you open NWR Stream Manager, it starts with <code>http://</code>. That works, and on your home network or through Tailscale your connection is already protected in other ways. However, because browsers can't verify an <code>http://</code> address, some of them, including Firefox, Chrome and Edge, turn off certain features there. The one that matters most is listening in your browser: on an <code>http://</code> address, those browsers can't use the efficient audio format, so <a href="#monitoring">monitoring a stream</a> or using the <a href="#weather-radio-receiver">Weather Radio Receiver</a> uses several times more data, and the audio can't adjust itself when your connection gets slow. Safari on iPhone and iPad isn't affected.</p>
+  <p>If you haven't noticed by now, when you open NWR Stream Manager, it starts with <code>http://</code>. That works, and on your home network or through Tailscale your connection is already protected in other ways. However, because browsers can't verify an <code>http://</code> address, some of them, including Firefox, Chrome and Edge, turn off certain features there. The one that matters most is listening in your browser: on an <code>http://</code> address, those browsers can't use the efficient audio format, so <a href="#monitoring">monitoring a stream</a> or using the <a href="#weather-radio-receiver">Weather Radio Receiver</a> uses several times more data, and the audio can't adjust itself when your connection gets slow. Safari on iPhone and iPad isn't affected. Browsers also only let a page use your microphone on an <code>https://</code> address, so <a href="#custom-announcement">recording a custom fallback announcement</a> needs one too.</p>
   <p>Giving NWR Stream Manager an <code>https://</code> address fixes that. It needs a certificate, which is a kind of digital ID card proving the address is genuine. Getting one normally takes some technical work, but Tailscale can handle all of it for you. This is another reason I strongly recommend having Tailscale set up.</p>
   <h3 id="secure-address-what">What Tailscale Serve does</h3>
   <p>If you use <a href="#tailscale">Tailscale</a>, its Serve feature gives NWR Stream Manager a secure address that works on all of your Tailscale devices, such as <code>https://my-pi.example-tailnet.ts.net</code>, and takes care of the certificate for you. The annoying part is serve isn't turned on by default for new Tailscale accounts, so there are a few steps that need to be completed first. The good news is, once those steps are completed, you won't need to do them ever again.</p>
@@ -604,7 +628,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <p><strong>Your device names become public.</strong> Certificates are recorded in public logs that anyone can search, and those logs include the name of each device that gets a certificate, along with your Tailscale account's network name. Nothing else about your devices is shared, but if any of your device names contain something private, such as your full name or address, it might be a good idea to either get those devices off your tailnet or rename them.</p>
   </div>
   <h3 id="secure-address-serve">Give NWR Stream Manager a secure address</h3>
-  <p>Now that we've gotten the boring stuff out of the way, we can finally enable Tailscale Serve for NWR Stream Manager! Follow the steps below to turn it on:</main>p>
+  <p>Now that we've gotten the boring stuff out of the way, we can finally enable Tailscale Serve for NWR Stream Manager! Follow the steps below to turn it on:</p>
   <ol>
     <li>On the computer running NWR Stream Manager, open a command line and run the following. If you started NWR Stream Manager on a different port than 8080, use that number instead.
       <div class="command"><code>sudo tailscale serve --bg 8080</code><button type="button" class="copy-button" hidden>Copy</button></div>

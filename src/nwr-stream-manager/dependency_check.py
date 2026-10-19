@@ -133,6 +133,12 @@ NATIVE_DEPENDENCIES = (
         ("soxr_create", "soxr_process", "soxr_delay", "soxr_delete"),
     ),
     NativeDependency(
+        "libsndfile",
+        "sndfile",
+        ("libsndfile.so.1", "libsndfile.so"),
+        ("sf_open_virtual", "sf_readf_float", "sf_error", "sf_strerror", "sf_close"),
+    ),
+    NativeDependency(
         "liquid-dsp",
         "liquid",
         ("libliquid.so.1", "libliquid.so.2", "libliquid.so"),

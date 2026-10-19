@@ -404,12 +404,13 @@ class StreamGainChangeSignalMeterTests(unittest.TestCase):
                 "station": {"callsign": "WXN99", "frequency": str(center_frequency_hz / 1_000_000)},
                 "outputs": [],
                 "eas_recording": {"enabled": True},
+                "fallback_action": {"action": "none", "delay_seconds": 30},
             }
             fanout = Fanout()
             worker = wc.IcecastStreamWorker(
                 stream=stream,
                 fanout=fanout,
-                fallback_settings_provider=lambda: wc.WebFallbackSettings(enabled=False),
+                fallback_settings_provider=lambda: wc.WebFallbackSettings(),
                 alias_filter_strength_provider=lambda: wc.ALIAS_FILTER_STRENGTH_DEFAULT,
                 gain_provider=lambda: gain["value"],
                 state_directory=Path(tempdir),
@@ -535,11 +536,10 @@ class StreamNoSignalFallbackTests(unittest.TestCase):
                 "station": {"callsign": "WXN99", "frequency": "162.475"},
                 "outputs": [],
                 "eas_recording": {"enabled": True},
+                "fallback_action": {"action": "play_fallback_audio", "delay_seconds": delay_seconds},
             },
             fanout=fanout,
-            fallback_settings_provider=lambda: wc.WebFallbackSettings(
-                enabled=True, silence_timeout_seconds=delay_seconds, loop_delay_seconds=0.0
-            ),
+            fallback_settings_provider=lambda: wc.WebFallbackSettings(loop_delay_seconds=0.0),
             alias_filter_strength_provider=lambda: wc.ALIAS_FILTER_STRENGTH_DEFAULT,
             state_directory=Path(tempdir.name),
         )
