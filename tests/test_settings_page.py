@@ -53,15 +53,19 @@ class SettingsPageMarkupTests(unittest.TestCase):
     def test_settings_list_is_a_vertical_set_of_tabs_with_matching_panels(self) -> None:
         settings = view_markup(self.html, "settings")
 
-        self.assertIn('role="tablist" aria-orientation="vertical" aria-label="Settings"', settings)
-        tabs = re.findall(r'<button id="settings_tab_(\w+)" type="button" role="tab" data-settings-section="(\w+)" aria-controls="settings_panel_(\w+)"', settings)
+        # Without the page script the list is a form whose buttons open each setting;
+        # the page script makes it tabs, or buttons on phones.
+        self.assertIn('<form id="settings_list" class="settings-list" method="get" action="/" aria-label="Settings">', settings)
+        tabs = re.findall(r'<button id="settings_tab_(\w+)" type="submit" name="section" value="(\w+)" data-settings-section="(\w+)" data-baseline-submit', settings)
         self.assertEqual([tab[0] for tab in tabs], ["accounts", "account", "sdr_sharing", "notifications", "fallback_audio"])
-        for name, section, panel in tabs:
+        for name, value, section in tabs:
+            self.assertEqual(name, value)
             self.assertEqual(name, section)
-            self.assertEqual(name, panel)
-            self.assertIn(f'<div id="settings_panel_{name}" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_{name}" hidden>', settings)
-        # Only one entry in the list is reached with Tab; the arrow keys reach the rest.
-        self.assertEqual(settings.count('tabindex="-1"'), 5)
+            self.assertIn(f'<div id="settings_panel_{name}" class="settings-panel" hidden>', settings)
+        self.assertIn('list.setAttribute("role", "tablist");', self.html)
+        self.assertIn('tab.setAttribute("role", "tab");', self.html)
+        self.assertIn("tab.tabIndex = selected ? 0 : -1;", self.html)
+        self.assertIn('panel.setAttribute("role", "tabpanel");', self.html)
 
     def test_fallback_audio_is_set_once_in_settings_not_in_each_stream(self) -> None:
         settings = view_markup(self.html, "settings")
@@ -80,7 +84,7 @@ class SettingsPageMarkupTests(unittest.TestCase):
         self.assertEqual(re.findall(r"<h2>([^<]+)</h2>", settings), ["Settings"])
         self.assertEqual(
             re.findall(r"<h3>([^<]+)</h3>", settings),
-            ["Accounts", "Create account", "Change account password", "Account", "SDR sharing", "Pair a device", "Find devices", "Fallback audio", "Record an announcement", "Notifications"],
+            ["This setting doesn't work in this browser yet", "Accounts", "Create account", "Change account password", "Account", "SDR sharing", "Pair a device", "Find devices", "Fallback audio", "Record an announcement", "Notifications"],
         )
         self.assertEqual(
             re.findall(r"<h4>([^<]+)</h4>", settings),
@@ -91,7 +95,7 @@ class SettingsPageMarkupTests(unittest.TestCase):
         dark = self.html[self.html.index("@media (prefers-color-scheme: dark) {"):]
         dark = dark[:dark.index("\n}\n")]
 
-        self.assertIn("header, section, select, input, button, nav a { background: #181d24;", dark)
+        self.assertIn("header, section, select, input, button, nav a, .button-link { background: #181d24;", dark)
         self.assertIn('nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #6f9be0;', dark)
 
     def test_phones_show_one_screen_at_a_time_in_either_orientation(self) -> None:

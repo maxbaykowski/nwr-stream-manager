@@ -57,6 +57,24 @@ class PageEditingTests(unittest.TestCase):
         self.assertFalse(self.pages.form_token_valid("", ""))
         self.assertIn("HttpOnly", self.pages.form_token_cookie_header(token))
 
+    def test_elements_can_be_moved_and_added_to_even_with_nested_elements(self) -> None:
+        page = '<div id="outer"><div id="inner">x</div></div><form id="form"><div>f</div></form><div id="home"><h3>Home</h3></div>'
+
+        moved = self.pages.move_element(page, "form", "home")
+        self.assertEqual(moved, '<div id="outer"><div id="inner">x</div></div><div id="home"><h3>Home</h3><form id="form"><div>f</div></form></div>')
+        self.assertEqual(self.pages.set_content(page, "outer", "y")[:23], '<div id="outer">y</div>')
+        self.assertIn('<div id="outer"><div id="inner">x</div>!</div>', self.pages.append_content(page, "outer", "!"))
+
+    def test_notices_are_a_page_of_their_own_without_the_page_script(self) -> None:
+        wc = load_web_control_module()
+        page = wc.render_notice_page("Heads up", "<p>Something <b>happened</b>.</p>", {"view": "streams"})
+
+        self.assertEqual(re.search(r"<title>(.*?)</title>", page).group(1), "Heads up - NWR Stream Manager")
+        self.assertIn('<h1 id="notice_title">Heads up</h1>', page)
+        self.assertIn('<div id="notice_body"><p>Something <b>happened</b>.</p></div>', page)
+        self.assertIn('<input type="hidden" name="view" value="streams"><button id="notice_copy_button"', page)
+        self.assertIn('<label id="notice_copy" hidden>', page)
+
     def test_internet_explorer_6_is_given_a_class_it_can_hide(self) -> None:
         self.assertTrue(self.pages.old_internet_explorer("Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1)"))
         self.assertFalse(self.pages.old_internet_explorer("Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.0)"))
@@ -93,9 +111,18 @@ class PageScriptLoadingTests(unittest.TestCase):
     def test_only_pages_that_work_without_the_page_script_are_shown_without_it(self) -> None:
         pages = __import__("sys").modules["nwr_stream_manager.page_rendering"]
         page = self.web_control.INDEX_HTML
-        self.assertFalse(pages.view_needs_app(page, "logs"))
-        for view in self.web_control.INDEX_VIEWS - {"logs"}:
+        baseline = {"logs", "settings", "change_password"}
+        for view in baseline:
+            self.assertFalse(pages.view_needs_app(page, view), view)
+        for view in self.web_control.INDEX_VIEWS - baseline:
             self.assertTrue(pages.view_needs_app(page, view), view)
+
+
+class AccountDateTests(unittest.TestCase):
+    def test_dates_read_as_the_page_script_shows_them(self) -> None:
+        wc = load_web_control_module()
+        self.assertEqual(wc.format_account_date(None), "Never")
+        self.assertRegex(wc.format_account_date(1792375834), r"^[A-Z][a-z]+ \d{1,2}, \d{4}$")
 
 
 class StandInService(types.SimpleNamespace):
@@ -235,6 +262,84 @@ class BaselinePageServerTests(unittest.TestCase):
         self.assertIn('<a id="nav_rtl" href="/?view=rtl" data-view="rtl" hidden>', page)
         self.assertIn('<a id="nav_settings" href="/?view=settings" data-view="settings" hidden>', page)
         self.assertIn('<a id="nav_change_password" href="/?view=change_password" data-view="change_password">', page)
+
+    def owner_with_token(self):
+        self.accounts.create_admin("owner", "password1", "password1")
+        owner = ("owner", "password1")
+        response, page = self.request("GET", "/?view=settings&section=accounts", user=owner)
+        token = self.form_token(response)
+        return owner, token, f"nwrstmgr_form={token}"
+
+    def test_the_owner_manages_accounts_with_plain_forms(self) -> None:
+        owner, token, cookie = self.owner_with_token()
+
+        _, page = self.request("GET", "/?view=settings&section=accounts", cookie=cookie, user=owner)
+        self.assertEqual(self.title(page), "Accounts - Settings - NWR Stream Manager")
+        self.assertIn('<a class="button-link" href="/?view=settings&amp;section=account">Change account password</a>', page)
+        self.assertIn('<button id="settings_tab_accounts" type="submit" name="section" value="accounts" data-settings-section="accounts" data-baseline-submit aria-current="page">', page)
+
+        response, page = self.request("POST", "/accounts/create", fields={"username": "bad name", "read_only": "1", "form_token": token}, cookie=cookie, user=owner)
+        self.assertEqual(response.status, 400)
+        self.assertTrue(self.title(page).startswith("Error: Username may contain only letters"))
+        self.assertIn('value="bad name"', page)
+        self.assertRegex(page, r'<input id="new_account_read_only"[^>]* checked="checked">')
+
+        # The temporary password is on a page of its own, not in a notice some browsers can't show.
+        response, page = self.request("POST", "/accounts/create", fields={"username": "helper", "form_token": token}, cookie=cookie, user=owner)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.title(page), "Account helper created. - Temporary password - NWR Stream Manager")
+        self.assertNotIn('id="view_settings"', page)
+        secret = re.search(r'<input id="notice_copy_value" readonly value="([^"]+)">', page).group(1)
+        self.assertIsNotNone(self.accounts.verify_basic_account("helper", secret))
+        self.assertIn('<input type="hidden" name="section" value="accounts">', page)
+        helper = next(account for account in self.accounts.list_accounts() if account["username"] == "helper")
+        _, page = self.request("GET", "/?view=settings&section=accounts", cookie=cookie, user=owner)
+        self.assertIn('aria-label="Make helper read-only">Make read-only</button>', page)
+
+        self.request("POST", "/accounts/read-only", fields={"account_id": helper["id"], "read_only": "1", "form_token": token}, cookie=cookie, user=owner)
+        self.assertTrue(self.accounts.account_by_id(helper["id"]).is_read_only)
+
+        _, page = self.request("GET", f"/?view=settings&section=accounts&confirm=reset&account={helper['id']}", cookie=cookie, user=owner)
+        self.assertEqual(self.title(page), "Reset the password for helper? - Accounts - Settings - NWR Stream Manager")
+        self.assertIn('<form method="post" action="/accounts/reset-password">', page)
+        _, page = self.request("POST", "/accounts/reset-password", fields={"account_id": helper["id"], "form_token": token}, cookie=cookie, user=owner)
+        self.assertEqual(self.title(page), "Password reset for helper. - Temporary password - NWR Stream Manager")
+        self.assertIn(helper["id"], self.revoked)
+
+        _, page = self.request("POST", "/accounts/delete", fields={"account_id": helper["id"], "form_token": token}, cookie=cookie, user=owner)
+        self.assertEqual(self.title(page), "Account deleted. - Accounts - Settings - NWR Stream Manager")
+        self.assertIsNone(self.accounts.account_by_id(helper["id"]))
+
+    def test_account_forms_need_the_owner_and_a_matching_token(self) -> None:
+        owner, token, cookie = self.owner_with_token()
+        account, secret = self.accounts.create_account("helper", False)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+
+        response, _ = self.request("POST", "/accounts/delete", fields={"account_id": 1, "form_token": token}, cookie=cookie, user=("helper", "password2"))
+        self.assertEqual(response.status, 403)
+        response, page = self.request("POST", "/accounts/delete", fields={"account_id": account["id"], "form_token": "guess"}, cookie=cookie, user=owner)
+        self.assertEqual(response.status, 400)
+        self.assertIn("This page had expired", page)
+        self.assertIsNotNone(self.accounts.account_by_id(account["id"]))
+
+    def test_each_account_changes_its_own_password_where_its_settings_are(self) -> None:
+        owner, token, cookie = self.owner_with_token()
+        account, secret = self.accounts.create_account("helper", False)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        helper = ("helper", "password2")
+
+        _, page = self.request("GET", "/?view=settings&section=accounts", cookie=cookie, user=helper)
+        self.assertEqual(self.title(page), "Account - Settings - NWR Stream Manager")
+        self.assertRegex(page, r'<div id="settings_panel_account" class="settings-panel">\s*<h3>Account</h3>\s*<form id="change_password_form"')
+        self.assertIn('<a id="change_password_cancel_link" class="baseline-only button-link" href="/?view=settings">', page)
+
+        fields = {"current_password": "wrong", "new_password": "password3", "confirm_password": "password3", "form_token": token}
+        response, page = self.request("POST", "/change-password", fields=fields, cookie=cookie, user=helper)
+        self.assertEqual(response.status, 400)
+        self.assertEqual(self.title(page), "Error: Current password is incorrect. - Account - Settings - NWR Stream Manager")
+
+        _, page = self.request("GET", "/?view=settings&section=account", cookie=cookie, user=owner)
+        self.assertRegex(page, r'<div id="settings_owner_password_page">\s*<h3>Change account password</h3>\s*<form id="change_password_form"')
 
     def test_a_required_password_change_works_as_a_plain_form(self) -> None:
         self.accounts.create_admin("owner", "password1", "password1")

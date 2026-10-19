@@ -678,6 +678,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <ul>
     <li>To change your own password as an administrator, open <strong>More</strong>, then <strong>Settings</strong>, then <strong>Account</strong>. Read-only accounts open <strong>More</strong>, then <strong>Change account password</strong>. The owner does this from <strong>Accounts</strong> in Settings instead, by choosing <strong>Change account password</strong> from their own account's <strong>More actions</strong> menu.</li>
     <li>If someone forgets their password, the owner can open <strong>Accounts</strong> in Settings and choose <strong>Reset password</strong> from that account's <strong>More actions</strong> menu. This gives them a new temporary password.</li>
+    <li>In an <a href="#older-browsers">older browser</a>, each account's actions are buttons instead of a <strong>More actions</strong> menu, and resetting a password or deleting an account asks you to confirm on the page first. A temporary password is shown on a page of its own; select <strong>Done</strong> once you've copied it.</li>
     <li>If the owner password is lost, NWR Stream Manager has to be stopped and its account database (the <code>accounts.db</code> file in its settings folder) deleted. The setup page then appears again so a new owner account can be created. Your streams and settings are kept. Starting to get the memo yet? Don't forget your password!</li>
   </ul>
 </section>
@@ -706,8 +707,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
 <section aria-labelledby="older-browsers">
   <h2 id="older-browsers">Older browsers</h2>
-  <p>When a page opens, NWR Stream Manager checks what your browser can do. In an up-to-date browser, pages update by themselves and you can listen to streams. In an older browser, such as Internet Explorer, or with JavaScript turned off, pages work as plain pages instead: forms save when you submit them, and Refresh shows the latest information.</p>
-  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, changing a temporary password, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
+  <p>When a page opens, NWR Stream Manager checks what your browser can do. In an up-to-date browser, pages update by themselves and you can listen to streams. In an older browser, such as Internet Explorer, or with JavaScript turned off, pages work as plain pages instead: forms save when you submit them, and Refresh shows the latest information. Messages that pop up at the edge of the screen in an up-to-date browser, such as a new account's temporary password, get a page of their own instead; select <strong>Done</strong> to carry on.</p>
+  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, accounts and passwords, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
 </section>
 
 </main>

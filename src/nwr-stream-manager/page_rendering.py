@@ -147,14 +147,41 @@ def set_attribute(page: str, element_id: str, name: str, value: str | None) -> s
     return markup[: match.start()] + tag + markup[match.end() :] + scripts
 
 
+def _closing_tag_start(markup: str, match: re.Match[str]) -> int:
+    """Where an element's closing tag starts, allowing for elements of its kind inside it."""
+    name = match.group(1).lower()
+    tags = re.compile(r"<(/?)%s\b[^<>]*>" % re.escape(name), re.IGNORECASE)
+    depth = 1
+    for tag in tags.finditer(markup, match.end()):
+        depth += -1 if tag.group(1) else 1
+        if depth == 0:
+            return tag.start()
+    raise KeyError(f"element {match.group(0)} is not closed")
+
+
 def set_content(page: str, element_id: str, content_html: str) -> str:
-    """Replaces what is inside an element that holds no element of its own kind."""
+    """Replaces what is inside an element."""
     markup, scripts = _split_markup(page)
     match = _opening_tag(markup, element_id)
-    closing = markup.find(f"</{match.group(1)}>", match.end())
-    if closing < 0:
-        raise KeyError(f"element with id {element_id} is not closed")
+    closing = _closing_tag_start(markup, match)
     return markup[: match.end()] + content_html + markup[closing:] + scripts
+
+
+def append_content(page: str, element_id: str, content_html: str) -> str:
+    """Adds to the end of what is inside an element."""
+    markup, scripts = _split_markup(page)
+    closing = _closing_tag_start(markup, _opening_tag(markup, element_id))
+    return markup[:closing] + content_html + markup[closing:] + scripts
+
+
+def move_element(page: str, element_id: str, target_id: str) -> str:
+    """Moves an element to the end of another one."""
+    markup, scripts = _split_markup(page)
+    match = _opening_tag(markup, element_id)
+    closing = _closing_tag_start(markup, match)
+    end = markup.index(">", closing) + 1
+    element = markup[match.start() : end]
+    return append_content(markup[: match.start()] + markup[end:] + scripts, target_id, element)
 
 
 def set_text(page: str, element_id: str, text: str) -> str:

@@ -513,6 +513,53 @@ VIEW_NAV_ITEMS = {
 READ_ONLY_RESTRICTED_VIEWS = {
     "rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "settings",
 }
+# Settings, as the page script has them.
+SETTINGS_SECTION_TITLES = {
+    "accounts": "Accounts",
+    "create_account": "Create account",
+    "account": "Account",
+    "sdr_sharing": "SDR sharing",
+    "pair_device": "Pair a device",
+    "find_devices": "Find devices",
+    "notifications": "Notifications",
+    "fallback_audio": "Fallback audio",
+    "record_announcement": "Record an announcement",
+}
+SETTINGS_BACK_NAMES = {"accounts": "accounts", "sdr_sharing": "SDR sharing", "fallback_audio": "fallback audio"}
+SETTINGS_TABS = ("accounts", "account", "sdr_sharing", "notifications", "fallback_audio")
+SETTINGS_PAGE_PARENTS = {
+    "create_account": "accounts",
+    "pair_device": "sdr_sharing",
+    "find_devices": "sdr_sharing",
+    "record_announcement": "fallback_audio",
+}
+# The settings that work without the page script.
+BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account"}
+ACCOUNT_FORM_PATHS = {"/accounts/create", "/accounts/reset-password", "/accounts/read-only", "/accounts/delete"}
+
+
+def settings_sections_for(owner: bool) -> list[str]:
+    sections = ["account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"]
+    return ["accounts", "create_account", *sections] if owner else sections
+
+
+def settings_tab_section(section: str, owner: bool) -> str:
+    """The entry in the list of settings that a page of Settings belongs to."""
+    if section == "account" and owner:
+        # The owner's own password is a page within Accounts.
+        return "accounts"
+    return SETTINGS_PAGE_PARENTS.get(section, section)
+
+
+def format_account_date(epoch_seconds: Any) -> str:
+    try:
+        seconds = float(epoch_seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    if not seconds:
+        return "Never"
+    moment = datetime.fromtimestamp(seconds)
+    return f"{moment:%B} {moment.day}, {moment.year}"
 STREAM_TEST_MODE_SAME_AUDIO = "same_test.wav"
 STREAM_TEST_MODE_SAME_LOCATION = "999000"
 STREAM_TEST_MODE_SAME_SENDER_ID = "NWRSTMGR"
@@ -9196,9 +9243,17 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         return f"{host}:{port}" if port else host
 
     def _auth_ok_or_setup_response(self, path: str, method: str) -> bool:
-        self.current_account = None
         # One connection can carry several requests.
         self._new_form_token = ""
+        allowed = self._check_auth_or_respond(path, method)
+        if not allowed and method != "GET":
+            # Answered without reading the request body, which would otherwise be
+            # taken for the connection's next request.
+            self.close_connection = True
+        return allowed
+
+    def _check_auth_or_respond(self, path: str, method: str) -> bool:
+        self.current_account = None
         if path == HELP_PATH and method == "GET":
             # Help holds nothing private, and people need it before and during setup too.
             self._send_help()
@@ -9280,7 +9335,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 return True
             self._send_json({"error": "password change is required"}, status=HTTPStatus.FORBIDDEN)
             return False
-        if path.startswith("/api/accounts") or path in {"/api/account-reset-password", "/api/account-read-only"}:
+        if path.startswith("/api/accounts") or path in {"/api/account-reset-password", "/api/account-read-only"} or path in ACCOUNT_FORM_PATHS:
             if not account.is_owner:
                 self._send_json({"error": "owner account is required"}, status=HTTPStatus.FORBIDDEN)
                 return False
@@ -9874,6 +9929,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == CHANGE_PASSWORD_FORM_PATH:
             self._handle_change_password_form()
             return
+        if path in ACCOUNT_FORM_PATHS:
+            self._handle_account_form(path)
+            return
         if path == "/api/setup-account":
             try:
                 payload = self._read_json()
@@ -9908,37 +9966,18 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == "/api/accounts":
             try:
                 payload = self._read_json()
-                account, secret = self.service.accounts.create_account(
-                    str(payload.get("username", "")),
-                    bool(payload.get("read_only", False)),
-                )
+                account, secret = self._create_account(str(payload.get("username", "")), bool(payload.get("read_only", False)))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
-            LOG.info("created account %s", account.get("username", ""))
             self._send_json({"success": True, "account": account, "secret": secret})
             return
         if path == "/api/account-reset-password":
             try:
-                requester = getattr(self, "current_account", None)
-                if not isinstance(requester, AccountRecord):
-                    raise ValueError("authentication is required")
-                payload = self._read_json()
-                account_id = int(payload.get("account_id", 0))
-                if requester.id == account_id:
-                    raise ValueError("use change account password for your own account")
-                account, secret = self.service.accounts.reset_password(account_id)
-                self.service.auth_sessions.invalidate_account(account_id)
-                self.service.revoke_account_long_lived_resources(
-                    account_id,
-                    stop_webrtc=True,
-                    abort_downloads=True,
-                    stop_iq_recording=True,
-                )
+                account, secret = self._reset_account_password(int(self._read_json().get("account_id", 0)))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
-            LOG.info("reset password for account %s", account.get("username", ""))
             self._send_json({"success": True, "account": account, "secret": secret})
             return
         if path == "/api/eas-alert-delete":
@@ -10229,22 +10268,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/accounts":
             try:
-                requester = getattr(self, "current_account", None)
-                if not isinstance(requester, AccountRecord):
-                    raise ValueError("authentication is required")
-                account_id = int(parse_qs(parsed.query).get("account_id", ["0"])[0])
-                account = self.service.accounts.delete_account(account_id, requester.id)
-                self.service.auth_sessions.invalidate_account(account_id)
-                self.service.revoke_account_long_lived_resources(
-                    account_id,
-                    stop_webrtc=True,
-                    abort_downloads=True,
-                    stop_iq_recording=True,
-                )
+                account = self._delete_account(int(parse_qs(parsed.query).get("account_id", ["0"])[0]))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
-            LOG.info("deleted account %s", account.get("username", ""))
             self._send_json({"success": True, "account": account})
             return
         if parsed.path == "/api/eas-alert":
@@ -10306,15 +10333,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == "/api/account-read-only":
             try:
                 payload = self._read_json()
-                account_id = int(payload.get("account_id", 0))
-                read_only = bool(payload.get("read_only", False))
-                account = self.service.accounts.set_read_only(account_id, read_only)
-                if read_only:
-                    self.service.revoke_account_long_lived_resources(account_id, stop_iq_recording=True)
+                account = self._set_account_read_only(int(payload.get("account_id", 0)), bool(payload.get("read_only", False)))
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
-            LOG.info("updated account %s role to %s", account.get("username", ""), account.get("role", ""))
             self._send_json({"success": True, "account": account})
             return
         if path == "/api/stream-output":
@@ -10635,6 +10657,84 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         LOG.info("changed password for account %s", updated.get("username", ""))
         return updated
 
+    def _create_account(self, username: str, read_only: bool) -> tuple[dict[str, Any], str]:
+        account, secret = self.service.accounts.create_account(username, read_only)
+        LOG.info("created account %s", account.get("username", ""))
+        return account, secret
+
+    def _requester(self) -> AccountRecord:
+        requester = getattr(self, "current_account", None)
+        if not isinstance(requester, AccountRecord):
+            raise ValueError("authentication is required")
+        return requester
+
+    def _sign_out_account(self, account_id: int) -> None:
+        self.service.auth_sessions.invalidate_account(account_id)
+        self.service.revoke_account_long_lived_resources(
+            account_id,
+            stop_webrtc=True,
+            abort_downloads=True,
+            stop_iq_recording=True,
+        )
+
+    def _reset_account_password(self, account_id: int) -> tuple[dict[str, Any], str]:
+        if self._requester().id == account_id:
+            raise ValueError("use change account password for your own account")
+        account, secret = self.service.accounts.reset_password(account_id)
+        self._sign_out_account(account_id)
+        LOG.info("reset password for account %s", account.get("username", ""))
+        return account, secret
+
+    def _set_account_read_only(self, account_id: int, read_only: bool) -> dict[str, Any]:
+        account = self.service.accounts.set_read_only(account_id, read_only)
+        if read_only:
+            self.service.revoke_account_long_lived_resources(account_id, stop_iq_recording=True)
+        LOG.info("updated account %s role to %s", account.get("username", ""), account.get("role", ""))
+        return account
+
+    def _delete_account(self, account_id: int) -> dict[str, Any]:
+        account = self.service.accounts.delete_account(account_id, self._requester().id)
+        self._sign_out_account(account_id)
+        LOG.info("deleted account %s", account.get("username", ""))
+        return account
+
+    def _handle_account_form(self, path: str) -> None:
+        """The owner's account forms, for browsers without the page script."""
+        accounts_page = {"view": "settings", "section": "accounts"}
+        form: dict[str, str] = {}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            if path == "/accounts/create":
+                try:
+                    account, secret = self._create_account(form.get("username", ""), form.get("read_only") == "1")
+                except ValueError as exc:
+                    # Shown on the form, which keeps what was entered.
+                    query = {"view": "settings", "section": "create_account"}
+                    result = ("create-account-result", form_message(str(exc)), "error")
+                    self._send_page(self._render_index_page(query, result=result, form=form), HTTPStatus.BAD_REQUEST)
+                    return
+                summary = f"Account {account.get('username', '')} created."
+                self._send_page(render_account_secret_page(summary, secret))
+                return
+            account_id = int(form.get("account_id", "0") or 0)
+            if path == "/accounts/reset-password":
+                account, secret = self._reset_account_password(account_id)
+                self._send_page(render_account_secret_page(f"Password reset for {account.get('username', '')}.", secret))
+                return
+            if path == "/accounts/read-only":
+                self._set_account_read_only(account_id, form.get("read_only") == "1")
+                message = "Account updated."
+            else:
+                self._delete_account(account_id)
+                message = "Account deleted."
+        except Exception as exc:
+            result = ("account-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(accounts_page, result=result), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_page(self._render_index_page(accounts_page, result=("account-result", message, "success")))
+
     def _handle_setup_form(self) -> None:
         form: dict[str, str] = {}
         try:
@@ -10669,10 +10769,13 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 form.get("confirm_password", ""),
             )
         except Exception as exc:
+            message = form_message(str(exc))
             if account.must_change_password:
-                self._send_page(render_change_password_page(self._form_token(), form_message(str(exc))), HTTPStatus.BAD_REQUEST)
+                self._send_page(render_change_password_page(self._form_token(), message), HTTPStatus.BAD_REQUEST)
             else:
-                self._send_redirect("/?view=change_password")
+                query = {"view": "change_password"} if account.is_read_only else {"view": "settings", "section": "account"}
+                result = ("change-password-result", message, "error")
+                self._send_page(self._render_index_page(query, result=result), HTTPStatus.BAD_REQUEST)
             return
         # The browser is asked to sign in again, with the new password.
         self._send_redirect("/")
@@ -10739,15 +10842,30 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         self._send_html(page, status)
 
     def _send_index_page(self, parsed) -> None:
-        """The main page, showing the view asked for, filled in for browsers without the page script."""
+        query = {name: values[0] for name, values in parse_qs(parsed.query).items()}
+        self._send_page(self._render_index_page(query))
+
+    def _render_index_page(
+        self,
+        query: dict[str, str],
+        *,
+        result: tuple[str, str, str] | None = None,
+        form: dict[str, str] | None = None,
+    ) -> str:
+        """The main page, showing the view asked for, filled in for browsers without the page script.
+
+        result is a message to show: the element for it, its text, and "success" or "error".
+        form is what was entered in a form being shown again.
+        """
         account = getattr(self, "current_account", None)
         read_only = isinstance(account, AccountRecord) and account.is_read_only
-        view = parse_qs(parsed.query).get("view", [""])[0] or "dashboard"
+        view = query.get("view", "") or "dashboard"
         if view not in INDEX_VIEWS or (read_only and view in READ_ONLY_RESTRICTED_VIEWS):
             view = "dashboard"
         page = page_rendering.show_view(INDEX_HTML, view)
+        page = page.replace("__FORM_TOKEN_INPUT__", page_rendering.form_token_input(self._form_token()))
         page = page_rendering.set_hidden(page, "baseline_unavailable", not page_rendering.view_needs_app(page, view))
-        page = page_rendering.set_title(page, f"{VIEW_TITLES.get(view, 'Dashboard')} - NWR Stream Manager")
+        title = VIEW_TITLES.get(view, "Dashboard")
         page = page_rendering.set_hidden(page, "nav_rtl", read_only)
         page = page_rendering.set_hidden(page, "nav_settings", read_only)
         page = page_rendering.set_hidden(page, "nav_change_password", not read_only)
@@ -10756,7 +10874,78 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             page = page_rendering.set_attribute(page, f"nav_{item}", "aria-current", "page" if item == current else None)
         if view == "logs":
             page = self._fill_logs_view(page, read_only)
-        self._send_page(page)
+        if view == "change_password" and isinstance(account, AccountRecord):
+            page = page_rendering.set_attribute(page, "change_password_cancel_link", "href", "/")
+        if view == "settings" and isinstance(account, AccountRecord):
+            page, title = self._fill_settings_view(page, account, query, form or {})
+        title = f"{title} - NWR Stream Manager"
+        if result:
+            element_id, message, kind = result
+            page = page_rendering.set_text(page, element_id, message)
+            page = page_rendering.set_attribute(page, element_id, "class", f"message {kind}")
+            page = page_rendering.set_attribute(page, element_id, "role", "alert" if kind == "error" else "status")
+            # In the title too, so it's the first thing read when the page loads.
+            title = f"Error: {message} - {title}" if kind == "error" else f"{message} - {title}"
+        return page_rendering.set_title(page, title)
+
+    def _fill_settings_view(self, page: str, account: AccountRecord, query: dict[str, str], form: dict[str, str]) -> tuple[str, str]:
+        owner = account.is_owner
+        section = query.get("section", "")
+        if not owner and section in {"accounts", "create_account"}:
+            section = "account"
+        if section not in settings_sections_for(owner):
+            section = ""
+        tab = settings_tab_section(section, owner)
+        parent = tab if tab != section else ""
+        works = section in BASELINE_SETTINGS_SECTIONS
+        page = page_rendering.set_hidden(page, "settings_tab_accounts", not owner)
+        page = page_rendering.set_hidden(page, "settings_tab_account", owner)
+        for name in SETTINGS_TABS:
+            page = page_rendering.set_attribute(page, f"settings_tab_{name}", "aria-current", "page" if name == tab else None)
+            page = page_rendering.set_hidden(page, f"settings_panel_{name}", not (works and name == tab))
+        page = page_rendering.set_hidden(page, "settings_accounts_page", section != "accounts")
+        page = page_rendering.set_hidden(page, "settings_create_account_page", section != "create_account")
+        page = page_rendering.set_hidden(page, "settings_owner_password_page", not (section == "account" and owner))
+        layout = ["settings-layout"] + (["settings-detail-active"] if section else []) + (["settings-subpage-active"] if parent else [])
+        page = page_rendering.set_attribute(page, "settings_layout", "class", " ".join(layout))
+        page = page_rendering.set_text(page, "settings_back", f"Back to {SETTINGS_BACK_NAMES[parent]}" if parent else "Back to settings")
+        page = page_rendering.set_attribute(page, "settings_back_section", "value", parent)
+        page = page_rendering.set_hidden(page, "settings_choose", bool(section))
+        page = page_rendering.set_hidden(page, "settings_section_unavailable", not section or works)
+        title = f"{SETTINGS_SECTION_TITLES[section]} - Settings" if section else "Settings"
+        if section == "account":
+            page = self._place_password_form(page, "settings_owner_password_page" if owner else "settings_panel_account")
+            page = page_rendering.set_attribute(
+                page, "change_password_cancel_link", "href", "/?view=settings&section=accounts" if owner else "/?view=settings"
+            )
+        if section == "create_account":
+            if form.get("username"):
+                page = page_rendering.set_attribute(page, "new_account_username", "value", form["username"])
+            if form.get("read_only") == "1":
+                page = page_rendering.set_attribute(page, "new_account_read_only", "checked", "checked")
+        if section == "accounts":
+            page, confirm_title = self._fill_accounts_page(page, account, query)
+            if confirm_title:
+                title = f"{confirm_title} - {title}"
+        return page, title
+
+    def _place_password_form(self, page: str, home_id: str) -> str:
+        # One password form serves every account; the page script moves it the same way.
+        return page_rendering.move_element(page, "change_password_form", home_id)
+
+    def _fill_accounts_page(self, page: str, requester: AccountRecord, query: dict[str, str]) -> tuple[str, str]:
+        accounts = self.service.accounts.list_accounts()
+        token_input = page_rendering.form_token_input(self._form_token())
+        rows = [account_row_html(account, requester.id, token_input) for account in accounts]
+        page = page_rendering.set_content(page, "accounts-body", "".join(rows) or EMPTY_ACCOUNTS_ROW)
+        # Resetting a password and deleting an account are confirmed first.
+        confirm = query.get("confirm", "")
+        target = next((account for account in accounts if str(account.get("id")) == query.get("account", "")), None)
+        if confirm not in {"reset", "delete"} or target is None or target.get("owner") or target.get("id") == requester.id:
+            return page, ""
+        content, title = account_confirmation_html(confirm, target, token_input)
+        page = page_rendering.set_content(page, "account_confirm", content)
+        return page_rendering.set_hidden(page, "account_confirm", False), title
 
     def _fill_logs_view(self, page: str, read_only: bool) -> str:
         status = self.service.status(read_only=read_only)
@@ -13193,7 +13382,7 @@ footer a { color: #174a98; }
       <p class="hint">Create the administrator account for this NWR Stream Manager.</p>
       <label>
         Username
-        <input id="setup_username" name="username" autocomplete="username" required pattern="[A-Za-z0-9_-]{1,64}" autofocus>
+        <input id="setup_username" name="username" autocomplete="username" required pattern="[A-Za-z0-9_\\-]{1,64}" autofocus>
       </label>
       <label>
         Password
@@ -13437,6 +13626,115 @@ __PAGE_SCRIPT_STARTER__
 ).replace("__BASE_PAGE_STYLES__", page_rendering.BASE_PAGE_STYLES)
 
 
+NOTICE_PAGE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NWR Stream Manager</title>
+__PAGE_SCRIPT_LOADER__
+<style>
+__BASE_PAGE_STYLES__
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; background: #f6f7f9; color: #14181f; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 24px; }
+.panel { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 24px; }
+label { display: grid; gap: 6px; margin: 14px 0; font-weight: 700; }
+input { font: inherit; padding: 10px; border: 1px solid #aab2c0; border-radius: 6px; }
+.actions { display: flex; gap: 10px; margin-top: 18px; }
+button { font: inherit; padding: 10px 14px; border: 1px solid #9aa4b2; border-radius: 6px; background: #fff; color: #14181f; cursor: pointer; }
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+.primary { background: #174a98; color: #fff; border-color: #174a98; }
+.message { min-height: 1.5em; margin-top: 14px; font-weight: 700; }
+.error { color: #a61b1b; }
+.hint { color: #4b5563; }
+footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
+footer a { color: #174a98; }
+.screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+@media (prefers-color-scheme: dark) {
+  .error { color: #ff8a8a; }
+  body { background: #111827; color: #f9fafb; }
+  .panel, button, input { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
+  .hint { color: #cbd5e1; }
+  footer a { color: #93c5fd; }
+}
+</style>
+</head>
+<body>
+<main>
+  <section class="panel" aria-labelledby="notice_title">
+    <h1 id="notice_title"></h1>
+    <div id="notice_body"></div>
+    <label id="notice_copy" hidden><span id="notice_copy_label"></span>
+      <input id="notice_copy_value" readonly>
+    </label>
+    <form id="notice_continue" class="actions" method="get" action="/">
+      <button id="notice_copy_button" type="button" hidden>Copy to clipboard</button>
+      <button id="notice_done" class="primary" type="submit">Done</button>
+    </form>
+    <div id="notice_message" class="message" aria-live="polite"></div>
+  </section>
+</main>
+<footer>
+  <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
+</footer>
+<script>
+// Copying, for browsers that can. Written so that older browsers can run it too.
+(function () {
+  var d = document;
+  var nav = window.navigator;
+  var input = d.getElementById("notice_copy_value");
+  var button = d.getElementById("notice_copy_button");
+  var message = d.getElementById("notice_message");
+  if (d.getElementById("notice_copy").getAttribute("hidden") !== null) return;
+  var clipboard = !!(nav.clipboard && nav.clipboard.writeText && window.isSecureContext);
+  var copyCommand = false;
+  try {
+    copyCommand = !!(d.queryCommandSupported && d.queryCommandSupported("copy"));
+  } catch (error) {
+  }
+  if (!clipboard && !copyCommand) return;
+
+  function show(copied) {
+    var text = copied ? "Copied to the clipboard." : "Copy failed. Select it and copy it instead.";
+    if (message.textContent !== undefined) message.textContent = text;
+    else message.innerText = text;
+    message.className = copied ? "message success" : "message error";
+  }
+
+  function copyBySelecting() {
+    input.focus();
+    input.select();
+    var copied = false;
+    try {
+      copied = d.execCommand("copy");
+    } catch (error) {
+    }
+    button.focus();
+    return copied;
+  }
+
+  button.removeAttribute("hidden");
+  button.onclick = function () {
+    if (clipboard) {
+      nav.clipboard.writeText(input.value).then(function () {
+        show(true);
+      }, function () {
+        show(copyCommand && copyBySelecting());
+      });
+    } else {
+      show(copyBySelecting());
+    }
+  };
+})();
+</script>
+</body>
+</html>
+""".replace("__PAGE_SCRIPT_LOADER__", page_rendering.PAGE_SCRIPT_LOADER).replace(
+    "__BASE_PAGE_STYLES__", page_rendering.BASE_PAGE_STYLES
+)
+
+
 def form_message(message: str) -> str:
     """An error from the server, written as a sentence for showing on a page."""
     text = str(message).strip()
@@ -13466,6 +13764,52 @@ def render_setup_page(step: str, form_token: str, message: str = "", username: s
     return page
 
 
+def render_notice_page(
+    heading: str,
+    body_html: str,
+    continue_to: dict[str, str],
+    *,
+    copy_label: str = "",
+    copy_value: str = "",
+    title: str = "",
+) -> str:
+    """A message on a page of its own, for browsers without the page script.
+
+    The page script shows these messages as notices at the edge of the screen,
+    which not every browser can show. Done goes to the main page with continue_to
+    as its address, and copy_value is shown in a field it can be copied from.
+    """
+    page = page_rendering.set_text(NOTICE_PAGE_HTML, "notice_title", heading)
+    page = page_rendering.set_content(page, "notice_body", body_html)
+    fields = "".join(
+        f'<input type="hidden" name="{html.escape(name)}" value="{html.escape(value)}">' for name, value in continue_to.items()
+    )
+    page = page_rendering.set_content(
+        page,
+        "notice_continue",
+        fields
+        + '<button id="notice_copy_button" type="button" hidden>Copy to clipboard</button>'
+        + '<button id="notice_done" class="primary" type="submit">Done</button>',
+    )
+    if copy_value:
+        page = page_rendering.set_hidden(page, "notice_copy", False)
+        page = page_rendering.set_text(page, "notice_copy_label", copy_label)
+        page = page_rendering.set_attribute(page, "notice_copy_value", "value", copy_value)
+    return page_rendering.set_title(page, f"{title or heading} - NWR Stream Manager")
+
+
+def render_account_secret_page(summary: str, secret: str) -> str:
+    """A temporary password, which the page script shows in a notice."""
+    return render_notice_page(
+        "Temporary password",
+        f"<p>{html.escape(summary)}</p><p>Copy the temporary password and give it to the user. You won't be able to see it again.</p>",
+        {"view": "settings", "section": "accounts"},
+        copy_label="Temporary password",
+        copy_value=secret,
+        title=f"{summary} - Temporary password",
+    )
+
+
 def render_change_password_page(form_token: str, message: str = "") -> str:
     page = MUST_CHANGE_PASSWORD_HTML.replace("__FORM_TOKEN_INPUT__", page_rendering.form_token_input(form_token))
     if message:
@@ -13474,6 +13818,72 @@ def render_change_password_page(form_token: str, message: str = "") -> str:
 
 
 FORM_EXPIRED_MESSAGE = "This page had expired, so nothing was changed. Please try again."
+ACCOUNTS_PAGE_PATH = "/?view=settings&amp;section=accounts"
+EMPTY_ACCOUNTS_ROW = '<tr data-row-key="empty" role="row"><td colspan="4" class="hint" role="cell">No accounts.</td></tr>'
+
+
+def account_row_html(account: dict[str, Any], requester_id: int, token_input: str) -> str:
+    """A row of the accounts table, with plain links and forms for its actions.
+
+    Laid out and keyed as the page script lays out its rows, which have a menu instead.
+    """
+    account_id = int(account.get("id") or 0)
+    name = html.escape(str(account.get("username") or ""))
+
+    def cell(label: str, content: str, class_name: str = "") -> str:
+        class_attribute = f' class="{class_name}"' if class_name else ""
+        return f'<td{class_attribute} role="cell" data-label="{label}">{content}</td>'
+
+    if account_id == requester_id:
+        actions = '<a class="button-link" href="/?view=settings&amp;section=account">Change account password</a>'
+    elif account.get("owner"):
+        actions = ""
+    else:
+        read_only = bool(account.get("read_only"))
+        change = (
+            f'<button type="submit" aria-label="Make {name} an administrator">Make administrator</button>'
+            if read_only
+            else f'<button type="submit" aria-label="Make {name} read-only">Make read-only</button>'
+        )
+        actions = (
+            f'<a class="button-link" href="{ACCOUNTS_PAGE_PATH}&amp;confirm=reset&amp;account={account_id}" '
+            f'aria-label="Reset password for {name}">Reset password</a>'
+            f'<form method="post" action="/accounts/read-only">{token_input}'
+            f'<input type="hidden" name="account_id" value="{account_id}">'
+            f'<input type="hidden" name="read_only" value="{"0" if read_only else "1"}">{change}</form>'
+            f'<a class="button-link" href="{ACCOUNTS_PAGE_PATH}&amp;confirm=delete&amp;account={account_id}" '
+            f'aria-label="Delete account {name}">Delete account</a>'
+        )
+    return (
+        f'<tr data-row-key="account:{account_id}" role="row">'
+        + cell("Username", name)
+        + cell("Account type", html.escape(str(account.get("account_type") or "Administrator")))
+        + cell("Last accessed", html.escape(format_account_date(account.get("last_accessed_at"))))
+        + cell("Actions", f'<div class="account-actions">{actions}</div>' if actions else "")
+        + "</tr>"
+    )
+
+
+def account_confirmation_html(kind: str, account: dict[str, Any], token_input: str) -> tuple[str, str]:
+    """Asks before resetting a password or deleting an account; the page script uses a dialog."""
+    username = str(account.get("username") or "")
+    name = html.escape(username)
+    if kind == "delete":
+        question = f"Delete {username}?"
+        explanation = f"{name} won't be able to sign in any more."
+        action, button = "/accounts/delete", "Delete account"
+    else:
+        question = f"Reset the password for {username}?"
+        explanation = f"{name} is signed out and given a temporary password, which you'll need to pass on to them."
+        action, button = "/accounts/reset-password", "Reset password"
+    content = (
+        f"<h4>{html.escape(question)}</h4><p>{explanation}</p>"
+        f'<form method="post" action="{action}">{token_input}'
+        f'<input type="hidden" name="account_id" value="{int(account.get("id") or 0)}">'
+        f'<div class="actions"><button type="submit" class="primary" autofocus>{button}</button>'
+        f'<a class="button-link" href="{ACCOUNTS_PAGE_PATH}">Cancel</a></div></form>'
+    )
+    return content, question
 
 
 INDEX_HTML = """<!doctype html>
@@ -13517,6 +13927,12 @@ nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 nav a { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; text-decoration: none; }
 nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #2557a7; box-shadow: inset 0 -2px 0 #2557a7; }
 .logs-refresh { margin-top: 12px; }
+.needs-app-inline { display: none; }
+.js-app .needs-app-inline { display: inline-block; }
+.button-link { display: inline-block; font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; text-decoration: none; }
+.settings-back-form { margin: 0; }
+.account-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.account-actions form { display: inline; margin: 0; }
 /* Without the page script the More links sit in the bar with the others; with it they're a menu. */
 .nav-more, .nav-more-menu { display: contents; }
 .js-app .nav-more { display: inline; position: relative; }
@@ -13580,7 +13996,7 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .settings-layout { display: grid; grid-template-columns: minmax(180px, 240px) minmax(0, 1fr); gap: 24px; align-items: start; }
 .settings-list { display: grid; gap: 8px; }
 .settings-list button { text-align: left; }
-.settings-list button[aria-selected="true"] { border-color: #2557a7; box-shadow: inset 3px 0 0 #2557a7; }
+.settings-list button[aria-selected="true"], .settings-list button[aria-current="page"] { border-color: #2557a7; box-shadow: inset 3px 0 0 #2557a7; }
 .settings-detail { min-width: 0; }
 .settings-detail h3 { margin-top: 0; }
 .settings-back { display: none; }
@@ -13623,7 +14039,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 @media (prefers-color-scheme: dark) {
   .error { color: #ff8a8a; }
   body { background: #101318; color: #eef2f7; }
-  header, section, select, input, button, nav a { background: #181d24; color: #eef2f7; border-color: #333b48; }
+  header, section, select, input, button, nav a, .button-link { background: #181d24; color: #eef2f7; border-color: #333b48; }
   nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #6f9be0; box-shadow: inset 0 -2px 0 #6f9be0; }
   footer { border-color: #333b48; }
   .settings-group { border-color: #333b48; }
@@ -14111,25 +14527,37 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_settings" class="view needs-app" hidden>
+  <div id="view_settings" class="view" hidden>
     <section>
       <h2>Settings</h2>
       <div id="settings_layout" class="settings-layout">
-        <div id="settings_list" class="settings-list" role="tablist" aria-orientation="vertical" aria-label="Settings">
-          <button id="settings_tab_accounts" type="button" role="tab" data-settings-section="accounts" aria-controls="settings_panel_accounts" aria-selected="false" tabindex="-1" hidden>Accounts</button>
-          <button id="settings_tab_account" type="button" role="tab" data-settings-section="account" aria-controls="settings_panel_account" aria-selected="false" tabindex="-1" hidden>Account</button>
-          <button id="settings_tab_sdr_sharing" type="button" role="tab" data-settings-section="sdr_sharing" aria-controls="settings_panel_sdr_sharing" aria-selected="false" tabindex="-1">SDR sharing</button>
-          <button id="settings_tab_notifications" type="button" role="tab" data-settings-section="notifications" aria-controls="settings_panel_notifications" aria-selected="false" tabindex="-1">Notifications</button>
-          <button id="settings_tab_fallback_audio" type="button" role="tab" data-settings-section="fallback_audio" aria-controls="settings_panel_fallback_audio" aria-selected="false" tabindex="-1">Fallback audio</button>
-        </div>
+        <form id="settings_list" class="settings-list" method="get" action="/" aria-label="Settings">
+          <input type="hidden" name="view" value="settings">
+          <button id="settings_tab_accounts" type="submit" name="section" value="accounts" data-settings-section="accounts" data-baseline-submit hidden>Accounts</button>
+          <button id="settings_tab_account" type="submit" name="section" value="account" data-settings-section="account" data-baseline-submit hidden>Account</button>
+          <button id="settings_tab_sdr_sharing" type="submit" name="section" value="sdr_sharing" data-settings-section="sdr_sharing" data-baseline-submit>SDR sharing</button>
+          <button id="settings_tab_notifications" type="submit" name="section" value="notifications" data-settings-section="notifications" data-baseline-submit>Notifications</button>
+          <button id="settings_tab_fallback_audio" type="submit" name="section" value="fallback_audio" data-settings-section="fallback_audio" data-baseline-submit>Fallback audio</button>
+        </form>
         <div class="settings-detail">
-          <button id="settings_back" class="settings-back" type="button">Back to settings</button>
-          <div id="settings_panel_accounts" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_accounts" hidden>
+          <form class="settings-back-form" method="get" action="/">
+            <input type="hidden" name="view" value="settings">
+            <input id="settings_back_section" type="hidden" name="section" value="">
+            <button id="settings_back" class="settings-back" type="submit" data-baseline-submit>Back to settings</button>
+          </form>
+          <p id="settings_choose" class="baseline-only hint" hidden>Choose a setting.</p>
+          <section id="settings_section_unavailable" class="baseline-only" hidden>
+            <h3>This setting doesn't work in this browser yet</h3>
+            <p>Account settings work in every browser.</p>
+          </section>
+          <div id="settings_panel_accounts" class="settings-panel" hidden>
             <div id="settings_accounts_page">
               <h3>Accounts</h3>
               <div id="account-result" class="message"></div>
+              <div id="account_confirm" class="baseline-only" hidden></div>
               <div class="actions">
-                <button id="open_create_account" type="button">Create account</button>
+                <button id="open_create_account" type="button" class="needs-app-inline">Create account</button>
+                <a class="baseline-only button-link" href="/?view=settings&amp;section=create_account">Create account</a>
               </div>
               <table class="responsive-table" role="table" aria-label="Accounts">
                 <thead role="rowgroup">
@@ -14145,26 +14573,28 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 </tbody>
               </table>
             </div>
-            <div id="settings_create_account_page" hidden>
+            <form id="settings_create_account_page" method="post" action="/accounts/create" hidden>
+              __FORM_TOKEN_INPUT__
               <h3>Create account</h3>
               <div id="create-account-result" class="message"></div>
               <label>Username
-                <input id="new_account_username" autocomplete="off" pattern="[A-Za-z0-9_-]{1,64}">
+                <input id="new_account_username" name="username" autocomplete="off" pattern="[A-Za-z0-9_\\-]{1,64}">
               </label>
-              <label><input id="new_account_read_only" type="checkbox"> Read-only account</label>
+              <label><input id="new_account_read_only" name="read_only" value="1" type="checkbox"> Read-only account</label>
               <div class="actions">
-                <button id="create_account" type="button">Create account</button>
-                <button id="cancel_create_account" type="button">Cancel</button>
+                <button id="create_account" type="submit" data-baseline-submit>Create account</button>
+                <button id="cancel_create_account" type="button" class="needs-app-inline">Cancel</button>
+                <a class="baseline-only button-link" href="/?view=settings&amp;section=accounts">Cancel</a>
               </div>
-            </div>
+            </form>
             <div id="settings_owner_password_page" hidden>
               <h3>Change account password</h3>
             </div>
           </div>
-          <div id="settings_panel_account" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_account" hidden>
+          <div id="settings_panel_account" class="settings-panel" hidden>
             <h3>Account</h3>
           </div>
-          <div id="settings_panel_sdr_sharing" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_sdr_sharing" hidden>
+          <div id="settings_panel_sdr_sharing" class="settings-panel" hidden>
             <div id="settings_sdr_sharing_page">
               <h3>SDR sharing</h3>
               <div id="sdr_sharing_section" class="settings-group">
@@ -14247,7 +14677,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               <div id="remote-pair-result" class="message" aria-live="polite"></div>
             </div>
           </div>
-          <div id="settings_panel_fallback_audio" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_fallback_audio" hidden>
+          <div id="settings_panel_fallback_audio" class="settings-panel" hidden>
             <div id="settings_fallback_audio_page">
             <h3>Fallback audio</h3>
             <p class="hint">Fallback audio plays on streams whose fallback action is Play fallback audio. Choose each stream's fallback action in its stream settings. These settings apply to every stream that plays fallback audio.</p>
@@ -14305,7 +14735,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               <div id="fallback-recording-result" class="message" aria-live="polite"></div>
             </div>
           </div>
-          <div id="settings_panel_notifications" class="settings-panel" role="tabpanel" aria-labelledby="settings_tab_notifications" hidden>
+          <div id="settings_panel_notifications" class="settings-panel" hidden>
             <h3>Notifications</h3>
             <div id="notification-result" class="message" aria-live="polite"></div>
             <div id="notification_intro">
@@ -14412,25 +14842,27 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_change_password" class="view needs-app" hidden>
+  <div id="view_change_password" class="view" hidden>
     <section>
       <h2>Change Account Password</h2>
-      <div id="change_password_form">
+      <form id="change_password_form" method="post" action="/change-password">
+        __FORM_TOKEN_INPUT__
         <div id="change-password-result" class="message"></div>
         <label>Current password
-          <input id="account_current_password" type="password" autocomplete="current-password">
+          <input id="account_current_password" name="current_password" type="password" autocomplete="current-password">
         </label>
         <label>New password
-          <input id="account_new_password" type="password" autocomplete="new-password">
+          <input id="account_new_password" name="new_password" type="password" autocomplete="new-password">
         </label>
         <label>Confirm new password
-          <input id="account_confirm_password" type="password" autocomplete="new-password">
+          <input id="account_confirm_password" name="confirm_password" type="password" autocomplete="new-password">
         </label>
         <div class="actions">
-          <button id="change_account_password" type="button">Change password</button>
-          <button id="cancel_change_password" type="button">Cancel</button>
+          <button id="change_account_password" type="submit" data-baseline-submit>Change password</button>
+          <button id="cancel_change_password" type="button" class="needs-app-inline">Cancel</button>
+          <a id="change_password_cancel_link" class="baseline-only button-link" href="/">Cancel</a>
         </div>
-      </div>
+      </form>
     </section>
   </div>
 
@@ -20545,7 +20977,7 @@ function stationLabelForActionMenu(stream) {
 }
 
 function menuItems(menu) {
-  return Array.from(menu.querySelectorAll("[role='menuitem']"));
+  return Array.from(menu.querySelectorAll("[role='menuitem'], [role='menuitemcheckbox']"));
 }
 
 function openStreamActionMenu(button, focus = "first") {
@@ -22835,6 +23267,8 @@ function renderSettingsSection() {
   for (const tab of settingsTabs()) {
     const name = tab.dataset.settingsSection;
     const selected = name === tabSection;
+    // Marked by the server for browsers without this script.
+    tab.removeAttribute("aria-current");
     if (singlePane) {
       tab.removeAttribute("role");
       tab.removeAttribute("aria-selected");
@@ -24688,6 +25122,12 @@ document.addEventListener("click", event => {
   navigateTo(targetView, targetParams, replace);
 });
 
+// Buttons that submit a form only for browsers that don't run this script; here
+// they act on the page instead, and their forms aren't sent.
+for (const button of document.querySelectorAll("button[data-baseline-submit]")) {
+  button.type = "button";
+  if (button.form) button.form.addEventListener("submit", event => event.preventDefault());
+}
 // The page comes with the More links listed in the bar, for browsers that don't
 // run this script; here they become a menu.
 (() => {
@@ -24810,6 +25250,42 @@ document.getElementById("accounts-body").addEventListener("keydown", event => {
     if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
       event.preventDefault();
       openStreamActionMenu(target, "first");
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      openStreamActionMenu(target, "last");
+      return;
+    }
+  }
+  if (["menuitem", "menuitemcheckbox"].includes(target.getAttribute("role"))) {
+    const menu = target.closest(".stream-actions-menu");
+    if (!menu) return;
+    const items = menuItems(menu);
+    const index = items.indexOf(target);
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      items[(index + 1) % items.length].focus();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      items[(index - 1 + items.length) % items.length].focus();
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      items[0].focus();
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      items[items.length - 1].focus();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeStreamActionMenu(menu, true);
     }
   }
 });
