@@ -116,7 +116,10 @@ class PageScriptLoadingTests(unittest.TestCase):
     def test_only_pages_that_work_without_the_page_script_are_shown_without_it(self) -> None:
         pages = __import__("sys").modules["nwr_stream_manager.page_rendering"]
         page = self.web_control.INDEX_HTML
-        baseline = {"logs", "settings", "change_password", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"}
+        baseline = {
+            "logs", "settings", "change_password", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail",
+            "iq_recorder", "iq_recorder_start", "iq_recording_download",
+        }
         for view in baseline:
             self.assertFalse(pages.view_needs_app(page, view), view)
         for view in self.web_control.INDEX_VIEWS - baseline:
@@ -136,6 +139,8 @@ class StandInService(types.SimpleNamespace):
     def __getattr__(self, name):
         if name == "eas_alert_streams":
             return lambda: {"streams": []}
+        if name in {"iq_recorder_status", "redacted_iq_recorder_status"}:
+            return lambda: {"active": False, "status": "idle"}
         return lambda *args, **kwargs: None
 
 
@@ -556,6 +561,212 @@ class EasAlertPageTests(unittest.TestCase):
         self.assertEqual(self.title(page), "30 alerts deleted. - EAS Alerts - NWR Stream Manager")
         self.assertEqual(self.alert_ids(), [])
         self.assertIn("No EAS alerts recorded for this stream.", page)
+
+
+class IqRecorderServiceStandIn(StandInService):
+    """The real recordings list, removal and downloads, with a recorder the test controls."""
+
+    REAL = ("iq_recordings", "remove_iq_recording", "iq_recording_download", "begin_iq_recording_download", "finish_iq_recording_download")
+
+    def __getattr__(self, name):
+        if name.startswith(self.REAL):
+            return getattr(self.service_class, name).__get__(self)
+        return super().__getattr__(name)
+
+
+class IqRecorderPageTests(unittest.TestCase):
+    """The I/Q recorder pages, as a browser without the page script uses them."""
+
+    request = BaselinePageServerTests.request
+    form_token = BaselinePageServerTests.form_token
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        state = Path(tempdir.name)
+        self.accounts = wc.AccountStore(state / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        account, secret = self.accounts.create_account("viewer", True)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        self.owner, self.viewer = ("owner", "password1"), ("viewer", "password2")
+        directory = state / "iq-recordings"
+        directory.mkdir()
+        recordings = []
+        for number, started in enumerate((1_790_000_000, 1_790_003_600)):
+            path = directory / f"recording{number}.cf32"
+            path.write_bytes(bytes(8 * 100))
+            recordings.append({
+                "id": f"rec{number}", "mode": "stream", "stream_label": "WXN99", "sample_rate": 24000,
+                "frequency_hz": 162425000, "duration_seconds": 65, "file_path": str(path), "started_at": started,
+            })
+        (directory / "index.json").write_text(__import__("json").dumps({"version": 1, "recordings": recordings}))
+        self.recorder = {"active": False, "status": "idle"}
+        self.started: list[dict] = []
+        self.stopped: list[bool] = []
+        streams = [
+            {"id": "s1", "enabled": True, "station": {"callsign": "WXN99", "frequency": "162.425"}},
+            {"id": "s2", "enabled": False, "station": {"callsign": "WZ2560", "frequency": "162.550"}},
+        ]
+        service = IqRecorderServiceStandIn(
+            accounts=self.accounts,
+            auth_sessions=wc.AuthSessionStore(),
+            service_class=wc.RtlControlService,
+            lock=threading.RLock(),
+            streams=streams,
+            iq_recordings_directory=directory,
+            iq_recordings_index_path=directory / "index.json",
+            iq_recording_downloads=set(),
+            iq_recording_download_accounts={},
+            iq_recording_download_recordings={},
+            aborted_iq_recording_downloads=set(),
+            iq_recorder_status=lambda: dict(self.recorder),
+            redacted_iq_recorder_status=lambda: {"active": False, "status": "idle"},
+            start_iq_recording=lambda payload, account_id=None: self.started.append(payload),
+            stop_iq_recording=lambda: self.stopped.append(True),
+            storage_monitor=types.SimpleNamespace(snapshot=lambda: {"filesystems": [{"summary": "Storage: 12.0 GB free"}]}),
+        )
+        service.iq_recording_download_aborted = lambda download_id: False
+        handler = type("IqRecorderPageTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def token(self):
+        response, _ = self.request("GET", "/?view=iq_recorder", user=self.owner)
+        token = self.form_token(response)
+        return token, f"nwrstmgr_form={token}"
+
+    def test_recordings_are_listed_with_plain_links(self) -> None:
+        _, page = self.request("GET", "/?view=iq_recorder", user=self.owner)
+        self.assertEqual(self.title(page), "I/Q Recorder - NWR Stream Manager")
+        self.assertIn('<tr data-row-key="recording:rec1" role="row"><td role="cell" data-label="Time of recording">', page)
+        self.assertIn('<td role="cell" data-label="Duration">1:05</td><td role="cell" data-label="Sample rate">24000 S/s</td>', page)
+        self.assertIn('<a class="button-link" href="/?view=iq_recording_download&amp;recording=rec1">Download recording<span class="screen-reader-only"> from ', page)
+        self.assertIn('<a class="button-link" href="/?view=iq_recorder&amp;confirm=remove&amp;recording=rec1">Remove recording', page)
+        # The newest first.
+        self.assertLess(page.index("recording:rec1"), page.index("recording:rec0"))
+        self.assertIn('<a id="open_iq_start_link" class="baseline-only button-link" href="/?view=iq_recorder_start">', page)
+        self.assertRegex(page, r'<div id="iq_recorder_active" hidden>')
+
+        _, page = self.request("GET", "/?view=iq_recorder", user=self.viewer)
+        self.assertIn('href="/?view=iq_recording_download&amp;recording=rec1"', page)
+        self.assertNotIn("confirm=remove", page)
+        self.assertRegex(page, r'<a id="open_iq_start_link"[^>]* hidden>')
+        _, page = self.request("GET", "/?view=iq_recorder_start", user=self.viewer)
+        self.assertEqual(self.title(page), "Dashboard - NWR Stream Manager")
+
+    def test_a_running_recording_shows_its_status_and_a_stop_button(self) -> None:
+        self.recorder = {
+            "active": True, "status": "recording", "mode": "stream", "stream_label": "WXN99", "sample_rate": 24000,
+            "bytes_written": 2_500_000, "elapsed_seconds": 75.6, "duration_seconds": 600, "storage_remaining_seconds": 7200,
+        }
+        _, page = self.request("GET", "/?view=iq_recorder", user=self.owner)
+        self.assertIn('<div id="iq_recorder_active">', page)
+        for element_id, text in (
+            ("iq_status", "Recording"), ("iq_source", "WXN99"), ("iq_active_sample_rate", "24000 S/s"),
+            ("iq_file_size", "2.5 MB"), ("iq_elapsed", "1:15"), ("iq_remaining", "2:00:00"),
+            ("iq_auto_stop_remaining", "8:45"), ("iq_storage", "12.0 GB free"),
+        ):
+            self.assertIn(f'<span id="{element_id}">{text}</span>', page)
+        self.assertIn('<div class="metric" id="iq_auto_stop_metric"><b>', page)
+        self.assertIn('<form id="iq_stop_form" class="actions" method="post" action="/iq-recorder/stop">', page)
+        self.assertRegex(page, r'<a id="open_iq_start_link"[^>]* hidden>')
+        # Every page has the banner, with what a script needs to keep its timer going.
+        _, page = self.request("GET", "/?view=eas_alerts", user=self.owner)
+        self.assertIn('<div id="iq_recording_banner" class="global-status-banner" data-elapsed-seconds="75" data-duration-seconds="600">', page)
+        self.assertIn('<span id="iq_recording_banner_elapsed">1:15</span>', page)
+        _, page = self.request("GET", "/?view=iq_recorder_start", user=self.owner)
+        self.assertRegex(page, r'<form id="iq_recorder_idle" method="post" action="/iq-recorder/start" hidden>')
+        # A read-only account doesn't see it.
+        _, page = self.request("GET", "/?view=eas_alerts", user=self.viewer)
+        self.assertIn('<div id="iq_recording_banner" class="global-status-banner" hidden>', page)
+
+    def test_recordings_start_and_stop_from_plain_forms(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=iq_recorder_start", user=self.owner)
+        self.assertIn('<select id="iq_stream_select" name="stream_id"><option value="s1">WXN99 162.425 MHz</option></select>', page)
+        self.assertIn('<option value="192000" selected>192000 S/s</option>', page)
+        self.assertIn('<div id="iq_spectrum_fields">', page)
+
+        fields = {"iq_recording_mode": "spectrum", "sample_rate": "1024000", "duration_minutes": "abc", "form_token": token}
+        response, page = self.request("POST", "/iq-recorder/start", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+        self.assertEqual(self.title(page), "Error: Enter a number of minutes from 0 to 1440. - New I/Q Recording - NWR Stream Manager")
+        self.assertIn('<option value="1024000" selected>', page)
+        self.assertIn('id="iq_mode_spectrum" name="iq_recording_mode" type="radio" value="spectrum" checked="checked">', page)
+        self.assertIn('value="abc"', page)
+        response, _ = self.request("POST", "/iq-recorder/start", fields={**fields, "form_token": "guess"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+        response, _ = self.request("POST", "/iq-recorder/start", fields={**fields, "duration_minutes": "5"}, cookie=cookie, user=self.viewer)
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.started, [])
+
+        response, _ = self.request("POST", "/iq-recorder/start", fields={**fields, "duration_minutes": "5"}, cookie=cookie, user=self.owner)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/?view=iq_recorder&result=started"))
+        self.assertEqual(self.started, [{"mode": "spectrum", "duration_seconds": 300, "sample_rate": "1024000"}])
+        fields = {"iq_recording_mode": "stream", "stream_id": "s1", "duration_minutes": "", "form_token": token}
+        self.request("POST", "/iq-recorder/start", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(self.started[-1], {"mode": "stream", "duration_seconds": 0, "stream_id": "s1"})
+
+        self.recorder = {"active": True, "status": "recording"}
+        _, page = self.request("GET", "/?view=iq_recorder&result=started", user=self.owner)
+        self.assertEqual(self.title(page), "I/Q recording started. - I/Q Recorder - NWR Stream Manager")
+        response, _ = self.request("POST", "/iq-recorder/stop", fields={"form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/?view=iq_recorder&result=stopped"))
+        self.assertEqual(self.stopped, [True])
+
+        # One that stopped by itself says so when the recorder opens, as the page script does.
+        self.recorder = {"active": False, "status": "completed"}
+        _, page = self.request("GET", "/?view=iq_recorder&result=started", user=self.owner)
+        self.assertEqual(self.title(page), "I/Q recording completed. - I/Q Recorder - NWR Stream Manager")
+
+    def test_a_recording_is_removed_after_a_confirmation(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=iq_recorder&confirm=remove&recording=rec0", user=self.owner)
+        self.assertTrue(self.title(page).startswith("Remove I/Q recording from "))
+        self.assertIn('<form method="post" action="/iq-recordings/remove">', page)
+        self.assertIn('<input type="hidden" name="recording" value="rec0">', page)
+
+        fields = {"recording": "rec0", "form_token": token}
+        response, _ = self.request("POST", "/iq-recordings/remove", fields=fields, cookie=cookie, user=self.viewer)
+        self.assertEqual(response.status, 403)
+        response, page = self.request("POST", "/iq-recordings/remove", fields={"recording": "missing", "form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual(self.title(page), "Error: I/Q recording was not found. - I/Q Recorder - NWR Stream Manager")
+        response, _ = self.request("POST", "/iq-recordings/remove", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=iq_recorder&result=removed")
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "I/Q recording removed. - I/Q Recorder - NWR Stream Manager")
+        self.assertNotIn("recording:rec0", page)
+
+    def test_a_recording_downloads_from_a_plain_form(self) -> None:
+        _, page = self.request("GET", "/?view=iq_recording_download&recording=rec0", user=self.viewer)
+        self.assertTrue(self.title(page).startswith("Download I/Q recording from "))
+        self.assertIn('<form id="iq_download_form" method="get" action="/iq-recordings/download">', page)
+        self.assertIn('<input id="iq_download_recording_id" type="hidden" name="id" value="rec0">', page)
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self.addCleanup(connection.close)
+        authorization = "Basic " + base64.b64encode(b"viewer:password2").decode()
+        connection.request("GET", "/iq-recordings/download?id=rec0&format=s16", headers={"Authorization": authorization})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertIn("attachment", response.getheader("Content-Disposition"))
+        self.assertEqual(len(response.read()), 400)
+
+        response, page = self.request("GET", "/iq-recordings/download?id=rec0&format=wav", user=self.viewer)
+        self.assertEqual(response.status, 400)
+        self.assertTrue(self.title(page).startswith("Error: "))
+        _, page = self.request("GET", "/?view=iq_recording_download&recording=missing", user=self.viewer)
+        self.assertIn('<p id="iq_download_recording_label" class="hint">I/Q recording was not found.</p>', page)
+        self.assertRegex(page, r'<button id="iq_download_recording" type="submit" data-baseline-submit disabled')
 
 
 if __name__ == "__main__":

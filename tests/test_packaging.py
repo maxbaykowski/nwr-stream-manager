@@ -157,7 +157,7 @@ class PackagingTests(unittest.TestCase):
     def test_iq_recorder_defaults_and_preferences_are_in_ui(self) -> None:
         script = self.web_control.INDEX_HTML
 
-        self.assertIn('id="iq_duration_minutes" type="number" min="0" max="1440" step="1" value="0"', script)
+        self.assertIn('id="iq_duration_minutes" name="duration_minutes" type="number" min="0" max="1440" step="1" value="0"', script)
         self.assertIn("const IQ_RECORDER_DEFAULT_SAMPLE_RATE = 192000", script)
         self.assertIn("const IQ_RECORDER_DEFAULT_DURATION_MINUTES = 0", script)
         self.assertIn("nwr-stream-manager:iq-recorder-preferences", script)

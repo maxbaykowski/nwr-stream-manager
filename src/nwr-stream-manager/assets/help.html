@@ -691,6 +691,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li><strong>New recording</strong> records either one stream's station or the entire weather radio band. You can have it stop on its own after a number of minutes.</li>
     <li>While a recording is running, a banner at the top of every page reminds you.</li>
     <li>Recordings can be downloaded in a few formats. Choose whichever one you need.</li>
+    <li>In older browsers, the recording's timer keeps counting on its own wherever the browser can run scripts, and in most of them the file size and storage time remaining update too. With JavaScript turned off, refresh the page to see the latest. Removing a recording asks you to confirm on a page of its own.</li>
   </ul>
   <p><strong>Warning</strong>: Recording and saving I/Q data will absolutely <strong>chew</strong> through disk space like nobody's business if you aren't careful. Keep an eye on the storage space shown while recording.</p>
 </section>
@@ -709,7 +710,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 <section aria-labelledby="older-browsers">
   <h2 id="older-browsers">Older browsers</h2>
   <p>When a page opens, NWR Stream Manager checks what your browser can do. In an up-to-date browser, pages update by themselves and you can listen to streams. In an older browser, such as Internet Explorer, or with JavaScript turned off, pages work as plain pages instead: forms save when you submit them, and Refresh shows the latest information. Messages that pop up at the edge of the screen in an up-to-date browser, such as a new account's temporary password, get a page of their own instead; select <strong>Done</strong> to carry on.</p>
-  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, accounts and passwords, EAS alerts, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
+  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, accounts and passwords, EAS alerts, the I/Q Recorder, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
 </section>
 
 </main>

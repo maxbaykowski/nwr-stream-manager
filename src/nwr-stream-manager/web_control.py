@@ -541,6 +541,15 @@ EAS_ALERT_FORM_PATHS = {"/eas-alerts/delete", "/eas-alerts/remove"}
 EAS_ALERT_VIEWS = {"eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"}
 EAS_ALERTS_PER_PAGE = 25
 EAS_ALERT_AUDIO_TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg"}
+IQ_RECORDER_FORM_PATHS = {"/iq-recorder/start", "/iq-recorder/stop", "/iq-recordings/remove"}
+IQ_RECORDING_DOWNLOAD_PATH = "/iq-recordings/download"
+IQ_RECORDER_VIEWS = {"iq_recorder", "iq_recorder_start", "iq_recording_download"}
+# What a finished form says once it has gone back to the I/Q recorder.
+IQ_RECORDER_RESULTS = {
+    "started": "I/Q recording started.",
+    "stopped": "I/Q recording stopped.",
+    "removed": "I/Q recording removed.",
+}
 
 
 def settings_sections_for(owner: bool) -> list[str]:
@@ -9420,6 +9429,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 "/api/iq-recorder/status",
                 "/api/iq-recordings",
                 "/api/iq-recording-download",
+                IQ_RECORDING_DOWNLOAD_PATH,
                 "/api/logs",
                 "/api/account/me",
             }
@@ -9754,6 +9764,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_index_page(parsed)
         elif path == EAS_ALERT_EXPORT_PATH:
             self._handle_eas_alert_export(parsed)
+        elif path == IQ_RECORDING_DOWNLOAD_PATH:
+            self._handle_iq_recording_download(parsed)
         elif path == "/api/status":
             query = parse_qs(parsed.query)
             account = getattr(self, "current_account", None)
@@ -9966,6 +9978,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return
         if path in EAS_ALERT_FORM_PATHS:
             self._handle_eas_alert_form(path)
+            return
+        if path in IQ_RECORDER_FORM_PATHS:
+            self._handle_iq_recorder_form(path)
             return
         if path == "/api/setup-account":
             try:
@@ -10185,6 +10200,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/iq-recorder/stop":
             try:
+                # Read even though nothing in it is used, so it isn't taken for the next request.
+                self._read_json()
                 response = self.service.stop_iq_recording()
             except Exception as exc:
                 LOG.warning("API I/Q recorder stop failed for %s: %s", self._client_address(), exc)
@@ -10917,6 +10934,12 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_hidden(page, "nav_eas_alerts", not eas_streams)
         if view in EAS_ALERT_VIEWS:
             page, title = self._fill_eas_alert_view(page, view, query, form or {}, eas_streams, read_only, title)
+        recorder = self.service.redacted_iq_recorder_status() if read_only else self.service.iq_recorder_status()
+        page = self._fill_iq_recording_banner(page, recorder)
+        if view in IQ_RECORDER_VIEWS:
+            page, title = self._fill_iq_recorder_view(page, view, query, form or {}, recorder, read_only, title)
+            if view == "iq_recorder" and not result:
+                result = iq_recorder_result(query, recorder)
         title = f"{title} - NWR Stream Manager"
         if result:
             element_id, message, kind = result
@@ -11212,6 +11235,179 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_hidden(page, "eas_delete_form", True)
         title = re.search(r"<title>(.*?)</title>", page).group(1)
         return page_rendering.set_title(page, f"{question} - {html.unescape(title)}")
+
+    def _fill_iq_recording_banner(self, page: str, recorder: dict[str, Any]) -> str:
+        if not recorder.get("active"):
+            return page
+        page = page_rendering.set_hidden(page, "iq_recording_banner", False)
+        # Where the page script can't run, a smaller script keeps the timer going from these.
+        elapsed = float(recorder.get("elapsed_seconds") or 0)
+        page = page_rendering.set_attribute(page, "iq_recording_banner", "data-elapsed-seconds", str(int(elapsed)))
+        page = page_rendering.set_attribute(
+            page, "iq_recording_banner", "data-duration-seconds", str(int(recorder.get("duration_seconds") or 0))
+        )
+        return page_rendering.set_text(page, "iq_recording_banner_elapsed", format_duration_hms(int(elapsed)))
+
+    def _fill_iq_recorder_view(
+        self,
+        page: str,
+        view: str,
+        query: dict[str, str],
+        form: dict[str, str],
+        recorder: dict[str, Any],
+        read_only: bool,
+        title: str,
+    ) -> tuple[str, str]:
+        active = bool(recorder.get("active"))
+        if view == "iq_recorder_start":
+            return self._fill_iq_recorder_start(page, form, active), title
+        recordings = self.service.iq_recordings()["recordings"]
+        if view == "iq_recording_download":
+            recording_id = query.get("recording", "")
+            recording = next((item for item in recordings if item.get("id") == recording_id), None)
+            page = page_rendering.set_attribute(page, "iq_download_recording_id", "value", recording_id)
+            fmt = form.get("format", "cf")
+            page = page_rendering.set_content(
+                page,
+                "iq_download_format",
+                "".join(
+                    f'<option value="{value}"{" selected" if value == fmt else ""}>{label}</option>'
+                    for value, label in (("cf", "Float 32 bit"), ("s16", "Signed 16 bit"), ("u8", "Unsigned 8-bit"))
+                ),
+            )
+            if recording is None:
+                page = page_rendering.set_text(page, "iq_download_recording_label", "I/Q recording was not found.")
+                return page_rendering.set_attribute(page, "iq_download_recording", "disabled", "disabled"), title
+            recorded_at = recording.get("recorded_at") or "Unknown"
+            page = page_rendering.set_text(
+                page,
+                "iq_download_recording_label",
+                f"{recorded_at}; {recording.get('sample_rate') or 0} S/s; {recording.get('frequency_hz') or 0} Hz",
+            )
+            return page, f"Download I/Q recording from {recording.get('recorded_at') or 'unknown time'}"
+        rows = "".join(iq_recording_row_html(recording, read_only) for recording in recordings)
+        if rows:
+            page = page_rendering.set_content(page, "iq-recordings-body", rows)
+        # Only one recording runs at a time.
+        page = page_rendering.set_hidden(page, "open_iq_start_link", read_only or active)
+        page = page_rendering.set_hidden(page, "iq_recorder_active", not active)
+        if active:
+            remaining = recorder.get("storage_remaining_seconds")
+            duration = int(recorder.get("duration_seconds") or 0)
+            elapsed = int(recorder.get("elapsed_seconds") or 0)
+            storage = self.service.storage_monitor.snapshot().get("filesystems") or []
+            summary = storage[0].get("summary") if storage else ""
+            for element_id, text in (
+                ("iq_status", "Recording" if recorder.get("status") == "recording" else str(recorder.get("status", ""))),
+                ("iq_source", iq_recorder_source_text(recorder)),
+                ("iq_active_sample_rate", f"{recorder.get('sample_rate') or 0} S/s"),
+                ("iq_file_size", format_decimal_bytes(recorder.get("bytes_written") or 0)),
+                ("iq_elapsed", format_duration_hms(elapsed)),
+                ("iq_remaining", "calculating" if remaining is None else format_duration_hms(int(remaining))),
+                ("iq_auto_stop_remaining", format_duration_hms(max(0, duration - elapsed))),
+                ("iq_storage", re.sub(r"^Storage: ", "", summary) if summary else "unknown"),
+            ):
+                page = page_rendering.set_text(page, element_id, text)
+            page = page_rendering.set_hidden(page, "iq_auto_stop_metric", duration <= 0)
+        # Removing a recording is confirmed first.
+        recording = next((item for item in recordings if item.get("id") == query.get("recording")), None)
+        if query.get("confirm") != "remove" or recording is None or read_only or recording.get("downloading"):
+            return page, title
+        recorded_at = recording.get("recorded_at") or "unknown time"
+        content = (
+            f"<h3>Remove this I/Q recording?</h3>"
+            f"<p>The I/Q recording from {html.escape(recorded_at)} will be permanently deleted.</p>"
+            f'<form method="post" action="/iq-recordings/remove">{page_rendering.form_token_input(self._form_token())}'
+            f'<input type="hidden" name="recording" value="{html.escape(str(recording.get("id", "")))}">'
+            f'<div class="actions"><button type="submit" class="primary" autofocus>Remove recording</button>'
+            f'<a class="button-link" href="/?view=iq_recorder">Cancel</a></div></form>'
+        )
+        page = page_rendering.set_content(page, "iq_remove_confirm", content)
+        page = page_rendering.set_hidden(page, "iq_remove_confirm", False)
+        return page, f"Remove I/Q recording from {recorded_at}? - {title}"
+
+    def _fill_iq_recorder_start(self, page: str, form: dict[str, str], active: bool) -> str:
+        # Only one recording runs at a time; the page script hides the form the same way.
+        page = page_rendering.set_hidden(page, "iq_recorder_idle", active)
+        mode = "spectrum" if form.get("iq_recording_mode") == IQ_RECORDER_MODE_SPECTRUM else "stream"
+        page = page_rendering.set_attribute(page, "iq_mode_stream", "checked", "checked" if mode == "stream" else None)
+        page = page_rendering.set_attribute(page, "iq_mode_spectrum", "checked", "checked" if mode == "spectrum" else None)
+        # Both sets of settings show; a script, where one runs, shows only the chosen one.
+        page = page_rendering.set_hidden(page, "iq_spectrum_fields", False)
+        streams = [stream for stream in self.service.streams if stream.get("enabled", True) not in (False, "false", 0)]
+        options = []
+        for stream in streams:
+            station = stream.get("station") or {}
+            frequency = f" {station['frequency']} MHz" if station.get("frequency") else ""
+            selected = " selected" if str(stream.get("id", "")) == form.get("stream_id") else ""
+            options.append(
+                f'<option value="{html.escape(str(stream.get("id", "")))}"{selected}>'
+                f'{html.escape(str(station.get("callsign") or "Unknown") + frequency)}</option>'
+            )
+        page = page_rendering.set_content(page, "iq_stream_select", "".join(options))
+        rate = form.get("sample_rate", str(IQ_RECORDER_SAMPLE_RATES[0]))
+        page = page_rendering.set_content(
+            page,
+            "iq_sample_rate",
+            "".join(
+                f'<option value="{value}"{" selected" if str(value) == rate else ""}>{value} S/s</option>'
+                for value in IQ_RECORDER_SAMPLE_RATES
+            ),
+        )
+        if "duration_minutes" in form:
+            page = page_rendering.set_attribute(page, "iq_duration_minutes", "value", form["duration_minutes"])
+        return page
+
+    def _handle_iq_recorder_form(self, path: str) -> None:
+        """Starts and stops I/Q recording and removes recordings, for browsers without the page script."""
+        form: dict[str, str] = {}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            if path == "/iq-recorder/start":
+                account = getattr(self, "current_account", None)
+                self.service.start_iq_recording(
+                    iq_recording_payload_from_form(form), account.id if isinstance(account, AccountRecord) else None
+                )
+                done = "started"
+            elif path == "/iq-recorder/stop":
+                self.service.stop_iq_recording()
+                done = "stopped"
+            else:
+                self.service.remove_iq_recording(form.get("recording", ""))
+                done = "removed"
+        except Exception as exc:
+            if path == "/iq-recorder/start":
+                query, element_id = {"view": "iq_recorder_start"}, "iq-start-result"
+            else:
+                query, element_id = {"view": "iq_recorder"}, "iq-recorder-result"
+            result = (element_id, form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(query, result=result, form=form), HTTPStatus.BAD_REQUEST)
+            return
+        # Sent on to a page of its own, so refreshing it to see the latest doesn't send the form again.
+        self._send_redirect(f"/?view=iq_recorder&result={done}")
+
+    def _handle_iq_recording_download(self, parsed) -> None:
+        query = {name: values[0] for name, values in parse_qs(parsed.query).items()}
+        try:
+            recording, file_path, download_name, download_size = self.service.iq_recording_download_info(
+                query.get("id", ""), query.get("format", "cf")
+            )
+        except Exception as exc:
+            page_query = {"view": "iq_recording_download", "recording": query.get("id", "")}
+            result = ("iq-download-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(page_query, result=result, form=query), HTTPStatus.BAD_REQUEST)
+            return
+        account = getattr(self, "current_account", None)
+        self._send_iq_recording(
+            file_path,
+            download_name,
+            download_size,
+            query.get("format", "cf"),
+            str(recording.get("id", "")),
+            account.id if isinstance(account, AccountRecord) else None,
+        )
 
     def _fill_logs_view(self, page: str, read_only: bool) -> str:
         status = self.service.status(read_only=read_only)
@@ -14126,7 +14322,7 @@ def account_row_html(account: dict[str, Any], requester_id: int, token_input: st
         + cell("Username", name)
         + cell("Account type", html.escape(str(account.get("account_type") or "Administrator")))
         + cell("Last accessed", html.escape(format_account_date(account.get("last_accessed_at"))))
-        + cell("Actions", f'<div class="account-actions">{actions}</div>' if actions else "")
+        + cell("Actions", f'<div class="row-actions">{actions}</div>' if actions else "")
         + "</tr>"
     )
 
@@ -14237,6 +14433,87 @@ def eas_bulk_options_html(kind: str, presets: list[dict[str, Any]], chosen: str)
     )
 
 
+def format_decimal_bytes(value: float) -> str:
+    size = float(value or 0)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    index = 0
+    while size >= 1000 and index < len(units) - 1:
+        size /= 1000
+        index += 1
+    return f"{round(size)} {units[index]}" if index == 0 else f"{size:.1f} {units[index]}"
+
+
+def iq_recorder_source_text(recorder: dict[str, Any]) -> str:
+    if recorder.get("mode") == IQ_RECORDER_MODE_STREAM:
+        return str(recorder.get("stream_label") or "Stream channel")
+    return "Entire spectrum at 162.475 MHz"
+
+
+def iq_recorder_result(query: dict[str, str], recorder: dict[str, Any]) -> tuple[str, str, str] | None:
+    """The message the I/Q recorder shows when it opens, as the page script shows it."""
+    done = query.get("result", "")
+    status = str(recorder.get("status") or "idle")
+    if done in IQ_RECORDER_RESULTS and (done != "started" or recorder.get("active")):
+        return "iq-recorder-result", IQ_RECORDER_RESULTS[done], "success"
+    if recorder.get("active") or status == "idle":
+        return None
+    if recorder.get("error"):
+        return "iq-recorder-result", form_message(str(recorder["error"])), "error"
+    message = "I/Q recording completed." if status == "completed" else "I/Q recording stopped."
+    return "iq-recorder-result", message, "error" if status == "needs-attention" else "success"
+
+
+def iq_recording_payload_from_form(form: dict[str, str]) -> dict[str, Any]:
+    try:
+        minutes = float(form.get("duration_minutes", "").strip() or 0)
+    except ValueError:
+        minutes = -1
+    if not 0 <= minutes <= 1440:
+        raise ValueError("Enter a number of minutes from 0 to 1440.")
+    payload: dict[str, Any] = {
+        "mode": form.get("iq_recording_mode", IQ_RECORDER_MODE_STREAM),
+        "duration_seconds": round(minutes * 60),
+    }
+    if payload["mode"] == IQ_RECORDER_MODE_SPECTRUM:
+        payload["sample_rate"] = form.get("sample_rate", "")
+    elif not form.get("stream_id"):
+        raise ValueError("Select an active stream.")
+    else:
+        payload["stream_id"] = form["stream_id"]
+    return payload
+
+
+def iq_recording_row_html(recording: dict[str, Any], read_only: bool) -> str:
+    """A row of the recordings table, keyed and labelled as the page script makes them."""
+    recorded_at = html.escape(recording.get("recorded_at") or "Unknown")
+    recording_id = str(recording.get("id", ""))
+    labels = ("Time of recording", "Duration", "Sample rate", "Frequency")
+    values = (
+        recording.get("recorded_at") or "Unknown",
+        recording.get("duration") or "0:00",
+        f"{recording.get('sample_rate') or 0} S/s",
+        f"{recording.get('frequency_hz') or 0} Hz",
+    )
+    cells = "".join(
+        f'<td role="cell" data-label="{label}">{html.escape(str(value))}</td>' for label, value in zip(labels, values)
+    )
+    download = urlencode({"view": "iq_recording_download", "recording": recording_id})
+    actions = (
+        f'<a class="button-link" href="/?{html.escape(download)}">Download recording'
+        f'<span class="screen-reader-only"> from {recorded_at}</span></a>'
+    )
+    if not recording.get("downloading") and not read_only:
+        remove = urlencode({"view": "iq_recorder", "confirm": "remove", "recording": recording_id})
+        actions += (
+            f'<a class="button-link" href="/?{html.escape(remove)}">Remove recording'
+            f'<span class="screen-reader-only"> from {recorded_at}</span></a>'
+        )
+    return (
+        f'<tr data-row-key="recording:{html.escape(recording_id)}" role="row">{cells}'
+        f'<td class="menu-cell" role="cell" data-label="Actions"><div class="row-actions">{actions}</div></td></tr>'
+    )
+
+
 def eas_alert_audio_type(alert: dict[str, Any]) -> str:
     return EAS_ALERT_AUDIO_TYPES.get(Path(str(alert.get("file_path", ""))).suffix.lower(), "audio/wav")
 
@@ -14286,8 +14563,8 @@ nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #255
 .js-app .needs-app-inline { display: inline-block; }
 .button-link { display: inline-block; font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; text-decoration: none; }
 .settings-back-form { margin: 0; }
-.account-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.account-actions form { display: inline; margin: 0; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.row-actions form { display: inline; margin: 0; }
 /* Without the page script the More links sit in the bar with the others; with it they're a menu. */
 .nav-more, .nav-more-menu { display: contents; }
 .js-app .nav-more { display: inline; position: relative; }
@@ -14770,11 +15047,13 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_iq_recorder" class="view needs-app" hidden>
+  <div id="view_iq_recorder" class="view" hidden>
     <section>
       <h2>I/Q Recorder</h2>
       <div id="iq-recorder-result" class="message"></div>
+      <div id="iq_remove_confirm" class="baseline-only" hidden></div>
       <div id="iq_recorder_active" hidden>
+        <p id="iq_refresh_hint" class="hint baseline-only">Refresh the page to see the latest status.</p>
         <div class="status" aria-live="off">
           <div class="metric"><b>Status</b><span id="iq_status">Idle</span></div>
           <div class="metric"><b>Source</b><span id="iq_source">None</span></div>
@@ -14785,12 +15064,14 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <div class="metric" id="iq_auto_stop_metric" hidden><b>Automatic stop</b><span id="iq_auto_stop_remaining">0:00</span></div>
           <div class="metric"><b>Storage</b><span id="iq_storage">unknown</span></div>
         </div>
-        <div class="actions">
-          <button id="iq_stop_recording" type="button">Stop recording</button>
-        </div>
+        <form id="iq_stop_form" class="actions" method="post" action="/iq-recorder/stop">
+          __FORM_TOKEN_INPUT__
+          <button id="iq_stop_recording" type="submit" data-baseline-submit>Stop recording</button>
+        </form>
       </div>
       <div class="actions">
-        <button id="open_iq_start" type="button">New recording</button>
+        <button id="open_iq_start" class="needs-app-inline" type="button">New recording</button>
+        <a id="open_iq_start_link" class="baseline-only button-link" href="/?view=iq_recorder_start">New recording</a>
       </div>
       <table class="responsive-table" role="table" aria-label="I/Q recordings">
         <thead role="rowgroup">
@@ -14811,55 +15092,61 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_iq_recorder_start" class="view needs-app" hidden>
+  <div id="view_iq_recorder_start" class="view" hidden>
     <section>
       <h2>New I/Q Recording</h2>
       <div id="iq-start-result" class="message"></div>
-      <div id="iq_recorder_idle">
-        <fieldset>
+      <form id="iq_recorder_idle" method="post" action="/iq-recorder/start">
+        __FORM_TOKEN_INPUT__
+        <fieldset id="iq_mode_choices">
           <legend>Recording source</legend>
-          <label><input id="iq_mode_stream" name="iq_recording_mode" type="radio" value="stream" checked> Record I/Q data from an active stream</label>
-          <label><input id="iq_mode_spectrum" name="iq_recording_mode" type="radio" value="spectrum"> Record the entire spectrum</label>
+          <label class="checkbox-row"><input id="iq_mode_stream" name="iq_recording_mode" type="radio" value="stream" checked> Record I/Q data from an active stream</label>
+          <label class="checkbox-row"><input id="iq_mode_spectrum" name="iq_recording_mode" type="radio" value="spectrum"> Record the entire spectrum</label>
         </fieldset>
         <div id="iq_stream_fields">
           <label>Stream
-            <select id="iq_stream_select"></select>
+            <select id="iq_stream_select" name="stream_id"></select>
           </label>
           <div class="hint">Records the selected stream's 24 kHz channel before FM demodulation.</div>
         </div>
         <div id="iq_spectrum_fields" hidden>
           <label>Sample rate
-            <select id="iq_sample_rate"></select>
+            <select id="iq_sample_rate" name="sample_rate"></select>
           </label>
           <div class="hint">Records the radio spectrum centered at 162.475 MHz.</div>
         </div>
         <label>Stop recording after
-          <input id="iq_duration_minutes" type="number" min="0" max="1440" step="1" value="0" aria-describedby="iq_duration_hint">
+          <input id="iq_duration_minutes" name="duration_minutes" type="number" min="0" max="1440" step="1" value="0" aria-describedby="iq_duration_hint">
         </label>
         <div id="iq_duration_hint" class="hint">Minutes. Set to 0 to record until you manually stop it.</div>
         <div class="actions">
-          <button id="iq_start_recording" type="button">Start recording</button>
-          <button id="cancel_iq_start" type="button">Cancel</button>
+          <button id="iq_start_recording" type="submit" data-baseline-submit>Start recording</button>
+          <button id="cancel_iq_start" class="needs-app-inline" type="button">Cancel</button>
+          <a id="cancel_iq_start_link" class="baseline-only button-link" href="/?view=iq_recorder">Cancel</a>
         </div>
-      </div>
+      </form>
     </section>
   </div>
 
-  <div id="view_iq_recording_download" class="view needs-app" hidden>
+  <div id="view_iq_recording_download" class="view" hidden>
     <section>
       <h2>Download I/Q Recording</h2>
-      <p id="iq_download_recording_label" class="hint"></p>
-      <label>Download format
-        <select id="iq_download_format">
-          <option value="cf">Float 32 bit</option>
-          <option value="s16">Signed 16 bit</option>
-          <option value="u8">Unsigned 8-bit</option>
-        </select>
-      </label>
-      <div class="actions">
-        <button id="iq_download_recording" type="button">Download recording</button>
-        <button id="cancel_iq_download" type="button">Cancel</button>
-      </div>
+      <form id="iq_download_form" method="get" action="/iq-recordings/download">
+        <input id="iq_download_recording_id" type="hidden" name="id" value="">
+        <p id="iq_download_recording_label" class="hint"></p>
+        <label>Download format
+          <select id="iq_download_format" name="format">
+            <option value="cf">Float 32 bit</option>
+            <option value="s16">Signed 16 bit</option>
+            <option value="u8">Unsigned 8-bit</option>
+          </select>
+        </label>
+        <div class="actions">
+          <button id="iq_download_recording" type="submit" data-baseline-submit>Download recording</button>
+          <button id="cancel_iq_download" class="needs-app-inline" type="button">Cancel</button>
+          <a id="cancel_iq_download_link" class="baseline-only button-link" href="/?view=iq_recorder">Cancel</a>
+        </div>
+      </form>
       <div id="iq-download-result" class="message"></div>
     </section>
   </div>
@@ -16029,6 +16316,96 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   }
   manualRange("export");
   manualRange("delete");
+
+  // A new I/Q recording shows the settings for the chosen source.
+  (function () {
+    var choices = byId("iq_mode_choices"), spectrum = byId("iq_mode_spectrum");
+    if (!choices || !spectrum) return;
+    function update() {
+      show(byId("iq_stream_fields"), !spectrum.checked);
+      show(byId("iq_spectrum_fields"), spectrum.checked);
+    }
+    listen(choices, "click", update);
+    update();
+  })();
+
+  // The I/Q recording timer keeps going, and where the browser can ask for it,
+  // so does the rest of the recording's status.
+  (function () {
+    var banner = byId("iq_recording_banner");
+    if (!visible(banner)) return;
+    var loadedElapsed = Number(banner.getAttribute("data-elapsed-seconds")) || 0;
+    var duration = Number(banner.getAttribute("data-duration-seconds")) || 0;
+    var loadedAt = new Date().getTime();
+    var onRecorder = visible(byId("view_iq_recorder"));
+    function setText(id, text) {
+      var element = byId(id);
+      if (!element) return;
+      while (element.firstChild) element.removeChild(element.firstChild);
+      element.appendChild(d.createTextNode(text));
+    }
+    function pad(number) { return number < 10 ? "0" + number : String(number); }
+    function formatDuration(seconds) {
+      seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+      var hours = Math.floor(seconds / 3600), minutes = Math.floor((seconds % 3600) / 60);
+      return (hours ? hours + ":" + pad(minutes) : minutes) + ":" + pad(seconds % 60);
+    }
+    function formatBytes(value) {
+      var bytes = Number(value) || 0, units = ["B", "KB", "MB", "GB", "TB"], index = 0;
+      while (bytes >= 1000 && index < units.length - 1) {
+        bytes /= 1000;
+        index += 1;
+      }
+      return index ? bytes.toFixed(1) + " " + units[index] : Math.round(bytes) + " B";
+    }
+    function showElapsed(elapsed) {
+      setText("iq_recording_banner_elapsed", formatDuration(elapsed));
+      setText("iq_elapsed", formatDuration(elapsed));
+      if (duration > 0) setText("iq_auto_stop_remaining", formatDuration(duration - elapsed));
+    }
+    // Once it has finished, the I/Q recorder opens again to say how it went.
+    function finished() {
+      if (onRecorder) window.location.href = "/?view=iq_recorder";
+      else show(banner, false);
+    }
+    var request = null;
+    try {
+      if (window.XMLHttpRequest && window.JSON) request = new XMLHttpRequest();
+    } catch (error) {}
+    if (!request) {
+      setInterval(function () {
+        var elapsed = loadedElapsed + (new Date().getTime() - loadedAt) / 1000;
+        showElapsed(elapsed);
+        if (duration > 0 && elapsed >= duration + 3) finished();
+      }, 1000);
+      return;
+    }
+    show(byId("iq_refresh_hint"), false);
+    function update() {
+      // The time keeps Internet Explorer from answering with what it asked for last time.
+      request.open("GET", "/api/iq-recorder/status?time=" + new Date().getTime(), true);
+      request.onreadystatechange = function () {
+        if (request.readyState !== 4) return;
+        var status = null;
+        try {
+          if (request.status === 200) status = JSON.parse(request.responseText);
+        } catch (error) {}
+        if (status && !status.active) {
+          finished();
+          return;
+        }
+        if (status) {
+          showElapsed(status.elapsed_seconds);
+          setText("iq_file_size", formatBytes(status.bytes_written));
+          var remaining = status.storage_remaining_seconds;
+          setText("iq_remaining", remaining === null || remaining === undefined ? "calculating" : formatDuration(remaining));
+        }
+        setTimeout(update, 1000);
+      };
+      request.send(null);
+    }
+    setTimeout(update, 1000);
+  })();
 
   var audio = byId("eas_alert_baseline_audio");
   if (!audio || !audio.getAttribute("src")) return;
