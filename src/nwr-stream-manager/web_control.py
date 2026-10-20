@@ -39,7 +39,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 if __package__:
@@ -536,6 +536,11 @@ SETTINGS_PAGE_PARENTS = {
 # The settings that work without the page script.
 BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account"}
 ACCOUNT_FORM_PATHS = {"/accounts/create", "/accounts/reset-password", "/accounts/read-only", "/accounts/delete"}
+EAS_ALERT_EXPORT_PATH = "/eas-alerts/export"
+EAS_ALERT_FORM_PATHS = {"/eas-alerts/delete", "/eas-alerts/remove"}
+EAS_ALERT_VIEWS = {"eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"}
+EAS_ALERTS_PER_PAGE = 25
+EAS_ALERT_AUDIO_TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg"}
 
 
 def settings_sections_for(owner: bool) -> list[str]:
@@ -6867,6 +6872,30 @@ class RtlControlService:
         alert, index, _index_path = self._eas_alert_by_id(stream, alert_id)
         return {"stream": stream_summary, "alert": eas_alert_detail(stream, alert, index)}
 
+    def eas_alert_neighbors(self, stream_id: str, alert_id: str, per_page: int = 25) -> dict[str, Any]:
+        """The alerts either side of one in the alert list, and the list page each is on."""
+        with self.lock:
+            stream = self._stream_locked(stream_id)
+        alerts = load_eas_alert_entries(eas_alert_index_path(self.streams_directory, stream))
+        ordered = sorted(
+            enumerate(alerts),
+            key=lambda item: parse_utc_datetime(str(item[1].get("start_time_utc", ""))),
+            reverse=True,
+        )
+        ids = [eas_alert_id(alert, index) for index, alert in ordered]
+        if alert_id not in ids:
+            raise ValueError("EAS alert was not found")
+        position = ids.index(alert_id)
+
+        def neighbor(offset: int) -> dict[str, Any] | None:
+            target = position + offset
+            if not 0 <= target < len(ids):
+                return None
+            return {"id": ids[target], "page": target // per_page + 1}
+
+        # The list is newest first, so the previous alert is the older one.
+        return {"page": position // per_page + 1, "previous": neighbor(1), "next": neighbor(-1)}
+
     def eas_alert_audio_path(self, stream_id: str, alert_id: str) -> tuple[Path, str]:
         with self.lock:
             stream = self._stream_locked(stream_id)
@@ -9383,6 +9412,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 "/api/eas-alert-export",
                 "/api/eas-alert",
                 "/api/eas-alert-audio",
+                EAS_ALERT_EXPORT_PATH,
                 "/api/live-audio",
                 "/api/settings-events",
                 "/api/monitor/status",
@@ -9722,6 +9752,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self.end_headers()
         elif path == "/":
             self._send_index_page(parsed)
+        elif path == EAS_ALERT_EXPORT_PATH:
+            self._handle_eas_alert_export(parsed)
         elif path == "/api/status":
             query = parse_qs(parsed.query)
             account = getattr(self, "current_account", None)
@@ -9931,6 +9963,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             return
         if path in ACCOUNT_FORM_PATHS:
             self._handle_account_form(path)
+            return
+        if path in EAS_ALERT_FORM_PATHS:
+            self._handle_eas_alert_form(path)
             return
         if path == "/api/setup-account":
             try:
@@ -10878,6 +10913,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             page = page_rendering.set_attribute(page, "change_password_cancel_link", "href", "/")
         if view == "settings" and isinstance(account, AccountRecord):
             page, title = self._fill_settings_view(page, account, query, form or {})
+        eas_streams = self.service.eas_alert_streams()["streams"]
+        page = page_rendering.set_hidden(page, "nav_eas_alerts", not eas_streams)
+        if view in EAS_ALERT_VIEWS:
+            page, title = self._fill_eas_alert_view(page, view, query, form or {}, eas_streams, read_only, title)
         title = f"{title} - NWR Stream Manager"
         if result:
             element_id, message, kind = result
@@ -10946,6 +10985,233 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         content, title = account_confirmation_html(confirm, target, token_input)
         page = page_rendering.set_content(page, "account_confirm", content)
         return page_rendering.set_hidden(page, "account_confirm", False), title
+
+    def _fill_eas_alert_view(
+        self,
+        page: str,
+        view: str,
+        query: dict[str, str],
+        form: dict[str, str],
+        streams: list[dict[str, Any]],
+        read_only: bool,
+        title: str,
+    ) -> tuple[str, str]:
+        stream = next((item for item in streams if item.get("id") == query.get("stream")), streams[0] if streams else None)
+        stream_id = str(stream.get("id", "")) if stream else ""
+        try:
+            list_page = max(1, int(query.get("page") or 1))
+        except ValueError:
+            list_page = 1
+        options = "".join(
+            f'<option value="{html.escape(str(item.get("id", "")))}"{" selected" if item is stream else ""}>'
+            f"{html.escape(eas_alert_stream_label(item))}</option>"
+            for item in streams
+        )
+        page = page_rendering.set_content(page, "eas_alert_stream", options)
+        list_link = eas_alert_route("eas_alerts", stream=stream_id, page=list_page)
+        if view == "eas_alerts":
+            return self._fill_eas_alert_list(page, stream_id, list_page, read_only), title
+        if stream is None:
+            return page, title
+        if view in {"eas_alert_export", "eas_alert_delete"}:
+            kind = "export" if view == "eas_alert_export" else "delete"
+            bulk = self.service.eas_alert_bulk_options(stream_id)
+            presets = bulk.get(f"{kind}_presets") or []
+            page = page_rendering.set_text(page, f"eas_{kind}_stream_label", f"Stream: {eas_alert_stream_label(stream)}")
+            page = page_rendering.set_attribute(page, f"eas_{kind}_stream", "value", stream_id)
+            page = page_rendering.set_attribute(page, f"eas_{kind}_page", "value", str(list_page))
+            page = page_rendering.set_content(
+                page, f"eas_{kind}_options", eas_bulk_options_html(kind, presets, form.get(f"eas_{kind}_mode", ""))
+            )
+            # The page script shows the date range only once it's chosen.
+            now = bulk.get("now") or local_datetime_parts(datetime.now().astimezone())
+            start_default = local_datetime_parts(
+                datetime(now["year"], now["month"], now["day"], now["hour"], now["minute"]) - timedelta(hours=24)
+            )
+            end = now if form.get(f"eas_{kind}_now") else None
+            manual = eas_range_control_html(
+                kind, "start", "Start", eas_range_values(form, kind, "start", start_default), int(now["year"])
+            ) + eas_range_control_html(
+                kind, "end", "End", eas_range_values({} if end else form, kind, "end", now), int(now["year"])
+            )
+            page = page_rendering.set_content(page, f"eas_{kind}_manual", manual)
+            page = page_rendering.set_hidden(page, f"eas_{kind}_manual", False)
+            page = page_rendering.set_attribute(page, f"cancel_eas_{kind}_link", "href", list_link)
+            if not int(bulk.get("total") or 0):
+                page = page_rendering.set_attribute(page, f"eas_{kind}_alerts", "disabled", "disabled")
+            return page, title
+        return self._fill_eas_alert_detail(page, stream_id, query, list_page, list_link, read_only, title)
+
+    def _fill_eas_alert_list(self, page: str, stream_id: str, list_page: int, read_only: bool) -> str:
+        if not stream_id:
+            empty = '<div class="hint" data-row-key="empty">No streams record EAS alerts.</div>'
+            return page_rendering.set_content(page, "eas-alert-list", empty)
+        data = self.service.eas_alerts(stream_id, list_page, EAS_ALERTS_PER_PAGE)
+        list_page, total_pages = int(data["page"]), int(data["total_pages"])
+        rows = [
+            f'<a class="stream-item" data-row-key="alert:{html.escape(alert["id"])}" data-alert-id="{html.escape(alert["id"])}" '
+            f'href="{html.escape(eas_alert_route("eas_alert_detail", stream=stream_id, alert=alert["id"], page=list_page))}">'
+            f'{html.escape(alert.get("summary") or "Unknown EAS alert")}</a>'
+            for alert in data["alerts"]
+        ]
+        empty = '<div class="hint" data-row-key="empty">No EAS alerts recorded for this stream.</div>'
+        page = page_rendering.set_content(page, "eas-alert-list", "".join(rows) or empty)
+        page = page_rendering.set_text(page, "eas_alert_page", f"Page {list_page} of {total_pages}")
+        for name, target, available in (("prev", list_page - 1, list_page > 1), ("next", list_page + 1, list_page < total_pages)):
+            page = page_rendering.set_attribute(page, f"eas_alert_{name}", "disabled", None if available else "disabled")
+            page = page_rendering.set_hidden(page, f"eas_alert_page_{name}_link", not available)
+            page = page_rendering.set_attribute(
+                page, f"eas_alert_page_{name}_link", "href", eas_alert_route("eas_alerts", stream=stream_id, page=target)
+            )
+        for name in ("export", "delete"):
+            page = page_rendering.set_attribute(
+                page, f"open_eas_{name}_link", "href", eas_alert_route(f"eas_alert_{name}", stream=stream_id, page=list_page)
+            )
+        return page_rendering.set_hidden(page, "open_eas_delete_link", read_only)
+
+    def _fill_eas_alert_detail(
+        self,
+        page: str,
+        stream_id: str,
+        query: dict[str, str],
+        list_page: int,
+        list_link: str,
+        read_only: bool,
+        title: str,
+    ) -> tuple[str, str]:
+        alert_id = query.get("alert", "")
+        page = page_rendering.set_attribute(page, "back_to_eas_alerts", "href", list_link)
+        try:
+            alert = self.service.eas_alert_detail(stream_id, alert_id)["alert"]
+            neighbors = self.service.eas_alert_neighbors(stream_id, alert_id, EAS_ALERTS_PER_PAGE)
+        except ValueError:
+            page = page_rendering.set_hidden(page, "eas_alert_player", True)
+            page = page_rendering.set_hidden(page, "eas_alert_download", True)
+            page = page_rendering.set_hidden(page, "remove_eas_alert_link", True)
+            message = "EAS alert was not found."
+            page = page_rendering.set_text(page, "eas-alert-detail-result", message)
+            page = page_rendering.set_attribute(page, "eas-alert-detail-result", "class", "message error")
+            page = page_rendering.set_attribute(page, "eas-alert-detail-result", "role", "alert")
+            return page, f"Error: {message} - {title}"
+        event = alert.get("event_type") or "EAS alert"
+        page = page_rendering.set_text(page, "eas_alert_detail_title", event)
+        page = page_rendering.set_text(page, "eas_detail_event", alert.get("event_type") or "Unknown event")
+        page = page_rendering.set_text(page, "eas_detail_areas", ", ".join(alert.get("areas") or []) or "Unknown area")
+        page = page_rendering.set_text(page, "eas_detail_issued", alert.get("issued_at") or "Unknown")
+        page = page_rendering.set_text(page, "eas_detail_expires", alert.get("expires_at") or "Unknown")
+        page = page_rendering.set_attribute(page, "eas_alert_baseline_audio", "src", alert.get("audio_url") or "")
+        page = page_rendering.set_attribute(page, "eas_alert_baseline_audio", "data-audio-type", alert.get("audio_type") or "")
+        page = page_rendering.set_attribute(page, "eas_alert_download", "href", alert.get("download_url") or "#")
+        for name in ("previous", "next"):
+            target = neighbors.get(name)
+            page = page_rendering.set_hidden(page, f"eas_alert_{name}_link", target is None)
+            if target:
+                link = eas_alert_route("eas_alert_detail", stream=stream_id, alert=target["id"], page=target["page"])
+                page = page_rendering.set_attribute(page, f"eas_alert_{name}_link", "href", link)
+        detail_link = eas_alert_route("eas_alert_detail", stream=stream_id, alert=alert_id, page=list_page)
+        page = page_rendering.set_hidden(page, "remove_eas_alert_link", read_only)
+        page = page_rendering.set_attribute(page, "remove_eas_alert_link", "href", f"{detail_link}&confirm=remove")
+        title = f"Details for alert {event} issued on {alert.get('issued_at') or 'an unknown time'}"
+        if query.get("confirm") == "remove" and not read_only:
+            question = "Remove this EAS alert and its audio file?"
+            content = (
+                f"<h3>{question}</h3>"
+                f'<form method="post" action="/eas-alerts/remove">{page_rendering.form_token_input(self._form_token())}'
+                f'<input type="hidden" name="stream" value="{html.escape(stream_id)}">'
+                f'<input type="hidden" name="alert" value="{html.escape(alert_id)}">'
+                f'<input type="hidden" name="page" value="{list_page}">'
+                f'<div class="actions"><button type="submit" class="primary" autofocus>Remove alert</button>'
+                f'<a class="button-link" href="{html.escape(detail_link)}">Cancel</a></div></form>'
+            )
+            page = page_rendering.set_content(page, "eas_alert_remove_confirm", content)
+            page = page_rendering.set_hidden(page, "eas_alert_remove_confirm", False)
+            title = f"{question} - {title}"
+        return page, title
+
+    def _handle_eas_alert_export(self, parsed) -> None:
+        """Exports alerts for browsers without the page script, which download them from a form."""
+        query = {name: values[0] for name, values in parse_qs(parsed.query).items()}
+        query["view"] = "eas_alert_export"
+        if not query.get("eas_export_now"):
+            try:
+                zip_path, download_name = self.service.eas_alert_export_zip(*self._eas_alert_range(query, "export"))
+            except Exception as exc:
+                result = ("eas-export-result", form_message(str(exc)), "error")
+                self._send_page(self._render_index_page(query, result=result, form=query), HTTPStatus.BAD_REQUEST)
+                return
+            self._send_file(zip_path, download_name, True, delete_after=True)
+            return
+        self._send_page(self._render_index_page(query, form=query))
+
+    def _eas_alert_range(self, form: dict[str, str], kind: str) -> tuple[str, str, str, str]:
+        """The stream and range of alerts a form chose, as the page script sends them."""
+        mode = form.get(f"eas_{kind}_mode", "")
+        if mode != "manual":
+            return form.get("stream", ""), mode, "", ""
+        now = local_datetime_parts(datetime.now().astimezone())
+        start = eas_range_datetime(eas_range_values(form, kind, "start", now))
+        end = eas_range_datetime(eas_range_values(form, kind, "end", now))
+        return form.get("stream", ""), mode, start, end
+
+    def _handle_eas_alert_form(self, path: str) -> None:
+        """Deletes alerts for browsers without the page script."""
+        form: dict[str, str] = {}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            list_query = {"view": "eas_alerts", "stream": form.get("stream", ""), "page": form.get("page", "1")}
+            if path == "/eas-alerts/remove":
+                self.service.remove_eas_alert(form.get("stream", ""), form.get("alert", ""))
+                self._send_page(self._render_index_page(list_query, result=("eas-alert-result", "Alert removed.", "success")))
+                return
+            delete_query = {"view": "eas_alert_delete", "stream": form.get("stream", ""), "page": form.get("page", "1")}
+            if form.get("eas_delete_now"):
+                self._send_page(self._render_index_page(delete_query, form=form))
+                return
+            stream_id, mode, start, end = self._eas_alert_range(form, "delete")
+            if form.get("confirmed") != "1":
+                count = int(self.service.eas_alert_range_count(stream_id, mode, start, end).get("count") or 0)
+                if not count:
+                    raise ValueError("No alerts were issued during this time.")
+                self._send_page(self._render_eas_delete_confirmation(delete_query, form, count))
+                return
+            removed = int(self.service.remove_eas_alert_range(stream_id, mode, start, end).get("count") or 0)
+        except Exception as exc:
+            if path == "/eas-alerts/remove":
+                query = {"view": "eas_alert_detail", "stream": form.get("stream", ""), "alert": form.get("alert", ""), "page": form.get("page", "1")}
+                result = ("eas-alert-detail-result", form_message(str(exc)), "error")
+            else:
+                query = {"view": "eas_alert_delete", "stream": form.get("stream", ""), "page": form.get("page", "1")}
+                result = ("eas-delete-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(query, result=result, form=form), HTTPStatus.BAD_REQUEST)
+            return
+        message = f"{removed} alert{'' if removed == 1 else 's'} deleted."
+        self._send_page(self._render_index_page(list_query, result=("eas-alert-result", message, "success")))
+
+    def _render_eas_delete_confirmation(self, query: dict[str, str], form: dict[str, str], count: int) -> str:
+        """Asks before deleting alerts; the page script asks in a dialog."""
+        page = self._render_index_page(query, form=form)
+        question = f"Delete {count} alert{'' if count == 1 else 's'}?"
+        kept = "".join(
+            f'<input type="hidden" name="{html.escape(name)}" value="{html.escape(value)}">'
+            for name, value in form.items()
+            if name.startswith("eas_delete_") and name != "eas_delete_now" or name in {"stream", "page"}
+        )
+        list_link = eas_alert_route("eas_alerts", stream=query.get("stream", ""), page=query.get("page", "1"))
+        content = (
+            f"<h3>{html.escape(question)}</h3>"
+            f"<p>{count} alert{'' if count == 1 else 's'} and their audio files will be permanently deleted.</p>"
+            f'<form method="post" action="/eas-alerts/delete">{page_rendering.form_token_input(self._form_token())}{kept}'
+            f'<input type="hidden" name="confirmed" value="1">'
+            f'<div class="actions"><button type="submit" class="primary" autofocus>Delete alerts</button>'
+            f'<a class="button-link" href="{html.escape(list_link)}">Cancel</a></div></form>'
+        )
+        page = page_rendering.set_content(page, "eas_delete_confirm", content)
+        page = page_rendering.set_hidden(page, "eas_delete_confirm", False)
+        page = page_rendering.set_hidden(page, "eas_delete_form", True)
+        title = re.search(r"<title>(.*?)</title>", page).group(1)
+        return page_rendering.set_title(page, f"{question} - {html.unescape(title)}")
 
     def _fill_logs_view(self, page: str, read_only: bool) -> str:
         status = self.service.status(read_only=read_only)
@@ -11288,6 +11554,7 @@ def eas_alert_detail(stream: dict[str, Any], alert: dict[str, Any], index: int) 
         "expires_at": format_local_datetime(expires_at),
         "audio_url": f"/api/eas-alert-audio?stream_id={stream.get('id', '')}&alert_id={eas_alert_id(alert, index)}",
         "download_url": f"/api/eas-alert-audio?stream_id={stream.get('id', '')}&alert_id={eas_alert_id(alert, index)}&download=1",
+        "audio_type": eas_alert_audio_type(alert),
     }
 
 
@@ -13886,6 +14153,94 @@ def account_confirmation_html(kind: str, account: dict[str, Any], token_input: s
     return content, question
 
 
+def eas_alert_route(view: str, **params: Any) -> str:
+    """A link to one of the EAS alert pages, as the page script makes them."""
+    query = {"view": view}
+    query.update({name: str(value) for name, value in params.items() if value})
+    return "/?" + urlencode(query)
+
+
+def eas_alert_stream_label(stream: dict[str, Any]) -> str:
+    frequency = f" {stream.get('frequency')} MHz" if stream.get("frequency") else ""
+    count = int(stream.get("alert_count") or 0)
+    return f"{stream.get('callsign') or 'Unknown'}{frequency} ({count} alert{'' if count == 1 else 's'})"
+
+
+EAS_RANGE_PARTS = ("month", "day", "year", "hour", "minute", "ampm")
+
+
+def eas_range_values(form: dict[str, str], kind: str, edge: str, default: dict[str, int]) -> dict[str, str]:
+    """A date and time chosen for a range of alerts, as the form's lists have it."""
+    hour = int(default["hour"])
+    values = {
+        "month": str(default["month"]),
+        "day": str(default["day"]),
+        "year": str(default["year"]),
+        "hour": str(hour % 12 or 12),
+        "minute": str(default["minute"]),
+        "ampm": "PM" if hour >= 12 else "AM",
+    }
+    for part in EAS_RANGE_PARTS:
+        value = form.get(f"eas_{kind}_{edge}_{part}", "")
+        if value:
+            values[part] = value
+    return values
+
+
+def eas_range_datetime(values: dict[str, str]) -> str:
+    """The date and time in a range's lists, written as the page script sends it."""
+    try:
+        hour = int(values["hour"])
+        month, day, year, minute = (int(values[part]) for part in ("month", "day", "year", "minute"))
+    except (KeyError, ValueError):
+        return "invalid"
+    if values.get("ampm") == "AM" and hour == 12:
+        hour = 0
+    if values.get("ampm") == "PM" and hour != 12:
+        hour += 12
+    return f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:00"
+
+
+def eas_range_control_html(kind: str, edge: str, legend: str, values: dict[str, str], current_year: int) -> str:
+    """The lists for one end of a range of alerts, laid out as the page script lays them out."""
+    choices = {
+        "month": [(str(number), str(number)) for number in range(1, 13)],
+        "day": [(str(number), str(number)) for number in range(1, 32)],
+        "year": [(str(year), str(year)) for year in range(current_year, current_year - 11, -1)],
+        "hour": [(str(number), str(number)) for number in range(1, 13)],
+        "minute": [(str(number), f"{number:02d}") for number in range(60)],
+        "ampm": [("AM", "AM"), ("PM", "PM")],
+    }
+    labels = {"month": "Month", "day": "Day", "year": "Year", "hour": "Hour", "minute": "Minute", "ampm": "AM/PM"}
+    fields = []
+    for part in EAS_RANGE_PARTS:
+        name = f"eas_{kind}_{edge}_{part}"
+        options = "".join(
+            f'<option value="{value}"{" selected" if value == values.get(part) else ""}>{label}</option>'
+            for value, label in choices[part]
+        )
+        fields.append(f'<label>{labels[part]}<select id="{name}" name="{name}">{options}</select></label>')
+    now = f'<input type="submit" name="eas_{kind}_now" value="Now">' if edge == "end" else ""
+    return f'<fieldset><legend>{legend}</legend><div class="grid">{"".join(fields)}</div>{now}</fieldset>'
+
+
+def eas_bulk_options_html(kind: str, presets: list[dict[str, Any]], chosen: str) -> str:
+    """The choices of which alerts to export or delete, as the page script lists them."""
+    choices = [(str(preset.get("id", "")), f"{preset.get('label', '')} ({preset.get('count', 0)})") for preset in presets]
+    choices.append(("manual", "Manually select date range"))
+    if chosen not in {value for value, _label in choices}:
+        chosen = choices[0][0]
+    return "".join(
+        f'<label class="checkbox-row"><input type="radio" name="eas_{kind}_mode" value="{html.escape(value)}"'
+        f'{" checked" if value == chosen else ""}> {html.escape(label)}</label>'
+        for value, label in choices
+    )
+
+
+def eas_alert_audio_type(alert: dict[str, Any]) -> str:
+    return EAS_ALERT_AUDIO_TYPES.get(Path(str(alert.get("file_path", ""))).suffix.lower(), "audio/wav")
+
+
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -15497,90 +15852,127 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_eas_alerts" class="view needs-app" hidden>
+  <div id="view_eas_alerts" class="view" hidden>
     <section>
       <h2>EAS alerts</h2>
       <p>View and manage recorded EAS alerts.</p>
-      <label>Stream
-        <select id="eas_alert_stream"></select>
-      </label>
+      <form id="eas_alert_stream_form" method="get" action="/">
+        <input type="hidden" name="view" value="eas_alerts">
+        <label>Stream
+          <select id="eas_alert_stream" name="stream"></select>
+        </label>
+        <div class="actions baseline-only">
+          <button id="show_eas_alert_stream" type="submit" data-baseline-submit>Show alerts</button>
+        </div>
+      </form>
       <div class="actions">
-        <button id="open_eas_export" type="button">Export alerts</button>
-        <button id="open_eas_delete" type="button">Delete alerts</button>
+        <button id="open_eas_export" type="button" class="needs-app-inline">Export alerts</button>
+        <button id="open_eas_delete" type="button" class="needs-app-inline">Delete alerts</button>
+        <a id="open_eas_export_link" class="baseline-only button-link" href="/?view=eas_alert_export">Export alerts</a>
+        <a id="open_eas_delete_link" class="baseline-only button-link" href="/?view=eas_alert_delete">Delete alerts</a>
       </div>
       <div id="eas-alert-list" class="stream-list" aria-live="off"></div>
       <div class="actions">
-        <button id="eas_alert_prev" type="button">Previous</button>
+        <button id="eas_alert_prev" type="button" class="needs-app-inline">Previous</button>
+        <a id="eas_alert_page_prev_link" class="baseline-only button-link" href="/?view=eas_alerts" hidden>Previous page</a>
         <span id="eas_alert_page" class="hint">Page 1 of 1</span>
-        <button id="eas_alert_next" type="button">Next</button>
+        <button id="eas_alert_next" type="button" class="needs-app-inline">Next</button>
+        <a id="eas_alert_page_next_link" class="baseline-only button-link" href="/?view=eas_alerts" hidden>Next page</a>
       </div>
       <div id="eas-alert-result" class="message"></div>
     </section>
   </div>
 
-  <div id="view_eas_alert_export" class="view needs-app" hidden>
+  <div id="view_eas_alert_export" class="view" hidden>
     <section>
       <h2>Export alerts</h2>
-      <p id="eas_export_stream_label" class="hint"></p>
-      <fieldset>
-        <legend>Choose alerts to export</legend>
-        <div id="eas_export_options"></div>
-        <div id="eas_export_manual" hidden></div>
-      </fieldset>
-      <div class="actions">
-        <button id="eas_export_alerts" type="button">Export alerts</button>
-        <button id="cancel_eas_export" type="button">Cancel</button>
-      </div>
+      <form id="eas_export_form" method="get" action="/eas-alerts/export">
+        <input id="eas_export_stream" type="hidden" name="stream" value="">
+        <input id="eas_export_page" type="hidden" name="page" value="1">
+        <p id="eas_export_stream_label" class="hint"></p>
+        <fieldset>
+          <legend>Choose alerts to export</legend>
+          <div id="eas_export_options"></div>
+          <div id="eas_export_manual" hidden></div>
+        </fieldset>
+        <div class="actions">
+          <button id="eas_export_alerts" type="submit" data-baseline-submit>Export alerts</button>
+          <button id="cancel_eas_export" type="button" class="needs-app-inline">Cancel</button>
+          <a id="cancel_eas_export_link" class="baseline-only button-link" href="/?view=eas_alerts">Cancel</a>
+        </div>
+      </form>
       <div id="eas-export-result" class="message"></div>
     </section>
   </div>
 
-  <div id="view_eas_alert_delete" class="view needs-app" hidden>
+  <div id="view_eas_alert_delete" class="view" hidden>
     <section>
       <h2>Delete alerts</h2>
-      <p id="eas_delete_stream_label" class="hint"></p>
-      <fieldset>
-        <legend>Choose alerts to delete</legend>
-        <div id="eas_delete_options"></div>
-        <div id="eas_delete_manual" hidden></div>
-      </fieldset>
-      <div class="actions">
-        <button id="eas_delete_alerts" type="button">Delete alerts</button>
-        <button id="cancel_eas_delete" type="button">Cancel</button>
-      </div>
+      <div id="eas_delete_confirm" class="baseline-only" hidden></div>
+      <form id="eas_delete_form" method="post" action="/eas-alerts/delete">
+        __FORM_TOKEN_INPUT__
+        <input id="eas_delete_stream" type="hidden" name="stream" value="">
+        <input id="eas_delete_page" type="hidden" name="page" value="1">
+        <p id="eas_delete_stream_label" class="hint"></p>
+        <fieldset>
+          <legend>Choose alerts to delete</legend>
+          <div id="eas_delete_options"></div>
+          <div id="eas_delete_manual" hidden></div>
+        </fieldset>
+        <div class="actions">
+          <button id="eas_delete_alerts" type="submit" data-baseline-submit>Delete alerts</button>
+          <button id="cancel_eas_delete" type="button" class="needs-app-inline">Cancel</button>
+          <a id="cancel_eas_delete_link" class="baseline-only button-link" href="/?view=eas_alerts">Cancel</a>
+        </div>
+      </form>
       <div id="eas-delete-result" class="message"></div>
     </section>
   </div>
 
-  <div id="view_eas_alert_detail" class="view needs-app" hidden>
+  <div id="view_eas_alert_detail" class="view" hidden>
     <section>
       <h2 id="eas_alert_detail_title">EAS alert</h2>
+      <div id="eas_alert_remove_confirm" class="baseline-only" hidden></div>
       <dl class="details-list">
         <dt>Event type</dt><dd id="eas_detail_event">Unknown</dd>
         <dt>Areas impacted</dt><dd id="eas_detail_areas">Unknown</dd>
         <dt>Issued</dt><dd id="eas_detail_issued">Unknown</dd>
         <dt>Expires</dt><dd id="eas_detail_expires">Unknown</dd>
       </dl>
-      <audio id="eas_alert_audio" preload="metadata"></audio>
-      <div class="receiver-controls" aria-label="EAS alert playback controls">
-        <button id="eas_alert_detail_previous" class="receiver-control-button" type="button" aria-label="Previous alert" title="Previous alert">
-          <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M19 5v14L8 12l11-7zM6 5h2v14H6V5z"></path></svg>
-        </button>
-        <button id="eas_alert_detail_play_pause" class="receiver-control-button" type="button" aria-label="Play" title="Play">
-          <svg id="eas_alert_detail_play_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M8 5v14l11-7L8 5z"></path></svg>
-          <svg id="eas_alert_detail_pause_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false" hidden><path d="M7 5h4v14H7V5zm6 0h4v14h-4V5z"></path></svg>
-        </button>
-        <button id="eas_alert_detail_next" class="receiver-control-button" type="button" aria-label="Next alert" title="Next alert">
-          <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M5 19V5l11 7-11 7zm11-14h2v14h-2V5z"></path></svg>
-        </button>
+      <p id="eas_alert_cannot_play" hidden>This browser can't play alerts. To listen to this one, select Download alert.</p>
+      <div id="eas_alert_player" class="baseline-only">
+        <audio id="eas_alert_baseline_audio" controls preload="none"></audio>
+        <!-- Not fallback content: Internet Explorer 9 to 11 read that to screen readers while the player works. -->
+        <!--[if lt IE 9]><p>This browser can't play alerts. To listen to this one, select Download alert.</p><![endif]-->
+        <label id="eas_alert_baseline_autoplay_label" class="checkbox-row" hidden><input id="eas_alert_baseline_autoplay" type="checkbox"> Autoplay</label>
       </div>
-      <label class="desktop-volume-control">Volume
-        <input id="eas_alert_volume" type="range" min="0" max="100" step="1" value="100">
-      </label>
-      <label class="checkbox-row"><input id="eas_alert_autoplay" type="checkbox"> Autoplay</label>
+      <audio id="eas_alert_audio" preload="metadata"></audio>
+      <div id="eas_alert_app_player" class="needs-app">
+        <div class="receiver-controls" aria-label="EAS alert playback controls">
+          <button id="eas_alert_detail_previous" class="receiver-control-button" type="button" aria-label="Previous alert" title="Previous alert">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M19 5v14L8 12l11-7zM6 5h2v14H6V5z"></path></svg>
+          </button>
+          <button id="eas_alert_detail_play_pause" class="receiver-control-button" type="button" aria-label="Play" title="Play">
+            <svg id="eas_alert_detail_play_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M8 5v14l11-7L8 5z"></path></svg>
+            <svg id="eas_alert_detail_pause_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false" hidden><path d="M7 5h4v14H7V5zm6 0h4v14h-4V5z"></path></svg>
+          </button>
+          <button id="eas_alert_detail_next" class="receiver-control-button" type="button" aria-label="Next alert" title="Next alert">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M5 19V5l11 7-11 7zm11-14h2v14h-2V5z"></path></svg>
+          </button>
+        </div>
+        <label class="desktop-volume-control">Volume
+          <input id="eas_alert_volume" type="range" min="0" max="100" step="1" value="100">
+        </label>
+        <label class="checkbox-row"><input id="eas_alert_autoplay" type="checkbox"> Autoplay</label>
+      </div>
+      <div class="actions baseline-only">
+        <a id="eas_alert_previous_link" class="button-link" href="/?view=eas_alerts" hidden>Previous alert</a>
+        <a id="eas_alert_next_link" class="button-link" href="/?view=eas_alerts" hidden>Next alert</a>
+      </div>
       <div class="actions">
         <a id="eas_alert_download" role="button" href="#">Download alert</a>
-        <button id="remove_eas_alert" type="button">Remove alert</button>
+        <button id="remove_eas_alert" type="button" class="needs-app-inline">Remove alert</button>
+        <a id="remove_eas_alert_link" class="baseline-only button-link" href="/?view=eas_alerts">Remove alert</a>
         <a id="back_to_eas_alerts" href="/?view=eas_alerts">Alert list</a>
       </div>
       <div id="eas-alert-detail-result" class="message"></div>
@@ -15594,6 +15986,94 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
   <p id="footer_version">NWR Stream Manager version __APP_VERSION__</p>
 </footer>
+<script>
+// For browsers that can't run the page script but can run this: alert playback
+// that works as closely to the page script's as the browser allows.
+(function () {
+  var d = document;
+  if (/(^| )js-app( |$)/.test(d.documentElement.className) || !d.getElementById) return;
+  function byId(id) { return d.getElementById(id); }
+  function show(element, visible) {
+    if (!element) return;
+    if (visible) {
+      element.removeAttribute("hidden");
+      element.className = element.className.replace(/(^| )old-ie-hidden( |$)/, " ");
+      element.style.display = "";
+    } else {
+      element.setAttribute("hidden", "hidden");
+      element.style.display = "none";
+    }
+  }
+  function listen(element, name, handler) {
+    if (element.addEventListener) element.addEventListener(name, handler, false);
+    else if (element.attachEvent) element.attachEvent("on" + name, handler);
+  }
+  function visible(element) {
+    if (!element || element.style.display === "none") return false;
+    return element.hasAttribute ? !element.hasAttribute("hidden") : element.getAttribute("hidden") === null;
+  }
+
+  // A date range is only shown once it's chosen.
+  function manualRange(kind) {
+    var choices = byId("eas_" + kind + "_options"), range = byId("eas_" + kind + "_manual");
+    if (!choices || !range) return;
+    function update() {
+      var inputs = choices.getElementsByTagName("input"), chosen = false;
+      for (var i = 0; i < inputs.length; i++) {
+        if (inputs[i].value === "manual" && inputs[i].checked) chosen = true;
+      }
+      show(range, chosen);
+    }
+    listen(choices, "click", update);
+    update();
+  }
+  manualRange("export");
+  manualRange("delete");
+
+  var audio = byId("eas_alert_baseline_audio");
+  if (!audio || !audio.getAttribute("src")) return;
+  var type = audio.getAttribute("data-audio-type") || "";
+  if (!audio.canPlayType || !type || !audio.canPlayType(type)) {
+    show(byId("eas_alert_player"), false);
+    show(byId("eas_alert_cannot_play"), true);
+    return;
+  }
+  var search = window.location.search;
+  var autoplay = byId("eas_alert_baseline_autoplay");
+  show(byId("eas_alert_baseline_autoplay_label"), true);
+  autoplay.checked = /[?&]autoplay=1(&|$)/.test(search);
+  var volume = /[?&]volume=([0-9]+)(&|$)/.exec(search);
+  if (volume) {
+    try { audio.volume = Math.min(100, Number(volume[1])) / 100; } catch (error) {}
+  }
+  // Another alert keeps playing, the autoplay choice and the volume.
+  function carry(href, play) {
+    href = href.replace(/&(autoplay|play|volume)=[^&]*/g, "");
+    if (autoplay.checked) href += "&autoplay=1";
+    if (play) href += "&play=1";
+    if (audio.volume < 1) href += "&volume=" + Math.round(audio.volume * 100);
+    return href;
+  }
+  function carryOnSelect(link) {
+    if (!link) return;
+    listen(link, "click", function () {
+      link.href = carry(link.href, !audio.paused && !audio.ended);
+    });
+  }
+  carryOnSelect(byId("eas_alert_previous_link"));
+  carryOnSelect(byId("eas_alert_next_link"));
+  listen(audio, "ended", function () {
+    var next = byId("eas_alert_next_link");
+    if (autoplay.checked && visible(next)) window.location.href = carry(next.href, true);
+  });
+  if (/[?&]play=1(&|$)/.test(search) && audio.play) {
+    try {
+      var playing = audio.play();
+      if (playing && playing["catch"]) playing["catch"](function () {});
+    } catch (error) {}
+  }
+})();
+</script>
 <script type="text/x-nwr-app">
 const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto", "alias_filter_strength", "notify_sdr_failures"];
 const DEFAULT_STREAM_SAMPLE_RATE = 24000;
@@ -22293,6 +22773,7 @@ function renderBulkOptionGroup(kind, presets) {
   container.innerHTML = "";
   for (const preset of presets) {
     const label = document.createElement("label");
+    label.className = "checkbox-row";
     const input = document.createElement("input");
     input.type = "radio";
     input.name = `eas_${kind}_mode`;
@@ -22302,6 +22783,7 @@ function renderBulkOptionGroup(kind, presets) {
     container.appendChild(label);
   }
   const manualLabel = document.createElement("label");
+  manualLabel.className = "checkbox-row";
   const manualInput = document.createElement("input");
   manualInput.type = "radio";
   manualInput.name = `eas_${kind}_mode`;
@@ -22587,7 +23069,7 @@ function setEasAlertPlaybackState(playing) {
 
 async function playCurrentEasAlert() {
   const audio = document.getElementById("eas_alert_audio");
-  if (!audio || !audio.src) return;
+  if (!audio || !audio.src || document.getElementById("eas_alert_app_player").hidden) return;
   if (monitorPeerConnection || receiverPeerConnection) {
     await stopStreamMonitor({notifyServer: true});
     await stopWeatherReceiver({notifyServer: true});
@@ -22770,7 +23252,12 @@ async function loadEasAlertDetail() {
     setText("eas_detail_issued", alert.issued_at || "Unknown");
     setText("eas_detail_expires", alert.expires_at || "Unknown");
     const audio = document.getElementById("eas_alert_audio");
-    if (audio.src !== alert.audio_url) {
+    // Played here only where the browser can play its format; otherwise it can be downloaded.
+    const playable = Boolean(alert.audio_type && audio.canPlayType && audio.canPlayType(alert.audio_type));
+    setHidden("eas_alert_app_player", !playable);
+    setHidden("eas_alert_cannot_play", playable);
+    if (!playable) stopCurrentEasAlertForSwitch();
+    if (playable && audio.src !== alert.audio_url) {
       audio.src = alert.audio_url || "";
       audio.currentTime = 0;
       applyEasAlertPlaybackVolume();
