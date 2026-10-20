@@ -60,7 +60,7 @@ class PackagingTests(unittest.TestCase):
     def test_development_iq_source_ui_is_hidden_until_capability_is_enabled(self) -> None:
         script = self.web_control.INDEX_HTML
 
-        self.assertIn('id="iq_test_source_section" hidden', script)
+        self.assertIn('id="iq_test_source_section" class="needs-app" hidden', script)
         self.assertIn("let developmentIqSourcesEnabled = false;", script)
         self.assertIn("capabilities.development_iq_sources", script)
         self.assertIn('route.view === "rtl" && developmentIqSourcesEnabled', script)

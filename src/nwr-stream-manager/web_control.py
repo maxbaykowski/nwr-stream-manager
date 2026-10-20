@@ -544,6 +544,9 @@ EAS_ALERT_AUDIO_TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "aud
 IQ_RECORDER_FORM_PATHS = {"/iq-recorder/start", "/iq-recorder/stop", "/iq-recordings/remove"}
 IQ_RECORDING_DOWNLOAD_PATH = "/iq-recordings/download"
 IQ_RECORDER_VIEWS = {"iq_recorder", "iq_recorder_start", "iq_recording_download"}
+RTL_FORM_PATHS = {"/rtl-settings", "/rtl-settings/reset"}
+# The Active SDR list's shared RTL-SDRs, as the page script names them.
+REMOTE_SDR_CHOICE_PREFIX = "remote:"
 # What a finished form says once it has gone back to the I/Q recorder.
 IQ_RECORDER_RESULTS = {
     "started": "I/Q recording started.",
@@ -9982,6 +9985,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path in IQ_RECORDER_FORM_PATHS:
             self._handle_iq_recorder_form(path)
             return
+        if path in RTL_FORM_PATHS:
+            self._handle_rtl_form(path)
+            return
         if path == "/api/setup-account":
             try:
                 payload = self._read_json()
@@ -10934,6 +10940,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_hidden(page, "nav_eas_alerts", not eas_streams)
         if view in EAS_ALERT_VIEWS:
             page, title = self._fill_eas_alert_view(page, view, query, form or {}, eas_streams, read_only, title)
+        if view == "rtl":
+            page, title, rtl_result = self._fill_rtl_view(page, query, form or {}, title)
+            result = result or rtl_result
         recorder = self.service.redacted_iq_recorder_status() if read_only else self.service.iq_recorder_status()
         page = self._fill_iq_recording_banner(page, recorder)
         if view in IQ_RECORDER_VIEWS:
@@ -11235,6 +11244,143 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_hidden(page, "eas_delete_form", True)
         title = re.search(r"<title>(.*?)</title>", page).group(1)
         return page_rendering.set_title(page, f"{question} - {html.unescape(title)}")
+
+    def _fill_rtl_view(
+        self, page: str, query: dict[str, str], form: dict[str, str], title: str
+    ) -> tuple[str, str, tuple[str, str, str] | None]:
+        status = self.service.status()
+        devices = self.service.devices()
+        settings = status.get("settings") or {}
+        remote_sdr = status.get("remote_sdr") or {}
+        uses_remote = settings.get("source_mode") == "remote" and bool(settings.get("remote_host_id"))
+        local_devices = list(devices.get("devices") or [])
+        gain_values = [float(value) for value in status.get("gain_values") or []]
+        # What the page has now; every setting is sent with this, so only the ones changed are saved.
+        serial = f"{REMOTE_SDR_CHOICE_PREFIX}{settings.get('remote_host_id')}" if uses_remote else str(settings.get("serial") or "")
+        if not uses_remote and not serial and len(local_devices) == 1:
+            serial = str(local_devices[0].get("serial"))
+        gain = settings.get("gain")
+        loaded = {
+            "serial": serial,
+            "gain": f"{min(gain_values, key=lambda value: abs(value - float(gain))):g}" if gain is not None and gain_values else "auto",
+            "ppm_correction": str(settings.get("ppm_correction", 0)),
+            "alias_filter_strength": str(settings.get("alias_filter_strength", 100)),
+            "bias_tee": "1" if settings.get("bias_tee") else "0",
+            "notify_sdr_failures": "1" if settings.get("notify_sdr_failures") else "0",
+            "remote_buffer_seconds": f"{float(settings.get('remote_buffer_seconds') or 0):g}",
+        }
+        sent = form.get("form") == "rtl"
+        # Shown again after a mistake, the page keeps what was entered and what it first had.
+        shown = {name: form.get(name, "0" if name in {"bias_tee", "notify_sdr_failures"} else value) for name, value in loaded.items()} if sent else loaded
+        if sent:
+            loaded = {name: form.get(f"was_{name}", value) for name, value in loaded.items()}
+        page = page_rendering.set_content(
+            page,
+            "serial",
+            "".join(
+                f'<option value="{html.escape(value)}"{" selected" if value == shown["serial"] else ""}>{html.escape(label)}</option>'
+                for value, label in active_sdr_choices(status, local_devices)
+            ),
+        )
+        page = page_rendering.set_text(page, "device-errors", " | ".join(devices.get("errors") or []))
+        reset = status.get("sdr_reset") or None
+        resetting = bool(reset and reset.get("state") == "resetting")
+        page = page_rendering.set_hidden(page, "reset_rtl_device", uses_remote)
+        page = page_rendering.set_hidden(page, "reset_remote_sdr", not uses_remote)
+        page = page_rendering.set_hidden(page, "reset_sdr_link", resetting)
+        if reset:
+            kind = {"finished": "success", "failed": "error"}.get(str(reset.get("state")), "")
+            page = page_rendering.set_text(page, "sdr-reset-status", str(reset.get("message") or ""))
+            page = page_rendering.set_attribute(page, "sdr-reset-status", "class", f"message {kind}".strip())
+        page = page_rendering.set_hidden(page, "remote_sdr_controls", not uses_remote)
+        page = page_rendering.set_text(page, "remote_sdr_status", remote_sdr_status_text(remote_sdr))
+        page = page_rendering.set_attribute(page, "remote_buffer_seconds", "value", shown["remote_buffer_seconds"])
+        options = [("auto", "Automatic gain control")] + [(f"{value:g}", format_gain(value)) for value in gain_values]
+        page = page_rendering.set_content(
+            page,
+            "gain_choice",
+            "".join(
+                f'<option value="{value}"{" selected" if value == shown["gain"] else ""}>{html.escape(label)}</option>'
+                for value, label in options
+            ),
+        )
+        page = page_rendering.set_attribute(page, "ppm_correction", "value", shown["ppm_correction"])
+        page = page_rendering.set_attribute(page, "alias_filter_strength", "value", shown["alias_filter_strength"])
+        page = page_rendering.set_text(page, "alias_filter_strength_label", f"{shown['alias_filter_strength']}%")
+        for name in ("bias_tee", "notify_sdr_failures"):
+            page = page_rendering.set_attribute(page, name, "checked", "checked" if shown[name] == "1" else None)
+        page = page_rendering.append_content(
+            page,
+            "rtl_settings_form",
+            '<input type="hidden" name="form" value="rtl">'
+            + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
+        )
+        # Save changes comes last on the page.
+        notifications_shown = bool((status.get("notifications") or {}).get("topic"))
+        page = page_rendering.set_hidden(page, "rtl_notifications_section", not notifications_shown)
+        if notifications_shown:
+            page = page_rendering.move_element(page, "rtl_save_actions", "rtl_notifications_section")
+        if query.get("confirm") == "reset" and not resetting:
+            content = (
+                "<section><h2>Reset the RTL-SDR?</h2>"
+                "<p>The RTL-SDR restarts without being unplugged. Streams and anything else using it stop for a few seconds.</p>"
+                f'<form method="post" action="/rtl-settings/reset">{page_rendering.form_token_input(self._form_token())}'
+                '<div class="actions"><button type="submit" class="primary" autofocus>Reset SDR</button>'
+                '<a class="button-link" href="/?view=rtl">Cancel</a></div></form></section>'
+            )
+            page = page_rendering.set_content(page, "rtl_reset_confirm", content)
+            page = page_rendering.set_hidden(page, "rtl_reset_confirm", False)
+            page = page_rendering.set_hidden(page, "rtl_settings_form", True)
+            return page, f"Reset the RTL-SDR? - {title}", None
+        done = query.get("result", "")
+        if done not in {"saved", "source", "source-only"}:
+            return page, title, None
+        if done == "saved":
+            return page, title, ("rtl-save-result", "Changes saved.", "success")
+        device = next((item for item in remote_sdr.get("devices") or [] if item.get("id") == settings.get("remote_host_id")), None)
+        message = (
+            f"Now using the RTL-SDR shared by {remote_device_name(device)}."
+            if uses_remote
+            else "Now using the RTL-SDR connected to this machine."
+        )
+        if done == "source-only":
+            # Gain and the like belong to one RTL-SDR, so they aren't carried to another.
+            message += " The gain and other settings you changed were for the other RTL-SDR, so they weren't saved. These are this one's."
+        return page, title, ("rtl-save-result", message, "success")
+
+    def _handle_rtl_form(self, path: str) -> None:
+        """Saves the RTL-SDR settings, or resets it, for browsers without the page script."""
+        form: dict[str, str] = {}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            status = self.service.status()
+            if path == "/rtl-settings/reset":
+                # Takes as long as the reset; the page then says how it went.
+                reset = self.service.reset_rtl_device(str((status.get("settings") or {}).get("serial") or ""))
+                kind = "success" if reset.get("success") and reset.get("reappeared") else "error"
+                message = str(reset.get("message") or "RTL-SDR reset finished.")
+                self._send_page(self._render_index_page({"view": "rtl"}, result=("sdr-reset-status", message, kind)))
+                return
+            changes = rtl_settings_changes(form, [float(value) for value in status.get("gain_values") or []])
+            done = "source" if "source_mode" in changes or "serial" in changes else "saved"
+            if "source_mode" in changes:
+                # A shared RTL-SDR has its own gain and the like, and so does this machine's;
+                # they aren't carried from one to the other. The page then shows the new one's.
+                dropped = [name for name in REMOTE_SDR_HOST_SETTINGS if name in changes]
+                for name in dropped:
+                    del changes[name]
+                if dropped:
+                    done = "source-only"
+            if changes:
+                self.service.update(changes)
+        except Exception as exc:
+            element = "sdr-reset-status" if path == "/rtl-settings/reset" else "rtl-save-result"
+            result = (element, form_message(str(exc)), "error")
+            self._send_page(self._render_index_page({"view": "rtl"}, result=result, form=form), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_redirect(f"/?view=rtl&result={done}")
 
     def _fill_iq_recording_banner(self, page: str, recorder: dict[str, Any]) -> str:
         if not recorder.get("active"):
@@ -14449,6 +14595,108 @@ def iq_recorder_source_text(recorder: dict[str, Any]) -> str:
     return "Entire spectrum at 162.475 MHz"
 
 
+def format_gain(value: float) -> str:
+    return f"{float(value):g} dB"
+
+
+def active_sdr_choices(status: dict[str, Any], local_devices: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """The Active SDR list, as the page script makes it."""
+    settings = status.get("settings") or {}
+    remote = status.get("remote_sdr") or {}
+    paired = remote.get("devices") or []
+    uses_remote = settings.get("source_mode") == "remote" and bool(settings.get("remote_host_id"))
+    configured = str(settings.get("serial") or "")
+    choices: list[tuple[str, str]] = []
+    if not uses_remote and configured and not any(device.get("serial") == configured for device in local_devices):
+        choices.append((configured, f"Configured SDR, serial {configured} (not connected)"))
+    elif not uses_remote and not configured and len(local_devices) != 1:
+        none_found = not local_devices and not paired
+        choices.append(("", "No RTL-SDR devices found" if none_found else "Select an RTL-SDR..."))
+    for device in local_devices:
+        parts = [device.get("vendor"), device.get("name") or "RTL-SDR", f"serial {device.get('serial')}"]
+        choices.append((str(device.get("serial")), ", ".join(str(part) for part in parts if part)))
+    for device in paired:
+        choices.append((f"{REMOTE_SDR_CHOICE_PREFIX}{device.get('id')}", f"Shared by {remote_device_name(device)} over the network"))
+    return choices
+
+
+def remote_device_name(device: dict[str, Any] | None) -> str:
+    return str((device or {}).get("name") or "Unnamed NWR Stream Manager")
+
+
+def remote_sdr_status_text(remote_sdr: dict[str, Any]) -> str:
+    """How the shared RTL-SDR in use is doing, as the page script says it."""
+    remote = remote_sdr.get("remote") or {}
+    if remote.get("source_mode") != "remote" or not remote.get("device_id"):
+        return ""
+    status = remote.get("status") or {}
+    device = next((item for item in remote_sdr.get("devices") or [] if item.get("id") == remote.get("device_id")), None)
+    name = status.get("host_name") or remote_device_name(device)
+    if not status.get("reachable") and (status.get("connecting") or not status.get("host_id")):
+        return f"Connecting to {name}..."
+    if not status.get("reachable"):
+        return f"{name} is not reachable. Check that it is running and sharing its RTL-SDR."
+    sdr = status.get("sdr") or {}
+    reset = sdr.get("reset") or {}
+    problem = None if reset.get("state") == "resetting" else sdr.get("problem")
+    if problem == "disconnected":
+        return f"Connected to {name}, but its RTL-SDR is not connected."
+    if problem:
+        return f"Connected to {name}, but its RTL-SDR needs attention."
+    return f"Connected to {name}. Using {sdr.get('device_name') or 'its RTL-SDR'}."
+
+
+def rtl_settings_changes(form: dict[str, str], gain_values: list[float]) -> dict[str, Any]:
+    """The RTL-SDR settings changed on the form, which sends them all.
+
+    Each is compared with what the page had when it opened (its was_ field), and only
+    the ones changed there are saved, as the page script saves only what's changed. So
+    settings someone else has since changed are kept.
+    """
+    def changed(name: str, default: str = "") -> bool:
+        return form.get(name, default).strip() != form.get(f"was_{name}", default).strip()
+
+    changes: dict[str, Any] = {}
+    if changed("serial"):
+        chosen = form.get("serial", "")
+        if chosen.startswith(REMOTE_SDR_CHOICE_PREFIX):
+            changes.update(source_mode="remote", remote_host_id=chosen[len(REMOTE_SDR_CHOICE_PREFIX):])
+        elif form.get("was_serial", "").startswith(REMOTE_SDR_CHOICE_PREFIX):
+            changes.update(source_mode="local", serial=chosen)
+        else:
+            changes["serial"] = chosen
+    if changed("gain", "auto"):
+        gain = form.get("gain", "auto")
+        if gain == "auto":
+            changes["gain"] = None
+        else:
+            try:
+                value = float(gain)
+            except ValueError:
+                value = None
+            if value is None or not any(abs(value - float(item)) < 0.05 for item in gain_values):
+                raise ValueError("Select a gain from the list.")
+            changes["gain"] = value
+    for name, low, high, message in (
+        ("ppm_correction", -200, 200, "Enter a PPM correction from -200 to 200."),
+        ("alias_filter_strength", 0, 100, "Enter an alias filter strength from 0 to 100."),
+    ):
+        if changed(name):
+            try:
+                value = int(form.get(name, "").strip())
+            except ValueError:
+                raise ValueError(message) from None
+            if not low <= value <= high:
+                raise ValueError(message)
+            changes[name] = value
+    for name in ("bias_tee", "notify_sdr_failures"):
+        if (form.get(name) == "1") != (form.get(f"was_{name}") == "1"):
+            changes[name] = form.get(name) == "1"
+    if changed("remote_buffer_seconds"):
+        changes["remote_buffer_seconds"] = validate_remote_buffer_seconds(form.get("remote_buffer_seconds", ""))
+    return changes
+
+
 def iq_recorder_result(query: dict[str, str], recorder: dict[str, Any]) -> tuple[str, str, str] | None:
     """The message the I/Q recorder shows when it opens, as the page script shows it."""
     done = query.get("result", "")
@@ -14579,6 +14827,8 @@ nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #255
 .sdr-setting label { margin-bottom: 0; }
 .sdr-setting .checkbox-row { margin-top: 6px; }
 .sdr-setting input[type="number"] { max-width: 12rem; }
+.js-app .sdr-setting > .needs-app { display: grid; gap: 6px; }
+#view_rtl .actions { margin-top: 10px; }
 .sdr-value { font-weight: 600; }
 .row label { margin: 0; display: flex; align-items: center; gap: 8px; min-width: 44px; min-height: 44px; }
 .checkbox-row { display: flex; align-items: center; gap: 8px; min-height: 44px; margin-top: 14px; }
@@ -14933,23 +15183,28 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_rtl" class="view needs-app" hidden>
+  <div id="view_rtl" class="view" hidden>
+    <div id="rtl_reset_confirm" class="baseline-only" hidden></div>
+    <form id="rtl_settings_form" method="post" action="/rtl-settings">
+    __FORM_TOKEN_INPUT__
     <section>
       <h2>Configure RTL-SDR</h2>
       <label>Active SDR
-        <select id="serial" aria-describedby="serial_hint"></select>
+        <select id="serial" name="serial" aria-describedby="serial_hint"></select>
       </label>
       <span id="serial_hint" class="hint">Choose an RTL-SDR connected to this machine, or one shared over the network by a paired NWR Stream Manager. To add a shared one, pair with it in Settings, under SDR sharing.</span>
       <div class="actions">
-        <button id="rescan_devices" type="button">Rescan</button>
-        <button id="reset_rtl_device" type="button">Reset SDR</button>
-        <button id="reset_remote_sdr" type="button" hidden>Reset SDR</button>
+        <button id="rescan_devices" class="needs-app-inline" type="button">Rescan</button>
+        <a id="rescan_devices_link" class="baseline-only button-link" href="/?view=rtl">Rescan</a>
+        <button id="reset_rtl_device" class="needs-app-inline" type="button">Reset SDR</button>
+        <button id="reset_remote_sdr" class="needs-app-inline" type="button" hidden>Reset SDR</button>
+        <a id="reset_sdr_link" class="baseline-only button-link" href="/?view=rtl&amp;confirm=reset">Reset SDR</a>
       </div>
       <div id="device-errors" class="error"></div>
       <div id="remote_sdr_controls" hidden>
         <p id="remote_sdr_status"></p>
         <label>Network buffer in seconds
-          <input id="remote_buffer_seconds" type="number" min="0.1" max="10" step="0.1" aria-describedby="remote_buffer_seconds_hint">
+          <input id="remote_buffer_seconds" name="remote_buffer_seconds" type="number" min="0.1" max="10" step="0.1" aria-describedby="remote_buffer_seconds_hint">
         </label>
         <span id="remote_buffer_seconds_hint" class="hint">How much radio data to hold back to ride out Wi-Fi congestion and network dropouts. Higher values are more reliable on weak connections but put audio further behind real time; raising it pauses audio while the buffer fills, and lowering it skips ahead. Valid range is 0.1 through 10 seconds. This delay applies to everything using the shared RTL-SDR, including stream monitoring and the weather radio receiver, whose own playback buffering in the browser adds to it.</span>
       </div>
@@ -14959,40 +15214,55 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <section>
       <div class="sdr-settings">
         <div class="sdr-setting">
-          <label for="gain">Gain</label>
-          <input id="gain" type="range" min="0" max="0" step="1" value="0" disabled aria-describedby="gain_hint">
-          <span id="gain_label" class="sdr-value">Automatic</span>
+          <div class="needs-app">
+            <label for="gain">Gain</label>
+            <input id="gain" type="range" min="0" max="0" step="1" value="0" disabled aria-describedby="gain_hint">
+            <span id="gain_label" class="sdr-value">Automatic</span>
+          </div>
+          <label for="gain_choice" class="baseline-only">Gain</label>
+          <select id="gain_choice" class="baseline-only" name="gain" aria-describedby="gain_hint gain_auto_hint">
+            <option value="auto">Automatic gain control</option>
+          </select>
           <span id="gain_hint" class="hint">Controls how strongly the SDR amplifies received signals. Generally this should be kept around 30-35 dB. Setting gain too high can cause interference, setting it too low can significantly degrade reception.</span>
-          <label class="checkbox-row"><input id="gain_auto" type="checkbox" aria-describedby="gain_auto_hint"> Automatic gain control</label>
+          <div class="needs-app">
+            <label class="checkbox-row"><input id="gain_auto" type="checkbox" aria-describedby="gain_auto_hint"> Automatic gain control</label>
+          </div>
           <span id="gain_auto_hint" class="hint">Automatically adjusts the tuner gain based on signal strength. It is best to keep this setting switched off as it can increase the gain too high, causing interference.</span>
         </div>
         <div class="sdr-setting">
           <label for="ppm_correction">PPM correction</label>
-          <input id="ppm_correction" type="number" min="-200" max="200" step="1" aria-describedby="ppm_correction_hint">
+          <input id="ppm_correction" name="ppm_correction" type="number" min="-200" max="200" step="1" aria-describedby="ppm_correction_hint">
           <span id="ppm_correction_hint" class="hint">Controls hardware frequency correction for dongles that experience frequency drift.</span>
         </div>
         <div class="sdr-setting">
           <label for="alias_filter_strength">Alias filter strength</label>
-          <input id="alias_filter_strength" type="range" min="0" max="100" step="1" value="100" aria-describedby="alias_filter_strength_hint">
+          <input id="alias_filter_strength" name="alias_filter_strength" type="range" min="0" max="100" step="1" value="100" aria-describedby="alias_filter_strength_hint">
           <span id="alias_filter_strength_label" class="sdr-value" aria-hidden="true">100%</span>
           <span id="alias_filter_strength_hint" class="hint">Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.</span>
         </div>
         <div class="sdr-setting">
-          <label class="checkbox-row"><input id="bias_tee" type="checkbox" aria-describedby="bias_tee_hint"> Bias tee</label>
+          <label class="checkbox-row"><input id="bias_tee" name="bias_tee" value="1" type="checkbox" aria-describedby="bias_tee_hint"> Bias tee</label>
           <span id="bias_tee_hint" class="hint">Enable the RTL-SDR bias tee. Only enable this if attached hardware expects DC power.</span>
         </div>
       </div>
       <div id="sdr-settings-result" class="message" aria-live="polite"></div>
+      <div id="rtl_save_actions" class="baseline-only">
+        <div class="actions">
+          <button id="save_rtl_settings" type="submit" data-baseline-submit>Save changes</button>
+        </div>
+        <div id="rtl-save-result" class="message"></div>
+      </div>
     </section>
     <section id="rtl_notifications_section" hidden>
       <h3>Notifications</h3>
       <label class="checkbox-row">
-        <input id="notify_sdr_failures" type="checkbox" aria-describedby="notify_sdr_failures_hint">
+        <input id="notify_sdr_failures" name="notify_sdr_failures" value="1" type="checkbox" aria-describedby="notify_sdr_failures_hint">
         Notify when the RTL-SDR requires attention
       </label>
       <span id="notify_sdr_failures_hint" class="hint">Send an ntfy notification when the configured RTL-SDR disconnects, cannot be opened, or stops sending radio data.</span>
     </section>
-    <section id="iq_test_source_section" hidden>
+    </form>
+    <section id="iq_test_source_section" class="needs-app" hidden>
       <h3>I/Q test source</h3>
       <p class="hint">Use an interleaved complex float32 I/Q file as the receiver source for testing. Files loop until you switch back to the RTL-SDR.</p>
       <div class="grid">
@@ -16316,6 +16586,18 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   }
   manualRange("export");
   manualRange("delete");
+
+  // The alias filter strength says its value as it's set.
+  (function () {
+    var strength = byId("alias_filter_strength"), label = byId("alias_filter_strength_label");
+    if (!strength || !label) return;
+    function update() {
+      label.innerHTML = "";
+      label.appendChild(d.createTextNode(strength.value + "%"));
+    }
+    listen(strength, "change", update);
+    listen(strength, "input", update);
+  })();
 
   // A new I/Q recording shows the settings for the chosen source.
   (function () {

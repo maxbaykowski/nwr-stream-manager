@@ -118,7 +118,7 @@ class PageScriptLoadingTests(unittest.TestCase):
         page = self.web_control.INDEX_HTML
         baseline = {
             "logs", "settings", "change_password", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail",
-            "iq_recorder", "iq_recorder_start", "iq_recording_download",
+            "iq_recorder", "iq_recorder_start", "iq_recording_download", "rtl",
         }
         for view in baseline:
             self.assertFalse(pages.view_needs_app(page, view), view)
@@ -768,6 +768,178 @@ class IqRecorderPageTests(unittest.TestCase):
         self.assertIn('<p id="iq_download_recording_label" class="hint">I/Q recording was not found.</p>', page)
         self.assertRegex(page, r'<button id="iq_download_recording" type="submit" data-baseline-submit disabled')
 
+
+class RtlSettingsPageTests(unittest.TestCase):
+    """The Configure RTL-SDR page, as a browser without the page script uses it."""
+
+    request = BaselinePageServerTests.request
+    form_token = BaselinePageServerTests.form_token
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.accounts = wc.AccountStore(Path(tempdir.name) / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        account, secret = self.accounts.create_account("viewer", True)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        self.owner, self.viewer = ("owner", "password1"), ("viewer", "password2")
+        self.settings = {
+            "serial": "00000001", "gain": 33.8, "ppm_correction": 2, "bias_tee": False, "alias_filter_strength": 80,
+            "notify_sdr_failures": True, "source_mode": "local", "remote_host_id": "", "remote_buffer_seconds": 0.5,
+        }
+        self.remote_status = {"reachable": True, "host_id": "host1", "host_name": "Attic", "sdr": {"device_name": "Blog V4"}}
+        self.updates: list[dict] = []
+        self.resets: list[str] = []
+        service = StandInService(
+            accounts=self.accounts,
+            auth_sessions=wc.AuthSessionStore(),
+            status=self.status,
+            devices=lambda: {"devices": [{"serial": "00000001", "name": "Blog V4", "vendor": "RTL-SDR Blog"}], "errors": []},
+            update=self.update,
+            reset_rtl_device=self.reset,
+        )
+        handler = type("RtlSettingsPageTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def status(self, read_only=False):
+        remote = self.settings["source_mode"] == "remote"
+        return {
+            "settings": dict(self.settings),
+            "gain_values": [0.0, 28.0, 33.8, 49.6],
+            "notifications": {"topic": "secret-topic"},
+            "sdr_reset": None,
+            "remote_sdr": {
+                "devices": [{"id": "host1", "name": "Attic"}],
+                "remote": {"source_mode": self.settings["source_mode"], "device_id": "host1" if remote else "", "status": self.remote_status if remote else None},
+            },
+        }
+
+    def update(self, changes):
+        if changes.get("ppm_correction") == 150:
+            raise ValueError("the RTL-SDR could not be opened")
+        self.updates.append(changes)
+        self.settings.update(changes)
+        return self.status()
+
+    def reset(self, serial):
+        self.resets.append(serial)
+        return {"success": True, "reappeared": True, "message": "RTL-SDR reset finished."}
+
+    def token(self):
+        response, _ = self.request("GET", "/?view=rtl", user=self.owner)
+        token = self.form_token(response)
+        return token, f"nwrstmgr_form={token}"
+
+    def page_fields(self, token):
+        """Everything the page sends with Save changes, as it was filled in."""
+        _, page = self.request("GET", "/?view=rtl", user=self.owner)
+        fields = dict(re.findall(r'<input type="hidden" name="(was_\w+)" value="([^"]*)">', page))
+        fields.update({name[4:]: value for name, value in fields.items()})
+        for name in ("bias_tee", "notify_sdr_failures"):
+            if fields[name] != "1":
+                del fields[name]
+        return {**fields, "form": "rtl", "form_token": token}
+
+    def test_the_settings_are_filled_in(self) -> None:
+        _, page = self.request("GET", "/?view=rtl", user=self.owner)
+        self.assertEqual(self.title(page), "Configure RTL-SDR - NWR Stream Manager")
+        self.assertIn('<select id="serial" name="serial" aria-describedby="serial_hint">'
+                      '<option value="00000001" selected>RTL-SDR Blog, Blog V4, serial 00000001</option>'
+                      '<option value="remote:host1">Shared by Attic over the network</option></select>', page)
+        self.assertIn('<option value="auto">Automatic gain control</option><option value="0">0 dB</option>'
+                      '<option value="28">28 dB</option><option value="33.8" selected>33.8 dB</option>', page)
+        self.assertIn('<input id="ppm_correction" name="ppm_correction" type="number" min="-200" max="200" step="1" aria-describedby="ppm_correction_hint" value="2">', page)
+        self.assertIn('<span id="alias_filter_strength_label" class="sdr-value" aria-hidden="true">80%</span>', page)
+        self.assertIn('<input type="hidden" name="was_serial" value="00000001"><input type="hidden" name="was_gain" value="33.8">', page)
+        self.assertRegex(page, r'<input id="notify_sdr_failures" [^>]*checked="checked">')
+        self.assertRegex(page, r'<div id="remote_sdr_controls" hidden>')
+        # One Save changes, last on the page, under the notification setting.
+        view = page[page.index('<div id="view_rtl"'):page.index('<div id="view_receiver"')]
+        self.assertEqual(view.count('type="submit"'), 1)
+        self.assertRegex(page, r'(?s)<section id="rtl_notifications_section">.*<div id="rtl_save_actions" class="baseline-only">.*</section>(\s*<input type="hidden"[^>]*>)*\s*</form>')
+        _, page = self.request("GET", "/?view=rtl", user=self.viewer)
+        self.assertEqual(self.title(page), "Dashboard - NWR Stream Manager")
+
+    def test_only_the_settings_changed_are_saved(self) -> None:
+        token, cookie = self.token()
+        fields = {**self.page_fields(token), "gain": "28", "bias_tee": "1"}
+        response, _ = self.request("POST", "/rtl-settings", fields=fields, cookie=cookie, user=self.viewer)
+        self.assertEqual(response.status, 403)
+        response, _ = self.request("POST", "/rtl-settings", fields={**fields, "form_token": "guess"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+        response, _ = self.request("POST", "/rtl-settings", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/?view=rtl&result=saved"))
+        self.assertEqual(self.updates, [{"gain": 28.0, "bias_tee": True}])
+        _, page = self.request("GET", "/?view=rtl&result=saved", user=self.owner)
+        self.assertEqual(self.title(page), "Changes saved. - Configure RTL-SDR - NWR Stream Manager")
+
+        # Nothing changed, nothing saved; and turning things off counts as a change.
+        fields = self.page_fields(token)
+        self.request("POST", "/rtl-settings", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(len(self.updates), 1)
+        fields.pop("bias_tee"); fields.pop("notify_sdr_failures")
+        self.request("POST", "/rtl-settings", fields={**fields, "gain": "auto"}, cookie=cookie, user=self.owner)
+        self.assertEqual(self.updates[-1], {"gain": None, "bias_tee": False, "notify_sdr_failures": False})
+
+        fields = self.page_fields(token)
+        for change, message in (({"gain": "31"}, "Select a gain from the list."),
+                                ({"ppm_correction": "abc"}, "Enter a PPM correction from -200 to 200."),
+                                ({"alias_filter_strength": "101"}, "Enter an alias filter strength from 0 to 100."),
+                                ({"remote_buffer_seconds": "20"}, "The network buffer must be between 0.1 and 10 seconds."),
+                                ({"ppm_correction": "150", "bias_tee": "1"}, "The RTL-SDR could not be opened.")):
+            response, page = self.request("POST", "/rtl-settings", fields={**fields, **change}, cookie=cookie, user=self.owner)
+            self.assertEqual(response.status, 400)
+            self.assertEqual(self.title(page), f"Error: {message} - Configure RTL-SDR - NWR Stream Manager")
+        self.assertEqual(len(self.updates), 2)
+        # What was entered stays, and so does what the page first had.
+        self.assertIn('value="150"', page)
+        self.assertIn('<input type="hidden" name="was_ppm_correction" value="2">', page)
+        self.assertRegex(page, r'<input id="bias_tee" [^>]*checked="checked">')
+
+    def test_a_shared_sdr_is_chosen_without_carrying_settings_across(self) -> None:
+        token, cookie = self.token()
+        fields = {**self.page_fields(token), "serial": "remote:host1", "gain": "28", "remote_buffer_seconds": "2"}
+        response, _ = self.request("POST", "/rtl-settings", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=rtl&result=source-only")
+        self.assertEqual(self.updates, [{"source_mode": "remote", "remote_host_id": "host1", "remote_buffer_seconds": 2.0}])
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertTrue(self.title(page).startswith("Now using the RTL-SDR shared by Attic. The gain and other settings you changed were for the other RTL-SDR"))
+        self.assertIn('<option value="remote:host1" selected>', page)
+        self.assertIn('<div id="remote_sdr_controls">', page)
+        self.assertIn('<p id="remote_sdr_status">Connected to Attic. Using Blog V4.</p>', page)
+        self.assertRegex(page, r'<a id="reset_sdr_link" [^>]*href="/\?view=rtl&amp;confirm=reset">')
+
+        # Back to this machine's RTL-SDR.
+        fields = {**self.page_fields(token), "serial": "00000001"}
+        response, _ = self.request("POST", "/rtl-settings", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=rtl&result=source")
+        self.assertEqual(self.updates[-1], {"source_mode": "local", "serial": "00000001"})
+        self.remote_status = {"reachable": False, "host_id": "host1", "host_name": "Attic"}
+        self.settings.update(source_mode="remote", remote_host_id="host1")
+        _, page = self.request("GET", "/?view=rtl", user=self.owner)
+        self.assertIn("Attic is not reachable. Check that it is running and sharing its RTL-SDR.", page)
+
+    def test_the_sdr_is_reset_after_a_confirmation(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=rtl&confirm=reset", user=self.owner)
+        self.assertEqual(self.title(page), "Reset the RTL-SDR? - Configure RTL-SDR - NWR Stream Manager")
+        self.assertIn('<h2>Reset the RTL-SDR?</h2>', page)
+        self.assertRegex(page, r'<form id="rtl_settings_form" [^>]*hidden>')
+        response, _ = self.request("POST", "/rtl-settings/reset", fields={"form_token": token}, cookie=cookie, user=self.viewer)
+        self.assertEqual(response.status, 403)
+        response, page = self.request("POST", "/rtl-settings/reset", fields={"form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual(self.resets, ["00000001"])
+        self.assertEqual(self.title(page), "RTL-SDR reset finished. - Configure RTL-SDR - NWR Stream Manager")
 
 if __name__ == "__main__":
     unittest.main()
