@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import copy
 import fcntl
 import functools
 import hmac
@@ -73,6 +74,7 @@ if __package__:
         IQ_SAMPLE_RATE,
         VOLUME_MULTIPLIER_MAX,
         VOLUME_MULTIPLIER_MIN,
+        notch_max_width,
         parse_audio_config,
         parse_notch_config,
     )
@@ -211,6 +213,7 @@ else:
     IQ_SAMPLE_RATE = config_module.IQ_SAMPLE_RATE
     parse_audio_config = config_module.parse_audio_config
     parse_notch_config = config_module.parse_notch_config
+    notch_max_width = config_module.notch_max_width
     VOLUME_MULTIPLIER_MAX = config_module.VOLUME_MULTIPLIER_MAX
     VOLUME_MULTIPLIER_MIN = config_module.VOLUME_MULTIPLIER_MIN
     ComplexArray = dsp.ComplexArray
@@ -397,6 +400,8 @@ STREAM_IDLE_DETECTION_SECONDS = 1.0
 STREAM_RECONNECT_SECONDS = 5.0
 ICECAST_AUTH_CACHE_SECONDS = 600.0
 SOUNDCARD_PREVIEW_TIMEOUT_SECONDS = 8.0
+# A page without the page script can't keep a preview going, so each of its steps keeps it for this long.
+SOUNDCARD_PREVIEW_LEASE_SECONDS = 300.0
 SOUNDCARD_PREVIEW_CLEANUP_SECONDS = 2.0
 MAX_JSON_REQUEST_BYTES = 1_048_576
 RECENT_EAS_ALERT_SECONDS = 24 * 60 * 60
@@ -545,6 +550,36 @@ IQ_RECORDER_FORM_PATHS = {"/iq-recorder/start", "/iq-recorder/stop", "/iq-record
 IQ_RECORDING_DOWNLOAD_PATH = "/iq-recordings/download"
 IQ_RECORDER_VIEWS = {"iq_recorder", "iq_recorder_start", "iq_recording_download"}
 RTL_FORM_PATHS = {"/rtl-settings", "/rtl-settings/reset"}
+STREAM_FORM_PATHS = {"/streams/settings", "/streams/enabled", "/streams/remove"}
+OUTPUT_FORM_PATHS = {"/streams/outputs/save", "/streams/outputs/enabled", "/streams/outputs/reset-soundcard", "/streams/outputs/remove"}
+WIZARD_FORM_PATH = "/streams/wizard"
+WIZARD_STEPS = ("station", "type", "service", "codec", "credentials", "quality", "device", "controls")
+WIZARD_STEP_PANELS = {
+    "station": "wizard_step_station",
+    "type": "wizard_step_output_type",
+    "service": "wizard_step_service",
+    "codec": "wizard_step_codec",
+    "credentials": "wizard_step_credentials",
+    "quality": "wizard_step_quality",
+    "device": "wizard_step_soundcard_device",
+    "controls": "wizard_step_soundcard_controls",
+}
+# What the stream settings say once an output form has gone back to them.
+OUTPUT_RESULTS = {
+    "output-saved": "Stream output settings saved.",
+    "output-removed": "Output removed.",
+    "icecast-added": "Icecast output added.",
+    "soundcard-added": "Soundcard output added.",
+}
+# The stream settings tabs that work without the page script, in order.
+STREAM_SETTINGS_TABS = {
+    "outputs": "Outputs",
+    "eas": "EAS Recording",
+    "fallback_action": "Fallback Action",
+    "audio": "Audio Effects",
+    "notifications": "Notifications",
+}
+STREAM_RESULTS = {"started": "Stream started.", "stopped": "Stream stopped.", "removed": "Stream removed.", "created": "Stream created."}
 # The Active SDR list's shared RTL-SDRs, as the page script names them.
 REMOTE_SDR_CHOICE_PREFIX = "remote:"
 # What a finished form says once it has gone back to the I/Q recorder.
@@ -5832,7 +5867,7 @@ class RtlControlService:
         with self.lock:
             for preview_id, preview in list(getattr(self, "preview_streams", {}).items()):
                 heartbeat_at = float(preview.get("heartbeat_at", preview.get("updated_at", now)))
-                if now - heartbeat_at <= SOUNDCARD_PREVIEW_TIMEOUT_SECONDS:
+                if now - heartbeat_at <= float(preview.get("timeout_seconds", SOUNDCARD_PREVIEW_TIMEOUT_SECONDS)):
                     continue
                 self.preview_streams.pop(preview_id, None)
                 expired.append((preview_id, self.stream_workers.pop(stream_worker_key(preview), None)))
@@ -7072,6 +7107,7 @@ class RtlControlService:
         station_key = str(payload.get("station_key", "")).strip()
         station = self._station_by_key(station_key)
         soundcard = validate_soundcard_output_payload(payload.get("soundcard"))
+        timeout_seconds = SOUNDCARD_PREVIEW_LEASE_SECONDS if payload.get("lease") else SOUNDCARD_PREVIEW_TIMEOUT_SECONDS
         with self.lock:
             if not hasattr(self, "preview_streams"):
                 self.preview_streams = {}
@@ -7097,6 +7133,7 @@ class RtlControlService:
                     "created_at": time.time(),
                     "updated_at": time.time(),
                     "heartbeat_at": time.time(),
+                    "timeout_seconds": timeout_seconds,
                 }
                 self.preview_streams[preview_id] = preview
             else:
@@ -7109,6 +7146,7 @@ class RtlControlService:
                 outputs[0]["soundcard"] = soundcard
                 preview["updated_at"] = time.time()
                 preview["heartbeat_at"] = time.time()
+                preview["timeout_seconds"] = timeout_seconds
             output = mutable_stream_outputs(preview)[0]
             output["soundcard"] = self._normalize_soundcard_output_locked(
                 str(preview.get("id", "")),
@@ -9988,6 +10026,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path in RTL_FORM_PATHS:
             self._handle_rtl_form(path)
             return
+        if path in STREAM_FORM_PATHS:
+            self._handle_stream_form(path)
+            return
+        if path in OUTPUT_FORM_PATHS:
+            self._handle_output_form(path)
+            return
+        if path == WIZARD_FORM_PATH:
+            self._handle_wizard_form()
+            return
         if path == "/api/setup-account":
             try:
                 payload = self._read_json()
@@ -10920,6 +10967,19 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         view = query.get("view", "") or "dashboard"
         if view not in INDEX_VIEWS or (read_only and view in READ_ONLY_RESTRICTED_VIEWS):
             view = "dashboard"
+        if view in {"stream_output", "add_stream"} and query.get("stream") and not any(
+            stream.get("id") == query.get("stream") for stream in self.service.streams
+        ):
+            view, query = "streams", {"view": "streams"}
+            result = result or ("streams-result", "Stream was not found.", "error")
+        if view == "stream_output" and not self._stream_output(query.get("stream", ""), query.get("output", "")):
+            # As the page script does, an output that's gone goes back to its stream.
+            view, query = "stream_settings", {"view": "stream_settings", "stream": query.get("stream", "")}
+            result = result or ("output-list-result", "Stream output was not found.", "error")
+        if view == "stream_settings" and not any(stream.get("id") == query.get("stream") for stream in self.service.streams):
+            # As the page script does, a stream that's gone goes back to the list.
+            view, query = "streams", {"view": "streams"}
+            result = result or ("streams-result", "Stream was not found.", "error")
         page = page_rendering.show_view(INDEX_HTML, view)
         page = page.replace("__FORM_TOKEN_INPUT__", page_rendering.form_token_input(self._form_token()))
         page = page_rendering.set_hidden(page, "baseline_unavailable", not page_rendering.view_needs_app(page, view))
@@ -10940,6 +11000,20 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_hidden(page, "nav_eas_alerts", not eas_streams)
         if view in EAS_ALERT_VIEWS:
             page, title = self._fill_eas_alert_view(page, view, query, form or {}, eas_streams, read_only, title)
+        if view == "streams":
+            page, title = self._fill_streams_view(page, query, read_only, title)
+            if not result and query.get("result") in STREAM_RESULTS:
+                result = ("streams-result", STREAM_RESULTS[query["result"]], "success")
+        if view == "stream_settings":
+            page, title = self._fill_stream_settings_view(page, query, form or {}, title)
+            if not result and query.get("result") == "saved":
+                result = ("stream-settings-save-result", "Changes saved.", "success")
+            if not result and query.get("result") in OUTPUT_RESULTS:
+                result = ("output-list-result", OUTPUT_RESULTS[query["result"]], "success")
+        if view == "stream_output":
+            page, title = self._fill_stream_output_view(page, query, form or {})
+        if view == "add_stream" and not read_only:
+            page, title = self._fill_wizard_view(page, query, form or {})
         if view == "rtl":
             page, title, rtl_result = self._fill_rtl_view(page, query, form or {}, title)
             result = result or rtl_result
@@ -11040,7 +11114,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             for item in streams
         )
         page = page_rendering.set_content(page, "eas_alert_stream", options)
-        list_link = eas_alert_route("eas_alerts", stream=stream_id, page=list_page)
+        list_link = page_route("eas_alerts", stream=stream_id, page=list_page)
         if view == "eas_alerts":
             return self._fill_eas_alert_list(page, stream_id, list_page, read_only), title
         if stream is None:
@@ -11082,7 +11156,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         list_page, total_pages = int(data["page"]), int(data["total_pages"])
         rows = [
             f'<a class="stream-item" data-row-key="alert:{html.escape(alert["id"])}" data-alert-id="{html.escape(alert["id"])}" '
-            f'href="{html.escape(eas_alert_route("eas_alert_detail", stream=stream_id, alert=alert["id"], page=list_page))}">'
+            f'href="{html.escape(page_route("eas_alert_detail", stream=stream_id, alert=alert["id"], page=list_page))}">'
             f'{html.escape(alert.get("summary") or "Unknown EAS alert")}</a>'
             for alert in data["alerts"]
         ]
@@ -11093,11 +11167,11 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             page = page_rendering.set_attribute(page, f"eas_alert_{name}", "disabled", None if available else "disabled")
             page = page_rendering.set_hidden(page, f"eas_alert_page_{name}_link", not available)
             page = page_rendering.set_attribute(
-                page, f"eas_alert_page_{name}_link", "href", eas_alert_route("eas_alerts", stream=stream_id, page=target)
+                page, f"eas_alert_page_{name}_link", "href", page_route("eas_alerts", stream=stream_id, page=target)
             )
         for name in ("export", "delete"):
             page = page_rendering.set_attribute(
-                page, f"open_eas_{name}_link", "href", eas_alert_route(f"eas_alert_{name}", stream=stream_id, page=list_page)
+                page, f"open_eas_{name}_link", "href", page_route(f"eas_alert_{name}", stream=stream_id, page=list_page)
             )
         return page_rendering.set_hidden(page, "open_eas_delete_link", read_only)
 
@@ -11138,9 +11212,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             target = neighbors.get(name)
             page = page_rendering.set_hidden(page, f"eas_alert_{name}_link", target is None)
             if target:
-                link = eas_alert_route("eas_alert_detail", stream=stream_id, alert=target["id"], page=target["page"])
+                link = page_route("eas_alert_detail", stream=stream_id, alert=target["id"], page=target["page"])
                 page = page_rendering.set_attribute(page, f"eas_alert_{name}_link", "href", link)
-        detail_link = eas_alert_route("eas_alert_detail", stream=stream_id, alert=alert_id, page=list_page)
+        detail_link = page_route("eas_alert_detail", stream=stream_id, alert=alert_id, page=list_page)
         page = page_rendering.set_hidden(page, "remove_eas_alert_link", read_only)
         page = page_rendering.set_attribute(page, "remove_eas_alert_link", "href", f"{detail_link}&confirm=remove")
         title = f"Details for alert {event} issued on {alert.get('issued_at') or 'an unknown time'}"
@@ -11230,7 +11304,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             for name, value in form.items()
             if name.startswith("eas_delete_") and name != "eas_delete_now" or name in {"stream", "page"}
         )
-        list_link = eas_alert_route("eas_alerts", stream=query.get("stream", ""), page=query.get("page", "1"))
+        list_link = page_route("eas_alerts", stream=query.get("stream", ""), page=query.get("page", "1"))
         content = (
             f"<h3>{html.escape(question)}</h3>"
             f"<p>{count} alert{'' if count == 1 else 's'} and their audio files will be permanently deleted.</p>"
@@ -11244,6 +11318,594 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_hidden(page, "eas_delete_form", True)
         title = re.search(r"<title>(.*?)</title>", page).group(1)
         return page_rendering.set_title(page, f"{question} - {html.unescape(title)}")
+
+    def _fill_streams_view(self, page: str, query: dict[str, str], read_only: bool, title: str) -> tuple[str, str]:
+        status = self.service.status(read_only=read_only)
+        streams = list(status.get("streams") or [])
+        token_input = page_rendering.form_token_input(self._form_token())
+        rows = "".join(stream_row_html(stream, status, read_only, token_input) for stream in streams)
+        if rows:
+            page = page_rendering.set_content(page, "active-streams-body", rows)
+        page = page_rendering.set_hidden(page, "open_add_stream_link", read_only)
+        # Removing a stream is confirmed first.
+        stream = next((item for item in streams if item.get("id") == query.get("stream")), None)
+        if query.get("confirm") != "remove" or stream is None or read_only:
+            return page, title
+        label = html.escape(stream_label(stream))
+        content = (
+            f"<h3>Remove stream {label}?</h3>"
+            "<p>Its outputs and settings will be permanently deleted. EAS alerts it recorded are kept.</p>"
+            f'<form method="post" action="/streams/remove">{token_input}'
+            f'<input type="hidden" name="stream" value="{html.escape(str(stream.get("id", "")))}">'
+            '<div class="actions"><button type="submit" class="primary" autofocus>Remove stream</button>'
+            '<a class="button-link" href="/?view=streams">Cancel</a></div></form>'
+        )
+        page = page_rendering.set_content(page, "streams_confirm", content)
+        page = page_rendering.set_hidden(page, "streams_confirm", False)
+        return page, f"Remove stream {stream_label(stream)}? - {title}"
+
+    def _fill_stream_settings_view(self, page: str, query: dict[str, str], form: dict[str, str], title: str) -> tuple[str, str]:
+        status = self.service.status()
+        stream = next(item for item in status.get("streams") or [] if item.get("id") == query.get("stream"))
+        stream_id = str(stream.get("id", ""))
+        station = stream.get("station") or {}
+        callsign = str(station.get("callsign") or "stream")
+        page = page_rendering.set_text(page, "stream_settings_title", f"Edit stream {callsign}")
+        page = page_rendering.set_text(page, "stream_settings_station", f"{station.get('callsign') or 'Unknown'} {station.get('frequency') or ''} MHz")
+        page = page_rendering.set_attribute(page, "stream_settings_stream_id", "value", stream_id)
+        # Tabs are links, showing one at a time.
+        notifications = bool((status.get("notifications") or {}).get("topic"))
+        tabs = [name for name in STREAM_SETTINGS_TABS if name != "notifications" or notifications]
+        tab = query.get("tab") if query.get("tab") in tabs else "outputs"
+        page = page_rendering.set_attribute(page, "stream_settings_tab", "value", tab)
+        page = page_rendering.set_hidden(page, "tab_link_notifications", not notifications)
+        for name in STREAM_SETTINGS_TABS:
+            link = page_route("stream_settings", stream=stream_id, tab=name if name != "outputs" else "")
+            page = page_rendering.set_attribute(page, f"tab_link_{name}", "href", link)
+            page = page_rendering.set_attribute(page, f"tab_link_{name}", "aria-current", "page" if name == tab else None)
+            page = page_rendering.set_hidden(page, f"panel_{name}", name != tab)
+        page = page_rendering.set_hidden(page, "panel_test_mode", True)
+        # Signal
+        signal = (status.get("stream_signals") or {}).get(stream_id) if stream_enabled(stream) else None
+        display = stream_signal_display(signal)
+        problem = stream_reception_problem(signal)
+        text = display["text"]
+        if not stream_enabled(stream):
+            text = "Not measured while this stream is disabled."
+        elif problem == "no_signal":
+            text = RECEPTION_PROBLEM_DETAILS["no_signal"]
+        elif problem:
+            text = f"{display['text']}. {RECEPTION_PROBLEM_DETAILS['bad_reception']}"
+        page = page_rendering.set_text(page, "stream_settings_signal_value", text)
+        page = page_rendering.set_attribute(
+            page, "stream_settings_signal_value", "class", f"status-text signal-{display['quality']}" if display["quality"] else "hint"
+        )
+        page = page_rendering.set_hidden(page, "stream_settings_signal_levels_label", not display["detail"])
+        page = page_rendering.set_hidden(page, "stream_settings_signal_levels", not display["detail"])
+        page = page_rendering.set_text(page, "stream_settings_signal_levels", display["detail"])
+        # The settings, and what they were, so only the ones changed are saved.
+        groups = stream_settings_groups(stream)
+        loaded = {
+            name: stream_setting_text(stream_setting_value(groups, group, key), kind)
+            for name, group, key, kind in STREAM_SETTINGS_FIELDS
+        }
+        sent = form.get("form") == "stream_settings"
+        shown = dict(loaded)
+        if sent:
+            # Shown again after a mistake, the page keeps what was entered and what it first had.
+            for name, _group, _key, kind in STREAM_SETTINGS_FIELDS:
+                shown[name] = ("1" if form.get(name) == "1" else "0") if kind == "bool" else form.get(name, loaded[name])
+                loaded[name] = form.get(f"was_{name}", loaded[name])
+        for name, _group, _key, kind in STREAM_SETTINGS_FIELDS:
+            if kind == "bool":
+                page = page_rendering.set_attribute(page, name, "checked", "checked" if shown[name] == "1" else None)
+            elif name not in {"eas_format", "stream_fallback_action"}:
+                page = page_rendering.set_attribute(page, name, "value", shown[name])
+        for value in ("wav", "mp3"):
+            page = page_rendering.set_attribute(page, f"eas_format_{value}", "checked", "checked" if shown["eas_format"] == value else None)
+        for value in STREAM_FALLBACK_ACTIONS:
+            page = page_rendering.set_attribute(
+                page, f"stream_fallback_action_{value}", "checked", "checked" if shown["stream_fallback_action"] == value else None
+            )
+        # EAS recording can't be turned off when it's the stream's only output, as the page script shows.
+        eas = groups["eas_recording"]
+        page = page_rendering.set_hidden(page, "eas_enabled_label", bool(eas["enabled"]) and stream_output_count(stream) <= 1)
+        storage_critical = (status.get("storage") or {}).get("status") == "critical"
+        page = page_rendering.set_hidden(page, "eas_storage_blocked_hint", not (storage_critical and eas["enabled"]))
+        page = page_rendering.set_hidden(page, "stream_notify_eas_alerts_label", not eas["enabled"])
+        page = page_rendering.set_hidden(page, "stream_notify_eas_alerts_hint", not eas["enabled"])
+        # Every audio effect shows, one after another.
+        for effect in ("volume", "comfort_noise", "deemphasis", "highpass", "lowpass", "notch"):
+            page = page_rendering.set_hidden(page, f"audio_effect_{effect}", False)
+        try:
+            widest = int(notch_max_width(float(shown["audio_notch_frequency"])))
+        except ValueError:
+            widest = 2000
+        page = page_rendering.set_text(page, "audio_notch_width_max", str(widest))
+        # Outputs are listed, each linking to its own page.
+        outputs = [output for output in stream.get("outputs") or [] if isinstance(output, dict)]
+        soundcards = list(self.service.devices().get("soundcards") or [])
+        page = page_rendering.set_hidden(page, "soundcard_outputs_panel", False)
+        page = page_rendering.set_attribute(page, "open_add_output_link", "href", page_route("add_stream", stream=stream_id))
+        for kind in ("icecast", "soundcard"):
+            rows = "".join(
+                stream_output_row_html(stream, output, status, soundcards)
+                for output in outputs
+                if str(output.get("type") or "icecast") == kind
+            )
+            if rows:
+                page = page_rendering.set_content(page, f"{kind}-outputs-body", rows)
+        page = page_rendering.append_content(
+            page,
+            "stream_settings_form",
+            '<input type="hidden" name="form" value="stream_settings">'
+            + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
+        )
+        tab_title = f"{STREAM_SETTINGS_TABS[tab]} - " if tab != "outputs" else ""
+        return page, f"{tab_title}Edit stream {callsign}"
+
+    def _handle_stream_form(self, path: str) -> None:
+        """Starts, stops, removes and changes streams, for browsers without the page script."""
+        form: dict[str, str] = {}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            stream_id = form.get("stream", "")
+            if path == "/streams/enabled":
+                enabled = form.get("enabled") == "1"
+                self.service.update_stream({"stream_id": stream_id, "enabled": enabled})
+                self._send_redirect(f"/?view=streams&result={'started' if enabled else 'stopped'}")
+                return
+            if path == "/streams/remove":
+                self.service.remove_stream(stream_id)
+                self._send_redirect("/?view=streams&result=removed")
+                return
+            stream = next((item for item in self.service.streams if item.get("id") == stream_id), None)
+            if stream is None:
+                raise ValueError("Stream was not found.")
+            changes = stream_settings_changes(form, stream)
+            # Its own settings first, so turning the stream on uses them.
+            for group, method, key in (
+                ("audio", self.service.update_audio_effects, "audio"),
+                ("notifications", self.service.update_stream_notifications, "notifications"),
+                ("fallback_action", self.service.update_stream_fallback_action, "fallback_action"),
+                ("eas_recording", self.service.update_eas_recording, "eas_recording"),
+            ):
+                if group in changes:
+                    method({"stream_id": stream_id, key: changes[group]})
+            if "enabled" in changes:
+                self.service.update_stream({"stream_id": stream_id, "enabled": changes["enabled"]["enabled"]})
+        except Exception as exc:
+            message = form_message(str(exc))
+            if path == "/streams/settings" and any(stream.get("id") == form.get("stream") for stream in self.service.streams):
+                query = {"view": "stream_settings", "stream": form.get("stream", ""), "tab": form.get("tab", "")}
+                result = ("stream-settings-save-result", message, "error")
+            else:
+                query, result = {"view": "streams"}, ("streams-result", message, "error")
+            self._send_page(self._render_index_page(query, result=result, form=form), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_redirect(page_route("stream_settings", stream=stream_id, tab=form.get("tab", ""), result="saved"))
+
+    def _stream_output(self, stream_id: str, output_id: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        stream = next((item for item in self.service.streams if item.get("id") == stream_id), None)
+        output = next((item for item in (stream or {}).get("outputs") or [] if item.get("id") == output_id), None)
+        return (stream, output) if stream and output else None
+
+    def _fill_stream_output_view(self, page: str, query: dict[str, str], form: dict[str, str]) -> tuple[str, str]:
+        stream, output = self._stream_output(query.get("stream", ""), query.get("output", ""))
+        stream_id, output_id = str(stream.get("id")), str(output.get("id"))
+        settings_link = page_route("stream_settings", stream=stream_id)
+        sent = form.get("form") == "output"
+        soundcards = list(self.service.devices().get("soundcards") or [])
+        for element_id in ("settings_icecast_service_stream", "settings_icecast_form_stream", "settings_soundcard_form_stream"):
+            page = page_rendering.set_attribute(page, element_id, "value", stream_id)
+        for element_id in ("settings_icecast_service_output", "settings_icecast_form_output", "settings_soundcard_form_output"):
+            page = page_rendering.set_attribute(page, element_id, "value", output_id)
+        for element_id in ("cancel_output_form_link", "cancel_soundcard_output_form_link"):
+            page = page_rendering.set_attribute(page, element_id, "href", settings_link)
+        enabled = output.get("enabled") is not False
+        if output.get("type") == "soundcard":
+            heading = "Edit sound card output"
+            soundcard = output.get("soundcard") or {}
+            loaded = {
+                "stable_id": str(soundcard.get("stable_id") or ""),
+                "channel_mode": str(soundcard.get("channel_mode") or "both"),
+                "volume": f"{float(soundcard.get('volume', 1.0)):g}",
+            }
+            values = dict(loaded)
+            if sent:
+                # Shown again after a mistake, the page keeps what was entered and what it first had.
+                values.update(stable_id=form.get("stable_id", ""), channel_mode=form.get("settings_soundcard_channel", ""), volume=form.get("volume", ""))
+                loaded = {name: form.get(f"was_{name}", value) for name, value in loaded.items()}
+            page = page_rendering.set_hidden(page, "icecast_output_edit_panel", True)
+            page = page_rendering.set_hidden(page, "soundcard_output_edit_panel", False)
+            options, chosen = soundcard_device_options_html(self.service.streams, soundcards, values["stable_id"], output_id, True)
+            page = page_rendering.set_content(page, "settings_soundcard_device", options)
+            connected = any(device.get("stable_id") == values["stable_id"] for device in soundcards)
+            hint = (
+                "The configured sound card is not connected." if values["stable_id"] and not connected
+                else "NWR Stream Manager will open the hardware device directly." if chosen
+                else "No sound cards have available channels."
+            )
+            page = page_rendering.set_text(page, "settings_soundcard_device_hint", hint)
+            page = fill_soundcard_channels(page, "settings", available_soundcard_channels(self.service.streams, chosen, output_id), values["channel_mode"])
+            page = page_rendering.set_attribute(page, "settings_soundcard_volume", "value", values["volume"])
+            page = page_rendering.set_attribute(page, "refresh_settings_soundcards", "href", page_route("stream_output", stream=stream_id, output=output_id))
+            page = page_rendering.append_content(
+                page,
+                "soundcard_output_edit_panel",
+                '<input type="hidden" name="form" value="output">'
+                + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
+            )
+            device = next((item for item in soundcards if item.get("stable_id") == soundcard.get("stable_id")), None)
+            usb = bool(device and device.get("bus") == "usb")
+            label = soundcard_label(soundcard, soundcards)
+        else:
+            heading = "Edit output"
+            icecast = output.get("icecast") or {}
+            current_service = icecast_service(icecast)
+            loaded = icecast_form_values(icecast)
+            service = form.get("service") if sent else query.get("service") or current_service
+            if service not in STREAM_SERVICE_NAMES:
+                service = current_service
+            if sent:
+                values = {name: form.get(name, "") for name in ICECAST_FORM_FIELDS}
+                values["format"] = form.get("settings_icecast_format", loaded["format"])
+                loaded = {name: form.get(f"was_{name}", value) for name, value in loaded.items()}
+            elif service == current_service:
+                values = dict(loaded)
+            else:
+                # Another service starts from its own settings, as the page script's does.
+                values = {"format": "mp3", "sample_rate": "24000", "bitrate": "64", "alt_number": "1"}
+            page = fill_icecast_fields(page, "settings_icecast", values, service, stream.get("station"))
+            page = page_rendering.set_attribute(page, "settings_icecast_form_service", "value", service)
+            page = page_rendering.set_hidden(page, "save_output_settings", False)
+            page = page_rendering.append_content(
+                page,
+                "settings_icecast_form",
+                '<input type="hidden" name="form" value="output">'
+                + f'<input type="hidden" name="was_service" value="{html.escape(form.get("was_service", current_service) if sent else current_service)}">'
+                + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
+            )
+            usb = False
+            label = f"{icecast.get('host')}:{icecast.get('port')}{icecast.get('mount')}"
+        page = page_rendering.set_text(page, "output_form_title", heading)
+        title = f"{heading} {label} - Edit stream {stream_label(stream)}"
+        token_input = page_rendering.form_token_input(self._form_token())
+        hidden = f'{token_input}<input type="hidden" name="stream" value="{html.escape(stream_id)}"><input type="hidden" name="output" value="{html.escape(output_id)}">'
+        others_enabled = stream_output_count(stream) - (1 if enabled else 0) > 0
+        if query.get("confirm") == "remove" and (not enabled or others_enabled):
+            content = (
+                f"<h3>Remove output {html.escape(label)}?</h3>"
+                "<p>The stream stops sending audio to it, and its settings are deleted.</p>"
+                f'<form method="post" action="/streams/outputs/remove">{hidden}'
+                '<div class="actions"><button type="submit" class="primary" autofocus>Remove output</button>'
+                f'<a class="button-link" href="{html.escape(page_route("stream_output", stream=stream_id, output=output_id))}">Cancel</a></div></form>'
+            )
+            page = page_rendering.set_content(page, "output_confirm", content)
+            page = page_rendering.set_hidden(page, "output_confirm", False)
+            page = page_rendering.set_hidden(page, "icecast_output_edit_panel", True)
+            page = page_rendering.set_hidden(page, "soundcard_output_edit_panel", True)
+            return page, f"Remove output {label}? - {title}"
+        # The output's other actions, which the page script has in its row's menu.
+        actions = []
+        if not enabled or others_enabled:
+            verb = "Disable" if enabled else "Enable"
+            actions.append(
+                f'<form method="post" action="/streams/outputs/enabled">{hidden}'
+                f'<input type="hidden" name="enabled" value="{"0" if enabled else "1"}">'
+                f'<button type="submit">{verb} output</button></form>'
+            )
+        if usb:
+            actions.append(f'<form method="post" action="/streams/outputs/reset-soundcard">{hidden}<button type="submit">Reset USB sound card</button></form>')
+        if not enabled or others_enabled:
+            remove = page_route("stream_output", stream=stream_id, output=output_id, confirm="remove")
+            actions.append(f'<a class="button-link" href="{html.escape(remove)}">Remove output</a>')
+        else:
+            actions.append('<p class="hint">This is the stream\'s only enabled output, so it can\'t be disabled or removed.</p>')
+        page = page_rendering.set_content(page, "output_actions", f'<h3>Other actions</h3><div class="row-actions">{"".join(actions)}</div>')
+        page = page_rendering.set_hidden(page, "output_actions", False)
+        return page, title
+
+    def _handle_output_form(self, path: str) -> None:
+        """Changes, enables, resets and removes a stream's outputs, for browsers without the page script."""
+        form: dict[str, str] = {}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            stream_id, output_id = form.get("stream", ""), form.get("output", "")
+            found = self._stream_output(stream_id, output_id)
+            if found is None:
+                raise ValueError("Stream output was not found.")
+            stream, output = found
+            settings_link = page_route("stream_settings", stream=stream_id)
+            current = {
+                "stream_id": stream_id,
+                "output_id": output_id,
+                "enabled": output.get("enabled") is not False,
+                "type": output.get("type") or "icecast",
+                "icecast": output.get("icecast"),
+                "soundcard": output.get("soundcard"),
+            }
+            if path == "/streams/outputs/remove":
+                self.service.remove_stream_output(stream_id, output_id)
+                self._send_redirect(page_route("stream_settings", stream=stream_id, result="output-removed"))
+                return
+            if path == "/streams/outputs/reset-soundcard":
+                reset = self.service.reset_soundcard_device(str((output.get("soundcard") or {}).get("stable_id") or ""))
+                result = ("output-list-result", str(reset.get("message") or "Sound card reset finished."), "success" if reset.get("success") else "error")
+                self._send_page(self._render_index_page({"view": "stream_settings", "stream": stream_id}, result=result))
+                return
+            if path == "/streams/outputs/enabled":
+                response = self.service.update_stream_output({**current, "enabled": form.get("enabled") == "1"})
+            elif current["type"] == "soundcard":
+                soundcard = dict(output.get("soundcard") or {})
+                for name, field in (("stable_id", "stable_id"), ("channel_mode", "settings_soundcard_channel"), ("volume", "volume")):
+                    if form.get(field, "") != form.get(f"was_{name}", ""):
+                        soundcard[name] = form.get(field, "")
+                try:
+                    soundcard["volume"] = float(soundcard.get("volume", 1.0))
+                except ValueError:
+                    raise ValueError("Enter a volume from 0 to 2.") from None
+                response = self.service.update_stream_output({**current, "soundcard": soundcard})
+            else:
+                # A changed service starts over with that service's settings; otherwise
+                # only what was changed here is taken from the form.
+                service = form.get("service", "")
+                values = icecast_form_values(output.get("icecast") or {})
+                form_values = {name: form.get(name, "") for name in ICECAST_FORM_FIELDS}
+                form_values["format"] = form.get("settings_icecast_format", "mp3")
+                if service != form.get("was_service"):
+                    values = form_values
+                else:
+                    for name in ICECAST_FORM_FIELDS:
+                        if form_values[name] != form.get(f"was_{name}", ""):
+                            values[name] = form_values[name]
+                icecast = apply_icecast_service_preset(icecast_payload(values), service, stream.get("station"))
+                response = self.service.update_stream_output({**current, "icecast": icecast})
+                if response.get("success") and service == STREAM_SERVICE_NWRORG and form.get("was_service") != STREAM_SERVICE_NWRORG:
+                    self._send_page(render_notice_page(
+                        "NOAA Weather Radio Org", NWRORG_SUBMISSION_HTML,
+                        {"view": "stream_settings", "stream": stream_id, "result": "output-saved"},
+                    ))
+                    return
+            if not response.get("success"):
+                raise ValueError(str(response.get("message") or "The output could not be saved."))
+        except Exception as exc:
+            query = {"view": "stream_output", "stream": form.get("stream", ""), "output": form.get("output", "")}
+            result = ("output-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(query, result=result, form=form if path == "/streams/outputs/save" else None), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_redirect(page_route("stream_settings", stream=stream_id, result="output-saved"))
+
+    def _wizard_state(self, form: dict[str, str], adding_stream: bool) -> dict[str, str]:
+        first = "station" if adding_stream else "type"
+        step = form.get("step") if form.get("step") in WIZARD_STEPS else first
+        return {
+            "step": first if step == "station" and not adding_stream else step,
+            "q": form.get("q", "").strip(),
+            "station_key": form.get("station_key", ""),
+            "output_type": "soundcard" if form.get("wizard_output_type") == "soundcard" else "icecast",
+            "service": form.get("service") if form.get("service") in STREAM_SERVICE_NAMES else STREAM_SERVICE_CUSTOM,
+            "host": form.get("host", ""),
+            "port": form.get("port", ""),
+            "username": form.get("username", ""),
+            "password": form.get("password", ""),
+            "mount": form.get("mount", ""),
+            "format": "ogg" if form.get("icecast_format") == "ogg" else "mp3",
+            "sample_rate": form.get("sample_rate", "24000"),
+            "bitrate": form.get("bitrate", "64"),
+            "alt_enabled": "1" if form.get("alt_enabled") == "1" else "",
+            "alt_number": form.get("alt_number", "1"),
+            "stable_id": form.get("stable_id", ""),
+            "channel_mode": form.get("wizard_soundcard_channel", "both"),
+            "volume": form.get("volume", "1"),
+            "output_id": form.get("output_id", ""),
+            "preview_id": form.get("preview_id", ""),
+        }
+
+    def _wizard_station(self, key: str) -> dict[str, Any] | None:
+        return next((station for station in self.service.stations if station.get("key") == key), None) if key else None
+
+    def _fill_wizard_view(self, page: str, query: dict[str, str], form: dict[str, str]) -> tuple[str, str]:
+        """Add Stream and Add Output, one step at a time; every step's fields go with the form."""
+        stream = next((item for item in self.service.streams if item.get("id") == query.get("stream")), None)
+        state = self._wizard_state(form if form.get("form") == "wizard" else {}, stream is None)
+        step = state["step"]
+        if stream is not None:
+            station = stream.get("station")
+            heading = f"Add output for {(station or {}).get('callsign') or 'stream'}"
+        else:
+            station = self._wizard_station(state["station_key"])
+            heading = "Add Stream"
+        page = page_rendering.set_text(page, "stream_wizard_title", heading)
+        page = page_rendering.set_attribute(page, "wizard_form_stream", "value", str(stream.get("id")) if stream else "")
+        page = page_rendering.set_attribute(page, "wizard_form_step", "value", step)
+        page = page_rendering.set_attribute(page, "wizard_form_output", "value", state["output_id"])
+        page = page_rendering.set_attribute(page, "wizard_form_preview", "value", state["preview_id"])
+        page = page_rendering.append_content(page, "stream_wizard_form", '<input type="hidden" name="form" value="wizard">')
+        for name, panel in WIZARD_STEP_PANELS.items():
+            page = page_rendering.set_hidden(page, panel, name != step)
+        # The station: found by searching on its own step, and kept for the others.
+        page = page_rendering.set_attribute(page, "station_search", "value", state["q"])
+        if step == "station":
+            page = page_rendering.set_content(page, "wizard_station_actions", '<input type="submit" name="wizard_action" value="Search">')
+            results = self.service.search_stations(state["q"], 75)["stations"] if state["q"] else []
+        else:
+            results = [station] if station and stream is None else []
+        if state["q"] or results:
+            options = "".join(
+                f'<option value="{html.escape(str(item.get("key")))}"{" selected" if item.get("key") == state["station_key"] else ""}>'
+                f"{html.escape(station_choice_label(item))}</option>"
+                for item in results
+            ) or '<option value="">No stations found</option>'
+            page = page_rendering.set_content(page, "station_results", options)
+            page = page_rendering.set_hidden(page, "station_results_label", False)
+        if station and stream is None:
+            page = page_rendering.set_text(page, "selected_station", f"Selected {station_choice_label(station)}")
+        elif state["q"]:
+            page = page_rendering.set_text(page, "selected_station", "Select a station to continue.")
+        for value in ("icecast", "soundcard"):
+            page = page_rendering.set_attribute(page, f"wizard_output_type_{value}", "checked", "checked" if state["output_type"] == value else None)
+        page = fill_icecast_fields(page, "icecast", state, state["service"], station)
+        options, chosen = soundcard_device_options_html(self.service.streams, list(self.service.devices().get("soundcards") or []), state["stable_id"], state["output_id"], False)
+        page = page_rendering.set_content(page, "wizard_soundcard_device", options)
+        page = page_rendering.set_text(page, "wizard_soundcard_device_hint", "NWR Stream Manager will open the hardware device directly." if chosen else "No sound cards have available channels.")
+        page = fill_soundcard_channels(page, "wizard", available_soundcard_channels(self.service.streams, chosen, state["output_id"]), state["channel_mode"])
+        page = page_rendering.set_attribute(page, "wizard_soundcard_volume", "value", state["volume"])
+        if state["preview_id"]:
+            minutes = int(SOUNDCARD_PREVIEW_LEASE_SECONDS // 60)
+            page = page_rendering.set_text(
+                page,
+                "wizard_soundcard_status",
+                f"The sound card is playing the station so you can check it. The preview stops {minutes} minutes after your last change; select Try these settings to keep it going.",
+            )
+        # The buttons for this step, going forward first so Enter goes forward.
+        last = step in ("quality", "controls") or (step == "credentials" and state["service"] == STREAM_SERVICE_NWRORG)
+        buttons = [("Finish" if last else "Next", step == "device" and not chosen)]
+        if step not in ("station", "type") or (step == "type" and stream is None):
+            buttons.append(("Back", False))
+        buttons.append(("Cancel", False))
+        page = page_rendering.set_content(
+            page,
+            "wizard_baseline_actions",
+            "".join(f'<input type="submit" name="wizard_action" value="{label}"{" disabled" if disabled else ""}>' for label, disabled in buttons),
+        )
+        if step == "device":
+            page = page_rendering.set_content(page, "wizard_soundcard_device_actions", '<input type="submit" name="wizard_action" value="Refresh sound card list">')
+        if step == "controls":
+            page = page_rendering.set_content(page, "wizard_soundcard_controls_actions", '<input type="submit" name="wizard_action" value="Try these settings">')
+        return page, heading
+
+    def _handle_wizard_form(self) -> None:
+        """Adds a stream, or an output to one, a step at a time, for browsers without the page script."""
+        form: dict[str, str] = {}
+        state: dict[str, str] = {}
+        message: tuple[str, str] | None = None
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            stream_id = form.get("stream", "")
+            stream = next((item for item in self.service.streams if item.get("id") == stream_id), None) if stream_id else None
+            if stream_id and stream is None:
+                raise ValueError("Stream was not found.")
+            adding_stream = stream is None
+            done_link = page_route("streams") if adding_stream else page_route("stream_settings", stream=stream_id)
+            state = self._wizard_state(form, adding_stream)
+            step, action, service = state["step"], form.get("wizard_action", ""), state["service"]
+            station = self._wizard_station(state["station_key"]) if adding_stream else stream.get("station")
+            try:
+                volume = float(state["volume"])
+            except ValueError:
+                volume = 1.0
+            soundcard = {"stable_id": state["stable_id"], "channel_mode": state["channel_mode"], "volume": volume, "sample_rate": 48000}
+            fixed = service in (STREAM_SERVICE_GWES, STREAM_SERVICE_NWRORG)
+
+            def try_soundcard() -> dict[str, Any]:
+                # A new stream's sound card plays a preview; an existing stream's gets its output.
+                if adding_stream:
+                    response = self.service.upsert_soundcard_preview_stream(
+                        {"preview_id": state["preview_id"], "station_key": state["station_key"], "soundcard": soundcard, "lease": True}
+                    )
+                    state["preview_id"] = str(response.get("preview_id") or "")
+                elif state["output_id"]:
+                    response = self.service.update_stream_output(
+                        {"stream_id": stream_id, "output_id": state["output_id"], "type": "soundcard", "enabled": True, "soundcard": soundcard}
+                    )
+                else:
+                    response = self.service.add_stream_output({"stream_id": stream_id, "type": "soundcard", "soundcard": soundcard})
+                    state["output_id"] = str(response.get("output_id") or "")
+                if not response.get("success"):
+                    raise ValueError(str(response.get("message")))
+                return response
+
+            def stop_soundcard() -> None:
+                if state["preview_id"]:
+                    self.service.discard_soundcard_preview_stream(state["preview_id"])
+                if state["output_id"]:
+                    self.service.remove_stream_output(stream_id, state["output_id"])
+                state["preview_id"] = state["output_id"] = ""
+
+            if action == "Cancel":
+                stop_soundcard()
+                self._send_redirect(done_link)
+                return
+            if action == "Back" and step == "device":
+                # The sound card tried on this step stops, as another type may be chosen.
+                stop_soundcard()
+                state["step"] = "type"
+            elif action == "Back":
+                state["step"] = {
+                    "type": "station", "service": "type", "codec": "service", "controls": "device", "quality": "credentials",
+                    "credentials": "service" if fixed else "codec",
+                }.get(step, "type")
+            elif action in ("Search", "Refresh sound card list"):
+                pass
+            elif action == "Try these settings" and step == "controls":
+                try_soundcard()
+                message = ("Soundcard preview updated." if adding_stream else "Soundcard output updated.", "success")
+            elif step == "station":
+                if station is None:
+                    raise ValueError("Select a station to continue.")
+                state["step"] = "type"
+            elif step == "type":
+                state["step"] = "device" if state["output_type"] == "soundcard" else "service"
+            elif step == "service":
+                state["step"] = "credentials" if fixed else "codec"
+            elif step == "codec":
+                if service == STREAM_SERVICE_WEATHERUSA and not state["mount"].strip():
+                    state["mount"] = weatherusa_mount(station, state["format"])
+                state["step"] = "credentials"
+            elif step == "device":
+                response = try_soundcard()
+                message = (str(response.get("message") or "Soundcard preview started."), "success")
+                state["step"] = "controls"
+            elif step == "controls":
+                if adding_stream:
+                    response = self.service.add_stream(
+                        {"station_key": state["station_key"], "type": "soundcard", "preview_id": state["preview_id"], "soundcard": soundcard}
+                    )
+                else:
+                    response = try_soundcard()
+                if not response.get("success"):
+                    raise ValueError(str(response.get("message")))
+                self._send_redirect(page_route("streams", result="created") if adding_stream else page_route("stream_settings", stream=stream_id, result="soundcard-added"))
+                return
+            else:
+                icecast = apply_icecast_service_preset(icecast_payload(state), service, station)
+                if step == "credentials" and service != STREAM_SERVICE_NWRORG:
+                    # Tested before going on, as the page script does.
+                    response = self.service.test_icecast_auth_payload({"icecast": icecast})
+                    if not response.get("success"):
+                        raise ValueError(str(response.get("message")))
+                    message = (str(response.get("message")), "success")
+                    state["step"] = "quality"
+                else:
+                    if adding_stream:
+                        response = self.service.add_stream({"station_key": state["station_key"], "type": "icecast", "icecast": icecast})
+                        done = {"view": "streams", "result": "created"}
+                    else:
+                        response = self.service.add_stream_output({"stream_id": stream_id, "icecast": icecast})
+                        done = {"view": "stream_settings", "stream": stream_id, "result": "icecast-added"}
+                    if not response.get("success"):
+                        raise ValueError(str(response.get("message")))
+                    if service == STREAM_SERVICE_NWRORG:
+                        self._send_page(render_notice_page("NOAA Weather Radio Org", NWRORG_SUBMISSION_HTML, done))
+                        return
+                    self._send_redirect(page_route(**done))
+                    return
+            fields = {**form, **{name: state[name] for name in ("step", "output_id", "preview_id", "mount")}}
+            result = ("stream-result", message[0], message[1]) if message else None
+            self._send_page(self._render_index_page({"view": "add_stream", "stream": stream_id}, result=result, form=fields))
+        except Exception as exc:
+            # What was tried before the mistake is kept track of.
+            fields = {**form, **{name: state[name] for name in ("output_id", "preview_id") if name in state}}
+            result = ("stream-result", form_message(str(exc)), "error")
+            query = {"view": "add_stream", "stream": form.get("stream", "")}
+            self._send_page(self._render_index_page(query, result=result, form=fields), HTTPStatus.BAD_REQUEST)
 
     def _fill_rtl_view(
         self, page: str, query: dict[str, str], form: dict[str, str], title: str
@@ -14495,7 +15157,7 @@ def account_confirmation_html(kind: str, account: dict[str, Any], token_input: s
     return content, question
 
 
-def eas_alert_route(view: str, **params: Any) -> str:
+def page_route(view: str, **params: Any) -> str:
     """A link to one of the EAS alert pages, as the page script makes them."""
     query = {"view": view}
     query.update({name: str(value) for name, value in params.items() if value})
@@ -14593,6 +15255,599 @@ def iq_recorder_source_text(recorder: dict[str, Any]) -> str:
     if recorder.get("mode") == IQ_RECORDER_MODE_STREAM:
         return str(recorder.get("stream_label") or "Stream channel")
     return "Entire spectrum at 162.475 MHz"
+
+
+SIGNAL_QUALITY_LABELS = {"excellent": "Excellent", "good": "Good", "fair": "Fair", "poor": "Poor", "no_signal": "No signal"}
+RECEPTION_PROBLEM_DETAILS = {
+    "bad_reception": "Bad reception: the signal is too weak or noisy to be usable.",
+    "no_signal": "No signal: only static is being received.",
+}
+STREAM_STATUS_LABELS = {
+    "enabled": "Enabled",
+    "needs-attention": "Needs attention",
+    "standby": "Disconnected (no station audio)",
+    "disabled": "Disabled",
+}
+
+
+def stream_enabled(stream: dict[str, Any]) -> bool:
+    return stream.get("enabled") not in (False, "false", 0)
+
+
+def stream_label(stream: dict[str, Any]) -> str:
+    station = stream.get("station") or {}
+    if station.get("callsign") and station.get("frequency"):
+        return f"{station['callsign']} {station['frequency']} MHz"
+    return str(station.get("callsign") or "stream")
+
+
+def stream_signal_display(signal: dict[str, Any] | None) -> dict[str, str]:
+    """A stream's signal, as the page script describes it."""
+    if not signal or not signal.get("available"):
+        return {"text": "No signal data", "quality": "", "detail": ""}
+    snr = signal.get("snr_db")
+    has_snr = isinstance(snr, (int, float)) and math.isfinite(snr)
+    quality = "no_signal" if not has_snr else signal.get("quality") if signal.get("quality") in SIGNAL_QUALITY_LABELS else "poor"
+    no_signal = quality == "no_signal"
+    text = SIGNAL_QUALITY_LABELS["no_signal"] if no_signal else f"{SIGNAL_QUALITY_LABELS[quality]} ({round(snr)} dB SNR)"
+    parts = []
+    if not no_signal and isinstance(signal.get("signal_dbfs"), (int, float)):
+        parts.append(f"Signal {signal['signal_dbfs']:.0f} dBFS")
+    if isinstance(signal.get("noise_floor_dbfs"), (int, float)):
+        parts.append(f"{'noise' if parts else 'Noise'} floor {signal['noise_floor_dbfs']:.0f} dBFS")
+    return {"text": text, "quality": quality, "detail": ", ".join(parts)}
+
+
+def stream_reception_problem(signal: dict[str, Any] | None) -> str | None:
+    if not signal or not signal.get("available"):
+        return None
+    problem = signal.get("reception_problem")
+    return problem if problem in RECEPTION_PROBLEM_DETAILS else None
+
+
+def stream_list_status(stream: dict[str, Any], status: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """A configured stream's status and signal, as the Manage Streams list shows them."""
+    signals = status.get("stream_signals") or {}
+    signal = signals.get(stream.get("id")) if stream_enabled(stream) else None
+    if signal and not signal.get("available"):
+        signal = None
+    statuses = []
+    for item in status.get("active_streams") or []:
+        if item.get("id") == stream.get("id"):
+            value = str(item.get("status") or "disabled").lower().replace("_", "-")
+            statuses.append(value if value in STREAM_STATUS_LABELS else "disabled")
+    if stream_reception_problem(signal):
+        statuses.append("needs-attention")
+    for value in ("needs-attention", "enabled", "standby"):
+        if value in statuses:
+            return value, signal
+    return "disabled", signal
+
+
+def stream_output_count(stream: dict[str, Any]) -> int:
+    outputs = stream.get("outputs") if isinstance(stream.get("outputs"), list) else []
+    count = sum(1 for output in outputs if output.get("enabled") is not False)
+    return count + (1 if (stream.get("eas_recording") or {}).get("enabled") else 0)
+
+
+def stream_row_html(stream: dict[str, Any], status: dict[str, Any], read_only: bool, token_input: str) -> str:
+    """A row of the Manage Streams list, keyed and labelled as the page script makes them."""
+    station = stream.get("station") or {}
+    stream_id = html.escape(str(stream.get("id", "")))
+    state, signal = stream_list_status(stream, status)
+    display = stream_signal_display(signal)
+    label = html.escape(stream_label(stream))
+    signal_class = f"status-text signal-{display['quality']}" if display["quality"] else "hint"
+    signal_title = f' title="{html.escape(display["detail"])}"' if display["quality"] and display["detail"] else ""
+    actions = ""
+    if not read_only:
+        enabled = stream_enabled(stream)
+        verb = "Stop stream" if enabled else "Start stream"
+        settings = urlencode({"view": "stream_settings", "stream": stream.get("id", "")})
+        remove = urlencode({"view": "streams", "confirm": "remove", "stream": stream.get("id", "")})
+        actions = (
+            f'<form method="post" action="/streams/enabled">{token_input}'
+            f'<input type="hidden" name="stream" value="{stream_id}">'
+            f'<input type="hidden" name="enabled" value="{"0" if enabled else "1"}">'
+            f'<button type="submit" aria-label="{verb} {label}">{verb}</button></form>'
+            f'<a class="button-link" href="/?{html.escape(settings)}" aria-label="Edit stream settings for {label}">Edit stream settings</a>'
+            f'<a class="button-link" href="/?{html.escape(remove)}" aria-label="Remove stream {label}">Remove stream</a>'
+        )
+    frequency = f"{station.get('frequency')} MHz" if station.get("frequency") else "Unknown"
+    cells = (
+        f'<td role="cell" data-label="Callsign">{html.escape(str(station.get("callsign") or "Unknown"))}</td>'
+        f'<td role="cell" data-label="Frequency">{html.escape(frequency)}</td>'
+        f'<td role="cell" data-label="Outputs">{stream_output_count(stream)}</td>'
+        f'<td class="{signal_class}"{signal_title} role="cell" data-label="Signal">{html.escape(display["text"])}</td>'
+        f'<td class="status-text status-{state}" role="cell" data-label="Status">{html.escape(STREAM_STATUS_LABELS[state])}</td>'
+        f'<td class="menu-cell" role="cell" data-label="Actions"><div class="row-actions">{actions}</div></td>'
+    )
+    return f'<tr data-row-key="stream:{stream_id}" role="row">{cells}</tr>'
+
+
+def station_choice_label(station: dict[str, Any]) -> str:
+    """A station, as the page script lists it when choosing one."""
+    place = ", ".join(str(part) for part in (station.get("city"), station.get("state")) if part)
+    site = f", {station['site_name']}" if station.get("site_name") and station.get("site_name") != station.get("city") else ""
+    return f"{station.get('callsign')} {station.get('frequency')} MHz, {place}{site}"
+
+
+def soundcard_label(soundcard: dict[str, Any], devices: list[dict[str, Any]]) -> str:
+    """A sound card's name, as the page script gives it."""
+    device = next((item for item in devices if item.get("stable_id") == soundcard.get("stable_id")), None)
+    if device is None:
+        return str(
+            soundcard.get("display_name") or soundcard.get("card_long_name") or soundcard.get("card_name")
+            or soundcard.get("device") or "Sound card"
+        )
+    card = str(device.get("card_long_name") or device.get("card_name") or device.get("card_id") or "").strip()
+    pcm = str(device.get("pcm_name") or device.get("pcm_id") or "").strip()
+    bus = {"usb": "USB", "pci": "PCI"}.get(str(device.get("bus") or ""), "")
+    parts = [card] if card else []
+    if pcm and pcm.lower() not in card.lower():
+        parts.append(pcm)
+    if bus:
+        parts.append(bus)
+    label = re.sub(r"\b(Generic USB|SOF[- ]DSP|sof[- ]hdadsp)\b", "", ", ".join(parts), flags=re.IGNORECASE)
+    label = re.sub(r"\s{2,}", " ", re.sub(r"\s+,", ",", label)).strip()
+    return label or str(device.get("display_name") or device.get("hw_device") or "Sound card")
+
+
+def stream_output_status(stream: dict[str, Any], output: dict[str, Any], status: dict[str, Any]) -> str:
+    if not stream_enabled(stream) or output.get("enabled") is False:
+        return "disabled"
+    for item in status.get("active_streams") or []:
+        if item.get("id") == stream.get("id") and any(active.get("id") == output.get("id") for active in item.get("outputs") or []):
+            value = str(item.get("status") or "").lower().replace("_", "-")
+            return {"enabled": "connected", "standby": "standby"}.get(value, "needs-attention")
+    return "needs-attention"
+
+
+OUTPUT_STATUS_LABELS = {
+    "connected": "Connected",
+    "needs-attention": "Needs attention",
+    "standby": "Disconnected (no station audio)",
+    "disabled": "Disabled",
+}
+
+
+def stream_output_row_html(stream: dict[str, Any], output: dict[str, Any], status: dict[str, Any], soundcards: list[dict[str, Any]]) -> str:
+    """A row of a stream's outputs, keyed and labelled as the page script makes them."""
+    state = stream_output_status(stream, output, status)
+    label = OUTPUT_STATUS_LABELS[state]
+    if output.get("type") == "soundcard":
+        soundcard = output.get("soundcard") or {}
+        label = "Enabled" if state == "connected" else label
+        channels = {"left": "Left", "right": "Right"}.get(str(soundcard.get("channel_mode") or ""), "Both left and right")
+        destination_label = soundcard_label(soundcard, soundcards)
+        values = (("Sound card name", destination_label), ("Channels", channels))
+    else:
+        icecast = output.get("icecast") or {}
+        destination = f"{icecast.get('host')}:{icecast.get('port')}{icecast.get('mount')}" if icecast.get("host") else "Unknown"
+        fmt = str(icecast.get("format") or "mp3")
+        bitrate = icecast.get("bitrate") or {"mp3": 64, "ogg": 48}.get(fmt, 64)
+        destination_label = destination
+        values = (
+            ("Destination", destination),
+            ("Format", fmt.upper()),
+            ("Sample rate", f"{icecast.get('sample_rate') or 24000} Hz"),
+            ("Bitrate", f"{bitrate} Kbps"),
+        )
+    cells = "".join(f'<td role="cell" data-label="{name}">{html.escape(str(value))}</td>' for name, value in values)
+    return (
+        f'<tr data-row-key="output:{html.escape(str(output.get("id", "")))}" role="row">{cells}'
+        f'<td class="status-text status-{state}" role="cell" data-label="Status">{label}</td>'
+        f'<td class="menu-cell" role="cell" data-label="Actions"><div class="row-actions">'
+        f'<a class="button-link" href="{html.escape(page_route("stream_output", stream=stream.get("id", ""), output=output.get("id", "")))}" '
+        f'aria-label="Edit output {html.escape(destination_label)}">Edit output</a></div></td></tr>'
+    )
+
+
+STREAM_SERVICE_HELP_HTML = {
+    STREAM_SERVICE_GWES: (
+        "If you do not yet have icecast credentials for streaming this station to this service, you'll need to "
+        '<a href="https://forms.office.com/r/MLx6hKmnCe" target="_blank" rel="noopener noreferrer">submit your stream</a> '
+        "to GWES Weather Radio and receive icecast credentials."
+    ),
+    STREAM_SERVICE_WEATHERUSA: (
+        "If you do not yet have icecast credentials for streaming this station to this service, you must "
+        '<a href="https://www.weatherusa.net/members/new" target="_blank" rel="noopener noreferrer">create an account on WeatherUSA</a> and '
+        '<a href="https://www.weatherusa.net/members/services/radio" target="_blank" rel="noopener noreferrer">create a stream</a>. '
+        "Once your stream is created, you must enter the icecast credentials into this page."
+    ),
+    STREAM_SERVICE_NWRORG: (
+        'Use the <a href="https://noaaweatherradio.org/N2radio-finder.php" target="_blank" rel="noopener noreferrer">'
+        "Weather Radio Station Lookup Utility</a> from NOAA Weather Radio Org to determine what the mountpoint should be."
+    ),
+}
+NWRORG_SUBMISSION_HTML = (
+    "<p>If you have not already done so, you must fill out the "
+    '<a href="http://noaaweatherradio.org/addstream/addstream.html" target="_blank" rel="noopener noreferrer">submission form</a> '
+    "for NOAA Weather Radio Org before your stream will appear on the website.</p>"
+)
+STREAM_SAMPLE_RATE_CHOICES = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000)
+STREAM_BITRATE_CHOICES = tuple(range(8, 321, 8))
+# The Icecast fields that a form keeps, by their form names.
+ICECAST_FORM_FIELDS = ("host", "port", "username", "password", "mount", "format", "sample_rate", "bitrate", "alt_enabled", "alt_number")
+
+
+def station_site_token(station: dict[str, Any] | None) -> str:
+    words = re.sub(r"[^A-Za-z0-9 ]+", " ", str((station or {}).get("site_name") or "")).split()
+    return "".join(word[:1].upper() + word[1:].lower() for word in words)
+
+
+def weatherusa_mount(station: dict[str, Any] | None, stream_format: str) -> str:
+    callsign = str((station or {}).get("callsign") or "").strip().upper() or "CALLSIGN"
+    return f"/NWR/{callsign}.{stream_format or 'mp3'}"
+
+
+def nwrorg_mount(station: dict[str, Any] | None, alternate: bool, alternate_number: Any) -> str:
+    state = str((station or {}).get("state") or "").strip().upper() or "XX"
+    callsign = str((station or {}).get("callsign") or "").strip().upper() or "CALLSIGN"
+    base = f"/{state}-{station_site_token(station) or 'Site'}-{callsign}"
+    if not alternate:
+        return base
+    try:
+        number = max(1, min(9, int(alternate_number or 1)))
+    except ValueError:
+        number = 1
+    return f"{base}-alt{number}"
+
+
+def icecast_service(icecast: dict[str, Any] | None) -> str:
+    explicit = str((icecast or {}).get("service") or "").strip()
+    if explicit in STREAM_SERVICE_NAMES:
+        return explicit
+    host = re.sub(r"^[a-z][a-z0-9+.-]*://", "", str((icecast or {}).get("host") or "").strip().lower())
+    return STREAM_SERVICE_HOSTS.get(re.split(r"[/:?#]", host)[0], STREAM_SERVICE_CUSTOM)
+
+
+def number_or(value: Any, default: int) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def apply_icecast_service_preset(icecast: dict[str, Any], service: str, station: dict[str, Any] | None) -> dict[str, Any]:
+    """An Icecast output with its streaming service's fixed settings, as the page script sets them."""
+    payload = {**icecast, "service": service}
+    stream_format = payload.get("format") or "mp3"
+    if service == STREAM_SERVICE_GWES:
+        payload.update(host="ingest.wxr.gwes-cdn.net", port=10000, format="mp3")
+        payload["bitrate"] = max(64, number_or(payload.get("bitrate"), 64))
+        payload["sample_rate"] = number_or(payload.get("sample_rate"), 22050) or 22050
+    elif service == STREAM_SERVICE_WEATHERUSA:
+        payload.update(host="radio-master.weatherusa.net", port=80, username="source", format=stream_format)
+        payload["bitrate"] = max(32, min(56, number_or(payload.get("bitrate"), 56 if stream_format == "mp3" else 48)))
+        payload["sample_rate"] = min(22050, number_or(payload.get("sample_rate"), 22050) or 22050)
+        if not str(payload.get("mount") or "").strip():
+            payload["mount"] = weatherusa_mount(station, stream_format)
+    elif service == STREAM_SERVICE_NWRORG:
+        payload.update(host="wxradio.org", port=8000, username="source", password="WxRadio2014", format="mp3", bitrate=32, sample_rate=22050)
+        payload["mount"] = nwrorg_mount(station, bool(payload.get("alt_enabled")), payload.get("alt_number"))
+    return payload
+
+
+def icecast_value_allowed(service: str, name: str, value: int) -> bool:
+    """Whether a service allows a bitrate or sample rate, as the page script's lists offer them."""
+    if service == STREAM_SERVICE_GWES:
+        return value >= 64 if name == "bitrate" else True
+    if service == STREAM_SERVICE_WEATHERUSA:
+        return 32 <= value <= 56 if name == "bitrate" else value <= 22050
+    if service == STREAM_SERVICE_NWRORG:
+        return value == (32 if name == "bitrate" else 22050)
+    return True
+
+
+def icecast_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    """An Icecast output from form fields, in the form the server checks."""
+    return {
+        "host": str(raw.get("host") or "").strip(),
+        "port": number_or(raw.get("port"), 0),
+        "username": str(raw.get("username") or ""),
+        "password": str(raw.get("password") or ""),
+        "mount": str(raw.get("mount") or "").strip(),
+        "format": "ogg" if raw.get("format") == "ogg" else "mp3",
+        "sample_rate": number_or(raw.get("sample_rate"), 24000),
+        "bitrate": number_or(raw.get("bitrate"), 64),
+        "alt_enabled": raw.get("alt_enabled") in (True, "1"),
+        "alt_number": raw.get("alt_number") or "1",
+    }
+
+
+def icecast_form_values(icecast: dict[str, Any]) -> dict[str, str]:
+    """An Icecast output as form fields show it."""
+    host = str(icecast.get("host") or "")
+    if icecast.get("tls") and host and not host.lower().startswith("https:"):
+        host = f"https://{host}"
+    mount = str(icecast.get("mount") or "")
+    match = re.search(r"-alt([1-9])$", mount)
+    return {
+        "host": host,
+        "port": str(icecast.get("port") or ""),
+        "username": str(icecast.get("username") or ""),
+        "password": str(icecast.get("password") or ""),
+        "mount": mount,
+        "format": str(icecast.get("format") or "mp3"),
+        "sample_rate": str(icecast.get("sample_rate") or 24000),
+        "bitrate": str(icecast.get("bitrate") or (64 if icecast.get("format", "mp3") == "mp3" else 48)),
+        "alt_enabled": "1" if icecast_service(icecast) == STREAM_SERVICE_NWRORG and match else "",
+        "alt_number": match.group(1) if match else "1",
+    }
+
+
+def soundcard_occupancy(streams: list[dict[str, Any]], ignore_output_id: str = "") -> dict[str, set[str]]:
+    """The sound card channels in use, as the page script counts them."""
+    occupied: dict[str, set[str]] = {}
+    for stream in streams:
+        for output in stream.get("outputs") or []:
+            if output.get("type") != "soundcard" or output.get("enabled") is False or output.get("id") == ignore_output_id:
+                continue
+            stable_id = str((output.get("soundcard") or {}).get("stable_id") or "")
+            if stable_id:
+                occupied.setdefault(stable_id, set()).update(soundcard_channels((output.get("soundcard") or {}).get("channel_mode") or "both"))
+    return occupied
+
+
+def available_soundcard_channels(streams: list[dict[str, Any]], stable_id: str, ignore_output_id: str = "") -> list[str]:
+    used = soundcard_occupancy(streams, ignore_output_id).get(stable_id, set())
+    return [channel for channel in ("left", "right") if channel not in used]
+
+
+def soundcard_channel_choice(preferred: str, available: list[str]) -> str:
+    if not available:
+        return ""
+    if preferred == "both" and len(available) == 2:
+        return "both"
+    if preferred in available:
+        return preferred
+    return available[0]
+
+
+def fill_icecast_fields(page: str, prefix: str, values: dict[str, str], service: str, station: dict[str, Any] | None) -> str:
+    """Fills an Icecast form (prefix "icecast" in the wizard, "settings_icecast" when editing) for its
+    streaming service, showing and offering what the page script does for that service."""
+    preset = apply_icecast_service_preset(icecast_payload(values), service, station)
+    shown = {**values, **{name: str(preset[name]) for name in ("host", "port", "username", "password", "mount") if service != STREAM_SERVICE_CUSTOM}}
+    shown["format"] = str(preset["format"])
+    page = page_rendering.set_content(
+        page,
+        f"{prefix}_service",
+        "".join(
+            f'<option value="{value}"{" selected" if value == service else ""}>{html.escape(name)}</option>'
+            for value, name in (
+                (STREAM_SERVICE_CUSTOM, "Custom Icecast server"),
+                (STREAM_SERVICE_GWES, STREAM_SERVICE_NAMES[STREAM_SERVICE_GWES]),
+                (STREAM_SERVICE_WEATHERUSA, STREAM_SERVICE_NAMES[STREAM_SERVICE_WEATHERUSA]),
+                (STREAM_SERVICE_NWRORG, STREAM_SERVICE_NAMES[STREAM_SERVICE_NWRORG]),
+            )
+        ),
+    )
+    page = page_rendering.set_content(page, f"{prefix}_service_help", STREAM_SERVICE_HELP_HTML.get(service, ""))
+    for name in ("host", "port", "username", "password", "mount"):
+        page = page_rendering.set_attribute(page, f"{prefix}_{name}", "value", shown.get(name, ""))
+    page = page_rendering.set_attribute(page, f"{prefix}_username", "readonly", "readonly" if service == STREAM_SERVICE_WEATHERUSA else None)
+    custom = service == STREAM_SERVICE_CUSTOM
+    fixed = service in (STREAM_SERVICE_GWES, STREAM_SERVICE_NWRORG)
+    nwrorg = service == STREAM_SERVICE_NWRORG
+    show_password = "settings_show_icecast_password_label" if prefix == "settings_icecast" else "show_icecast_password_label"
+    for element_id, hidden in (
+        (f"{prefix}_host_label", not custom),
+        (f"{prefix}_port_label", not custom),
+        (f"{prefix}_username_label", service in (STREAM_SERVICE_WEATHERUSA, STREAM_SERVICE_NWRORG)),
+        (f"{prefix}_password_label", nwrorg),
+        # Shown by a script where one runs, since showing the password needs it.
+        (show_password, True),
+        (f"{prefix}_mount_label", nwrorg),
+        (f"{prefix}_alt_label", not nwrorg),
+        (f"{prefix}_alt_number_label", not nwrorg),
+        (f"{prefix}_format_fieldset", fixed),
+        (f"{prefix}_sample_rate_label", nwrorg),
+        (f"{prefix}_bitrate_label", nwrorg),
+    ):
+        page = page_rendering.set_hidden(page, element_id, hidden)
+    for stream_format in ("mp3", "ogg"):
+        page = page_rendering.set_attribute(page, f"{prefix}_format_{stream_format}", "checked", "checked" if shown["format"] == stream_format else None)
+    page = page_rendering.set_attribute(page, f"{prefix}_alt_enabled", "checked", "checked" if values.get("alt_enabled") == "1" else None)
+    page = page_rendering.set_attribute(page, f"{prefix}_alt_number", "value", values.get("alt_number") or "1")
+    for name, choices, unit in (("sample_rate", STREAM_SAMPLE_RATE_CHOICES, "Hz"), ("bitrate", STREAM_BITRATE_CHOICES, "Kbps")):
+        allowed = [value for value in choices if icecast_value_allowed(service, name, value)]
+        chosen = number_or(preset[name], allowed[0])
+        if chosen not in allowed:
+            chosen = allowed[0]
+        page = page_rendering.set_content(
+            page,
+            f"{prefix}_{name}",
+            "".join(
+                f'<option value="{value}"{" selected" if value == chosen else ""}{"" if value in allowed else " disabled"}>{value} {unit}</option>'
+                for value in choices
+            ),
+        )
+    return page
+
+
+def soundcard_device_options_html(
+    streams: list[dict[str, Any]], devices: list[dict[str, Any]], selected: str, ignore_output_id: str, keep_configured: bool
+) -> tuple[str, str]:
+    """The sound card list, as the page script makes it, with each card's free channels for a
+    script to show; and the card it chooses."""
+    options: list[tuple[str, str, list[str]]] = []
+    device_ids = {str(device.get("stable_id")) for device in devices}
+    if keep_configured and selected and selected not in device_ids:
+        options.append((selected, f"Configured sound card, {selected} (not connected)", available_soundcard_channels(streams, selected, ignore_output_id)))
+    for device in devices:
+        stable_id = str(device.get("stable_id") or "")
+        channels = available_soundcard_channels(streams, stable_id, ignore_output_id)
+        if stable_id != selected and not channels or not stable_id:
+            continue
+        options.append((stable_id, soundcard_label({"stable_id": stable_id}, devices), channels))
+    if not options:
+        return '<option value="">No sound cards found</option>', ""
+    chosen = selected if any(value == selected for value, _label, _channels in options) else options[0][0]
+    return "".join(
+        f'<option value="{html.escape(value)}" data-channels="{" ".join(channels)}"{" selected" if value == chosen else ""}>{html.escape(label)}</option>'
+        for value, label, channels in options
+    ), chosen
+
+
+def fill_soundcard_channels(page: str, prefix: str, available: list[str], preferred: str) -> str:
+    """Offers only the channels a sound card has free, as the page script does."""
+    chosen = soundcard_channel_choice(preferred, available)
+    for mode in ("left", "both", "right"):
+        free = all(channel in available for channel in soundcard_channels(mode))
+        control = f"{prefix}_soundcard_channel_{mode}"
+        page = page_rendering.set_attribute(page, control, "checked", "checked" if mode == chosen else None)
+        page = page_rendering.set_attribute(page, control, "disabled", None if free else "disabled")
+        page = page_rendering.set_hidden(page, f"{control}_label", not free)
+    return page
+
+
+# The stream settings that work without the page script: the form field, which
+# settings it's in, its key there, and how to read it. Numbers have the page's limits.
+STREAM_SETTINGS_FIELDS: tuple[tuple[str, str, str, str], ...] = (
+    ("stream_enabled", "enabled", "enabled", "bool"),
+    ("eas_enabled", "eas_recording", "enabled", "bool"),
+    ("eas_pre_seconds", "eas_recording", "pre_seconds", "text"),
+    ("eas_post_seconds", "eas_recording", "post_seconds", "text"),
+    ("eas_max_seconds", "eas_recording", "max_seconds", "text"),
+    ("eas_format", "eas_recording", "format", "text"),
+    ("stream_fallback_action", "fallback_action", "action", "text"),
+    ("stream_fallback_delay", "fallback_action", "delay_seconds", "text"),
+    ("audio_volume_enabled", "audio", "volume.enabled", "bool"),
+    ("audio_volume_multiplier", "audio", "volume.multiplier", "number"),
+    ("audio_comfort_noise_enabled", "audio", "comfort_noise.enabled", "bool"),
+    ("audio_comfort_noise_level", "audio", "comfort_noise.level_db", "number"),
+    ("audio_deemphasis_enabled", "audio", "deemphasis.enabled", "bool"),
+    ("audio_highpass_enabled", "audio", "highpass.enabled", "bool"),
+    ("audio_highpass_frequency", "audio", "highpass.frequency", "number"),
+    ("audio_highpass_sharpness", "audio", "highpass.sharpness", "number"),
+    ("audio_lowpass_enabled", "audio", "lowpass.enabled", "bool"),
+    ("audio_lowpass_frequency", "audio", "lowpass.frequency", "number"),
+    ("audio_lowpass_sharpness", "audio", "lowpass.sharpness", "number"),
+    ("audio_notch_enabled", "audio", "notch.enabled", "bool"),
+    ("audio_notch_frequency", "audio", "notch.frequency", "number"),
+    ("audio_notch_width", "audio", "notch.width", "number"),
+    ("stream_notify_icecast_failures", "notifications", "icecast_failures", "bool"),
+    ("stream_notify_soundcard_failures", "notifications", "soundcard_failures", "bool"),
+    ("stream_notify_bad_reception", "notifications", "bad_reception", "bool"),
+    ("stream_notify_eas_alerts", "notifications", "recorded_eas_alerts", "bool"),
+)
+AUDIO_NUMBER_LIMITS = {
+    "audio_volume_multiplier": (0.1, 2, "Enter a volume multiplier from 0.1 to 2."),
+    "audio_comfort_noise_level": (-60, -30, "Enter a comfort noise level from -60 to -30."),
+    "audio_highpass_frequency": (1, 900, "Enter a highpass frequency from 1 to 900 Hz."),
+    "audio_highpass_sharpness": (0, 10, "Enter a highpass sharpness from 0 to 10."),
+    "audio_lowpass_frequency": (2200, 12000, "Enter a lowpass frequency from 2200 to 12000 Hz."),
+    "audio_lowpass_sharpness": (0, 10, "Enter a lowpass sharpness from 0 to 10."),
+    "audio_notch_frequency": (1, 12000, "Enter a notch filter frequency from 1 to 12000 Hz."),
+    "audio_notch_width": (60, 2000, "Enter a notch filter width from 60 to 2000 Hz."),
+}
+PROTECTED_AUDIO_BANDS_HZ = ((900, 1100), (1400, 1600), (2000, 2200))
+
+
+# Audio effects a stream hasn't set, as the page script shows them.
+DEFAULT_AUDIO_EFFECTS = {
+    "volume": {"enabled": False, "multiplier": 1.0},
+    "comfort_noise": {"enabled": False, "level_db": -40.0},
+    "deemphasis": {"enabled": True, "tau": 300.0},
+    "highpass": {"enabled": False, "frequency": 300.0, "sharpness": 0.0},
+    "lowpass": {"enabled": False, "frequency": 3400.0, "sharpness": 2.0},
+    "notch": {"enabled": False, "frequency": 3000.0, "width": 100.0},
+}
+
+
+def stream_audio_effects(stream: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """A stream's audio effects, as the page script shows them: its own over the defaults,
+    with a filter that has no frequency given the default one."""
+    audio = stream.get("audio") if isinstance(stream.get("audio"), dict) else {}
+    effects = {}
+    for name, defaults in DEFAULT_AUDIO_EFFECTS.items():
+        settings = {**defaults, **(audio.get(name) if isinstance(audio.get(name), dict) else {})}
+        if "frequency" in defaults and not settings.get("frequency"):
+            settings["frequency"] = defaults["frequency"]
+        effects[name] = settings
+    return effects
+
+
+def stream_settings_groups(stream: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """A stream's settings, as the stream settings form shows them."""
+    return {
+        "enabled": {"enabled": stream_enabled(stream)},
+        "eas_recording": asdict(eas_recording_settings_from_stream(stream)),
+        "fallback_action": asdict(stream_fallback_action_from_stream(stream)),
+        "audio": stream_audio_effects(stream),
+        "notifications": asdict(stream_notification_settings_from_stream(stream)),
+    }
+
+
+def stream_setting_value(groups: dict[str, dict[str, Any]], group: str, key: str) -> Any:
+    value: Any = groups[group]
+    for part in key.split("."):
+        value = value[part]
+    return value
+
+
+def stream_setting_text(value: Any, kind: str) -> str:
+    if kind == "bool":
+        return "1" if value else "0"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def stream_settings_changes(form: dict[str, str], stream: dict[str, Any]) -> dict[str, Any]:
+    """The settings changed on the stream settings form, which sends them all.
+
+    Each is compared with what the page had when it opened (its was_ field), and
+    each group of settings with a change is sent in full, with only the changed
+    ones taken from the form. So settings someone else has since changed are kept.
+    Everything is checked before anything is saved.
+    """
+    groups = stream_settings_groups(stream)
+    changes: dict[str, Any] = {}
+    for name, group, key, kind in STREAM_SETTINGS_FIELDS:
+        sent = ("1" if form.get(name) == "1" else "0") if kind == "bool" else form.get(name, "").strip()
+        if sent == form.get(f"was_{name}", "").strip():
+            continue
+        if kind == "bool":
+            value: Any = sent == "1"
+        elif kind == "number":
+            low, high, message = AUDIO_NUMBER_LIMITS[name]
+            try:
+                value = float(sent)
+            except ValueError:
+                raise ValueError(message) from None
+            if not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(message)
+        else:
+            value = sent
+        settings = changes.setdefault(group, copy.deepcopy(groups[group]))
+        *path, last = key.split(".")
+        target = settings
+        for part in path:
+            target = target[part]
+        target[last] = value
+    audio = changes.get("audio")
+    if audio is not None:
+        notch = audio["notch"]
+        frequency = float(notch["frequency"])
+        if any(low <= frequency <= high for low, high in PROTECTED_AUDIO_BANDS_HZ):
+            raise ValueError(
+                "The notch filter frequency can't be within 900-1100, 1400-1600, or 2000-2200 Hz, "
+                "to protect the attention tone and SAME tones."
+            )
+        widest = int(notch_max_width(frequency))
+        if float(notch["width"]) > widest:
+            raise ValueError(f"Enter a notch filter width from 60 to {widest} Hz, the widest allowed at {frequency:g} Hz.")
+        changes["audio"] = validate_audio_payload(audio)
+    if "eas_recording" in changes:
+        changes["eas_recording"] = asdict(validate_eas_recording_payload(changes["eas_recording"]))
+    if "fallback_action" in changes:
+        changes["fallback_action"] = asdict(validate_stream_fallback_action_payload(changes["fallback_action"]))
+    if "notifications" in changes:
+        changes["notifications"] = asdict(validate_stream_notification_payload(changes["notifications"]))
+    return changes
 
 
 def format_gain(value: float) -> str:
@@ -14795,7 +16050,8 @@ section { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; paddi
 [hidden] { display: none !important; }
 label { display: grid; gap: 6px; font-weight: 600; margin-bottom: 14px; min-width: 0; }
 select, input, button { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; max-width: 100%; }
-select, input:not([type="checkbox"]):not([type="radio"]), textarea { width: 100%; min-width: 0; }
+select, input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]), textarea { width: 100%; min-width: 0; }
+input[type="submit"] { cursor: pointer; }
 input[type="checkbox"], input[type="radio"] { width: auto; min-width: 13px; }
 input[type="range"] { min-height: 40px; }
 fieldset { border: 1px solid #d8dde6; border-radius: 6px; margin: 16px 0 0; padding: 14px; }
@@ -14808,6 +16064,8 @@ nav a { font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radi
 nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #2557a7; box-shadow: inset 0 -2px 0 #2557a7; }
 .logs-refresh { margin-top: 12px; }
 .needs-app-inline { display: none; }
+.needs-app-flex { display: none !important; }
+.js-app .needs-app-flex { display: flex !important; }
 .js-app .needs-app-inline { display: inline-block; }
 .button-link { display: inline-block; font: inherit; padding: 8px 10px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; color: #14181f; text-decoration: none; }
 .settings-back-form { margin: 0; }
@@ -14869,8 +16127,12 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #d8dde6; margin: 16px 0; }
 .tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: -1px; }
 .tabs button[aria-selected="true"] { border-color: #2557a7; border-bottom-color: #fff; box-shadow: inset 0 2px 0 #2557a7; }
+.tabs a { border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: -1px; }
+.tabs a[aria-current="page"] { border-color: #2557a7; border-bottom-color: #fff; box-shadow: inset 0 2px 0 #2557a7; }
+html:not(.js-app) .audio-effect-panel + .audio-effect-panel { margin-top: 20px; }
+#stream_settings_save_actions { margin-top: 18px; }
 .tabpanel[hidden] { display: none; }
-.effects-layout { display: grid; grid-template-columns: minmax(180px, 240px) 1fr; gap: 16px; align-items: start; }
+.js-app .effects-layout { display: grid; grid-template-columns: minmax(180px, 240px) 1fr; gap: 16px; align-items: start; }
 .effects-list { display: grid; gap: 8px; }
 .effects-list button { text-align: left; }
 .effects-list button[aria-current="true"] { border-color: #2557a7; box-shadow: inset 3px 0 0 #2557a7; }
@@ -14943,7 +16205,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
   .js-app .nav-more-menu { background: #181d24; border-color: #333b48; }
   .tabs { border-color: #333b48; }
-  .tabs button[aria-selected="true"] { border-bottom-color: #181d24; }
+  .tabs button[aria-selected="true"], .tabs a[aria-current="page"] { border-bottom-color: #181d24; }
   .notice-dialog { background: #181d24; border-color: #333b48; }
   .fullscreen-dialog { background: #101318; }
   .fullscreen-dialog-panel { background: #181d24; border-color: #333b48; }
@@ -14959,10 +16221,10 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   main { padding: 16px; }
   footer { margin: 0 16px; padding-bottom: 24px; }
   .global-status-banner { margin: 14px 16px 0; padding: 12px 16px; }
-  .effects-layout { display: block; }
-  .effects-layout.effect-detail-active .effects-list { display: none; }
-  .effects-layout:not(.effect-detail-active) .effects-detail { display: none; }
-  .audio-effects-back { display: inline-block; margin-bottom: 12px; }
+  .js-app .effects-layout { display: block; }
+  .js-app .effects-layout.effect-detail-active .effects-list { display: none; }
+  .js-app .effects-layout:not(.effect-detail-active) .effects-detail { display: none; }
+  .js-app .audio-effects-back { display: inline-block; margin-bottom: 12px; }
   .desktop-volume-control { display: none; }
   /* Stacked cards for phones. Explicit ARIA roles on the table keep its
      semantics once display changes, the header row stays available to screen
@@ -15778,11 +17040,13 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_streams" class="view needs-app" hidden>
+  <div id="view_streams" class="view" hidden>
     <section>
       <h2>Manage Streams</h2>
+      <div id="streams_confirm" class="baseline-only" hidden></div>
       <div class="actions">
-        <button id="open_add_stream" type="button">Add stream</button>
+        <button id="open_add_stream" class="needs-app-inline" type="button">Add stream</button>
+        <a id="open_add_stream_link" class="baseline-only button-link" href="/?view=add_stream">Add stream</a>
       </div>
       <table class="responsive-table" role="table" aria-label="Manage streams">
         <thead role="rowgroup">
@@ -15805,19 +17069,26 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_add_stream" class="view needs-app" hidden>
+  <div id="view_add_stream" class="view" hidden>
     <section>
       <h2 id="stream_wizard_title">Add Stream</h2>
+      <form id="stream_wizard_form" method="post" action="/streams/wizard">
+      __FORM_TOKEN_INPUT__
+      <input id="wizard_form_stream" type="hidden" name="stream" value="">
+      <input id="wizard_form_step" type="hidden" name="step" value="">
+      <input id="wizard_form_output" type="hidden" name="output_id" value="">
+      <input id="wizard_form_preview" type="hidden" name="preview_id" value="">
       <div id="wizard_step_station" class="wizard-step">
         <p>Let's get your stream set up and running! What station would you like to stream?</p>
         <label>Station Lookup
-          <input id="station_search" type="search" placeholder="Callsign, city, state, or frequency" autocomplete="off">
+          <input id="station_search" name="q" type="search" placeholder="Callsign, city, state, or frequency" autocomplete="off">
         </label>
         <div class="actions">
-          <button id="station_search_button" type="button" disabled>Search</button>
+          <button id="station_search_button" class="needs-app-inline" type="button" disabled>Search</button>
+          <span id="wizard_station_actions" class="baseline-only"></span>
         </div>
         <label id="station_results_label" hidden>Matching Stations
-          <select id="station_results" size="8"></select>
+          <select id="station_results" name="station_key" size="8"></select>
         </label>
         <div id="selected_station" class="hint">Enter search text to find a station.</div>
       </div>
@@ -15828,19 +17099,19 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <legend>Icecast Credentials</legend>
           <div class="grid">
             <label id="icecast_host_label">Host
-              <input id="icecast_host" type="text" autocomplete="off" aria-describedby="icecast_host_hint">
+              <input id="icecast_host" name="host" type="text" autocomplete="off" aria-describedby="icecast_host_hint">
             </label>
             <span id="icecast_host_hint" class="hint">The hostname, IP address, or web URL of the Icecast server.</span>
             <label id="icecast_port_label">Port
-              <input id="icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="icecast_port_hint">
+              <input id="icecast_port" name="port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="icecast_port_hint">
             </label>
             <span id="icecast_port_hint" class="hint">The port the Icecast server listens on.</span>
             <label id="icecast_username_label">Username
-              <input id="icecast_username" type="text" autocomplete="username" aria-describedby="icecast_username_hint">
+              <input id="icecast_username" name="username" type="text" autocomplete="username" aria-describedby="icecast_username_hint">
             </label>
             <span id="icecast_username_hint" class="hint">The username for authentication to the server.</span>
             <label id="icecast_password_label">Password
-              <input id="icecast_password" type="password" autocomplete="current-password" aria-describedby="icecast_password_hint">
+              <input id="icecast_password" name="password" type="password" autocomplete="current-password" aria-describedby="icecast_password_hint">
             </label>
             <span id="icecast_password_hint" class="hint">The password for authentication to the server.</span>
             <label id="show_icecast_password_label" class="checkbox-row">
@@ -15848,15 +17119,15 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               Show password
             </label>
             <label id="icecast_mount_label">Mountpoint
-              <input id="icecast_mount" type="text" placeholder="/station.mp3" aria-describedby="icecast_mount_hint">
+              <input id="icecast_mount" name="mount" type="text" placeholder="/station.mp3" aria-describedby="icecast_mount_hint">
             </label>
             <span id="icecast_mount_hint" class="hint">The mountpoint where the stream will be accessible to listeners.</span>
             <label id="icecast_alt_label" class="checkbox-row" hidden>
-              <input id="icecast_alt_enabled" type="checkbox">
+              <input id="icecast_alt_enabled" name="alt_enabled" value="1" type="checkbox">
               Alternate stream
             </label>
             <label id="icecast_alt_number_label" hidden>Alternate stream number
-              <input id="icecast_alt_number" type="number" min="1" max="9" step="1" value="1">
+              <input id="icecast_alt_number" name="alt_number" type="number" min="1" max="9" step="1" value="1">
             </label>
           </div>
         </fieldset>
@@ -15864,7 +17135,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div id="wizard_step_service" class="wizard-step" hidden>
         <p>There are several online platforms you may stream to. You can choose to stream to one of them, or you may stream to a custom icecast server.</p>
         <label>Streaming service
-          <select id="icecast_service">
+          <select id="icecast_service" name="service">
             <option value="custom">Custom Icecast server</option>
             <option value="gwes">GWES Weather Radio</option>
             <option value="weatherusa">WeatherUSA</option>
@@ -15876,9 +17147,9 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <p>Select the output type.</p>
         <fieldset>
           <legend>Output type</legend>
-          <label><input id="wizard_output_type_icecast" name="wizard_output_type" type="radio" value="icecast" checked aria-describedby="wizard_output_type_icecast_hint"> Icecast mountpoint</label>
+          <label class="checkbox-row"><input id="wizard_output_type_icecast" name="wizard_output_type" type="radio" value="icecast" checked aria-describedby="wizard_output_type_icecast_hint"> Icecast mountpoint</label>
           <span id="wizard_output_type_icecast_hint" class="hint">Send station audio to an Icecast mountpoint, including private servers or services like GWES Weather Radio, NOAA Weather Radio Org, and WeatherUSA.</span>
-          <label><input id="wizard_output_type_soundcard" name="wizard_output_type" type="radio" value="soundcard" aria-describedby="wizard_output_type_soundcard_hint"> Sound card</label>
+          <label class="checkbox-row"><input id="wizard_output_type_soundcard" name="wizard_output_type" type="radio" value="soundcard" aria-describedby="wizard_output_type_soundcard_hint"> Sound card</label>
           <span id="wizard_output_type_soundcard_hint" class="hint">Send station audio to a local sound card, useful for feeding an Emergency Alert System ENDEC.</span>
         </fieldset>
       </div>
@@ -15886,30 +17157,32 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <p>Select the sound card that should play this stream.</p>
         <p>The sound card must be connected to the machine running NWR Stream Manager, not the phone, tablet, or computer used to access this web interface.</p>
         <label>Sound card
-          <select id="wizard_soundcard_device"></select>
+          <select id="wizard_soundcard_device" name="stable_id"></select>
         </label>
         <div id="wizard_soundcard_device_hint" class="hint"></div>
+        <div id="wizard_soundcard_device_actions" class="actions baseline-only"></div>
       </div>
       <div id="wizard_step_soundcard_controls" class="wizard-step" hidden>
         <p>Choose which output channels to use and adjust the playback volume.</p>
         <fieldset>
           <legend>Output channels</legend>
-          <label><input id="wizard_soundcard_channel_both" name="wizard_soundcard_channel" type="radio" value="both" checked> Both left and right</label>
-          <label><input id="wizard_soundcard_channel_left" name="wizard_soundcard_channel" type="radio" value="left"> Left</label>
-          <label><input id="wizard_soundcard_channel_right" name="wizard_soundcard_channel" type="radio" value="right"> Right</label>
+          <label id="wizard_soundcard_channel_both_label" class="checkbox-row"><input id="wizard_soundcard_channel_both" name="wizard_soundcard_channel" type="radio" value="both" checked> Both left and right</label>
+          <label id="wizard_soundcard_channel_left_label" class="checkbox-row"><input id="wizard_soundcard_channel_left" name="wizard_soundcard_channel" type="radio" value="left"> Left</label>
+          <label id="wizard_soundcard_channel_right_label" class="checkbox-row"><input id="wizard_soundcard_channel_right" name="wizard_soundcard_channel" type="radio" value="right"> Right</label>
         </fieldset>
         <label>Volume
-          <input id="wizard_soundcard_volume" type="range" min="0" max="2" step="0.01" value="1">
+          <input id="wizard_soundcard_volume" name="volume" type="range" min="0" max="2" step="0.01" value="1">
         </label>
         <div id="wizard_soundcard_status" class="hint"></div>
+        <div id="wizard_soundcard_controls_actions" class="actions baseline-only"></div>
       </div>
       <div id="wizard_step_codec" class="wizard-step" hidden>
         <p>What audio codec would you like to use for the stream format? MP3 is generally more compatible, while OGG may give better audio quality at lower internet usage.</p>
         <fieldset id="icecast_format_fieldset">
           <legend>Stream Format</legend>
           <div class="hint">Encoding format for this Icecast mountpoint.</div>
-          <label><input id="icecast_format_mp3" name="icecast_format" type="radio" value="mp3" checked> MP3</label>
-          <label><input id="icecast_format_ogg" name="icecast_format" type="radio" value="ogg"> OGG</label>
+          <label class="checkbox-row"><input id="icecast_format_mp3" name="icecast_format" type="radio" value="mp3" checked> MP3</label>
+          <label class="checkbox-row"><input id="icecast_format_ogg" name="icecast_format" type="radio" value="ogg"> OGG</label>
         </fieldset>
       </div>
       <div id="wizard_step_quality" class="wizard-step" hidden>
@@ -15918,7 +17191,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <legend>Audio Settings</legend>
         <div class="grid">
           <label id="icecast_sample_rate_label">Sample Rate
-            <select id="icecast_sample_rate" aria-describedby="icecast_sample_rate_hint">
+            <select id="icecast_sample_rate" name="sample_rate" aria-describedby="icecast_sample_rate_hint">
               <option value="8000">8000 Hz</option>
               <option value="11025">11025 Hz</option>
               <option value="16000">16000 Hz</option>
@@ -15931,40 +17204,56 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           </label>
           <span id="icecast_sample_rate_hint" class="hint">The audio sample rate to encode at for this Icecast mountpoint.</span>
           <label id="icecast_bitrate_label">Bitrate
-            <select id="icecast_bitrate" aria-describedby="icecast_bitrate_hint"></select>
+            <select id="icecast_bitrate" name="bitrate" aria-describedby="icecast_bitrate_hint"></select>
           </label>
           <span id="icecast_bitrate_hint" class="hint">Encoder bitrate in Kbps for this Icecast mountpoint.</span>
         </div>
       </fieldset>
       </div>
-      <div class="actions">
+      <div class="actions needs-app-flex">
         <button id="cancel_wizard" type="button">Cancel</button>
         <button id="wizard_back" type="button" hidden>Back</button>
         <button id="wizard_next" type="button">Next</button>
         <button id="wizard_finish" type="button" hidden>Finish</button>
       </div>
+      <div id="wizard_baseline_actions" class="actions baseline-only"></div>
+      </form>
       <div id="stream-result" class="message"></div>
     </section>
   </div>
 
-  <div id="view_stream_settings" class="view needs-app" hidden>
+  <div id="view_stream_settings" class="view" hidden>
     <section>
       <h2 id="stream_settings_title">Stream Settings</h2>
+      <form id="stream_settings_form" method="post" action="/streams/settings">
+      __FORM_TOKEN_INPUT__
+      <input id="stream_settings_stream_id" type="hidden" name="stream" value="">
+      <input id="stream_settings_tab" type="hidden" name="tab" value="">
       <div id="stream_settings_station" class="hint"></div>
       <label class="checkbox-row">
-        <input id="stream_enabled" type="checkbox">
+        <input id="stream_enabled" name="stream_enabled" value="1" type="checkbox">
         Enable this stream
       </label>
-      <label id="stream_monitor_label" class="checkbox-row">
-        <input id="stream_monitor_enabled" type="checkbox" aria-describedby="stream_monitor_hint">
-        Monitor
-      </label>
-      <span id="stream_monitor_hint" class="hint">Listen to this stream's audio in your browser.</span>
+      <div class="needs-app">
+        <label id="stream_monitor_label" class="checkbox-row">
+          <input id="stream_monitor_enabled" type="checkbox" aria-describedby="stream_monitor_hint">
+          Monitor
+        </label>
+        <span id="stream_monitor_hint" class="hint">Listen to this stream's audio in your browser.</span>
+      </div>
       <div id="stream-settings-result" class="message"></div>
       <dl id="stream_settings_signal" class="details-list">
         <dt>Signal</dt><dd id="stream_settings_signal_value" class="hint">No signal data</dd>
         <dt id="stream_settings_signal_levels_label" hidden>Levels</dt><dd id="stream_settings_signal_levels" hidden></dd>
       </dl>
+      <div id="stream_settings_tab_links" class="tabs baseline-only" role="navigation" aria-label="Stream settings sections">
+        <a id="tab_link_outputs" class="button-link" href="">Outputs</a>
+        <a id="tab_link_eas" class="button-link" href="">EAS Recording</a>
+        <a id="tab_link_fallback_action" class="button-link" href="">Fallback Action</a>
+        <a id="tab_link_audio" class="button-link" href="">Audio Effects</a>
+        <a id="tab_link_notifications" class="button-link" href="" hidden>Notifications</a>
+      </div>
+      <div class="needs-app">
       <div class="tabs" role="tablist" aria-label="Stream settings sections">
         <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
         <button id="tab_eas" type="button" role="tab" aria-selected="false" aria-controls="panel_eas" tabindex="-1">EAS Recording</button>
@@ -15973,16 +17262,20 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <button id="tab_notifications" type="button" role="tab" aria-selected="false" aria-controls="panel_notifications" tabindex="-1" hidden>Notifications</button>
         <button id="tab_test_mode" type="button" role="tab" aria-selected="false" aria-controls="panel_test_mode" tabindex="-1">Test Mode</button>
       </div>
+      </div>
       <div id="panel_outputs" class="tabpanel" role="tabpanel" aria-labelledby="tab_outputs">
         <div class="actions">
-          <button id="open_add_output" type="button">Add output</button>
+          <button id="open_add_output" class="needs-app-inline" type="button">Add output</button>
+          <a id="open_add_output_link" class="baseline-only button-link" href="">Add output</a>
         </div>
+        <div class="needs-app">
         <label>Show outputs
           <select id="output_type_filter">
             <option value="icecast">Icecast outputs</option>
             <option value="soundcard">Sound card outputs</option>
           </select>
         </label>
+        </div>
         <div id="icecast_outputs_panel">
         <h3>Icecast outputs</h3>
         <table class="responsive-table" role="table" aria-label="Icecast outputs">
@@ -16026,6 +17319,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <div id="panel_audio" class="tabpanel" role="tabpanel" aria-labelledby="tab_audio" hidden>
         <h3>Audio effects</h3>
         <div id="audio_effects_layout" class="effects-layout">
+          <div class="needs-app">
           <div id="audio_effects_list" class="effects-list" aria-label="Audio effects">
             <button type="button" data-audio-effect="volume">Volume multiplier</button>
             <button type="button" data-audio-effect="comfort_noise">Comfort noise</button>
@@ -16034,36 +17328,37 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             <button type="button" data-audio-effect="lowpass">Lowpass</button>
             <button type="button" data-audio-effect="notch">Notch filter</button>
           </div>
+          </div>
           <div class="effects-detail">
             <button id="audio_effects_back" class="audio-effects-back" type="button">Back to effects</button>
             <div id="audio_effect_volume" class="audio-effect-panel">
               <h4>Volume multiplier</h4>
               <label class="checkbox-row">
-                <input id="audio_volume_enabled" type="checkbox" aria-describedby="audio_volume_enabled_hint">
+                <input id="audio_volume_enabled" name="audio_volume_enabled" value="1" type="checkbox" aria-describedby="audio_volume_enabled_hint">
                 Enable volume multiplier
               </label>
               <span id="audio_volume_enabled_hint" class="hint">Controls the stream volume.</span>
               <label>Multiplier
-                <input id="audio_volume_multiplier" type="number" min="0.1" max="2" step="0.1" aria-describedby="audio_volume_multiplier_hint">
+                <input id="audio_volume_multiplier" name="audio_volume_multiplier" type="number" min="0.1" max="2" step="0.1" aria-describedby="audio_volume_multiplier_hint">
               </label>
               <span id="audio_volume_multiplier_hint" class="hint">1 leaves the volume unchanged, 2 doubles it and 0.5 halves it. Valid range is 0.1 through 2.</span>
             </div>
             <div id="audio_effect_comfort_noise" class="audio-effect-panel" hidden>
               <h4>Comfort noise</h4>
               <label class="checkbox-row">
-                <input id="audio_comfort_noise_enabled" type="checkbox" aria-describedby="audio_comfort_noise_enabled_hint">
+                <input id="audio_comfort_noise_enabled" name="audio_comfort_noise_enabled" value="1" type="checkbox" aria-describedby="audio_comfort_noise_enabled_hint">
                 Enable comfort noise
               </label>
               <span id="audio_comfort_noise_enabled_hint" class="hint">Mixes very quiet white noise into demodulated audio, similar to some analog receivers.</span>
               <label>Level
-                <input id="audio_comfort_noise_level" type="number" min="-60" max="-30" step="1" aria-describedby="audio_comfort_noise_level_hint">
+                <input id="audio_comfort_noise_level" name="audio_comfort_noise_level" type="number" min="-60" max="-30" step="1" aria-describedby="audio_comfort_noise_level_hint">
               </label>
               <span id="audio_comfort_noise_level_hint" class="hint">Noise level in dB below full scale. Valid range is -60 through -30.</span>
             </div>
             <div id="audio_effect_deemphasis" class="audio-effect-panel" hidden>
               <h4>NWR deemphasis</h4>
               <label class="checkbox-row">
-                <input id="audio_deemphasis_enabled" type="checkbox" aria-describedby="audio_deemphasis_enabled_hint">
+                <input id="audio_deemphasis_enabled" name="audio_deemphasis_enabled" value="1" type="checkbox" aria-describedby="audio_deemphasis_enabled_hint">
                 Enable NWR deemphasis
               </label>
               <span id="audio_deemphasis_enabled_hint" class="hint">Reduces high-frequency audio components like an actual NOAA Weather Radio receiver would.</span>
@@ -16072,48 +17367,48 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             <div id="audio_effect_highpass" class="audio-effect-panel" hidden>
               <h4>Highpass</h4>
               <label class="checkbox-row">
-                <input id="audio_highpass_enabled" type="checkbox" aria-describedby="audio_highpass_enabled_hint">
+                <input id="audio_highpass_enabled" name="audio_highpass_enabled" value="1" type="checkbox" aria-describedby="audio_highpass_enabled_hint">
                 Enable highpass
               </label>
               <span id="audio_highpass_enabled_hint" class="hint">Gets rid of low-frequency audio, such as 60 Hz hums.</span>
               <label>Frequency
-                <input id="audio_highpass_frequency" type="number" min="1" max="900" step="1" aria-describedby="audio_highpass_frequency_hint">
+                <input id="audio_highpass_frequency" name="audio_highpass_frequency" type="number" min="1" max="900" step="1" aria-describedby="audio_highpass_frequency_hint">
               </label>
               <span id="audio_highpass_frequency_hint" class="hint">Frequency in Hz. Frequencies below this value will be attenuated. To protect the 1050 Hz attention tone, this cannot be set above 900 Hz.</span>
               <label>Sharpness
-                <input id="audio_highpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_highpass_sharpness_hint">
+                <input id="audio_highpass_sharpness" name="audio_highpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_highpass_sharpness_hint">
               </label>
               <span id="audio_highpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
             </div>
             <div id="audio_effect_lowpass" class="audio-effect-panel" hidden>
               <h4>Lowpass</h4>
               <label class="checkbox-row">
-                <input id="audio_lowpass_enabled" type="checkbox" aria-describedby="audio_lowpass_enabled_hint">
+                <input id="audio_lowpass_enabled" name="audio_lowpass_enabled" value="1" type="checkbox" aria-describedby="audio_lowpass_enabled_hint">
                 Enable lowpass
               </label>
               <span id="audio_lowpass_enabled_hint" class="hint">Gets rid of high-frequency audio. This is separate from the standard NWR deemphasis curve.</span>
               <label>Frequency
-                <input id="audio_lowpass_frequency" type="number" min="2200" max="12000" step="1" aria-describedby="audio_lowpass_frequency_hint">
+                <input id="audio_lowpass_frequency" name="audio_lowpass_frequency" type="number" min="2200" max="12000" step="1" aria-describedby="audio_lowpass_frequency_hint">
               </label>
               <span id="audio_lowpass_frequency_hint" class="hint">Frequency in Hz. Frequencies above this value will be attenuated. To protect SAME tones, this cannot be set below 2200 Hz.</span>
               <label>Sharpness
-                <input id="audio_lowpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_lowpass_sharpness_hint">
+                <input id="audio_lowpass_sharpness" name="audio_lowpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_lowpass_sharpness_hint">
               </label>
               <span id="audio_lowpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
             </div>
             <div id="audio_effect_notch" class="audio-effect-panel" hidden>
               <h4>Notch filter</h4>
               <label class="checkbox-row">
-                <input id="audio_notch_enabled" type="checkbox" aria-describedby="audio_notch_enabled_hint">
+                <input id="audio_notch_enabled" name="audio_notch_enabled" value="1" type="checkbox" aria-describedby="audio_notch_enabled_hint">
                 Enable notch filter
               </label>
               <span id="audio_notch_enabled_hint" class="hint">Removes a narrow band of audio around one frequency, useful for analog whines.</span>
               <label>Frequency
-                <input id="audio_notch_frequency" type="number" min="1" max="12000" step="1" aria-describedby="audio_notch_frequency_hint">
+                <input id="audio_notch_frequency" name="audio_notch_frequency" type="number" min="1" max="12000" step="1" aria-describedby="audio_notch_frequency_hint">
               </label>
               <span id="audio_notch_frequency_hint" class="hint">Frequency in Hz. Frequencies of and near this value will be attenuated. To protect the 1050 Hz attention tone and SAME tones, this cannot be within 900-1100, 1400-1600, or 2000-2200 Hz.</span>
               <label>Width
-                <input id="audio_notch_width" type="number" min="60" max="2000" step="1" aria-describedby="audio_notch_width_hint">
+                <input id="audio_notch_width" name="audio_notch_width" type="number" min="60" max="2000" step="1" aria-describedby="audio_notch_width_hint">
               </label>
               <span id="audio_notch_width_hint" class="hint">Width in Hz of the band that will be attenuated. Narrow widths remove just the tone; wider widths also remove the audio around it. To protect the 1050 Hz attention tone and SAME tones, the widest allowed depends on the frequency: <span id="audio_notch_width_max">2000</span> Hz at the current frequency.</span>
             </div>
@@ -16125,28 +17420,28 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <h3>EAS recording</h3>
         <div class="grid">
           <label id="eas_enabled_label" class="checkbox-row">
-            <input id="eas_enabled" type="checkbox" aria-describedby="eas_enabled_hint">
+            <input id="eas_enabled" name="eas_enabled" value="1" type="checkbox" aria-describedby="eas_enabled_hint">
             Enable EAS recording
           </label>
           <span id="eas_enabled_hint" class="hint">Record EAS alerts received from this station.</span>
           <span id="eas_storage_blocked_hint" class="error" hidden>Disabled due to insufficient disk space.</span>
           <label>Pre-recording time in seconds
-            <input id="eas_pre_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_pre_seconds_hint">
+            <input id="eas_pre_seconds" name="eas_pre_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_pre_seconds_hint">
           </label>
           <span id="eas_pre_seconds_hint" class="hint">Seconds of audio to prepend before the decoded SAME header. Valid range is 0 through 10.</span>
           <label>Post-recording time in seconds
-            <input id="eas_post_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_post_seconds_hint">
+            <input id="eas_post_seconds" name="eas_post_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_post_seconds_hint">
           </label>
           <span id="eas_post_seconds_hint" class="hint">Seconds of audio to append after EOM. Valid range is 0 through 10.</span>
           <label>Maximum recording time in seconds
-            <input id="eas_max_seconds" type="number" min="1" max="3600" step="1" aria-describedby="eas_max_seconds_hint">
+            <input id="eas_max_seconds" name="eas_max_seconds" type="number" min="1" max="3600" step="1" aria-describedby="eas_max_seconds_hint">
           </label>
           <span id="eas_max_seconds_hint" class="hint">Maximum recording length for a single alert, in seconds.</span>
           <fieldset>
             <legend>Recording format</legend>
             <div class="hint">Recording format for saved alert audio.</div>
-            <label><input id="eas_format_wav" name="eas_format" type="radio" value="wav" checked> WAV</label>
-            <label><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
+            <label class="checkbox-row"><input id="eas_format_wav" name="eas_format" type="radio" value="wav" checked> WAV</label>
+            <label class="checkbox-row"><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
           </fieldset>
         </div>
         <div id="eas-result" class="message"></div>
@@ -16161,7 +17456,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         </fieldset>
         <p class="hint">Do nothing leaves the stream as it is. Disconnect from Icecast outputs disconnects this stream from all of its Icecast servers, so listeners are not left listening to dead air, and reconnects when the station returns; sound card outputs keep playing. Play fallback audio plays the fallback announcement until the station returns.</p>
         <label id="stream_fallback_delay_label">Fallback delay in seconds
-          <input id="stream_fallback_delay" type="number" min="30" max="120" step="1" aria-describedby="stream_fallback_delay_hint">
+          <input id="stream_fallback_delay" name="stream_fallback_delay" type="number" min="30" max="120" step="1" aria-describedby="stream_fallback_delay_hint">
         </label>
         <span id="stream_fallback_delay_hint" class="hint">How long to wait before the fallback action happens. Valid range is 30 through 120 seconds.</span>
         <div id="stream-fallback-action-result" class="message" aria-live="polite"></div>
@@ -16171,25 +17466,32 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
         <p class="hint">Choose which problems for this stream should send notifications.</p>
         <div class="grid">
           <label class="checkbox-row">
-            <input id="stream_notify_icecast_failures" type="checkbox">
+            <input id="stream_notify_icecast_failures" name="stream_notify_icecast_failures" value="1" type="checkbox">
             Failed Icecast mountpoints
           </label>
           <label class="checkbox-row">
-            <input id="stream_notify_soundcard_failures" type="checkbox">
+            <input id="stream_notify_soundcard_failures" name="stream_notify_soundcard_failures" value="1" type="checkbox">
             Disconnected sound cards
           </label>
           <label class="checkbox-row">
-            <input id="stream_notify_bad_reception" type="checkbox">
+            <input id="stream_notify_bad_reception" name="stream_notify_bad_reception" value="1" type="checkbox">
             Bad reception or no signal
           </label>
           <label id="stream_notify_eas_alerts_label" class="checkbox-row" hidden>
-            <input id="stream_notify_eas_alerts" type="checkbox" aria-describedby="stream_notify_eas_alerts_hint">
+            <input id="stream_notify_eas_alerts" name="stream_notify_eas_alerts" value="1" type="checkbox" aria-describedby="stream_notify_eas_alerts_hint">
             Recorded EAS alerts
           </label>
           <span id="stream_notify_eas_alerts_hint" class="hint" hidden>Send a notification when a new EAS alert recording is saved.</span>
         </div>
         <div id="stream-notifications-result" class="message"></div>
       </div>
+      <div id="stream_settings_save_actions" class="baseline-only">
+        <div class="actions">
+          <button id="save_stream_settings" type="submit" data-baseline-submit>Save changes</button>
+        </div>
+        <div id="stream-settings-save-result" class="message"></div>
+      </div>
+      </form>
       <div id="panel_test_mode" class="tabpanel" role="tabpanel" aria-labelledby="tab_test_mode" hidden>
         <h3>Test mode</h3>
         <p class="hint">Replace this stream's real radio channel with a simulated NOAA Weather Radio channel for testing outputs and SAME handling. Test mode can be used for up to 10 minutes in any hour, shared by all streams.</p>
@@ -16299,37 +17601,51 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     </section>
   </div>
 
-  <div id="view_stream_output" class="view needs-app" hidden>
+  <div id="view_stream_output" class="view" hidden>
     <section>
       <div id="output_form_panel">
           <h2 id="output_form_title">Add output</h2>
+          <div id="output_confirm" class="baseline-only" hidden></div>
           <div id="icecast_output_edit_panel">
-          <label>Streaming service
-            <select id="settings_icecast_service">
-              <option value="custom">Custom Icecast server</option>
-              <option value="gwes">GWES Weather Radio</option>
-              <option value="weatherusa">WeatherUSA</option>
-              <option value="nwrorg">NOAA Weather Radio Org</option>
-            </select>
-          </label>
+          <form id="settings_icecast_service_form" method="get" action="/">
+            <input type="hidden" name="view" value="stream_output">
+            <input id="settings_icecast_service_stream" type="hidden" name="stream" value="">
+            <input id="settings_icecast_service_output" type="hidden" name="output" value="">
+            <label>Streaming service
+              <select id="settings_icecast_service" name="service">
+                <option value="custom">Custom Icecast server</option>
+                <option value="gwes">GWES Weather Radio</option>
+                <option value="weatherusa">WeatherUSA</option>
+                <option value="nwrorg">NOAA Weather Radio Org</option>
+              </select>
+            </label>
+            <div class="actions baseline-only">
+              <button id="change_settings_icecast_service" type="submit" data-baseline-submit>Change service</button>
+            </div>
+          </form>
           <div id="settings_icecast_service_help" class="hint"></div>
+          <form id="settings_icecast_form" method="post" action="/streams/outputs/save">
+          __FORM_TOKEN_INPUT__
+          <input id="settings_icecast_form_stream" type="hidden" name="stream" value="">
+          <input id="settings_icecast_form_output" type="hidden" name="output" value="">
+          <input id="settings_icecast_form_service" type="hidden" name="service" value="">
           <fieldset>
             <legend>Icecast output</legend>
             <div class="grid">
               <label id="settings_icecast_host_label">Host
-                <input id="settings_icecast_host" type="text" autocomplete="off" aria-describedby="settings_icecast_host_hint">
+                <input id="settings_icecast_host" name="host" type="text" autocomplete="off" aria-describedby="settings_icecast_host_hint">
               </label>
               <span id="settings_icecast_host_hint" class="hint">The hostname, IP address, or web URL of the Icecast server.</span>
               <label id="settings_icecast_port_label">Port
-                <input id="settings_icecast_port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="settings_icecast_port_hint">
+                <input id="settings_icecast_port" name="port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="settings_icecast_port_hint">
               </label>
               <span id="settings_icecast_port_hint" class="hint">The port the Icecast server listens on.</span>
               <label id="settings_icecast_username_label">Username
-                <input id="settings_icecast_username" type="text" autocomplete="username" aria-describedby="settings_icecast_username_hint">
+                <input id="settings_icecast_username" name="username" type="text" autocomplete="username" aria-describedby="settings_icecast_username_hint">
               </label>
               <span id="settings_icecast_username_hint" class="hint">The username for authentication to the server.</span>
               <label id="settings_icecast_password_label">Password
-                <input id="settings_icecast_password" type="password" autocomplete="current-password" aria-describedby="settings_icecast_password_hint">
+                <input id="settings_icecast_password" name="password" type="password" autocomplete="current-password" aria-describedby="settings_icecast_password_hint">
               </label>
               <span id="settings_icecast_password_hint" class="hint">The password for authentication to the server.</span>
               <label id="settings_show_icecast_password_label" class="checkbox-row">
@@ -16337,24 +17653,24 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 Show password
               </label>
               <label id="settings_icecast_mount_label">Mountpoint
-                <input id="settings_icecast_mount" type="text" placeholder="/station.mp3" aria-describedby="settings_icecast_mount_hint">
+                <input id="settings_icecast_mount" name="mount" type="text" placeholder="/station.mp3" aria-describedby="settings_icecast_mount_hint">
               </label>
               <span id="settings_icecast_mount_hint" class="hint">The mountpoint where the stream will be accessible to listeners.</span>
               <label id="settings_icecast_alt_label" class="checkbox-row" hidden>
-                <input id="settings_icecast_alt_enabled" type="checkbox">
+                <input id="settings_icecast_alt_enabled" name="alt_enabled" value="1" type="checkbox">
                 Alternate stream
               </label>
               <label id="settings_icecast_alt_number_label" hidden>Alternate stream number
-                <input id="settings_icecast_alt_number" type="number" min="1" max="9" step="1" value="1">
+                <input id="settings_icecast_alt_number" name="alt_number" type="number" min="1" max="9" step="1" value="1">
               </label>
               <fieldset id="settings_icecast_format_fieldset">
                 <legend>Format</legend>
                 <div class="hint">Encoding format for this Icecast mountpoint.</div>
-                <label><input id="settings_icecast_format_mp3" name="settings_icecast_format" type="radio" value="mp3" checked> MP3</label>
-                <label><input id="settings_icecast_format_ogg" name="settings_icecast_format" type="radio" value="ogg"> OGG</label>
+                <label class="checkbox-row"><input id="settings_icecast_format_mp3" name="settings_icecast_format" type="radio" value="mp3" checked> MP3</label>
+                <label class="checkbox-row"><input id="settings_icecast_format_ogg" name="settings_icecast_format" type="radio" value="ogg"> OGG</label>
               </fieldset>
               <label id="settings_icecast_sample_rate_label">Sample rate
-                <select id="settings_icecast_sample_rate" aria-describedby="settings_icecast_sample_rate_hint">
+                <select id="settings_icecast_sample_rate" name="sample_rate" aria-describedby="settings_icecast_sample_rate_hint">
                   <option value="8000">8000 Hz</option>
                   <option value="11025">11025 Hz</option>
                   <option value="16000">16000 Hz</option>
@@ -16367,42 +17683,53 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               </label>
               <span id="settings_icecast_sample_rate_hint" class="hint">The audio sample rate to encode at for this Icecast mountpoint.</span>
               <label id="settings_icecast_bitrate_label">Bitrate
-                <select id="settings_icecast_bitrate" aria-describedby="settings_icecast_bitrate_hint"></select>
+                <select id="settings_icecast_bitrate" name="bitrate" aria-describedby="settings_icecast_bitrate_hint"></select>
               </label>
               <span id="settings_icecast_bitrate_hint" class="hint">Encoder bitrate in Kbps for this Icecast mountpoint.</span>
             </div>
           </fieldset>
           <div class="actions">
-            <button id="cancel_output_form" type="button">Cancel</button>
-            <button id="add_output" type="button">Add output</button>
-            <button id="save_output_settings" type="button" hidden>Save changes</button>
+            <button id="save_output_settings" type="submit" data-baseline-submit hidden>Save changes</button>
+            <button id="cancel_output_form" class="needs-app-inline" type="button">Cancel</button>
+            <a id="cancel_output_form_link" class="baseline-only button-link" href="">Cancel</a>
+            <button id="add_output" class="needs-app-inline" type="button">Add output</button>
           </div>
+          </form>
           </div>
-          <div id="soundcard_output_edit_panel" hidden>
+          <form id="soundcard_output_edit_panel" method="post" action="/streams/outputs/save" hidden>
+            __FORM_TOKEN_INPUT__
+            <input id="settings_soundcard_form_stream" type="hidden" name="stream" value="">
+            <input id="settings_soundcard_form_output" type="hidden" name="output" value="">
             <fieldset>
               <legend>Sound card output</legend>
               <div class="grid">
                 <label>Sound card
-                  <select id="settings_soundcard_device"></select>
+                  <select id="settings_soundcard_device" name="stable_id"></select>
                 </label>
+                <div class="baseline-only">
+                  <a id="refresh_settings_soundcards" class="button-link" href="">Refresh sound card list</a>
+                </div>
                 <button id="reset_soundcard_device" type="button" hidden>Reset USB sound card</button>
                 <span id="settings_soundcard_device_hint" class="hint"></span>
                 <label>Volume
-                  <input id="settings_soundcard_volume" type="range" min="0" max="2" step="0.01" value="1">
+                  <input id="settings_soundcard_volume" name="volume" type="range" min="0" max="2" step="0.01" value="1">
                 </label>
                 <span class="hint">This volume applies only to this sound card output.</span>
                 <fieldset>
                   <legend>Channels</legend>
-                  <label><input id="settings_soundcard_channel_left" name="settings_soundcard_channel" type="radio" value="left"> Left</label>
-                  <label><input id="settings_soundcard_channel_both" name="settings_soundcard_channel" type="radio" value="both" checked> Both left and right</label>
-                  <label><input id="settings_soundcard_channel_right" name="settings_soundcard_channel" type="radio" value="right"> Right</label>
+                  <label id="settings_soundcard_channel_left_label" class="checkbox-row"><input id="settings_soundcard_channel_left" name="settings_soundcard_channel" type="radio" value="left"> Left</label>
+                  <label id="settings_soundcard_channel_both_label" class="checkbox-row"><input id="settings_soundcard_channel_both" name="settings_soundcard_channel" type="radio" value="both" checked> Both left and right</label>
+                  <label id="settings_soundcard_channel_right_label" class="checkbox-row"><input id="settings_soundcard_channel_right" name="settings_soundcard_channel" type="radio" value="right"> Right</label>
                 </fieldset>
               </div>
             </fieldset>
             <div class="actions">
-              <button id="cancel_soundcard_output_form" type="button">Cancel</button>
+              <button id="save_soundcard_output" class="baseline-only" type="submit" data-baseline-submit>Save changes</button>
+              <button id="cancel_soundcard_output_form" class="needs-app-inline" type="button">Cancel</button>
+              <a id="cancel_soundcard_output_form_link" class="baseline-only button-link" href="">Cancel</a>
             </div>
-          </div>
+          </form>
+          <div id="output_actions" class="baseline-only" hidden></div>
         </div>
         <div id="output-result" class="message"></div>
       </div>
@@ -16597,6 +17924,80 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     }
     listen(strength, "change", update);
     listen(strength, "input", update);
+  })();
+
+  // A stream's fallback delay shows only when there's something to wait for.
+  (function () {
+    var choices = byId("panel_fallback_action"), none = byId("stream_fallback_action_none");
+    if (!choices || !none) return;
+    function update() {
+      show(byId("stream_fallback_delay_label"), !none.checked);
+      show(byId("stream_fallback_delay_hint"), !none.checked);
+    }
+    listen(choices, "click", update);
+    update();
+  })();
+
+  // Show password, where the browser can change a password field to a text field.
+  (function () {
+    var probe = d.createElement("input"), works = false;
+    try {
+      d.body.appendChild(probe);
+      probe.type = "text";
+      probe.type = "password";
+      works = probe.type === "password";
+    } catch (error) {}
+    if (probe.parentNode) probe.parentNode.removeChild(probe);
+    if (!works) return;
+    function offer(labelId, checkboxId, passwordId) {
+      var label = byId(labelId), checkbox = byId(checkboxId), password = byId(passwordId);
+      if (!label || !checkbox || !password || !visible(byId(passwordId + "_label"))) return;
+      show(label, true);
+      listen(checkbox, "click", function () {
+        password.type = checkbox.checked ? "text" : "password";
+      });
+    }
+    offer("show_icecast_password_label", "show_icecast_password", "icecast_password");
+    offer("settings_show_icecast_password_label", "settings_show_icecast_password", "settings_icecast_password");
+  })();
+
+  // An alternate stream's number shows once it's chosen.
+  (function () {
+    var prefixes = ["icecast", "settings_icecast"];
+    for (var i = 0; i < prefixes.length; i++) {
+      (function (prefix) {
+        var checkbox = byId(prefix + "_alt_enabled"), number = byId(prefix + "_alt_number_label");
+        if (!checkbox || !number || !visible(byId(prefix + "_alt_label"))) return;
+        function update() { show(number, checkbox.checked); }
+        listen(checkbox, "click", update);
+        update();
+      })(prefixes[i]);
+    }
+  })();
+
+  // A sound card offers only the channels it has free.
+  (function () {
+    var select = byId("settings_soundcard_device");
+    if (!select) return;
+    function update() {
+      var option = select.options[select.selectedIndex];
+      var free = " " + ((option && option.getAttribute("data-channels")) || "") + " ";
+      var modes = ["left", "both", "right"], checked = null, offered = [];
+      for (var i = 0; i < modes.length; i++) {
+        var control = byId("settings_soundcard_channel_" + modes[i]);
+        var ok = modes[i] === "both" ? free.indexOf(" left ") >= 0 && free.indexOf(" right ") >= 0 : free.indexOf(" " + modes[i] + " ") >= 0;
+        show(byId("settings_soundcard_channel_" + modes[i] + "_label"), ok);
+        control.disabled = !ok;
+        if (!ok) control.checked = false;
+        if (ok) offered.push(control);
+        if (control.checked) checked = control;
+      }
+      if (!checked && offered.length) {
+        var both = byId("settings_soundcard_channel_both");
+        (both.disabled ? offered[0] : both).checked = true;
+      }
+    }
+    listen(select, "change", update);
   })();
 
   // A new I/Q recording shows the settings for the chosen source.

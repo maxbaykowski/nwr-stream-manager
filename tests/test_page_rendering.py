@@ -1,4 +1,5 @@
 import base64
+import html
 import http.client
 import re
 import tempfile
@@ -118,7 +119,7 @@ class PageScriptLoadingTests(unittest.TestCase):
         page = self.web_control.INDEX_HTML
         baseline = {
             "logs", "settings", "change_password", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail",
-            "iq_recorder", "iq_recorder_start", "iq_recording_download", "rtl",
+            "iq_recorder", "iq_recorder_start", "iq_recording_download", "rtl", "streams", "stream_settings", "stream_output", "add_stream",
         }
         for view in baseline:
             self.assertFalse(pages.view_needs_app(page, view), view)
@@ -260,9 +261,9 @@ class BaselinePageServerTests(unittest.TestCase):
         self.assertIn('<a id="nav_logs" href="/?view=logs" data-view="logs" aria-current="page">', page)
         self.assertIn('<a id="nav_settings" href="/?view=settings" data-view="settings">', page)
 
-        _, page = self.request("GET", "/?view=streams", user=owner)
+        _, page = self.request("GET", "/?view=receiver", user=owner)
         self.assertIn('<section id="baseline_unavailable" class="baseline-only">', page)
-        self.assertIn('<div id="view_streams" class="view needs-app">', page)
+        self.assertIn('<div id="view_receiver" class="view needs-app">', page)
 
     def test_read_only_accounts_see_their_own_menu_and_no_settings(self) -> None:
         self.accounts.create_admin("owner", "password1", "password1")
@@ -940,6 +941,437 @@ class RtlSettingsPageTests(unittest.TestCase):
         response, page = self.request("POST", "/rtl-settings/reset", fields={"form_token": token}, cookie=cookie, user=self.owner)
         self.assertEqual(self.resets, ["00000001"])
         self.assertEqual(self.title(page), "RTL-SDR reset finished. - Configure RTL-SDR - NWR Stream Manager")
+
+class StreamPageTests(unittest.TestCase):
+    """Manage Streams and stream settings, as a browser without the page script uses them."""
+
+    request = BaselinePageServerTests.request
+    form_token = BaselinePageServerTests.form_token
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.accounts = wc.AccountStore(Path(tempdir.name) / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        account, secret = self.accounts.create_account("viewer", True)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        self.owner, self.viewer = ("owner", "password1"), ("viewer", "password2")
+        self.streams = [
+            {"id": "s1", "enabled": True, "station": {"callsign": "WXN99", "frequency": "162.425"},
+             "outputs": [{"id": "o1", "type": "icecast", "enabled": True, "icecast": {"host": "icecast.example", "port": 8000, "mount": "/wxn99.mp3", "format": "mp3", "sample_rate": 24000, "bitrate": 64}}],
+             "audio": {"volume": {"enabled": True, "multiplier": 1.5}}},
+            {"id": "s2", "enabled": False, "station": {"callsign": "WZ2560", "frequency": "162.550"}, "outputs": [],
+             "eas_recording": {"enabled": True, "pre_seconds": 2, "post_seconds": 5, "max_seconds": 120, "format": "wav"}},
+        ]
+        self.notifications = {"topic": "secret-topic"}
+        self.calls: list[tuple] = []
+        service = StandInService(
+            accounts=self.accounts,
+            auth_sessions=wc.AuthSessionStore(),
+            streams=self.streams,
+            status=self.status,
+            devices=lambda: {"devices": [], "soundcards": [], "errors": []},
+        )
+        for name in ("update_stream", "remove_stream", "update_eas_recording", "update_audio_effects",
+                     "update_stream_notifications", "update_stream_fallback_action"):
+            setattr(service, name, lambda payload, name=name: self.calls.append((name, payload)))
+        handler = type("StreamPageTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def status(self, read_only=False):
+        return {
+            "streams": self.streams,
+            "notifications": self.notifications,
+            "active_streams": [{"id": "s1", "status": "enabled", "outputs": [{"id": "o1"}]}],
+            "stream_signals": {"s1": {"available": True, "snr_db": 31.6, "quality": "excellent", "signal_dbfs": -22, "noise_floor_dbfs": -60}},
+            "storage": {"status": "ok"},
+        }
+
+    def token(self):
+        response, _ = self.request("GET", "/?view=streams", user=self.owner)
+        token = self.form_token(response)
+        return token, f"nwrstmgr_form={token}"
+
+    def page_fields(self, token, stream="s1", tab=""):
+        _, page = self.request("GET", f"/?view=stream_settings&stream={stream}&tab={tab}", user=self.owner)
+        was = dict(re.findall(r'<input type="hidden" name="(was_\w+)" value="([^"]*)">', page))
+        fields = {name[4:]: value for name, value in was.items() if value != "0" or not name[4:].endswith(("enabled", "failures", "reception", "alerts"))}
+        return {**was, **fields, "form": "stream_settings", "stream": stream, "tab": tab, "form_token": token}
+
+    def test_streams_are_listed_with_their_actions(self) -> None:
+        _, page = self.request("GET", "/?view=streams", user=self.owner)
+        self.assertEqual(self.title(page), "Manage Streams - NWR Stream Manager")
+        self.assertIn('<tr data-row-key="stream:s1" role="row"><td role="cell" data-label="Callsign">WXN99</td>'
+                      '<td role="cell" data-label="Frequency">162.425 MHz</td><td role="cell" data-label="Outputs">1</td>'
+                      '<td class="status-text signal-excellent" title="Signal -22 dBFS, noise floor -60 dBFS" role="cell" data-label="Signal">Excellent (32 dB SNR)</td>'
+                      '<td class="status-text status-enabled" role="cell" data-label="Status">Enabled</td>', page)
+        self.assertIn('<button type="submit" aria-label="Stop stream WXN99 162.425 MHz">Stop stream</button>', page)
+        self.assertIn('<button type="submit" aria-label="Start stream WZ2560 162.550 MHz">Start stream</button>', page)
+        self.assertIn('<a class="button-link" href="/?view=stream_settings&amp;stream=s1" aria-label="Edit stream settings for WXN99 162.425 MHz">', page)
+        _, page = self.request("GET", "/?view=streams", user=self.viewer)
+        self.assertNotIn('aria-label="Stop stream', page)
+        self.assertRegex(page, r'<a id="open_add_stream_link"[^>]* hidden>')
+        _, page = self.request("GET", "/?view=stream_settings&stream=s1", user=self.viewer)
+        self.assertEqual(self.title(page), "Dashboard - NWR Stream Manager")
+
+    def test_streams_start_stop_and_are_removed_after_a_confirmation(self) -> None:
+        token, cookie = self.token()
+        response, _ = self.request("POST", "/streams/enabled", fields={"stream": "s2", "enabled": "1", "form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=streams&result=started")
+        self.assertEqual(self.calls, [("update_stream", {"stream_id": "s2", "enabled": True})])
+        _, page = self.request("GET", "/?view=streams&result=started", user=self.owner)
+        self.assertEqual(self.title(page), "Stream started. - Manage Streams - NWR Stream Manager")
+        response, _ = self.request("POST", "/streams/enabled", fields={"stream": "s2", "enabled": "1", "form_token": token}, cookie=cookie, user=self.viewer)
+        self.assertEqual(response.status, 403)
+        response, _ = self.request("POST", "/streams/remove", fields={"stream": "s2", "form_token": "guess"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+
+        _, page = self.request("GET", "/?view=streams&confirm=remove&stream=s2", user=self.owner)
+        self.assertEqual(self.title(page), "Remove stream WZ2560 162.550 MHz? - Manage Streams - NWR Stream Manager")
+        self.assertIn('<form method="post" action="/streams/remove">', page)
+        response, _ = self.request("POST", "/streams/remove", fields={"stream": "s2", "form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=streams&result=removed")
+        self.assertEqual(self.calls[-1], ("remove_stream", "s2"))
+
+    def test_stream_settings_show_one_tab_at_a_time(self) -> None:
+        _, page = self.request("GET", "/?view=stream_settings&stream=s1&tab=audio", user=self.owner)
+        self.assertEqual(self.title(page), "Audio Effects - Edit stream WXN99 - NWR Stream Manager")
+        self.assertIn('<a id="tab_link_audio" class="button-link" href="/?view=stream_settings&amp;stream=s1&amp;tab=audio" aria-current="page">', page)
+        self.assertIn('<a id="tab_link_notifications" class="button-link" href="/?view=stream_settings&amp;stream=s1&amp;tab=notifications">', page)
+        self.assertRegex(page, r'<div id="panel_eas" [^>]*hidden>')
+        self.assertRegex(page, r'<div id="panel_audio" class="tabpanel" role="tabpanel" aria-labelledby="tab_audio">')
+        # Unset filters show the page script's defaults, and every effect shows.
+        self.assertIn('name="audio_volume_multiplier" type="number" min="0.1" max="2" step="0.1" aria-describedby="audio_volume_multiplier_hint" value="1.5">', page)
+        self.assertIn('aria-describedby="audio_notch_frequency_hint" value="3000">', page)
+        self.assertIn('<div id="audio_effect_notch" class="audio-effect-panel">', page)
+        self.assertIn('<input type="hidden" name="was_audio_volume_enabled" value="1">', page)
+        self.assertIn('<dd id="stream_settings_signal_value" class="status-text signal-excellent">Excellent (32 dB SNR)</dd>', page)
+        self.notifications = {}
+        _, page = self.request("GET", "/?view=stream_settings&stream=s1&tab=notifications", user=self.owner)
+        self.assertEqual(self.title(page), "Edit stream WXN99 - NWR Stream Manager")
+        self.assertRegex(page, r'<a id="tab_link_notifications" [^>]* hidden')
+        # A stream that's gone goes back to the list.
+        _, page = self.request("GET", "/?view=stream_settings&stream=gone", user=self.owner)
+        self.assertEqual(self.title(page), "Error: Stream was not found. - Manage Streams - NWR Stream Manager")
+
+    def test_only_the_settings_changed_are_saved(self) -> None:
+        token, cookie = self.token()
+        fields = {**self.page_fields(token, tab="eas"), "eas_pre_seconds": "4"}
+        response, _ = self.request("POST", "/streams/settings", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=stream_settings&stream=s1&tab=eas&result=saved")
+        self.assertEqual(self.calls, [("update_eas_recording", {"stream_id": "s1", "eas_recording": {"enabled": False, "pre_seconds": 4, "post_seconds": 5, "max_seconds": 120, "format": "wav"}})])
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "Changes saved. - EAS Recording - Edit stream WXN99 - NWR Stream Manager")
+
+        # Unchanged, nothing is saved; turning things off is a change.
+        self.calls.clear()
+        fields = self.page_fields(token)
+        self.request("POST", "/streams/settings", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(self.calls, [])
+        fields.pop("stream_enabled"); fields.pop("audio_volume_enabled")
+        self.request("POST", "/streams/settings", fields={**fields, "stream_notify_bad_reception": "1"}, cookie=cookie, user=self.owner)
+        self.assertEqual([name for name, _ in self.calls], ["update_audio_effects", "update_stream_notifications", "update_stream"])
+        self.assertEqual(self.calls[0][1]["audio"]["volume"], {"enabled": False, "multiplier": 1.5})
+        self.assertTrue(self.calls[1][1]["notifications"]["bad_reception"])
+        self.assertEqual(self.calls[2][1], {"stream_id": "s1", "enabled": False})
+
+        self.calls.clear()
+        fields = self.page_fields(token, tab="audio")
+        for change, message in (
+            ({"audio_notch_frequency": "1000"}, "The notch filter frequency can't be within 900-1100, 1400-1600, or 2000-2200 Hz, to protect the attention tone and SAME tones."),
+            ({"audio_notch_width": "1500"}, "Enter a notch filter width from 60 to 1138 Hz, the widest allowed at 3000 Hz."),
+            ({"audio_volume_multiplier": "loud"}, "Enter a volume multiplier from 0.1 to 2."),
+            ({"eas_max_seconds": "0", "audio_volume_multiplier": "2"}, "Maximum recording time must be greater than 0 seconds."),
+        ):
+            response, page = self.request("POST", "/streams/settings", fields={**fields, **change}, cookie=cookie, user=self.owner)
+            self.assertEqual(response.status, 400)
+            self.assertEqual(html.unescape(self.title(page)), f"Error: {message} - Audio Effects - Edit stream WXN99 - NWR Stream Manager")
+        # Nothing is saved when anything is wrong, and what was entered stays.
+        self.assertEqual(self.calls, [])
+        self.assertIn('aria-describedby="eas_max_seconds_hint" value="0">', page)
+        self.assertIn('<input type="hidden" name="was_eas_max_seconds" value="120">', page)
+        response, _ = self.request("POST", "/streams/settings", fields={**fields, "form_token": "guess"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+        response, _ = self.request("POST", "/streams/settings", fields=fields, cookie=cookie, user=self.viewer)
+        self.assertEqual(response.status, 403)
+
+
+class OutputPageTests(unittest.TestCase):
+    """Editing and adding a stream's outputs, as a browser without the page script does it."""
+
+    request = BaselinePageServerTests.request
+    form_token = BaselinePageServerTests.form_token
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.accounts = wc.AccountStore(Path(tempdir.name) / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        self.owner = ("owner", "password1")
+        self.icecast = {"service": "custom", "host": "icecast.example", "port": 8000, "tls": False, "username": "source",
+                        "password": "secret", "mount": "/wxn99.mp3", "format": "mp3", "sample_rate": 24000, "bitrate": 64}
+        self.streams = [
+            {"id": "s1", "enabled": True, "station": {"callsign": "WXN99", "frequency": "162.425", "state": "MI", "site_name": "West Olive"},
+             "outputs": [
+                 {"id": "o1", "type": "icecast", "enabled": True, "icecast": dict(self.icecast)},
+                 {"id": "o2", "type": "soundcard", "enabled": True, "soundcard": {"stable_id": "usb-endec", "channel_mode": "left", "volume": 1.0, "sample_rate": 48000}},
+             ]},
+        ]
+        self.soundcards = [
+            {"stable_id": "usb-endec", "card_long_name": "ENDEC Interface", "pcm_name": "USB Audio", "bus": "usb"},
+            {"stable_id": "pci-onboard", "card_long_name": "Onboard Audio", "pcm_name": "Analog", "bus": "pci"},
+        ]
+        self.calls: list[tuple] = []
+        self.auth_ok = True
+        service = StandInService(
+            accounts=self.accounts,
+            auth_sessions=wc.AuthSessionStore(),
+            streams=self.streams,
+            status=lambda read_only=False: {"streams": self.streams, "notifications": {}, "active_streams": [], "stream_signals": {}, "storage": {}},
+            devices=lambda: {"devices": [], "soundcards": self.soundcards, "errors": []},
+        )
+
+        def record(name, response):
+            def call(*args):
+                self.calls.append((name, *args))
+                return response() if callable(response) else response
+            return call
+        service.update_stream_output = record("update", lambda: {"success": self.auth_ok, "message": "Stream output settings saved." if self.auth_ok else "Invalid Icecast username or password."})
+        service.add_stream_output = record("add", lambda: {"success": self.auth_ok, "message": "Soundcard output added." if self.auth_ok else "Invalid Icecast username or password.", "output_id": "new"})
+        service.remove_stream_output = record("remove", {})
+        service.test_icecast_auth_payload = record("auth", lambda: {"success": self.auth_ok, "message": "Icecast authentication successful." if self.auth_ok else "Invalid Icecast username or password."})
+        stations = [
+            {"key": "WXN99|162.425|MI|West Olive|West Olive", "callsign": "WXN99", "frequency": "162.425", "city": "West Olive", "state": "MI", "site_name": "West Olive"},
+            {"key": "WZ2560|162.550|MI|Cannonsburg|Cannonsburg", "callsign": "WZ2560", "frequency": "162.550", "city": "Cannonsburg", "state": "MI", "site_name": "Cannonsburg"},
+        ]
+        service.stations = stations
+        service.search_stations = lambda query, limit=50: {"stations": [station for station in stations if query.lower() in station["callsign"].lower() + station["city"].lower()]}
+        service.upsert_soundcard_preview_stream = record("preview", {"success": True, "message": "Soundcard preview started.", "preview_id": "p1"})
+        service.discard_soundcard_preview_stream = record("discard", {"success": True})
+        service.add_stream = record("create", lambda: {"success": self.auth_ok, "message": "Stream created." if self.auth_ok else "Invalid Icecast username or password."})
+        handler = type("OutputPageTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def token(self):
+        response, _ = self.request("GET", "/?view=streams", user=self.owner)
+        token = self.form_token(response)
+        return token, f"nwrstmgr_form={token}"
+
+    def page_fields(self, page, form_id):
+        start = page.index(f'<form id="{form_id}"')
+        form = page[start:page.index("</form>", start)]
+        fields = dict(re.findall(r'<input type="hidden" name="(\w+)" value="([^"]*)">', form))
+        fields.update(re.findall(r'<input id="\w+" type="hidden" name="(\w+)" value="([^"]*)">', form))
+        for name, value in fields.copy().items():
+            if name.startswith("was_") and value:
+                fields.setdefault(name[4:], value)
+        return fields
+
+    def test_outputs_link_to_their_own_page(self) -> None:
+        _, page = self.request("GET", "/?view=stream_settings&stream=s1", user=self.owner)
+        self.assertIn('<a class="button-link" href="/?view=stream_output&amp;stream=s1&amp;output=o1" aria-label="Edit output icecast.example:8000/wxn99.mp3">Edit output</a>', page)
+        self.assertIn('<a id="open_add_output_link" class="baseline-only button-link" href="/?view=add_stream&amp;stream=s1">Add output</a>', page)
+        _, page = self.request("GET", "/?view=stream_output&stream=s1&output=gone", user=self.owner)
+        self.assertEqual(self.title(page), "Error: Stream output was not found. - Edit stream WXN99 - NWR Stream Manager")
+
+    def test_an_icecast_output_is_edited_and_only_changes_are_saved(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=stream_output&stream=s1&output=o1", user=self.owner)
+        self.assertEqual(self.title(page), "Edit output icecast.example:8000/wxn99.mp3 - Edit stream WXN99 162.425 MHz - NWR Stream Manager")
+        self.assertIn('<input id="settings_icecast_port" name="port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="settings_icecast_port_hint" value="8000">', page)
+        self.assertIn('<option value="64" selected>64 Kbps</option>', page)
+        self.assertIn('<form method="post" action="/streams/outputs/enabled">', page)
+        fields = {**self.page_fields(page, "settings_icecast_form"), "form_token": token, "port": "8001", "settings_icecast_format": "mp3"}
+        # Changed elsewhere meanwhile; only the port is changed here.
+        self.streams[0]["outputs"][0]["icecast"]["password"] = "changed elsewhere"
+        response, _ = self.request("POST", "/streams/outputs/save", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=stream_settings&stream=s1&result=output-saved")
+        icecast = self.calls[-1][1]["icecast"]
+        self.assertEqual((icecast["port"], icecast["password"], icecast["mount"]), (8001, "changed elsewhere", "/wxn99.mp3"))
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "Stream output settings saved. - Edit stream WXN99 - NWR Stream Manager")
+
+        self.auth_ok = False
+        response, page = self.request("POST", "/streams/outputs/save", fields={**fields, "password": "wrong"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+        self.assertTrue(self.title(page).startswith("Error: Invalid Icecast username or password. - Edit output"))
+        self.assertIn('aria-describedby="settings_icecast_port_hint" value="8001">', page)
+
+    def test_a_service_change_shows_its_own_settings_and_its_notice(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=stream_output&stream=s1&output=o1&service=nwrorg", user=self.owner)
+        self.assertIn('<option value="nwrorg" selected>NOAA Weather Radio Org</option>', page)
+        self.assertRegex(page, r'<label id="settings_icecast_host_label" hidden>')
+        self.assertRegex(page, r'<label id="settings_icecast_alt_label" class="checkbox-row">')
+        self.assertIn("Weather Radio Station Lookup Utility", page)
+        fields = {**self.page_fields(page, "settings_icecast_form"), "form_token": token, "alt_enabled": "1", "alt_number": "2"}
+        self.assertEqual(fields["service"], "nwrorg")
+        _, page = self.request("POST", "/streams/outputs/save", fields=fields, cookie=cookie, user=self.owner)
+        icecast = self.calls[-1][1]["icecast"]
+        self.assertEqual((icecast["host"], icecast["password"], icecast["mount"], icecast["bitrate"]), ("wxradio.org", "WxRadio2014", "/MI-WestOlive-WXN99-alt2", 32))
+        self.assertEqual(self.title(page), "NOAA Weather Radio Org - NWR Stream Manager")
+        self.assertIn('<input type="hidden" name="result" value="output-saved">', page)
+
+    def test_a_sound_card_output_offers_its_free_channels(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=stream_output&stream=s1&output=o2", user=self.owner)
+        self.assertIn('<option value="usb-endec" data-channels="left right" selected>ENDEC Interface, USB Audio, USB</option>', page)
+        self.assertIn('<a id="refresh_settings_soundcards" class="button-link" href="/?view=stream_output&amp;stream=s1&amp;output=o2">', page)
+        self.assertIn('action="/streams/outputs/reset-soundcard"', page)
+        fields = {**self.page_fields(page, "soundcard_output_edit_panel"), "form_token": token, "stable_id": "pci-onboard", "settings_soundcard_channel": "both", "volume": "1"}
+        response, _ = self.request("POST", "/streams/outputs/save", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(self.calls[-1][1]["soundcard"], {"stable_id": "pci-onboard", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000})
+
+        # Another output on the same card leaves only the other channel.
+        self.streams[0]["outputs"][0] = {"id": "o3", "type": "soundcard", "enabled": True, "soundcard": {"stable_id": "usb-endec", "channel_mode": "right"}}
+        _, page = self.request("GET", "/?view=stream_output&stream=s1&output=o2", user=self.owner)
+        self.assertIn('<option value="usb-endec" data-channels="left" selected>', page)
+        self.assertRegex(page, r'<label id="settings_soundcard_channel_both_label" class="checkbox-row" hidden>')
+
+    def test_outputs_are_disabled_and_removed_after_a_confirmation(self) -> None:
+        token, cookie = self.token()
+        fields = {"stream": "s1", "output": "o1", "form_token": token}
+        self.request("POST", "/streams/outputs/enabled", fields={**fields, "enabled": "0"}, cookie=cookie, user=self.owner)
+        self.assertEqual(self.calls[-1][1]["enabled"], False)
+        _, page = self.request("GET", "/?view=stream_output&stream=s1&output=o1&confirm=remove", user=self.owner)
+        self.assertTrue(self.title(page).startswith("Remove output icecast.example:8000/wxn99.mp3? - Edit output"))
+        response, _ = self.request("POST", "/streams/outputs/remove", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=stream_settings&stream=s1&result=output-removed")
+        self.assertEqual(self.calls[-1], ("remove", "s1", "o1"))
+        # The only enabled output can't be disabled or removed.
+        self.streams[0]["outputs"].pop()
+        _, page = self.request("GET", "/?view=stream_output&stream=s1&output=o1", user=self.owner)
+        self.assertIn("This is the stream's only enabled output", page)
+        self.assertNotIn('action="/streams/outputs/enabled"', page)
+
+    def wizard(self, token, cookie, fields, action="Next"):
+        response, page = self.request("POST", "/streams/wizard", fields={**fields, "wizard_action": action, "form_token": token}, cookie=cookie, user=self.owner)
+        start = page.index('<form id="stream_wizard_form"') if 'id="stream_wizard_form"' in page else 0
+        step = re.search(r'name="step" value="(\w*)"', page[start:])
+        output = re.search(r'name="output_id" value="(\w*)"', page[start:])
+        return response, page, step.group(1) if step else "", output.group(1) if output else ""
+
+    def test_an_icecast_output_is_added_one_step_at_a_time(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=add_stream&stream=s1", user=self.owner)
+        self.assertEqual(self.title(page), "Add output for WXN99 - NWR Stream Manager")
+        self.assertIn('<div id="view_add_stream" class="view">', page)
+        self.assertIn('<div id="wizard_baseline_actions" class="actions baseline-only"><input type="submit" name="wizard_action" value="Next"><input type="submit" name="wizard_action" value="Cancel"></div>', page)
+        fields = {"form": "wizard", "stream": "s1", "step": "type", "wizard_output_type": "icecast", "service": "weatherusa", "icecast_format": "ogg"}
+        _, _, step, _ = self.wizard(token, cookie, fields)
+        self.assertEqual(step, "service")
+        _, _, step, _ = self.wizard(token, cookie, {**fields, "step": "service"})
+        self.assertEqual(step, "codec")
+        _, page, step, _ = self.wizard(token, cookie, {**fields, "step": "codec"})
+        self.assertEqual(step, "credentials")
+        # WeatherUSA's mountpoint is filled in, for the format chosen.
+        self.assertIn('value="/NWR/WXN99.ogg"', page)
+        self.auth_ok = False
+        response, page, step, _ = self.wizard(token, cookie, {**fields, "step": "credentials", "password": "wrong"})
+        self.assertEqual((response.status, step), (400, "credentials"))
+        self.assertEqual(self.title(page), "Error: Invalid Icecast username or password. - Add output for WXN99 - NWR Stream Manager")
+        self.auth_ok = True
+        _, page, step, _ = self.wizard(token, cookie, {**fields, "step": "credentials", "password": "right"})
+        self.assertEqual(step, "quality")
+        self.assertIn('<option value="56" selected>56 Kbps</option>', page)
+        self.assertIn('<option value="64" disabled>64 Kbps</option>', page)
+        _, _, step, _ = self.wizard(token, cookie, {**fields, "step": "quality"}, "Back")
+        self.assertEqual(step, "credentials")
+        response, _, _, _ = self.wizard(token, cookie, {**fields, "step": "quality", "password": "right", "bitrate": "48", "sample_rate": "22050"}, "Finish")
+        self.assertEqual(response.getheader("Location"), "/?view=stream_settings&stream=s1&result=icecast-added")
+        icecast = self.calls[-1][1]["icecast"]
+        self.assertEqual((icecast["host"], icecast["username"], icecast["mount"], icecast["bitrate"], icecast["format"]), ("radio-master.weatherusa.net", "source", "/NWR/WXN99.ogg", 48, "ogg"))
+
+    def test_a_sound_card_output_is_added_tried_and_cancelled(self) -> None:
+        token, cookie = self.token()
+        fields = {"form": "wizard", "stream": "s1", "wizard_output_type": "soundcard", "stable_id": "usb-endec", "wizard_soundcard_channel": "right", "volume": "1"}
+        _, page, step, _ = self.wizard(token, cookie, {**fields, "step": "type"})
+        self.assertEqual(step, "device")
+        self.assertIn('<input type="submit" name="wizard_action" value="Refresh sound card list">', page)
+        _, page, step, output = self.wizard(token, cookie, {**fields, "step": "device"})
+        self.assertEqual((step, output), ("controls", "new"))
+        self.assertEqual(self.calls[-1][1]["soundcard"]["stable_id"], "usb-endec")
+        self.assertIn('<input type="submit" name="wizard_action" value="Try these settings">', page)
+        _, page, step, _ = self.wizard(token, cookie, {**fields, "step": "controls", "output_id": "new", "volume": "0.5"}, "Try these settings")
+        self.assertEqual(self.calls[-1][1]["soundcard"]["volume"], 0.5)
+        self.assertEqual(self.title(page), "Soundcard output updated. - Add output for WXN99 - NWR Stream Manager")
+        # Going back to choose another type takes the sound card output away again, as does Cancel.
+        _, _, step, output = self.wizard(token, cookie, {**fields, "step": "device", "output_id": "new"}, "Back")
+        self.assertEqual((step, output, self.calls[-1]), ("type", "", ("remove", "s1", "new")))
+        response, _, _, _ = self.wizard(token, cookie, {**fields, "step": "controls", "output_id": "new"}, "Cancel")
+        self.assertEqual((response.getheader("Location"), self.calls[-1]), ("/?view=stream_settings&stream=s1", ("remove", "s1", "new")))
+        response, _, _, _ = self.wizard(token, cookie, {**fields, "step": "controls", "output_id": "new"}, "Finish")
+        self.assertEqual(response.getheader("Location"), "/?view=stream_settings&stream=s1&result=soundcard-added")
+
+    def test_a_stream_is_added_from_a_station_search(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=add_stream", user=self.owner)
+        self.assertEqual(self.title(page), "Add Stream - NWR Stream Manager")
+        self.assertIn('<span id="wizard_station_actions" class="baseline-only"><input type="submit" name="wizard_action" value="Search"></span>', page)
+        self.assertNotIn('value="Back"', page[page.index('id="wizard_baseline_actions"'):])
+        fields = {"form": "wizard", "step": "station", "q": "cannon", "wizard_output_type": "icecast", "service": "custom"}
+        _, page, step, _ = self.wizard(token, cookie, fields, "Search")
+        self.assertEqual(step, "station")
+        self.assertIn('<option value="WZ2560|162.550|MI|Cannonsburg|Cannonsburg">WZ2560 162.550 MHz, Cannonsburg, MI</option>', page)
+        response, page, step, _ = self.wizard(token, cookie, fields)
+        self.assertEqual((response.status, step), (400, "station"))
+        self.assertEqual(self.title(page), "Error: Select a station to continue. - Add Stream - NWR Stream Manager")
+        fields["station_key"] = "WZ2560|162.550|MI|Cannonsburg|Cannonsburg"
+        _, page, step, _ = self.wizard(token, cookie, fields)
+        self.assertEqual(step, "type")
+        self.assertIn('<input type="submit" name="wizard_action" value="Back">', page)
+        _, _, step, _ = self.wizard(token, cookie, {**fields, "step": "type"}, "Back")
+        self.assertEqual(step, "station")
+        icecast = {**fields, "host": "icecast.example", "port": "8000", "username": "source", "password": "secret", "mount": "/wz2560.mp3", "bitrate": "64", "sample_rate": "24000"}
+        response, _, _, _ = self.wizard(token, cookie, {**icecast, "step": "quality"}, "Finish")
+        self.assertEqual(response.getheader("Location"), "/?view=streams&result=created")
+        self.assertEqual((self.calls[-1][1]["station_key"], self.calls[-1][1]["icecast"]["mount"]), (fields["station_key"], "/wz2560.mp3"))
+        _, page = self.request("GET", "/?view=streams&result=created", user=self.owner)
+        self.assertEqual(self.title(page), "Stream created. - Manage Streams - NWR Stream Manager")
+        # NOAA Weather Radio Org names the mountpoint, and its notice gets a page of its own.
+        _, page, _, _ = self.wizard(token, cookie, {**fields, "step": "credentials", "service": "nwrorg"}, "Finish")
+        self.assertEqual(self.calls[-1][1]["icecast"]["mount"], "/MI-Cannonsburg-WZ2560")
+        self.assertEqual(self.title(page), "NOAA Weather Radio Org - NWR Stream Manager")
+
+    def test_a_new_streams_sound_card_plays_a_preview_until_it_is_created(self) -> None:
+        token, cookie = self.token()
+        fields = {"form": "wizard", "station_key": "WXN99|162.425|MI|West Olive|West Olive", "wizard_output_type": "soundcard",
+                  "stable_id": "pci-onboard", "wizard_soundcard_channel": "both", "volume": "1"}
+        _, page, step, _ = self.wizard(token, cookie, {**fields, "step": "device"})
+        self.assertEqual(step, "controls")
+        self.assertEqual(self.calls[-1][1]["lease"], True)
+        self.assertIn('name="preview_id" value="p1"', page)
+        self.assertIn("The preview stops 5 minutes after your last change", page)
+        self.wizard(token, cookie, {**fields, "step": "controls", "preview_id": "p1", "volume": "0.5"}, "Try these settings")
+        self.assertEqual((self.calls[-1][0], self.calls[-1][1]["preview_id"], self.calls[-1][1]["soundcard"]["volume"]), ("preview", "p1", 0.5))
+        _, _, step, _ = self.wizard(token, cookie, {**fields, "step": "device", "preview_id": "p1"}, "Back")
+        self.assertEqual((step, self.calls[-1]), ("type", ("discard", "p1")))
+        response, _, _, _ = self.wizard(token, cookie, {**fields, "step": "controls", "preview_id": "p1"}, "Finish")
+        self.assertEqual(response.getheader("Location"), "/?view=streams&result=created")
+        self.assertEqual((self.calls[-1][0], self.calls[-1][1]["preview_id"], self.calls[-1][1]["type"]), ("create", "p1", "soundcard"))
+        response, _, _, _ = self.wizard(token, cookie, {**fields, "step": "controls", "preview_id": "p1"}, "Cancel")
+        self.assertEqual((response.getheader("Location"), self.calls[-1]), ("/?view=streams", ("discard", "p1")))
+
 
 if __name__ == "__main__":
     unittest.main()

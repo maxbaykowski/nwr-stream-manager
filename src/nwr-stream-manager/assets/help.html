@@ -294,6 +294,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   </ol>
   <p>For a sound card, you choose the sound card, which of its left and right channels to use, and the volume instead. See <a href="#sound-card-outputs">Sound card outputs</a>.</p>
   <p>Once you finish, the stream starts right away. You can add more outputs to it later, so one station can go to several services and a sound card at once.</p>
+  <p>In an <a href="#older-browsers">older browser</a>, each step is a page of its own. Type your search and select <strong>Search</strong>, choose the station from the matches, then select <strong>Next</strong>. For a sound card, the station starts playing through it as soon as you choose it, so you can check it's the right one; select <strong>Try these settings</strong> to hear a change to the channels or volume. Without JavaScript, this preview keeps playing for 5 minutes after your last change, or until you select <strong>Finish</strong> or <strong>Cancel</strong>.</p>
 </section>
 
 <section aria-labelledby="output-types">
@@ -377,7 +378,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
       <strong>Disabled</strong> means the stream is stopped by the user; that one is self-explanatory.
     </dd>
     <dt>Actions</dt>
-    <dd>The <strong>More actions</strong> menu lets you start or stop the stream, listen to it in your browser (Monitor), open its settings (Edit stream settings), or remove it.</dd>
+    <dd>The <strong>More actions</strong> menu lets you start or stop the stream, listen to it in your browser (Monitor), open its settings (Edit stream settings), or remove it. In an <a href="#older-browsers">older browser</a>, these are buttons in the row instead, and <strong>Remove stream</strong> asks you to confirm first. Monitor needs an up-to-date browser.</dd>
   </dl>
 </section>
 
@@ -402,6 +403,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 <section aria-labelledby="stream-settings">
   <h2 id="stream-settings">Stream settings</h2>
   <p>To change a stream's settings, open <strong>Manage Streams</strong>, open the stream's <strong>More actions</strong> menu and select <strong>Edit stream settings</strong>. Changes take effect right away.</p>
+  <p>In an <a href="#older-browsers">older browser</a>, the tabs are links that open one tab at a time, and every audio effect is listed one after another. Make your changes, then select <strong>Save changes</strong>; only what you changed is saved. Save before moving to another tab, or the changes on this one are lost. The Test Mode tab isn't there; see <a href="#test-mode">Test mode</a>.</p>
 
   <h3 id="stream-settings-top">Enabling, monitoring and signal</h3>
   <p>Above the tabs are three controls that show up no matter where you are in the settings page:</p>
@@ -420,6 +422,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li><strong>Icecast:</strong> choose the streaming service, then enter its details. See <a href="#streaming-services">Streaming services</a>.</li>
     <li><strong>Sound card:</strong> choose the sound card, channels and volume. See <a href="#sound-card-outputs">Sound card outputs</a>.</li>
   </ul>
+  <p>In an <a href="#older-browsers">older browser</a>, both output types are listed one after the other, and each output has an <strong>Edit output</strong> button. Its page is where you change it, and where you'll find <strong>Disable output</strong>, <strong>Reset USB sound card</strong> and <strong>Remove output</strong>; removing asks you to confirm first. To switch an Icecast output to another streaming service, choose the service and select <strong>Change service</strong> before filling in the rest. When adding a sound card output, select <strong>Refresh sound card list</strong> if yours isn't listed. Once it's added, select <strong>Try these settings</strong> to hear a change to the channels or volume before you select <strong>Finish</strong>.</p>
   <div class="note">
     <p>Every stream needs at least one output working. This means if the stream only has one output, you can't disable it. EAS recording counts as an output, so it is possible to have a stream that gets sent nowhere and only records alerts.</p>
   </div>
@@ -486,6 +489,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <h3 id="test-mode">Test mode</h3>
   <p>Test mode swaps the real station for a simulated weather radio station, so you can check that your outputs and any connected alert equipment, such as an ENDEC, work properly without waiting for a real alert. The simulated station plays a looping test announcement, and it goes through your stream's outputs and audio effects just like the real station would.</p>
   <p>Turn on <strong>Enable test mode</strong> on the Test Mode tab. When you turn it off, the real station audio returns.</p>
+  <p>Test mode is only available in an up-to-date browser. While it's on, you need to see its countdown and be able to turn it off the moment something goes wrong, which an <a href="#older-browsers">older browser</a> can't promise, so the Test Mode tab doesn't appear there.</p>
   <dl>
     <dt>Signal strength</dt>
     <dd>Makes the simulated station stronger or weaker, from -80 to 0 dBFS. Lowering it lets you hear how your stream and equipment behave with a weak, noisy signal.</dd>
@@ -710,7 +714,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 <section aria-labelledby="older-browsers">
   <h2 id="older-browsers">Older browsers</h2>
   <p>When a page opens, NWR Stream Manager checks what your browser can do. In an up-to-date browser, pages update by themselves and you can listen to streams. In an older browser, such as Internet Explorer, or with JavaScript turned off, pages work as plain pages instead: forms save when you submit them, and Refresh shows the latest information. Messages that pop up at the edge of the screen in an up-to-date browser, such as a new account's temporary password, get a page of their own instead; select <strong>Done</strong> to carry on.</p>
-  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, accounts and passwords, Configure RTL-SDR, EAS alerts, the I/Q Recorder, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
+  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, accounts and passwords, Configure RTL-SDR, Manage Streams, adding streams and outputs, stream settings, EAS alerts, the I/Q Recorder, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
 </section>
 
 </main>
