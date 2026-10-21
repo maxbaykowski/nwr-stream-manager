@@ -593,6 +593,18 @@ class RemoteSdrProtocolTests(unittest.TestCase):
             # Checking in again does not bring back a pairing that has ended.
             self.assertFalse(self.server.keep_pairing_open()["active"])
 
+    def test_a_page_that_cannot_check_in_holds_pairing_until_the_code_expires(self) -> None:
+        from unittest.mock import patch
+
+        remote = self.remote
+        started = time.time()
+        with patch.object(remote.time, "time", return_value=started):
+            self.server.begin_pairing(held=True)
+        with patch.object(remote.time, "time", return_value=started + remote.PAIRING_CODE_TTL_SECONDS - 1):
+            self.assertTrue(self.server.pairing_status()["active"])
+        with patch.object(remote.time, "time", return_value=started + remote.PAIRING_CODE_TTL_SECONDS):
+            self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "expired"})
+
     def test_discovery_finds_host_by_identity(self) -> None:
         self.server.begin_pairing()
         hosts = self.discover()

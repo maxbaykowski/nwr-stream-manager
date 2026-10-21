@@ -539,7 +539,7 @@ SETTINGS_PAGE_PARENTS = {
     "record_announcement": "fallback_audio",
 }
 # The settings that work without the page script.
-BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account", "fallback_audio", "notifications"}
+BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account", "fallback_audio", "notifications", "sdr_sharing", "pair_device", "find_devices"}
 ACCOUNT_FORM_PATHS = {"/accounts/create", "/accounts/reset-password", "/accounts/read-only", "/accounts/delete"}
 EAS_ALERT_EXPORT_PATH = "/eas-alerts/export"
 EAS_ALERT_FORM_PATHS = {"/eas-alerts/delete", "/eas-alerts/remove"}
@@ -561,6 +561,7 @@ NOTIFICATION_RESULTS = {
     "tested": "Test notification sent.",
 }
 NTFY_PUBLIC_SERVER_URL = "https://ntfy.sh"
+SDR_SHARING_PATHS = {"/sdr-sharing/settings", "/sdr-sharing/pairing/start", "/sdr-sharing/pairing/stop", "/sdr-sharing/pair", "/sdr-sharing/unpair"}
 NOTIFICATIONS_SET_UP_HTML = (
     '<p>To get notifications for a stream, go to <a href="/?view=streams">Manage Streams</a>, '
     "select Edit stream settings for the stream, and open the Notifications tab.</p>"
@@ -8662,12 +8663,12 @@ class RtlControlService:
             host["paired"] = host["id"] in paired
         return {"hosts": hosts}
 
-    def start_remote_sdr_pairing(self) -> dict[str, Any]:
+    def start_remote_sdr_pairing(self, *, held: bool = False) -> dict[str, Any]:
         with self.lock:
             server = self.remote_server
         if server is None:
             raise ValueError("Turn on sharing before pairing another NWR Stream Manager.")
-        server.begin_pairing()
+        server.begin_pairing(held=held)
         return self.remote_sdr_status()
 
     def keep_remote_sdr_pairing_open(self) -> dict[str, Any]:
@@ -10057,6 +10058,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == WIZARD_FORM_PATH:
             self._handle_wizard_form()
             return
+        if path in SDR_SHARING_PATHS:
+            self._handle_sdr_sharing_form(path)
+            return
         if path in NOTIFICATION_FORM_PATHS:
             self._handle_notification_form(path)
             return
@@ -11029,6 +11033,15 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             page, title = self._fill_settings_view(page, account, query, form or {})
             if query.get("section") == "notifications" and not result and query.get("result") in NOTIFICATION_RESULTS:
                 result = ("notification-result", NOTIFICATION_RESULTS[query["result"]], "success")
+            if query.get("section") == "sdr_sharing" and not result:
+                name = query.get("name", "")
+                result = {
+                    "shared": ("remote-sharing-result", "This RTL-SDR is now shared with paired devices.", "success"),
+                    "unshared": ("remote-sharing-result", "Sharing is turned off.", "success"),
+                    "stopped": ("remote-sharing-result", "Pairing stopped.", "success"),
+                    "paired": ("remote-pair-outcome", f"Paired with {name}. Either device can now use the other's shared RTL-SDR.", "success"),
+                    "unpaired": ("paired-devices-result", f"Unpaired {name}.", "success"),
+                }.get(query.get("result", ""))
             if query.get("section") == "fallback_audio" and not result and query.get("result") in FALLBACK_RESULTS:
                 element_id, message = FALLBACK_RESULTS[query["result"]]
                 result = (element_id, message, "success")
@@ -11114,7 +11127,168 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             page, confirm_title = self._fill_notifications_page(page, query, form)
             if confirm_title:
                 title = f"{confirm_title} - {title}"
+        if section in {"sdr_sharing", "pair_device", "find_devices"}:
+            page, confirm_title = self._fill_sdr_sharing_page(page, section, query, form)
+            if confirm_title:
+                title = f"{confirm_title} - {title}"
         return page, title
+
+    def _fill_sdr_sharing_page(self, page: str, section: str, query: dict[str, str], form: dict[str, str]) -> tuple[str, str]:
+        remote_sdr = self.service.status().get("remote_sdr") or {}
+        sharing = remote_sdr.get("sharing") or {}
+        devices = list(remote_sdr.get("devices") or [])
+        # One of the tab's three pages shows, as the page script shows them.
+        for name in ("sdr_sharing", "pair_device", "find_devices"):
+            page = page_rendering.set_hidden(page, f"settings_{name}_page", name != section)
+        if section == "pair_device":
+            return self._fill_pair_device_page(page, sharing), ""
+        if section == "find_devices":
+            return self._fill_find_devices_page(page, form), ""
+        available = bool(sharing.get("available"))
+        page = page_rendering.set_hidden(page, "remote_access_unavailable", available)
+        page = page_rendering.set_hidden(page, "remote_access_controls", not available)
+        page = page_rendering.set_attribute(page, "remote_access_enabled", "checked", "checked" if sharing.get("enabled") else None)
+        page = page_rendering.append_content(
+            page, "remote_access_form", f'<input type="hidden" name="was_remote_access_enabled" value="{"1" if sharing.get("enabled") else "0"}">'
+        )
+        page = page_rendering.set_hidden(page, "remote_pairing_controls", not sharing.get("running"))
+        # The sharing machine shows a code; the other one enters it.
+        page = page_rendering.set_hidden(page, "remote_pair_section", bool(sharing.get("enabled") and available))
+        if sharing.get("error"):
+            page = page_rendering.set_text(page, "remote-sharing-result", str(sharing["error"]))
+            page = page_rendering.set_attribute(page, "remote-sharing-result", "class", "message error")
+        remote = remote_sdr.get("remote") or {}
+        if devices:
+            page = page_rendering.set_content(page, "paired-devices-body", "".join(paired_device_row_html(device, remote) for device in devices))
+        device = next((item for item in devices if item.get("id") == query.get("device")), None)
+        if query.get("confirm") != "unpair" or device is None:
+            return page, ""
+        name = remote_device_name(device)
+        content = (
+            f"<h4>Unpair {html.escape(name)}?</h4>"
+            "<p>Neither device will be able to use the other's RTL-SDR until you pair them again.</p>"
+            f'<form method="post" action="/sdr-sharing/unpair">{page_rendering.form_token_input(self._form_token())}'
+            f'<input type="hidden" name="device" value="{html.escape(str(device.get("id", "")))}">'
+            '<div class="actions"><button type="submit" class="primary" autofocus>Unpair</button>'
+            '<a class="button-link" href="/?view=settings&amp;section=sdr_sharing">Cancel</a></div></form>'
+        )
+        page = page_rendering.set_content(page, "sdr_sharing_confirm", content)
+        page = page_rendering.set_hidden(page, "sdr_sharing_confirm", False)
+        for element_id in ("sdr_sharing_section", "remote_pair_section", "paired_devices_section"):
+            page = page_rendering.set_hidden(page, element_id, True)
+        return page, f"Unpair {name}?"
+
+    def _fill_pair_device_page(self, page: str, sharing: dict[str, Any]) -> str:
+        """The pairing code. Opening this page keeps pairing open, as the page script does by checking in."""
+        pairing = sharing.get("pairing") or {}
+        if pairing.get("active"):
+            pairing = (self.service.keep_remote_sdr_pairing_open().get("sharing") or {}).get("pairing") or pairing
+        if pairing.get("active"):
+            expires = datetime.fromtimestamp(float(pairing.get("expires_at") or 0)).strftime("%I:%M %p").lstrip("0")
+            page = page_rendering.set_attribute(page, "remote_pairing_code", "value", str(pairing.get("code") or ""))
+            page = page_rendering.set_text(
+                page,
+                "remote_pairing_code_hint",
+                f"Enter this code on the other NWR Stream Manager before {expires}. It works for one device. "
+                "Pairing stays open until then, or until you select Stop pairing.",
+            )
+            page = page_rendering.set_text(page, "remote-pairing-status", "Refresh this page to see whether a device has paired.")
+            return page_rendering.set_attribute(page, "remote-pairing-status", "data-pairing", "active")
+        # Pairing has ended: say how, and offer another code.
+        reason = str(pairing.get("ended_reason") or "")
+        message = {
+            "paired": "A device paired with this one. It's listed under Paired devices, and either device can now use the other's shared RTL-SDR.",
+            "expired": "The pairing code expired.",
+            "too-many-attempts": "Pairing stopped after too many incorrect codes.",
+        }.get(reason, "Pairing stopped." if sharing.get("running") else "Turn on sharing before pairing another NWR Stream Manager.")
+        token_input = page_rendering.form_token_input(self._form_token())
+        again = (
+            f'<form method="post" action="/sdr-sharing/pairing/start">{token_input}<button type="submit">Show a new code</button></form>'
+            if sharing.get("running") else ""
+        )
+        content = (
+            f'<p class="message{" success" if reason == "paired" else ""}">{html.escape(message)}</p>'
+            f'<div class="actions">{again}<a class="button-link" href="/?view=settings&amp;section=sdr_sharing">Back to SDR sharing</a></div>'
+        )
+        page = page_rendering.set_content(page, "remote_pairing_done", content)
+        page = page_rendering.set_hidden(page, "remote_pairing_done", False)
+        for element_id in ("remote_pairing_code_label", "remote_pairing_code_hint", "remote_pairing_stop_form"):
+            page = page_rendering.set_hidden(page, element_id, True)
+        return page
+
+    def _fill_find_devices_page(self, page: str, form: dict[str, str]) -> str:
+        """Devices ready to pair, from one search; Search again searches once more."""
+        try:
+            hosts = list(self.service.discover_remote_sdrs().get("hosts") or [])
+            searched = ""
+        except Exception as exc:
+            hosts, searched = [], f"Searching failed: {form_message(str(exc))}"
+        choices = [
+            (remote_pair_choice(host), f"{remote_device_name(host)} ({'Tailscale' if host.get('via') == 'tailscale' else 'local network'}){', already paired' if host.get('paired') else ''}")
+            for host in hosts
+        ] + [("manual", "Enter an address")]
+        first_unpaired = next((remote_pair_choice(host) for host in hosts if not host.get("paired")), choices[0][0])
+        chosen = form.get("device") if form.get("device") in {value for value, _label in choices} else first_unpaired
+        page = page_rendering.set_content(
+            page,
+            "remote_pair_device",
+            "".join(f'<option value="{html.escape(value)}"{" selected" if value == chosen else ""}>{html.escape(label)}</option>' for value, label in choices),
+        )
+        count = len(hosts)
+        status = searched or (
+            f"Found {count} device{'' if count == 1 else 's'} ready to pair." if count
+            else "No devices are ready to pair yet. Once the other device shows a pairing code, select Search again."
+        )
+        page = page_rendering.set_text(page, "remote_pair_search_status", status)
+        page = page_rendering.set_attribute(page, "remote_pair_address", "value", form.get("address", ""))
+        # Shown here, as a page can't show it as it's chosen; a script, where one runs, does.
+        page = page_rendering.set_hidden(page, "remote_pair_address_label", False)
+        return page_rendering.set_hidden(page, "remote_pair_address_hint", False)
+
+    def _handle_sdr_sharing_form(self, path: str) -> None:
+        """Shares the RTL-SDR and pairs, for browsers without the page script."""
+        form: dict[str, str] = {}
+        query = {"view": "settings", "section": "sdr_sharing"}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            if path == "/sdr-sharing/pairing/start":
+                query["section"] = "pair_device"
+                self.service.start_remote_sdr_pairing(held=True)
+                self._send_redirect(page_route("settings", section="pair_device"))
+                return
+            if path == "/sdr-sharing/pairing/stop":
+                self.service.cancel_remote_sdr_pairing()
+                done = {"result": "stopped"}
+            elif path == "/sdr-sharing/pair":
+                query["section"] = "find_devices"
+                code = re.sub(r"\D", "", form.get("code", ""))
+                target = remote_pair_target(form)
+                if len(code) != 6:
+                    raise ValueError("Enter the 6-digit pairing code shown on the other device.")
+                before = {device.get("id") for device in self.service.remote_sdr_status().get("devices") or []}
+                devices = self.service.pair_remote_sdr({**target, "code": code}).get("devices") or []
+                added = next((device for device in devices if device.get("id") not in before), None)
+                done = {"result": "paired", "name": remote_device_name(added)}
+            elif path == "/sdr-sharing/unpair":
+                device = next((item for item in self.service.remote_sdr_status().get("devices") or [] if item.get("id") == form.get("device")), None)
+                if device is None:
+                    raise ValueError("That device isn't paired.")
+                self.service.unpair_remote_sdr_device({"device_id": device.get("id")})
+                done = {"result": "unpaired", "name": remote_device_name(device)}
+            else:
+                enabled = form.get("remote_access_enabled") == "1"
+                if enabled != (form.get("was_remote_access_enabled") == "1"):
+                    self.service.update({"remote_access_enabled": enabled})
+                done = {"result": "shared" if enabled else "unshared"}
+        except Exception as exc:
+            element = {"find_devices": "remote-pair-result", "pair_device": "remote-pairing-status"}.get(query["section"], "remote-sharing-result")
+            if path == "/sdr-sharing/unpair":
+                element = "paired-devices-result"
+            self._send_page(self._render_index_page(query, result=(element, form_message(str(exc)), "error"), form=form), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_redirect(page_route("settings", section="sdr_sharing", **done))
 
     def _fill_notifications_page(self, page: str, query: dict[str, str], form: dict[str, str]) -> tuple[str, str]:
         settings = self.service.notification_settings_snapshot().public_dict()
@@ -16271,6 +16445,49 @@ def notification_access_url_options_html(options: list[dict[str, str]], saved: s
     )
 
 
+def paired_device_status(device: dict[str, Any], remote: dict[str, Any]) -> str:
+    """How a paired device is getting on, as the page script says it."""
+    network = " over Tailscale" if device.get("via") == "tailscale" else ""
+    if device.get("in_use"):
+        reachable = (remote.get("status") or {}).get("reachable")
+        return f"This machine is using its RTL-SDR{network}" if reachable else "This machine is using its RTL-SDR (not reachable)"
+    if device.get("using_this_sdr"):
+        return f"Using this machine's RTL-SDR{network}"
+    return "Paired"
+
+
+def paired_device_row_html(device: dict[str, Any], remote: dict[str, Any]) -> str:
+    name = html.escape(remote_device_name(device))
+    unpair = page_route("settings", section="sdr_sharing", confirm="unpair", device=device.get("id", ""))
+    return (
+        f'<tr data-row-key="device:{html.escape(str(device.get("id", "")))}" role="row">'
+        f'<td role="cell" data-label="Name">{name}</td>'
+        f'<td role="cell" data-label="Status">{html.escape(paired_device_status(device, remote))}</td>'
+        f'<td role="cell" data-label="Actions"><a class="button-link" href="{html.escape(unpair)}" aria-label="Unpair {name}">Unpair</a></td></tr>'
+    )
+
+
+def remote_pair_choice(host: dict[str, Any]) -> str:
+    """A found device as a choice in the list, carrying what pairing with it needs."""
+    addresses = ",".join(str(address) for address in host.get("addresses") or [])
+    return "|".join(str(part) for part in (host.get("id", ""), host.get("address", ""), host.get("port") or "", addresses))
+
+
+def remote_pair_target(form: dict[str, str]) -> dict[str, Any]:
+    """Where to pair: a found device, or an address entered, as the page script reads them."""
+    choice = form.get("device", "")
+    if choice and choice != "manual":
+        host_id, address, port, addresses = (choice.split("|") + ["", "", "", ""])[:4]
+        target: dict[str, Any] = {"address": address, "host_id": host_id, "addresses": [item for item in addresses.split(",") if item]}
+        if port:
+            target["port"] = int(port)
+        return target
+    match = re.match(r"^\[?([^\]]+?)\]?(?::(\d+))?$", form.get("address", "").strip())
+    if not match:
+        raise ValueError("Find a device or enter its address first.")
+    return {"address": match.group(1), **({"port": int(match.group(2))} if match.group(2) else {})}
+
+
 def format_gain(value: float) -> str:
     return f"{float(value):g} dB"
 
@@ -17192,18 +17409,26 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <div id="settings_panel_sdr_sharing" class="settings-panel" hidden>
             <div id="settings_sdr_sharing_page">
               <h3>SDR sharing</h3>
+              <div id="sdr_sharing_confirm" class="baseline-only" hidden></div>
               <div id="sdr_sharing_section" class="settings-group">
                 <h4>Sharing</h4>
                 <p id="remote_access_unavailable" class="hint" hidden>Sharing is available while an RTL-SDR connected to this machine is selected.</p>
                 <div id="remote_access_controls">
-                  <label class="checkbox-row">
-                    <input id="remote_access_enabled" type="checkbox" aria-describedby="remote_access_hint">
-                    Share this RTL-SDR with paired devices
-                  </label>
-                  <span id="remote_access_hint" class="hint">Paired NWR Stream Manager devices on your network can use this RTL-SDR for their streams, weather radio receiver and I/Q recordings. To pair a device, select Pair a device to show a pairing code, then enter it on the other device. Sharing uses TCP port 47432 and UDP port 47433.</span>
-                  <div id="remote_pairing_controls" class="actions" hidden>
-                    <button id="start_remote_pairing" type="button">Pair a device</button>
-                  </div>
+                  <form id="remote_access_form" method="post" action="/sdr-sharing/settings">
+                    __FORM_TOKEN_INPUT__
+                    <label class="checkbox-row">
+                      <input id="remote_access_enabled" name="remote_access_enabled" value="1" type="checkbox" aria-describedby="remote_access_hint">
+                      Share this RTL-SDR with paired devices
+                    </label>
+                    <span id="remote_access_hint" class="hint">Paired NWR Stream Manager devices on your network can use this RTL-SDR for their streams, weather radio receiver and I/Q recordings. To pair a device, select Pair a device to show a pairing code, then enter it on the other device. Sharing uses TCP port 47432 and UDP port 47433.</span>
+                    <div class="actions baseline-only">
+                      <button id="save_remote_access" type="submit" data-baseline-submit>Save changes</button>
+                    </div>
+                  </form>
+                  <form id="remote_pairing_controls" class="actions" method="post" action="/sdr-sharing/pairing/start" hidden>
+                    __FORM_TOKEN_INPUT__
+                    <button id="start_remote_pairing" type="submit" data-baseline-submit>Pair a device</button>
+                  </form>
                 </div>
                 <div id="remote-sharing-result" class="message" aria-live="polite"></div>
               </div>
@@ -17211,7 +17436,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 <h4>Pair with another NWR Stream Manager</h4>
                 <p class="hint">Pair once and either device can use the other's RTL-SDR. On the device you are pairing with, turn on sharing and select Pair a device to show a pairing code, then select Find devices here.</p>
                 <div class="actions">
-                  <button id="find_remote_devices" type="button">Find devices</button>
+                  <button id="find_remote_devices" class="needs-app-inline" type="button">Find devices</button>
+                  <a id="find_remote_devices_link" class="baseline-only button-link" href="/?view=settings&amp;section=find_devices">Find devices</a>
                 </div>
                 <div id="remote-pair-outcome" class="message" aria-live="polite"></div>
               </div>
@@ -17236,39 +17462,49 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             </div>
             <div id="settings_pair_device_page" hidden>
               <h3>Pair a device</h3>
-              <p class="hint">On the other NWR Stream Manager, open Settings, then SDR sharing, select Find devices, choose this device and enter this code. Other devices can find this one only while this page is open, and pairing stops when you leave it.</p>
-              <label>Pairing code
+              <p class="hint needs-app">On the other NWR Stream Manager, open Settings, then SDR sharing, select Find devices, choose this device and enter this code. Other devices can find this one only while this page is open, and pairing stops when you leave it.</p>
+              <p class="hint baseline-only">On the other NWR Stream Manager, open Settings, then SDR sharing, select Find devices, choose this device and enter this code. Other devices can find this one until the code expires or you select Stop pairing.</p>
+              <label id="remote_pairing_code_label">Pairing code
                 <input id="remote_pairing_code" type="text" readonly autocomplete="off" spellcheck="false" aria-describedby="remote_pairing_code_hint">
               </label>
               <span id="remote_pairing_code_hint" class="hint"></span>
-              <div class="actions">
-                <button id="copy_remote_pairing_code" type="button">Copy pairing code</button>
-                <button id="cancel_remote_pairing" type="button">Stop pairing</button>
-              </div>
+              <form id="remote_pairing_stop_form" class="actions" method="post" action="/sdr-sharing/pairing/stop">
+                __FORM_TOKEN_INPUT__
+                <button id="copy_remote_pairing_code" class="needs-app-inline" type="button">Copy pairing code</button>
+                <button class="baseline-only" type="button" data-copy-from="remote_pairing_code" hidden>Copy pairing code</button>
+                <button id="cancel_remote_pairing" type="submit" data-baseline-submit>Stop pairing</button>
+              </form>
               <div id="remote-pairing-copy-result" class="message" aria-live="polite"></div>
               <div id="remote-pairing-status" class="message" aria-live="polite"></div>
+              <div id="remote_pairing_done" class="baseline-only" hidden></div>
             </div>
             <div id="settings_find_devices_page" hidden>
               <h3>Find devices</h3>
-              <p class="hint">On the device you are pairing with, open Settings, then SDR sharing, turn on sharing and select Pair a device. It appears here once it shows a pairing code. Searching continues until you pair or leave this page.</p>
+              <p class="hint needs-app">On the device you are pairing with, open Settings, then SDR sharing, turn on sharing and select Pair a device. It appears here once it shows a pairing code. Searching continues until you pair or leave this page.</p>
+              <p class="hint baseline-only">On the device you are pairing with, open Settings, then SDR sharing, turn on sharing and select Pair a device. It appears here once it shows a pairing code; select Search again if it isn't listed yet.</p>
               <p id="remote_pair_search_status" class="hint" aria-live="polite"></p>
+              <form id="remote_pair_form" method="post" action="/sdr-sharing/pair">
+              __FORM_TOKEN_INPUT__
               <div class="grid">
                 <label>Device
-                  <select id="remote_pair_device"></select>
+                  <select id="remote_pair_device" name="device"></select>
                 </label>
                 <label id="remote_pair_address_label" hidden>Address
-                  <input id="remote_pair_address" type="text" autocomplete="off" spellcheck="false" aria-describedby="remote_pair_address_hint">
+                  <input id="remote_pair_address" name="address" type="text" autocomplete="off" spellcheck="false" aria-describedby="remote_pair_address_hint">
                 </label>
                 <span id="remote_pair_address_hint" class="hint" hidden>The IP address or host name of the other NWR Stream Manager.</span>
                 <label>Pairing code
-                  <input id="remote_pair_code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" aria-describedby="remote_pair_code_hint">
+                  <input id="remote_pair_code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" aria-describedby="remote_pair_code_hint">
                 </label>
                 <span id="remote_pair_code_hint" class="hint">The 6-digit code shown on the other device.</span>
               </div>
               <div class="actions">
-                <button id="pair_remote_device" type="button">Pair</button>
-                <button id="cancel_find_devices" type="button">Cancel</button>
+                <button id="pair_remote_device" type="submit" data-baseline-submit>Pair</button>
+                <button id="cancel_find_devices" class="needs-app-inline" type="button">Cancel</button>
+                <a id="search_remote_devices_link" class="baseline-only button-link" href="/?view=settings&amp;section=find_devices">Search again</a>
+                <a id="cancel_find_devices_link" class="baseline-only button-link" href="/?view=settings&amp;section=sdr_sharing">Cancel</a>
               </div>
+              </form>
               <div id="remote-pair-result" class="message" aria-live="polite"></div>
             </div>
           </div>
@@ -18528,6 +18764,33 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     follow("notification_server_mode", "self-hosted", ["notification_configured_server_url_label", "notification_configured_server_url_hint"]);
     follow("notification_access_url_mode", "custom", ["notification_custom_access_url_label", "notification_custom_access_url_hint"]);
     follow("notification_wizard_access_url_mode", "custom", ["notification_wizard_custom_access_url_label", "notification_wizard_custom_access_url_hint"]);
+    follow("remote_pair_device", "manual", ["remote_pair_address_label", "remote_pair_address_hint"]);
+  })();
+
+  // While a pairing code shows, the page notices when pairing ends and reloads to say how.
+  (function () {
+    var status = byId("remote-pairing-status");
+    if (!status || status.getAttribute("data-pairing") !== "active" || !window.XMLHttpRequest || !window.JSON) return;
+    var request = new XMLHttpRequest();
+    function check() {
+      request.open("GET", "/api/remote-sdr?time=" + new Date().getTime(), true);
+      request.onreadystatechange = function () {
+        if (request.readyState !== 4) return;
+        var pairing = null;
+        try {
+          if (request.status === 200) pairing = JSON.parse(request.responseText).sharing.pairing;
+        } catch (error) {}
+        if (pairing && !pairing.active) {
+          window.location.reload();
+          return;
+        }
+        setTimeout(check, 3000);
+      };
+      request.send(null);
+    }
+    status.innerHTML = "";
+    status.appendChild(d.createTextNode("This page updates when a device pairs."));
+    setTimeout(check, 3000);
   })();
 
   // A new I/Q recording shows the settings for the chosen source.

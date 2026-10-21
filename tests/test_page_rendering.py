@@ -4,6 +4,7 @@ import http.client
 import re
 import tempfile
 import threading
+import time
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1627,6 +1628,133 @@ class NotificationPageTests(unittest.TestCase):
         self.assertRegex(self.settings.topic, r"^NWRSTMGR-[A-Za-z0-9]{24}$")
         response, _ = self.request("POST", "/notifications/regenerate", fields={"form_token": "guess"}, cookie=cookie, user=self.owner)
         self.assertEqual(response.status, 400)
+
+
+class SdrSharingPageTests(unittest.TestCase):
+    """SDR sharing and pairing, as a browser without the page script uses them."""
+
+    request = BaselinePageServerTests.request
+    form_token = BaselinePageServerTests.form_token
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.accounts = wc.AccountStore(Path(tempdir.name) / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        account, secret = self.accounts.create_account("viewer", True)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        self.owner, self.viewer = ("owner", "password1"), ("viewer", "password2")
+        self.sharing = {"enabled": False, "available": True, "running": False, "error": "", "pairing": {"active": False}}
+        self.devices: list[dict] = []
+        self.calls: list[tuple] = []
+
+        def remote_status():
+            return {"sharing": dict(self.sharing), "devices": [dict(device) for device in self.devices], "remote": {"source_mode": "local", "device_id": ""}}
+
+        def update(changes):
+            self.calls.append(("update", changes))
+            self.sharing.update(enabled=changes["remote_access_enabled"], running=changes["remote_access_enabled"])
+
+        def start(held=False):
+            self.calls.append(("start", held))
+            self.sharing["pairing"] = {"active": True, "code": "123456", "expires_at": time.time() + 300}
+            return remote_status()
+
+        def pair(payload):
+            self.calls.append(("pair", payload))
+            if payload["code"] != "123456":
+                raise ValueError("The pairing code is incorrect.")
+            self.devices.append({"id": "host2", "name": "Attic Pi"})
+            return remote_status()
+
+        service = StandInService(
+            accounts=self.accounts,
+            auth_sessions=wc.AuthSessionStore(),
+            status=lambda read_only=False: {"remote_sdr": remote_status()},
+            remote_sdr_status=remote_status,
+            update=update,
+            start_remote_sdr_pairing=start,
+            keep_remote_sdr_pairing_open=lambda: self.calls.append(("keep",)) or remote_status(),
+            cancel_remote_sdr_pairing=lambda: self.calls.append(("cancel",)) or self.sharing.update(pairing={"active": False, "ended_reason": "stopped"}),
+            discover_remote_sdrs=lambda: {"hosts": [{"id": "host2", "name": "Attic Pi", "address": "192.168.1.30", "addresses": ["192.168.1.30", "100.64.0.5"], "port": 47432, "via": "lan", "paired": False}]},
+            pair_remote_sdr=pair,
+            unpair_remote_sdr_device=lambda payload: self.calls.append(("unpair", payload)) or self.devices.clear(),
+        )
+        handler = type("SdrSharingPageTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def token(self):
+        response, _ = self.request("GET", "/?view=settings&section=sdr_sharing", user=self.owner)
+        token = self.form_token(response)
+        return token, f"nwrstmgr_form={token}"
+
+    def test_sharing_is_turned_on_and_a_code_held_open(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=settings&section=sdr_sharing", user=self.owner)
+        self.assertEqual(self.title(page), "SDR sharing - Settings - NWR Stream Manager")
+        self.assertRegex(page, r'<form id="remote_pairing_controls" [^>]* hidden>')
+        fields = {"remote_access_enabled": "1", "was_remote_access_enabled": "0", "form_token": token}
+        response, _ = self.request("POST", "/sdr-sharing/settings", fields=fields, cookie=cookie, user=self.viewer)
+        self.assertEqual(response.status, 403)
+        response, _ = self.request("POST", "/sdr-sharing/settings", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=sdr_sharing&result=shared")
+        self.assertEqual(self.calls, [("update", {"remote_access_enabled": True})])
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "This RTL-SDR is now shared with paired devices. - SDR sharing - Settings - NWR Stream Manager")
+
+        response, _ = self.request("POST", "/sdr-sharing/pairing/start", fields={"form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual((response.getheader("Location"), self.calls[-1]), ("/?view=settings&section=pair_device", ("start", True)))
+        _, page = self.request("GET", "/?view=settings&section=pair_device", user=self.owner)
+        self.assertEqual(self.calls[-1], ("keep",))
+        self.assertIn('value="123456"', page)
+        self.assertIn('<div id="remote-pairing-status" class="message" aria-live="polite" data-pairing="active">Refresh this page to see whether a device has paired.</div>', page)
+        self.assertRegex(page, r'<div id="settings_sdr_sharing_page" hidden>')
+        # Once a device has paired, the page says so instead of showing the code.
+        self.sharing["pairing"] = {"active": False, "ended_reason": "paired"}
+        _, page = self.request("GET", "/?view=settings&section=pair_device", user=self.owner)
+        self.assertIn("A device paired with this one.", page)
+        self.assertRegex(page, r'<label id="remote_pairing_code_label" hidden>')
+        response, _ = self.request("POST", "/sdr-sharing/pairing/stop", fields={"form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual((response.getheader("Location"), self.calls[-1]), ("/?view=settings&section=sdr_sharing&result=stopped", ("cancel",)))
+
+    def test_a_found_device_is_paired_and_unpaired_after_a_confirmation(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=settings&section=find_devices", user=self.owner)
+        choice = "host2|192.168.1.30|47432|192.168.1.30,100.64.0.5"
+        self.assertIn(f'<option value="{choice}" selected>Attic Pi (local network)</option><option value="manual">Enter an address</option>', page)
+        self.assertIn("Found 1 device ready to pair.", page)
+        fields = {"device": choice, "code": "000000", "form_token": token}
+        response, page = self.request("POST", "/sdr-sharing/pair", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+        self.assertEqual(self.title(page), "Error: The pairing code is incorrect. - Find devices - Settings - NWR Stream Manager")
+        response, page = self.request("POST", "/sdr-sharing/pair", fields={**fields, "code": "12345"}, cookie=cookie, user=self.owner)
+        self.assertEqual(self.title(page), "Error: Enter the 6-digit pairing code shown on the other device. - Find devices - Settings - NWR Stream Manager")
+        response, _ = self.request("POST", "/sdr-sharing/pair", fields={**fields, "code": "123 456"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=sdr_sharing&result=paired&name=Attic+Pi")
+        self.assertEqual(self.calls[-1][1], {"address": "192.168.1.30", "host_id": "host2", "addresses": ["192.168.1.30", "100.64.0.5"], "port": 47432, "code": "123456"})
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "Paired with Attic Pi. Either device can now use the other&#x27;s shared RTL-SDR. - SDR sharing - Settings - NWR Stream Manager")
+        self.assertIn('<a class="button-link" href="/?view=settings&amp;section=sdr_sharing&amp;confirm=unpair&amp;device=host2" aria-label="Unpair Attic Pi">Unpair</a>', page)
+        # An address entered instead of a found device.
+        self.devices.clear()
+        self.request("POST", "/sdr-sharing/pair", fields={"device": "manual", "address": "[fd00::5]:47500", "code": "123456", "form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual(self.calls[-1][1], {"address": "fd00::5", "port": 47500, "code": "123456"})
+
+        _, page = self.request("GET", "/?view=settings&section=sdr_sharing&confirm=unpair&device=host2", user=self.owner)
+        self.assertEqual(self.title(page), "Unpair Attic Pi? - SDR sharing - Settings - NWR Stream Manager")
+        response, _ = self.request("POST", "/sdr-sharing/unpair", fields={"device": "host2", "form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=sdr_sharing&result=unpaired&name=Attic+Pi")
+        self.assertEqual(self.calls[-1], ("unpair", {"device_id": "host2"}))
 
 
 if __name__ == "__main__":

@@ -116,8 +116,8 @@ class SdrPairingPageTests(unittest.TestCase):
         pair = self.settings[self.settings.index('<div id="settings_pair_device_page" hidden>'):self.settings.index('<div id="settings_find_devices_page"')]
         find = self.settings[self.settings.index('<div id="settings_find_devices_page" hidden>'):self.settings.index('<div id="settings_panel_notifications"')]
 
-        self.assertIn('<button id="start_remote_pairing" type="button">Pair a device</button>', sharing)
-        self.assertIn('<button id="find_remote_devices" type="button">Find devices</button>', sharing)
+        self.assertIn('<button id="start_remote_pairing" type="submit" data-baseline-submit>Pair a device</button>', sharing)
+        self.assertIn('<button id="find_remote_devices" class="needs-app-inline" type="button">Find devices</button>', sharing)
         self.assertIn('id="paired-devices-body"', sharing)
         for element in ("remote_pairing_code", "copy_remote_pairing_code", "cancel_remote_pairing"):
             self.assertIn(f'id="{element}"', pair)

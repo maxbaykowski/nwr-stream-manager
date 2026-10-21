@@ -1031,6 +1031,7 @@ class _PairingWindow:
     expires_at: float
     attempts: int = 0
     page_seen_at: float = 0.0
+    page_timeout: float = PAIRING_PAGE_TIMEOUT_SECONDS
 
 
 class RemoteSdrServer:
@@ -1119,8 +1120,11 @@ class RemoteSdrServer:
 
     # -- pairing ----------------------------------------------------------
 
-    def begin_pairing(self) -> dict[str, Any]:
-        """Enter pairing mode, keeping the current code if it is already on."""
+    def begin_pairing(self, *, held: bool = False) -> dict[str, Any]:
+        """Enter pairing mode, keeping the current code if it is already on.
+
+        A page that can't check in holds pairing open until the code expires instead.
+        """
         with self.lock:
             now = time.time()
             if self._active_pairing_locked() is None:
@@ -1130,6 +1134,8 @@ class RemoteSdrServer:
                 LOG.info("remote SDR pairing mode started for %.0f seconds", PAIRING_CODE_TTL_SECONDS)
             assert self.pairing is not None
             self.pairing.page_seen_at = now
+            if held:
+                self.pairing.page_timeout = PAIRING_CODE_TTL_SECONDS
         return self.pairing_status()
 
     def keep_pairing_open(self) -> dict[str, Any]:
@@ -1164,7 +1170,7 @@ class RemoteSdrServer:
         if self.pairing is not None and now >= self.pairing.expires_at:
             self.pairing = None
             self.pairing_ended_reason = "expired"
-        elif self.pairing is not None and now - self.pairing.page_seen_at > PAIRING_PAGE_TIMEOUT_SECONDS:
+        elif self.pairing is not None and now - self.pairing.page_seen_at > self.pairing.page_timeout:
             LOG.info("remote SDR pairing mode stopped: the page showing the code was closed")
             self.pairing = None
             self.pairing_ended_reason = "page-closed"

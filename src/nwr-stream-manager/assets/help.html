@@ -585,6 +585,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li>Still on the second computer, open <strong>Configure RTL-SDR</strong>, and choose <strong>Shared by</strong> the paired computer <strong>over the network</strong> from <strong>Active SDR</strong>. To go back to an RTL-SDR plugged into this computer, choose it from the same list.</li>
   </ol>
   <p>Paired computers are listed in SDR sharing under <strong>Paired devices</strong>, where you can also remove them.</p>
+  <p>Pairing works in an <a href="#older-browsers">older browser</a> too, a little differently, since the page can't check in with NWR Stream Manager while it's open:</p>
+  <ul>
+    <li>Turn sharing on or off, then select <strong>Save changes</strong>.</li>
+    <li>After <strong>Pair a device</strong>, pairing stays open until the code expires, even if you leave the page, or until you select <strong>Stop pairing</strong>. Refresh the page to see whether a device has paired. In browsers that can run scripts, the page notices by itself.</li>
+    <li><strong>Find devices</strong> searches once when the page opens. If the other computer isn't listed yet, select <strong>Search again</strong>.</li>
+    <li><strong>Unpair</strong> asks you to confirm first.</li>
+  </ul>
   <p>A computer sharing its RTL-SDR can only be found by computers it hasn't paired with yet while it's showing a pairing code. The rest of the time, only the computers already paired with it can find it, so it stays hidden from everyone else on the network.</p>
   <h3 id="remote-sdr-buffer">Network buffer</h3>
   <p>When using a shared RTL-SDR, network inconsistencies and dropouts have to be taken into account. When using an RTL-SDR connected directly over USB, there isn't much latency. However, the same can't be said for transmitting SDR data over the network. The <strong>Network buffer</strong> setting holds back a little radio data to ride out Wi-Fi hiccups and brief network dropouts. A bigger buffer is more reliable on a weak connection, but puts your audio a bit further behind real time. The delay applies to everything using the shared RTL-SDR, including monitoring and the Weather Radio Receiver. The buffer can be set between 0 and 10 seconds. You'll probably notice the delay the most when using the weather radio receiver, as depending on what the buffer is set to there will be a noticeable delay before the weather radio receiver plays audio or switches channels.</p>
@@ -716,7 +723,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 <section aria-labelledby="older-browsers">
   <h2 id="older-browsers">Older browsers</h2>
   <p>When a page opens, NWR Stream Manager checks what your browser can do. In an up-to-date browser, pages update by themselves and you can listen to streams. In an older browser, such as Internet Explorer, or with JavaScript turned off, pages work as plain pages instead: forms save when you submit them, and Refresh shows the latest information. Messages that pop up at the edge of the screen in an up-to-date browser, such as a new account's temporary password, get a page of their own instead; select <strong>Done</strong> to carry on.</p>
-  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, accounts and passwords, Configure RTL-SDR, Manage Streams, adding streams and outputs, stream settings, notifications, fallback audio, EAS alerts, the I/Q Recorder, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
+  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, accounts and passwords, Configure RTL-SDR, Manage Streams, adding streams and outputs, stream settings, notifications, SDR sharing, fallback audio, EAS alerts, the I/Q Recorder, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
 </section>
 
 </main>
