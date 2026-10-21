@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import types
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -308,7 +309,8 @@ class IcecastOutputHeldOffTests(unittest.TestCase):
                 "bitrate": 64,
             },
         }
-        with mock.patch.object(wc, "IcecastSource", Source):
+        # The output writer opens its Icecast connection where it lives.
+        with mock.patch.object(sys.modules[wc.IcecastOutputWriter.__module__], "IcecastSource", Source):
             writer = wc.IcecastOutputWriter(runtime, output)
             writer.start()
             self.addCleanup(writer.stop)

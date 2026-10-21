@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NWR Stream Manager Setup</title>
+__PAGE_SCRIPT_LOADER__
+<style>
+__BASE_PAGE_STYLES__
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; background: #f6f7f9; color: #14181f; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 24px; }
+.panel { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 24px; }
+label { display: grid; gap: 6px; margin: 14px 0; font-weight: 700; }
+input { font: inherit; padding: 10px; border: 1px solid #aab2c0; border-radius: 6px; }
+.actions { display: flex; gap: 10px; margin-top: 18px; }
+button { font: inherit; padding: 10px 14px; border: 1px solid #9aa4b2; border-radius: 6px; background: #fff; color: #14181f; cursor: pointer; }
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+.primary { background: #174a98; color: #fff; border-color: #174a98; }
+.message { min-height: 1.5em; margin-top: 14px; font-weight: 700; }
+.error { color: #a61b1b; }
+.hint { color: #4b5563; }
+footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
+footer a { color: #174a98; }
+.screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+@media (prefers-color-scheme: dark) {
+  .error { color: #ff8a8a; }
+  body { background: #111827; color: #f9fafb; }
+  .panel, button, input { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
+  .hint { color: #cbd5e1; }
+  footer a { color: #93c5fd; }
+}
+</style>
+</head>
+<body>
+<main>
+  <section class="panel" aria-labelledby="setup_title">
+    <h1 id="setup_title">NWR Stream Manager Setup</h1>
+    <div id="setup_welcome">
+      <p>Welcome to NWR Stream Manager, an all new tool for streaming NOAA Weather Radio to online services! To ensure no one else on the network tampers with your streams, please set up an account. Press the next button to continue.</p>
+      <form id="welcome_form" method="get" action="/">
+        <input type="hidden" name="step" value="account">
+        <div class="actions">
+          <button id="welcome_next" class="primary" type="submit">Next</button>
+        </div>
+      </form>
+    </div>
+    <form id="setup_form" method="post" action="/setup" hidden>
+      __FORM_TOKEN_INPUT__
+      <p class="hint">Create the administrator account for this NWR Stream Manager.</p>
+      <label>
+        Username
+        <input id="setup_username" name="username" autocomplete="username" required pattern="[A-Za-z0-9_\-]{1,64}" autofocus>
+      </label>
+      <label>
+        Password
+        <input id="setup_password" name="password" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <label>
+        Confirm password
+        <input id="setup_confirm_password" name="confirm_password" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <div class="actions">
+        <button id="setup_next" class="primary" type="submit">Next</button>
+      </div>
+      <div id="setup_message" class="message" aria-live="polite"></div>
+    </form>
+    <form id="setup_done" method="get" action="/" hidden>
+      <p>You're all set up! Click the finish button to log in.</p>
+      <div class="actions">
+        <button id="setup_finish" class="primary" type="submit">Finish</button>
+      </div>
+    </form>
+  </section>
+</main>
+<footer>
+  <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
+</footer>
+<script type="text/x-nwr-app">
+const usernamePattern = /^[A-Za-z0-9_-]{1,64}$/;
+const passwordPattern = /^[!-~]{8,256}$/;
+const welcome = document.getElementById("setup_welcome");
+const form = document.getElementById("setup_form");
+const done = document.getElementById("setup_done");
+const message = document.getElementById("setup_message");
+const next = document.getElementById("setup_next");
+const username = document.getElementById("setup_username");
+const password = document.getElementById("setup_password");
+const confirmPassword = document.getElementById("setup_confirm_password");
+
+async function redirectIfSetupComplete() {
+  try {
+    const response = await fetch("/api/setup-state", {cache: "no-store"});
+    if (!response.ok) return;
+    const data = await response.json();
+    if (!data.setup_required) window.location.replace("/");
+  } catch (error) {
+  }
+}
+
+function validateSetupForm() {
+  const valid = usernamePattern.test(username.value) &&
+    passwordPattern.test(password.value) &&
+    password.value === confirmPassword.value;
+  next.disabled = !valid;
+  if (!usernamePattern.test(username.value) && username.value) {
+    message.textContent = "Username may contain only letters, numbers, hyphen, and underscore.";
+    message.className = "message error";
+  } else if (!passwordPattern.test(password.value) && password.value) {
+    message.textContent = "Password must be at least 8 printable non-space characters.";
+    message.className = "message error";
+  } else if (confirmPassword.value && password.value !== confirmPassword.value) {
+    message.textContent = "Passwords do not match.";
+    message.className = "message error";
+  } else {
+    message.textContent = "";
+    message.className = "message";
+  }
+}
+
+document.getElementById("welcome_form").addEventListener("submit", event => {
+  event.preventDefault();
+  welcome.hidden = true;
+  form.hidden = false;
+  username.focus();
+});
+
+for (const input of [username, password, confirmPassword]) {
+  input.addEventListener("input", validateSetupForm);
+}
+
+form.addEventListener("submit", async event => {
+  event.preventDefault();
+  validateSetupForm();
+  if (next.disabled) return;
+  next.disabled = true;
+  try {
+    const response = await fetch("/api/setup-account", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        username: username.value,
+        password: password.value,
+        confirm_password: confirmPassword.value
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || response.statusText);
+    form.hidden = true;
+    done.hidden = false;
+    document.getElementById("setup_finish").focus();
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = "message error";
+    validateSetupForm();
+  }
+});
+
+done.addEventListener("submit", event => {
+  event.preventDefault();
+  window.location.replace("/");
+});
+validateSetupForm();
+window.addEventListener("pageshow", redirectIfSetupComplete);
+redirectIfSetupComplete();
+</script>
+__PAGE_SCRIPT_STARTER__
+</body>
+</html>

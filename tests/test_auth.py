@@ -37,6 +37,9 @@ class AuthTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.web_control = load_web_control_module()
+        # Where the parts these tests swap out live.
+        cls.network = sys.modules["nwr_stream_manager.network"]
+        cls.notifications = sys.modules["nwr_stream_manager.notifications"]
 
     def test_account_store_creates_and_verifies_admin(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -156,7 +159,7 @@ class AuthTests(unittest.TestCase):
             captured["timeout"] = timeout
             return FakeResponse()
 
-        with patch.object(self.web_control, "urlopen", fake_urlopen):
+        with patch.object(self.notifications, "urlopen", fake_urlopen):
             self.web_control.send_ntfy_notification(
                 settings,
                 title="NWR Stream Manager",
@@ -191,7 +194,7 @@ class AuthTests(unittest.TestCase):
             captured["headers"] = dict(request.header_items())
             return FakeResponse()
 
-        with patch.object(self.web_control, "urlopen", fake_urlopen):
+        with patch.object(self.notifications, "urlopen", fake_urlopen):
             self.web_control.send_ntfy_notification(
                 settings,
                 title="NWR Stream Manager",
@@ -1184,12 +1187,12 @@ class AuthTests(unittest.TestCase):
     def test_automatic_notification_address_prefers_tailscale_serve(self) -> None:
         serve = {"url": "https://max-pi5.example.ts.net", "host": "max-pi5.example.ts.net", "public": False}
         with (
-            patch.object(self.web_control, "tailscale_serve_url_for_port", return_value=serve),
+            patch.object(self.network, "tailscale_serve_url_for_port", return_value=serve),
             patch.object(self.web_control.socket, "if_nameindex", return_value=[(1, "tailscale0")]),
-            patch.object(self.web_control, "interface_is_up", return_value=True),
-            patch.object(self.web_control, "interface_is_physical_or_tailscale", return_value=True),
-            patch.object(self.web_control, "interface_ipv4_address", return_value="100.108.97.122"),
-            patch.object(self.web_control, "tailscale_magicdns_name", return_value="max-pi5.example.ts.net"),
+            patch.object(self.network, "interface_is_up", return_value=True),
+            patch.object(self.network, "interface_is_physical_or_tailscale", return_value=True),
+            patch.object(self.network, "interface_ipv4_address", return_value="100.108.97.122"),
+            patch.object(self.network, "tailscale_magicdns_name", return_value="max-pi5.example.ts.net"),
         ):
             options = self.web_control.notification_access_url_options("0.0.0.0", 8080)
 
@@ -1200,16 +1203,16 @@ class AuthTests(unittest.TestCase):
 
     def test_notification_access_urls_include_tailscale_magicdns_when_detected(self) -> None:
         with (
-            patch.object(self.web_control, "tailscale_serve_url_for_port", return_value=None),
+            patch.object(self.network, "tailscale_serve_url_for_port", return_value=None),
             patch.object(self.web_control.socket, "if_nameindex", return_value=[(1, "tailscale0"), (2, "wlp9s0")]),
-            patch.object(self.web_control, "interface_is_up", return_value=True),
-            patch.object(self.web_control, "interface_is_physical_or_tailscale", return_value=True),
+            patch.object(self.network, "interface_is_up", return_value=True),
+            patch.object(self.network, "interface_is_physical_or_tailscale", return_value=True),
             patch.object(
-                self.web_control,
+                self.network,
                 "interface_ipv4_address",
                 side_effect=lambda name: "100.113.206.20" if name == "tailscale0" else "192.168.1.79",
             ),
-            patch.object(self.web_control, "tailscale_magicdns_name", return_value="max-thinkpad.example.ts.net"),
+            patch.object(self.network, "tailscale_magicdns_name", return_value="max-thinkpad.example.ts.net"),
         ):
             options = self.web_control.notification_access_url_options("0.0.0.0", 8080)
 
@@ -1220,20 +1223,20 @@ class AuthTests(unittest.TestCase):
 
     def test_notification_access_urls_prefer_default_route_after_tailscale(self) -> None:
         with (
-            patch.object(self.web_control, "tailscale_serve_url_for_port", return_value=None),
+            patch.object(self.network, "tailscale_serve_url_for_port", return_value=None),
             patch.object(
                 self.web_control.socket,
                 "if_nameindex",
                 return_value=[(1, "wlp9s0"), (2, "enp0s31f6")],
             ),
-            patch.object(self.web_control, "interface_is_up", return_value=True),
-            patch.object(self.web_control, "interface_is_physical_or_tailscale", return_value=True),
+            patch.object(self.network, "interface_is_up", return_value=True),
+            patch.object(self.network, "interface_is_physical_or_tailscale", return_value=True),
             patch.object(
-                self.web_control,
+                self.network,
                 "interface_ipv4_address",
                 side_effect=lambda name: "192.168.1.79" if name == "wlp9s0" else "10.0.0.24",
             ),
-            patch.object(self.web_control, "default_route_ipv4_address", return_value="10.0.0.24"),
+            patch.object(self.network, "default_route_ipv4_address", return_value="10.0.0.24"),
         ):
             options = self.web_control.notification_access_url_options("0.0.0.0", 8080)
 
@@ -1242,9 +1245,9 @@ class AuthTests(unittest.TestCase):
 
     def test_notification_access_urls_use_default_route_when_no_interfaces_match(self) -> None:
         with (
-            patch.object(self.web_control, "tailscale_serve_url_for_port", return_value=None),
+            patch.object(self.network, "tailscale_serve_url_for_port", return_value=None),
             patch.object(self.web_control.socket, "if_nameindex", return_value=[]),
-            patch.object(self.web_control, "default_route_ipv4_address", return_value="172.20.10.2"),
+            patch.object(self.network, "default_route_ipv4_address", return_value="172.20.10.2"),
         ):
             options = self.web_control.notification_access_url_options("0.0.0.0", 8080)
 
@@ -1770,9 +1773,12 @@ class AuthTests(unittest.TestCase):
         service.notification_effective_access_url_for_settings = lambda settings: "http://nwr.example"
         with tempfile.TemporaryDirectory() as directory:
             service.notification_state_path = Path(directory) / "notifications.json"
-            with self.assertLogs(web_control.LOG, level="INFO") as logs:
+            # Everything NWR Stream Manager logs, whichever part of it logs it.
+            with self.assertLogs("nwr_stream_manager", level="INFO") as logs:
                 service.update_notification_settings({"enabled": True, "server_url": "https://ntfy.sh", "topic": topic})
-                with patch.object(web_control, "send_ntfy_notification", lambda *args, **kwargs: None):
+                with patch.object(
+                    sys.modules["nwr_stream_manager.service_notifications"], "send_ntfy_notification", lambda *args, **kwargs: None
+                ):
                     service.test_notification_settings({"topic": topic})
 
         self.assertFalse(any(topic in line for line in logs.output), logs.output)

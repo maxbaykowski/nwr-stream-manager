@@ -265,7 +265,7 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
         self.assertFalse(wc.stream_notification_settings_from_stream({"notifications": {}}).bad_reception)
 
     def test_web_interface_exposes_signal_column_and_notification_toggle(self) -> None:
-        source = (PACKAGE_PATH / "web_control.py").read_text(encoding="utf-8")
+        source = self.web_control.INDEX_HTML
 
         self.assertIn('id="stream_notify_bad_reception"', source)
         self.assertIn("streamSignals = data.stream_signals || {};", source)
@@ -277,7 +277,7 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
         self.assertIn(".signal-poor, .signal-no_signal {", source)
 
     def test_stream_settings_shows_signal_above_tabs(self) -> None:
-        source = (PACKAGE_PATH / "web_control.py").read_text(encoding="utf-8")
+        source = self.web_control.INDEX_HTML
         signal_block = source.index('<dl id="stream_settings_signal" class="details-list">')
         tabs = source.index('<div class="tabs" role="tablist" aria-label="Stream settings sections">')
 
@@ -287,9 +287,8 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
         self.assertIn('"Not measured while this stream is disabled."', source)
 
     def test_served_page_scripts_parse(self) -> None:
-        # The page is a Python string, so a JS escape written with one
-        # backslash in web_control.py becomes a raw line break once served.
-        # Check the scripts exactly as the browser receives them.
+        # Check the scripts exactly as the browser receives them, once each
+        # page has been put together.
         import re
         import shutil
         import subprocess
@@ -308,7 +307,7 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
     def test_polled_lists_update_in_place_for_screen_readers(self) -> None:
         # Rebuilding a list on each poll destroys the node a screen reader is
         # reading and throws it back to the top of the page.
-        source = (PACKAGE_PATH / "web_control.py").read_text(encoding="utf-8")
+        source = self.web_control.INDEX_HTML
         for container in (
             "active-streams-body",
             "icecast-outputs-body",
@@ -327,7 +326,7 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
                 self.assertNotIn("containsFocusedElement(", body)
 
     def test_tables_phone_layout_keeps_table_semantics(self) -> None:
-        source = (PACKAGE_PATH / "web_control.py").read_text(encoding="utf-8")
+        source = self.web_control.INDEX_HTML
 
         self.assertIn('<th role="columnheader">Signal</th>', source)
         for label, body_id in (
@@ -506,13 +505,15 @@ class StreamNoSignalFallbackTests(unittest.TestCase):
     def setUp(self) -> None:
         wc = self.web_control
         self.rng = np.random.default_rng(21)
-        self.original_fallback_loader = wc.load_web_fallback_audio
         sample = self.FALLBACK_SAMPLE
-        wc.load_web_fallback_audio = lambda sample_rate=wc.IQ_SAMPLE_RATE: types.SimpleNamespace(
+        fallback_loader = lambda sample_rate=wc.IQ_SAMPLE_RATE: types.SimpleNamespace(
             pcm=np.full(sample_rate, sample, dtype="<i2").tobytes(),
             sample_rate=sample_rate,
         )
-        self.addCleanup(setattr, wc, "load_web_fallback_audio", self.original_fallback_loader)
+        # The stream worker loads the fallback audio where it lives.
+        for module in (wc, sys.modules[wc.IcecastStreamWorker.__module__]):
+            self.addCleanup(setattr, module, "load_web_fallback_audio", module.load_web_fallback_audio)
+            module.load_web_fallback_audio = fallback_loader
 
     def start_worker(self, delay_seconds: float):
         wc = self.web_control

@@ -1,0 +1,251 @@
+"""Settings, limits and file names shared across NWR Stream Manager."""
+
+from __future__ import annotations
+
+import re
+import struct
+from pathlib import Path
+
+import numpy as np
+
+from .config import IQ_SAMPLE_RATE, parse_audio_config
+from .rtl import DEFAULT_RTL_SAMPLE_RATE, RTL_ASYNC_BUFFER_SECONDS
+from .tone_generators import tone_max_frequency_hz
+
+
+STATE_DIRECTORY_NAME = "nwr-stream-manager"
+STATE_FILE_NAME = "rtl-control.json"
+LOG_FILE_NAME = "nwr-stream-manager.log"
+ACCOUNTS_DATABASE_FILE_NAME = "accounts.db"
+AUTH_REALM = "NWR Stream Manager"
+AUTH_SESSION_COOKIE_NAME = "nwrstmgr_session"
+AUTH_SESSION_SECONDS = 12 * 60 * 60
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+PASSWORD_RE = re.compile(r"^[!-~]{8,256}$")
+SCRYPT_N = 16_384
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_DKLEN = 32
+PASSWORD_HASH_SCHEME = "scrypt"
+PASSWORD_HASH_VERSION = 1
+ACCOUNT_ROLE_OWNER = "owner"
+ACCOUNT_ROLE_ADMIN = "administrator"
+ACCOUNT_ROLE_READ_ONLY = "read_only"
+ACCOUNT_ROLES = {ACCOUNT_ROLE_OWNER, ACCOUNT_ROLE_ADMIN, ACCOUNT_ROLE_READ_ONLY}
+STREAMS_STATE_FILE_NAME = "streams.json"
+STREAMS_DIRECTORY_NAME = "streams"
+STREAM_CONFIG_FILE_NAME = "config.json"
+STREAMS_DIRECTORY_MARKER_FILE_NAME = ".per-stream-configs"
+IQ_RECORDINGS_DIRECTORY_NAME = "iq-recordings"
+IQ_RECORDINGS_INDEX_FILE_NAME = "index.json"
+STORAGE_IDLE_POLL_SECONDS = 30.0
+STORAGE_RECORDING_POLL_SECONDS = 2.0
+STORAGE_LOW_FREE_BYTES = 1_000_000_000
+STORAGE_CRITICAL_FREE_BYTES = 256_000_000
+STORAGE_LOW_FREE_PERCENT = 5.0
+STORAGE_CRITICAL_FREE_PERCENT = 1.0
+STORAGE_LOW_INODES = 1024
+STORAGE_CRITICAL_INODES = 128
+STORAGE_STATUS_RECOVERY_SAMPLES = 3
+STATIONS_ASSET_PATH = Path(__file__).resolve().parent / "assets" / "nwr_stations.json"
+USB_VENDOR_NAMES = {
+    "0bda": "Realtek",
+}
+DEFAULT_STREAM_SAMPLE_RATE = 24_000
+DEFAULT_STREAM_BITRATES = {
+    "mp3": 64,
+    "ogg": 48,
+}
+STREAM_SERVICE_CUSTOM = "custom"
+STREAM_SERVICE_GWES = "gwes"
+STREAM_SERVICE_WEATHERUSA = "weatherusa"
+STREAM_SERVICE_NWRORG = "nwrorg"
+STREAM_SERVICE_NAMES = {
+    STREAM_SERVICE_CUSTOM: "Custom Icecast server",
+    STREAM_SERVICE_GWES: "GWES Weather Radio",
+    STREAM_SERVICE_WEATHERUSA: "WeatherUSA",
+    STREAM_SERVICE_NWRORG: "NOAA Weather Radio Org",
+}
+STREAM_SERVICE_HOSTS = {
+    "ingest.wxr.gwes-cdn.net": STREAM_SERVICE_GWES,
+    "radio-master.weatherusa.net": STREAM_SERVICE_WEATHERUSA,
+    "wxradio.org": STREAM_SERVICE_NWRORG,
+}
+STREAM_SAMPLE_RATES = {8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000}
+STREAM_FRAME_SECONDS = 0.02
+STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
+STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
+STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
+STREAM_SILENCE_FLOAT_FRAME = np.zeros(STREAM_FRAME_SAMPLES, dtype=np.float32)
+LIVE_AUDIO_BINARY_MAGIC = b"NWA1"
+LIVE_AUDIO_BINARY_HEADER = struct.Struct("!4sBBHII")
+LIVE_AUDIO_CODEC_OPUS = 1
+LIVE_AUDIO_CODEC_PCM_S16LE = 2
+RTL_RESET_COMMAND_TIMEOUT_SECONDS = 5.0
+RTL_RESET_REAPPEAR_TIMEOUT_SECONDS = 10.0
+# Longest a reset can take: releasing the reader, the reset command, then waiting to reappear.
+RTL_RESET_TOTAL_SECONDS = 2.0 + RTL_RESET_COMMAND_TIMEOUT_SECONDS + 1.0 + RTL_RESET_REAPPEAR_TIMEOUT_SECONDS
+# How long every page keeps showing how the last SDR reset ended.
+RTL_RESET_RESULT_SHOW_SECONDS = 60.0
+RTL_RESET_STARTED_MESSAGE = "Resetting RTL-SDR..."
+REMOTE_SDR_RESET_UNSUPPORTED_MESSAGE = (
+    "The NWR Stream Manager sharing this SDR needs to be updated before its SDR can be reset from here."
+)
+STREAM_WORKER_RAW_QUEUE_SECONDS = 1.50
+STREAM_WORKER_RAW_QUEUE_MIN_CHUNKS = 8
+STREAM_WORKER_RAW_QUEUE_MAX_CHUNKS = 256
+LIVE_IQ_QUEUE_SECONDS = 0.75
+INTERMEDIATE_SOURCE_QUEUE_CHUNKS = round(0.2 / RTL_ASYNC_BUFFER_SECONDS)
+IQ_RECORDER_QUEUE_CHUNKS = round(0.2 / RTL_ASYNC_BUFFER_SECONDS)
+INTERMEDIATE_IQ_SAMPLE_RATE = 192_000
+INTERMEDIATE_IQ_ALIAS_TRANSITION_HZ = 8_000.0
+INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB = 70.0
+CHANNEL_IQ_ALIAS_TRANSITION_HZ = 1_000.0
+ALIAS_FILTER_STRENGTH_MIN = 0
+ALIAS_FILTER_STRENGTH_MAX = 100
+ALIAS_FILTER_STRENGTH_DEFAULT = 100
+ALIAS_FILTER_MIN_ATTENUATION_DB = 20.0
+ALIAS_FILTER_MAX_TRANSITION_SCALE = 3.0
+IQ_DOWNLOAD_CHUNK_BYTES = 256 * 1024
+IQ_DOWNLOAD_YIELD_SECONDS = 0.001
+IQ_RECORDER_MODE_STREAM = "stream"
+IQ_RECORDER_MODE_SPECTRUM = "spectrum"
+IQ_RECORDER_SAMPLE_RATES = (192_000, 256_000, 384_000, 512_000, 768_000, 1_024_000, DEFAULT_RTL_SAMPLE_RATE)
+IQ_TEST_SOURCES_DIRECTORY_NAME = "iq-test-sources"
+IQ_TEST_SOURCE_CHUNK_SECONDS = 0.05
+IQ_TEST_SOURCE_MIN_SAMPLE_RATE = INTERMEDIATE_IQ_SAMPLE_RATE
+IQ_RECORDER_DEFAULT_DURATION_SECONDS = 0
+IQ_RECORDER_MIN_DURATION_SECONDS = 0
+IQ_RECORDER_MAX_DURATION_SECONDS = 24 * 60 * 60
+IQ_STORAGE_ESTIMATE_MIN_CORRECTION_SECONDS = 30.0
+IQ_STORAGE_ESTIMATE_MAX_CORRECTION_SECONDS = 300.0
+IQ_STORAGE_ESTIMATE_CORRECTION_FRACTION = 0.002
+STREAM_IDLE_DETECTION_SECONDS = 1.0
+STREAM_RECONNECT_SECONDS = 5.0
+ICECAST_AUTH_CACHE_SECONDS = 600.0
+SOUNDCARD_PREVIEW_TIMEOUT_SECONDS = 8.0
+# A page without the page script can't keep a preview going, so each of its steps keeps it for this long.
+SOUNDCARD_PREVIEW_LEASE_SECONDS = 300.0
+SOUNDCARD_PREVIEW_CLEANUP_SECONDS = 2.0
+MAX_JSON_REQUEST_BYTES = 1_048_576
+RECENT_EAS_ALERT_SECONDS = 24 * 60 * 60
+RECENT_EAS_ALERT_LIMIT = 10
+NWR_RECEIVER_CHANNELS_HZ = (
+    162_400_000,
+    162_425_000,
+    162_450_000,
+    162_475_000,
+    162_500_000,
+    162_525_000,
+    162_550_000,
+)
+RTL_DIAGNOSTIC_SECONDS = 1.0
+RTL_DIAGNOSTIC_QUEUE_SECONDS = 1.25
+RTL_DIAGNOSTIC_MIN_BATCHES = 2
+RTL_DIAGNOSTIC_MAX_BATCHES = 64
+RTL_DIAGNOSTIC_RAW_FFT_SIZE = 65_536
+RTL_DIAGNOSTIC_CHANNEL_FFT_SIZE = 2_048
+RECEIVER_AUDIO_CONFIG = parse_audio_config(
+    {
+        "deemphasis": {"enabled": True, "tau": 300},
+        "comfort_noise": {"enabled": False, "level_db": -40},
+        "volume": {"enabled": False, "multiplier": 1.0},
+        "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
+        "lowpass": {"enabled": False, "frequency": 3400, "sharpness": 2},
+        "notch": {"enabled": False, "frequency": 3000, "width": 100},
+    }
+)
+FALLBACK_STATE_FILE_NAME = "fallback.json"
+CUSTOM_FALLBACK_AUDIO_FILE_NAME = "fallback_custom.wav"
+NOTIFICATION_STATE_FILE_NAME = "notifications.json"
+SOUNDCARD_DEVICE_NAMES_FILE_NAME = "soundcard-devices.json"
+STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS = 30.0
+STREAM_NOTIFICATION_RECOVERY_SECONDS = 30.0
+STREAM_NOTIFICATION_REPEAT_SECONDS = 3600.0
+RTL_NOTIFICATION_NO_DATA_SECONDS = 30.0
+READ_ONLY_RESTRICTED_NOTIFICATION_VIEWS = {
+    "rtl",
+    "add_stream",
+    "stream_settings",
+    "stream_output",
+    "iq_recorder_start",
+    "eas_alert_delete",
+    "settings",
+    "accounts",
+    "create_account",
+    "notifications",
+}
+STREAM_TEST_MODE_HEARTBEAT_TIMEOUT_SECONDS = 12.0
+STREAM_TEST_MODE_TIME_LIMIT_REASON = "time limit reached"
+# WebSocket close code 1012 means the server is restarting; browsers treat it as a clean close.
+LIVE_AUDIO_SHUTDOWN_CLOSE_CODE = 1012
+LIVE_AUDIO_SHUTDOWN_NOTICE_SECONDS = 0.5
+# While there is no audio to send, the page is still sent something this often, so it
+# can tell a connection that went quiet from one lost when its device changed networks.
+LIVE_AUDIO_KEEPALIVE_SECONDS = 1.0
+# Audio a listener's device has not acknowledged for this long means it is gone (it
+# changed networks, say), so its session is ended instead of waiting many minutes.
+LIVE_AUDIO_UNACKNOWLEDGED_TIMEOUT_SECONDS = 10.0
+# A browser that went away without closing is noticed the next time one of these is sent.
+SETTINGS_EVENTS_KEEPALIVE_SECONDS = 20.0
+STREAM_TEST_MODE_DEVIATION_HZ = 5_000.0
+STREAM_TEST_MODE_NOISE_DBFS = -68.0
+STREAM_TEST_MODE_MIN_SIGNAL_DBFS = -80.0
+STREAM_TEST_MODE_MAX_SIGNAL_DBFS = 0.0
+STREAM_TEST_MODE_DEFAULT_SIGNAL_DBFS = -20.0
+STREAM_TEST_MODE_AUDIO_PEAK_LIMIT = 0.96
+STREAM_TEST_MODE_AUDIO_DRIVE = 5.0
+STREAM_TEST_MODE_TONE_PEAK = 0.90
+# Loudest the voice or SAME audio gets; tone generators share the remaining deviation.
+STREAM_TEST_MODE_PROGRAM_PEAK = max(STREAM_TEST_MODE_AUDIO_PEAK_LIMIT, STREAM_TEST_MODE_TONE_PEAK)
+STREAM_TEST_MODE_TONE_MAX_FREQUENCY_HZ = tone_max_frequency_hz(IQ_SAMPLE_RATE, STREAM_TEST_MODE_DEVIATION_HZ)
+STREAM_TEST_MODE_SIGNAL_FADE_SECONDS = 1.0
+STREAM_TEST_MODE_CROSSFADE_SECONDS = 1.0
+STREAM_TEST_MODE_LOOP_PERIOD_SECONDS = 5.0
+STREAM_TEST_MODE_PRE_EOM_SILENCE_SECONDS = 2.0
+STREAM_TEST_MODE_AUDIO = "test_mode.wav"
+
+
+STREAM_TEST_MODE_SAME_AUDIO = "same_test.wav"
+STREAM_TEST_MODE_SAME_LOCATION = "999000"
+STREAM_TEST_MODE_SAME_SENDER_ID = "NWRSTMGR"
+STREAM_TEST_MODE_TRANSMIT_EQ_POINTS: tuple[tuple[float, float], ...] = (
+    (0.0, -18.0),
+    (120.0, -16.0),
+    (250.0, -12.0),
+    (400.0, -8.0),
+    (800.0, 0.0),
+    (1_500.0, 5.0),
+    (3_000.0, 5.0),
+    (4_500.0, -2.0),
+    (6_000.0, -16.0),
+    (8_000.0, -32.0),
+    (12_000.0, -48.0),
+)
+
+
+SDR_SOURCE_LOCAL = "local"
+SDR_SOURCE_REMOTE = "remote"
+REMOTE_SDR_DIRECTORY_NAME = "remote-sdr"
+# While a congested network stops the host sending, IQ for a remote feed waits
+# here rather than being dropped at the source.
+REMOTE_HOST_CHANNEL_QUEUE_SECONDS = 5.0
+REMOTE_HOST_WIDEBAND_QUEUE_SECONDS = 10.0
+# Settings a remote client may change on the host's SDR.
+REMOTE_SDR_HOST_SETTINGS = ("gain", "ppm_correction", "bias_tee", "alias_filter_strength")
+
+
+# Which announcement fallback audio plays.
+FALLBACK_AUDIO_DEFAULT = "default"
+FALLBACK_AUDIO_CUSTOM = "custom"
+FALLBACK_AUDIO_CHOICES = (FALLBACK_AUDIO_DEFAULT, FALLBACK_AUDIO_CUSTOM)
+
+
+# What a stream does once it has had no radio audio, or no usable signal, for its
+# fallback delay. It undoes it as soon as the station is back.
+STREAM_FALLBACK_NONE = "none"
+STREAM_FALLBACK_DISCONNECT_ICECAST = "disconnect_icecast"
+STREAM_FALLBACK_PLAY_AUDIO = "play_fallback_audio"
+STREAM_FALLBACK_ACTIONS = (STREAM_FALLBACK_NONE, STREAM_FALLBACK_DISCONNECT_ICECAST, STREAM_FALLBACK_PLAY_AUDIO)
+STREAM_FALLBACK_MIN_DELAY_SECONDS = 30
+STREAM_FALLBACK_MAX_DELAY_SECONDS = 120

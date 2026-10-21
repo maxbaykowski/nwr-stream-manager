@@ -41,6 +41,10 @@ class EasAlertTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.web_control = load_web_control_module()
+        # Where the parts that these tests swap out live.
+        cls.stream_worker = importlib.import_module("nwr_stream_manager.stream_worker")
+        cls.service_devices = importlib.import_module("nwr_stream_manager.service_devices")
+        cls.service_iq_recorder = importlib.import_module("nwr_stream_manager.service_iq_recorder")
         cls.config = importlib.import_module("nwr_stream_manager.config")
         cls.audio_effects = importlib.import_module("nwr_stream_manager.audio_effects")
         cls.deemphasis = importlib.import_module("nwr_stream_manager.deemphasis")
@@ -903,15 +907,15 @@ class EasAlertTests(unittest.TestCase):
         service._cached_soundcards = lambda: [device]
         service._refresh_soundcards = lambda: [device]
         service.status = lambda: {"status": "ok"}
-        original_node = web_control.playback_device_usb_node
-        original_reset = web_control.reset_usb_device_node
-        web_control.playback_device_usb_node = lambda selected: Path("/dev/bus/usb/003/017")
-        web_control.reset_usb_device_node = lambda node, timeout_seconds=5.0: reset_nodes.append(node) or "python-helper"
+        original_node = self.service_devices.playback_device_usb_node
+        original_reset = self.service_devices.reset_usb_device_node
+        self.service_devices.playback_device_usb_node = lambda selected: Path("/dev/bus/usb/003/017")
+        self.service_devices.reset_usb_device_node = lambda node, timeout_seconds=5.0: reset_nodes.append(node) or "python-helper"
         try:
             response = service.reset_soundcard_device("alsa:usb:yeti")
         finally:
-            web_control.playback_device_usb_node = original_node
-            web_control.reset_usb_device_node = original_reset
+            self.service_devices.playback_device_usb_node = original_node
+            self.service_devices.reset_usb_device_node = original_reset
 
         self.assertTrue(response["success"])
         self.assertTrue(response["reappeared"])
@@ -1198,8 +1202,8 @@ class EasAlertTests(unittest.TestCase):
         worker.lock = web_control.threading.Lock()
         worker._soundcard_devices_provider = lambda: []
         worker._sync_eas_recorder = lambda stream: None
-        original_tap = web_control.AlsaStreamPlaybackTap
-        web_control.AlsaStreamPlaybackTap = Tap
+        original_tap = self.stream_worker.AlsaStreamPlaybackTap
+        self.stream_worker.AlsaStreamPlaybackTap = Tap
         try:
             worker.sync_stream({"outputs": [soundcard_output()]})
             worker.sync_stream({"outputs": [soundcard_output(channel_mode="right", volume=0.5)]})
@@ -1209,7 +1213,7 @@ class EasAlertTests(unittest.TestCase):
             self.assertEqual(Tap.instances[0].volume_updates[-1], 0.5)
             self.assertFalse(Tap.instances[0].stopped)
         finally:
-            web_control.AlsaStreamPlaybackTap = original_tap
+            self.stream_worker.AlsaStreamPlaybackTap = original_tap
 
     def test_stream_sync_replaces_soundcard_tap_when_device_changes(self) -> None:
         web_control = self.web_control
@@ -1258,8 +1262,8 @@ class EasAlertTests(unittest.TestCase):
         worker.lock = web_control.threading.Lock()
         worker._soundcard_devices_provider = lambda: []
         worker._sync_eas_recorder = lambda stream: None
-        original_tap = web_control.AlsaStreamPlaybackTap
-        web_control.AlsaStreamPlaybackTap = Tap
+        original_tap = self.stream_worker.AlsaStreamPlaybackTap
+        self.stream_worker.AlsaStreamPlaybackTap = Tap
         try:
             worker.sync_stream({"outputs": [soundcard_output("alsa:usb:one")]})
             first = Tap.instances[0]
@@ -1270,7 +1274,7 @@ class EasAlertTests(unittest.TestCase):
             self.assertEqual(Tap.instances[1].config.stable_id, "alsa:usb:two")
             self.assertTrue(Tap.instances[1].started)
         finally:
-            web_control.AlsaStreamPlaybackTap = original_tap
+            self.stream_worker.AlsaStreamPlaybackTap = original_tap
 
     def test_shared_soundcard_manager_serializes_disable_reenable_reopen(self) -> None:
         web_control = self.web_control
@@ -1308,8 +1312,8 @@ class EasAlertTests(unittest.TestCase):
             def snapshot(self):
                 return {"status": "enabled", "stable_id": self.stable_id, "device": "hw:1,0"}
 
-        original_tap = web_control.AlsaSharedPlaybackTap
-        web_control.AlsaSharedPlaybackTap = Tap
+        original_tap = self.stream_worker.AlsaSharedPlaybackTap
+        self.stream_worker.AlsaSharedPlaybackTap = Tap
         try:
             manager = web_control.SharedSoundcardOutputManager(devices_provider=lambda: [])
             soundcard = {"stable_id": "alsa:usb:yeti", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000}
@@ -1324,7 +1328,7 @@ class EasAlertTests(unittest.TestCase):
             self.assertTrue(Tap.instances[1].started)
             self.assertIn("output-1", Tap.instances[1].inputs)
         finally:
-            web_control.AlsaSharedPlaybackTap = original_tap
+            self.stream_worker.AlsaSharedPlaybackTap = original_tap
 
     def test_shared_soundcard_manager_recreates_dead_session_with_existing_inputs(self) -> None:
         web_control = self.web_control
@@ -1360,8 +1364,8 @@ class EasAlertTests(unittest.TestCase):
             def snapshot(self):
                 return {"status": "enabled", "stable_id": self.stable_id, "device": "hw:1,0"}
 
-        original_tap = web_control.AlsaSharedPlaybackTap
-        web_control.AlsaSharedPlaybackTap = Tap
+        original_tap = self.stream_worker.AlsaSharedPlaybackTap
+        self.stream_worker.AlsaSharedPlaybackTap = Tap
         try:
             manager = web_control.SharedSoundcardOutputManager(devices_provider=lambda: [])
             soundcard = {"stable_id": "alsa:usb:yeti", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000}
@@ -1376,7 +1380,7 @@ class EasAlertTests(unittest.TestCase):
             self.assertEqual(len(Tap.instances), 2)
             self.assertEqual(Tap.instances[1].inputs, {"stream-a", "stream-b"})
         finally:
-            web_control.AlsaSharedPlaybackTap = original_tap
+            self.stream_worker.AlsaSharedPlaybackTap = original_tap
 
     def test_shared_soundcard_manager_owner_prevents_stale_worker_removal(self) -> None:
         web_control = self.web_control
@@ -1408,8 +1412,8 @@ class EasAlertTests(unittest.TestCase):
             def push_float(self, output_id, samples):
                 self.pushed.append((output_id, samples.copy()))
 
-        original_tap = web_control.AlsaSharedPlaybackTap
-        web_control.AlsaSharedPlaybackTap = Tap
+        original_tap = self.stream_worker.AlsaSharedPlaybackTap
+        self.stream_worker.AlsaSharedPlaybackTap = Tap
         try:
             manager = web_control.SharedSoundcardOutputManager(devices_provider=lambda: [])
             soundcard = {"stable_id": "alsa:usb:yeti", "channel_mode": "both", "volume": 1.0, "sample_rate": 48000}
@@ -1425,7 +1429,7 @@ class EasAlertTests(unittest.TestCase):
             self.assertIn("output-1", session.inputs)
             self.assertEqual(len(session.pushed), 1)
         finally:
-            web_control.AlsaSharedPlaybackTap = original_tap
+            self.stream_worker.AlsaSharedPlaybackTap = original_tap
 
     def test_stream_worker_treats_eas_as_shared_processed_output(self) -> None:
         worker = object.__new__(self.web_control.IcecastStreamWorker)
@@ -2722,8 +2726,8 @@ class EasAlertTests(unittest.TestCase):
 
         created = []
         input_rates = []
-        original_create_audio_encoder = self.web_control.create_audio_encoder
-        self.web_control.create_audio_encoder = (
+        original_create_audio_encoder = self.stream_worker.create_audio_encoder
+        self.stream_worker.create_audio_encoder = (
             lambda icecast, **kwargs: input_rates.append(kwargs.get("input_sample_rate")) or created.append(icecast) or Encoder()
         )
         try:
@@ -2763,7 +2767,7 @@ class EasAlertTests(unittest.TestCase):
             self.assertEqual(input_rates, [self.web_control.IQ_SAMPLE_RATE])
             worker.stop()
         finally:
-            self.web_control.create_audio_encoder = original_create_audio_encoder
+            self.stream_worker.create_audio_encoder = original_create_audio_encoder
 
     def test_stream_sync_stops_only_changed_icecast_output(self) -> None:
         web_control = self.web_control
@@ -2811,8 +2815,8 @@ class EasAlertTests(unittest.TestCase):
                 },
             }
 
-        original_writer = web_control.IcecastOutputWriter
-        web_control.IcecastOutputWriter = Writer
+        original_writer = self.stream_worker.IcecastOutputWriter
+        self.stream_worker.IcecastOutputWriter = Writer
         try:
             stream = {
                 "id": "stream-1",
@@ -2839,7 +2843,7 @@ class EasAlertTests(unittest.TestCase):
             self.assertTrue(second_writer.stopped)
             self.assertEqual(len(Writer.instances), 3)
         finally:
-            web_control.IcecastOutputWriter = original_writer
+            self.stream_worker.IcecastOutputWriter = original_writer
 
     def test_iq_recorder_writes_spectrum_cf32_from_synthetic_rtl_iq(self) -> None:
         web_control = self.web_control
@@ -3047,7 +3051,7 @@ class EasAlertTests(unittest.TestCase):
             def storage_time_remaining(self, storage, recordings_directory):
                 return None
 
-        original_worker = web_control.IqRecorderWorker
+        original_worker = self.service_iq_recorder.IqRecorderWorker
         service = object.__new__(web_control.RtlControlService)
         service.lock = web_control.threading.RLock()
         service.iq_recorder = None
@@ -3059,7 +3063,7 @@ class EasAlertTests(unittest.TestCase):
         service.iq_recordings_directory = Path(tempfile.gettempdir()) / "nwr-stream-manager-test-iq"
         service.iq_recordings_index_path = service.iq_recordings_directory / "index.json"
         service.settings = web_control.RtlControlSettings(alias_filter_strength=web_control.ALIAS_FILTER_STRENGTH_DEFAULT)
-        web_control.IqRecorderWorker = Worker
+        self.service_iq_recorder.IqRecorderWorker = Worker
         try:
             for sample_rate in (web_control.INTERMEDIATE_IQ_SAMPLE_RATE, 768_000, web_control.DEFAULT_RTL_SAMPLE_RATE):
                 service.iq_recorder = None
@@ -3071,7 +3075,7 @@ class EasAlertTests(unittest.TestCase):
                     }
                 )
         finally:
-            web_control.IqRecorderWorker = original_worker
+            self.service_iq_recorder.IqRecorderWorker = original_worker
 
         # 192 ksps comes straight from the shared decimated feed; higher rates decimate
         # from the shared DC-blocked full-rate feed, never the dongle's raw bytes.

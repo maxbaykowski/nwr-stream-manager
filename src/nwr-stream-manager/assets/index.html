@@ -1,0 +1,1671 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NWR Stream Manager</title>
+__PAGE_SCRIPT_LOADER__
+<style>
+__INDEX_STYLES__</style>
+</head>
+<body>
+<header>
+  <div class="topbar">
+    <h1>NWR Stream Manager</h1>
+    <nav aria-label="Main">
+      <a id="nav_dashboard" href="/" data-view="dashboard" aria-current="page">Dashboard</a>
+      <a id="nav_rtl" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
+      <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
+      <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" data-eas-entry="restore" hidden>EAS alerts</a>
+      <span class="nav-more">
+        <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false" hidden>More</button>
+        <span id="nav_more_menu" class="nav-more-menu">
+          <a id="nav_receiver" class="needs-app-inline" href="/?view=receiver" data-view="receiver">Weather Radio Receiver</a>
+          <a id="nav_iq_recorder" href="/?view=iq_recorder" data-view="iq_recorder">I/Q Recorder</a>
+          <a id="nav_logs" href="/?view=logs" data-view="logs">Logs</a>
+          <a id="nav_settings" href="/?view=settings" data-view="settings" hidden>Settings</a>
+          <a id="nav_change_password" href="/?view=change_password" data-view="change_password" hidden>Change account password</a>
+        </span>
+      </span>
+    </nav>
+  </div>
+</header>
+<div id="nwrorg_submission_dialog" class="notice-dialog" role="dialog" aria-labelledby="nwrorg_submission_title" aria-live="polite" hidden>
+  <h2 id="nwrorg_submission_title">NOAA Weather Radio Org</h2>
+  <p>
+    If you have not already done so, you must fill out the
+    <a id="nwrorg_submission_link" href="http://noaaweatherradio.org/addstream/addstream.html" target="_blank" rel="noopener noreferrer">submission form</a>
+    for NOAA Weather Radio Org before your stream will appear on the website.
+  </p>
+  <div class="actions">
+    <button id="dismiss_nwrorg_submission" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="notification_setup_dialog" class="notice-dialog" role="dialog" tabindex="-1" aria-labelledby="notification_setup_title" aria-describedby="notification_setup_streams notification_setup_rtl" hidden>
+  <h2 id="notification_setup_title">Notifications are set up</h2>
+  <p id="notification_setup_streams">
+    To get notifications for a stream, go to <a href="/?view=streams" data-view="streams">Manage Streams</a>,
+    select More actions for the stream, select Edit stream settings, and open the Notifications tab.
+  </p>
+  <p id="notification_setup_rtl">
+    To get notifications when the RTL-SDR needs attention, go to <a href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
+    and turn on Notify when the RTL-SDR requires attention.
+  </p>
+  <div class="actions">
+    <button id="dismiss_notification_setup" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="monitor_unstable_dialog" class="notice-dialog" role="dialog" aria-labelledby="monitor_unstable_title" aria-live="assertive" hidden>
+  <h2 id="monitor_unstable_title">Stream monitoring stopped</h2>
+  <p>Your internet connection is too unstable for stream monitoring.</p>
+  <div class="actions">
+    <button id="dismiss_monitor_unstable" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="receiver_unstable_dialog" class="notice-dialog" role="dialog" aria-labelledby="receiver_unstable_title" aria-live="assertive" hidden>
+  <h2 id="receiver_unstable_title">Weather radio receiver stopped</h2>
+  <p>Your internet connection is too unstable for realtime listening of weather radio.</p>
+  <div class="actions">
+    <button id="dismiss_receiver_unstable" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="account_secret_dialog" class="notice-dialog" role="dialog" aria-labelledby="account_secret_title" aria-live="polite" hidden>
+  <h2 id="account_secret_title">Temporary password</h2>
+  <p>Copy it and share it with the user, you will not be able to see it again.</p>
+  <label>Temporary password
+    <input id="account_secret" readonly>
+  </label>
+  <div class="actions">
+    <button id="copy_account_secret" type="button">Copy to clipboard</button>
+    <button id="dismiss_account_secret" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="same_test_warning_dialog" class="fullscreen-dialog" role="dialog" aria-modal="true" aria-labelledby="same_test_warning_title" hidden>
+  <div class="fullscreen-dialog-panel">
+    <h2 id="same_test_warning_title">Send SAME test?</h2>
+    <p>
+      An EAS alert with valid SAME tones will be transmitted on <strong>all</strong> configured outputs, including Icecast mountpoints and sound cards.
+    </p>
+    <p>
+      This means any EAS equipment potentially monitoring the stream will receive the alert.
+    </p>
+    <p>
+      The alert will be sent as a Practice/Demo Warning with an invalid FIPS code of <strong>999000</strong> to mitigate unintentional activations.
+      Nevertheless, disable any outputs you do not want the alert sent to before proceeding, especially if streaming to public services such as NOAA Weather Radio Org or WeatherUSA.
+    </p>
+    <label class="checkbox-row">
+      <input id="same_test_warning_ack" type="checkbox">
+      I understand that this SAME test will be sent to all configured outputs.
+    </label>
+    <div class="actions">
+      <button id="cancel_same_test_warning" type="button">Cancel</button>
+      <button id="confirm_same_test_warning" type="button" class="primary" hidden>Send SAME test</button>
+    </div>
+  </div>
+</div>
+<div id="server_unavailable_dialog" class="fullscreen-dialog" role="alertdialog" aria-modal="true" aria-labelledby="server_unavailable_title" aria-describedby="server_unavailable_message" hidden>
+  <div class="fullscreen-dialog-panel">
+    <h2 id="server_unavailable_title" tabindex="-1">Can't reach NWR Stream Manager</h2>
+    <p id="server_unavailable_message"></p>
+    <div class="actions">
+      <button id="server_unavailable_reload" type="button" class="primary" hidden>Reload page</button>
+    </div>
+  </div>
+</div>
+<div id="resume_listening_dialog" class="notice-dialog" role="dialog" aria-labelledby="resume_listening_title" aria-describedby="resume_listening_message" hidden>
+  <h2 id="resume_listening_title">NWR Stream Manager restarted</h2>
+  <p id="resume_listening_message"></p>
+  <div class="actions">
+    <button id="resume_listening" type="button">Resume listening</button>
+    <button id="dismiss_resume_listening" type="button">Dismiss</button>
+  </div>
+</div>
+<div id="iq_recording_banner" class="global-status-banner" hidden>
+  <span>I/Q recording in progress</span>
+  <a href="/?view=iq_recorder" data-view="iq_recorder">Return to I/Q recorder</a>
+  <span id="iq_recording_banner_elapsed">0:00</span>
+</div>
+<div id="insecure_audio_banner" class="global-status-banner insecure-audio-banner" role="status" hidden>
+  <p>
+    <strong>Listening will use more data, and the audio may stutter more often.</strong>
+    This browser only allows efficient audio on secure (https) addresses, so NWR Stream Manager is sending uncompressed audio.
+    <a href="/help#secure-address" target="_blank" rel="noopener">Learn how to use a secure address<span class="screen-reader-only"> (opens in a new tab)</span></a>
+  </p>
+  <button id="dismiss_insecure_audio_banner" type="button">Dismiss</button>
+</div>
+<div id="listening_no_audio_banner" class="global-status-banner" hidden>
+  <p>No audio is coming from the SDR right now. Listening will continue when it returns.</p>
+</div>
+<div id="listening_reconnecting_banner" class="global-status-banner" hidden>
+  <p>Lost the connection to NWR Stream Manager. Listening will continue when it's back.</p>
+</div>
+<div id="listening_status_live" class="screen-reader-only" aria-live="polite" aria-atomic="true"></div>
+<div id="same_alert_flash" class="same-alert-flash" hidden></div>
+<div id="same_alert_live" class="screen-reader-only" aria-live="assertive" aria-relevant="additions text" aria-atomic="false"></div>
+<main>
+  <section id="baseline_unavailable" class="baseline-only" hidden>
+    <h2>This feature is unsupported by your browser</h2>
+    <p>This feature requires an up-to-date browser, such as a current version of Firefox, Chrome, Edge or Safari. <a href="/">Go to the dashboard</a></p>
+  </section>
+  <div id="view_dashboard" class="view">
+    <section id="dashboard_sdr_section">
+      <h2>Configured SDR</h2>
+      <p id="dashboard_sdr_attention" class="status-text status-needs-attention" hidden>RTL-SDR requires attention. Check the SDR immediately.</p>
+      <dl id="dashboard_sdr_details" class="details-list">
+        <dt>Source</dt><dd id="summary_source">RTL-SDR</dd>
+        <dt>Device</dt><dd id="summary_sdr">none</dd>
+        <dt>PPM correction</dt><dd id="summary_ppm">0</dd>
+        <dt>Gain level</dt><dd id="summary_gain">automatic</dd>
+        <dt>Bias tee</dt><dd id="summary_bias_tee">disabled</dd>
+        <dt>Alias filter</dt><dd id="summary_alias_filter">100%</dd>
+        <dt>Capture</dt><dd id="summary_capture">inactive</dd>
+      </dl>
+      <p><a id="dashboard_configure_sdr" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a></p>
+    </section>
+    <section id="dashboard_streams_section">
+      <h2>Configured streams</h2>
+      <p id="dashboard-stream-summary">No streams configured.</p>
+      <div id="dashboard-stream-attention" class="stream-list"></div>
+      <p><a href="/?view=streams" data-view="streams">Manage streams</a></p>
+    </section>
+    <section id="dashboard_recent_alerts_section">
+      <h2>Recently issued EAS alerts</h2>
+      <div id="dashboard-recent-alerts" class="stream-list"></div>
+    </section>
+    <section id="dashboard_storage_section">
+      <h2>Storage</h2>
+      <dl class="details-list">
+        <dt>Storage</dt><dd id="summary_storage">unknown</dd>
+        <dt>I/Q files</dt><dd id="summary_iq_storage">0 B</dd>
+        <dt>EAS recordings</dt><dd id="summary_eas_storage">0 B</dd>
+      </dl>
+      <div id="storage-warning" class="storage-warning" hidden></div>
+    </section>
+  </div>
+
+  <div id="view_rtl" class="view" hidden>
+    <div id="rtl_reset_confirm" class="baseline-only" hidden></div>
+    <form id="rtl_settings_form" method="post" action="/rtl-settings">
+    __FORM_TOKEN_INPUT__
+    <section>
+      <h2>Configure RTL-SDR</h2>
+      <label>Active SDR
+        <select id="serial" name="serial" aria-describedby="serial_hint"></select>
+      </label>
+      <span id="serial_hint" class="hint">Choose an RTL-SDR connected to this machine, or one shared over the network by a paired NWR Stream Manager. To add a shared one, pair with it in Settings, under SDR sharing.</span>
+      <div class="actions">
+        <button id="rescan_devices" class="needs-app-inline" type="button">Rescan</button>
+        <a id="rescan_devices_link" class="baseline-only button-link" href="/?view=rtl">Rescan</a>
+        <button id="reset_rtl_device" class="needs-app-inline" type="button">Reset SDR</button>
+        <button id="reset_remote_sdr" class="needs-app-inline" type="button" hidden>Reset SDR</button>
+        <a id="reset_sdr_link" class="baseline-only button-link" href="/?view=rtl&amp;confirm=reset">Reset SDR</a>
+      </div>
+      <div id="device-errors" class="error"></div>
+      <div id="remote_sdr_controls" hidden>
+        <p id="remote_sdr_status"></p>
+        <label>Network buffer in seconds
+          <input id="remote_buffer_seconds" name="remote_buffer_seconds" type="number" min="0.1" max="10" step="0.1" aria-describedby="remote_buffer_seconds_hint">
+        </label>
+        <span id="remote_buffer_seconds_hint" class="hint">How much radio data to hold back to ride out Wi-Fi congestion and network dropouts. Higher values are more reliable on weak connections but put audio further behind real time; raising it pauses audio while the buffer fills, and lowering it skips ahead. Valid range is 0.1 through 10 seconds. This delay applies to everything using the shared RTL-SDR, including stream monitoring and the weather radio receiver, whose own playback buffering in the browser adds to it.</span>
+      </div>
+      <div id="sdr-reset-status" class="message" aria-live="polite"></div>
+      <div id="sdr-source-result" class="message" aria-live="polite"></div>
+    </section>
+    <section>
+      <div class="sdr-settings">
+        <div class="sdr-setting">
+          <div class="needs-app">
+            <label for="gain">Gain</label>
+            <input id="gain" type="range" min="0" max="0" step="1" value="0" disabled aria-describedby="gain_hint">
+            <span id="gain_label" class="sdr-value">Automatic</span>
+          </div>
+          <label for="gain_choice" class="baseline-only">Gain</label>
+          <select id="gain_choice" class="baseline-only" name="gain" aria-describedby="gain_hint gain_auto_hint">
+            <option value="auto">Automatic gain control</option>
+          </select>
+          <span id="gain_hint" class="hint">Controls how strongly the SDR amplifies received signals. Generally this should be kept around 30-35 dB. Setting gain too high can cause interference, setting it too low can significantly degrade reception.</span>
+          <div class="needs-app">
+            <label class="checkbox-row"><input id="gain_auto" type="checkbox" aria-describedby="gain_auto_hint"> Automatic gain control</label>
+          </div>
+          <span id="gain_auto_hint" class="hint">Automatically adjusts the tuner gain based on signal strength. It is best to keep this setting switched off as it can increase the gain too high, causing interference.</span>
+        </div>
+        <div class="sdr-setting">
+          <label for="ppm_correction">PPM correction</label>
+          <input id="ppm_correction" name="ppm_correction" type="number" min="-200" max="200" step="1" aria-describedby="ppm_correction_hint">
+          <span id="ppm_correction_hint" class="hint">Controls hardware frequency correction for dongles that experience frequency drift.</span>
+        </div>
+        <div class="sdr-setting">
+          <label for="alias_filter_strength">Alias filter strength</label>
+          <input id="alias_filter_strength" name="alias_filter_strength" type="range" min="0" max="100" step="1" value="100" aria-describedby="alias_filter_strength_hint">
+          <span id="alias_filter_strength_label" class="sdr-value" aria-hidden="true">100%</span>
+          <span id="alias_filter_strength_hint" class="hint">Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.</span>
+        </div>
+        <div class="sdr-setting">
+          <label class="checkbox-row"><input id="bias_tee" name="bias_tee" value="1" type="checkbox" aria-describedby="bias_tee_hint"> Bias tee</label>
+          <span id="bias_tee_hint" class="hint">Enable the RTL-SDR bias tee. Only enable this if attached hardware expects DC power.</span>
+        </div>
+      </div>
+      <div id="sdr-settings-result" class="message" aria-live="polite"></div>
+      <div id="rtl_save_actions" class="baseline-only">
+        <div class="actions">
+          <button id="save_rtl_settings" type="submit" data-baseline-submit>Save changes</button>
+        </div>
+        <div id="rtl-save-result" class="message"></div>
+      </div>
+    </section>
+    <section id="rtl_notifications_section" hidden>
+      <h3>Notifications</h3>
+      <label class="checkbox-row">
+        <input id="notify_sdr_failures" name="notify_sdr_failures" value="1" type="checkbox" aria-describedby="notify_sdr_failures_hint">
+        Notify when the RTL-SDR requires attention
+      </label>
+      <span id="notify_sdr_failures_hint" class="hint">Send an ntfy notification when the configured RTL-SDR disconnects, cannot be opened, or stops sending radio data.</span>
+    </section>
+    </form>
+    <section id="iq_test_source_section" class="needs-app" hidden>
+      <h3>I/Q test source</h3>
+      <p class="hint">Use an interleaved complex float32 I/Q file as the receiver source for testing. Files loop until you switch back to the RTL-SDR.</p>
+      <div class="grid">
+        <label>Source file
+          <select id="iq_test_source_file"></select>
+        </label>
+        <label>File sample rate in samples per second
+          <input id="iq_test_source_sample_rate" type="number" min="192000" step="1" value="1536000">
+        </label>
+      </div>
+      <div id="iq_test_source_directory" class="hint"></div>
+      <div id="iq_test_source_seek_controls" class="hint" tabindex="0" role="group" aria-label="I/Q file seek controls">
+        Use Up Arrow to seek forward 10 seconds, Down Arrow to seek backward 10 seconds, Page Up to seek forward 1 minute, and Page Down to seek backward 1 minute.
+      </div>
+      <div id="iq_test_source_position" class="hint"></div>
+      <div id="iq-test-source-result" class="message"></div>
+      <div class="actions iq-test-source-actions">
+        <button id="rescan_iq_test_sources" type="button">Rescan I/Q files</button>
+        <button id="start_iq_test_source" type="button">Use I/Q file source</button>
+        <button id="seek_iq_test_source_back_60" type="button">Back 1 minute</button>
+        <button id="seek_iq_test_source_back_10" type="button">Back 10 seconds</button>
+        <button id="seek_iq_test_source_forward_10" type="button">Forward 10 seconds</button>
+        <button id="seek_iq_test_source_forward_60" type="button">Forward 1 minute</button>
+        <button id="stop_iq_test_source" type="button">Return to RTL-SDR</button>
+      </div>
+    </section>
+  </div>
+
+  <div id="view_receiver" class="view needs-app" hidden>
+    <section>
+      <h2>Weather Radio Receiver</h2>
+      <p>Freely tune around the NWR band and listen right in your browser.</p>
+      <div class="status" aria-live="off">
+        <div class="metric"><b>Frequency</b><span id="receiver_frequency">162.475 MHz</span></div>
+      </div>
+      <div class="receiver-controls" aria-label="Weather radio receiver controls">
+        <button id="receiver_previous" class="receiver-control-button" type="button" aria-label="Previous channel" title="Previous channel">
+          <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M19 5v14L8 12l11-7zM6 5h2v14H6V5z"></path></svg>
+        </button>
+        <button id="receiver_play_pause" class="receiver-control-button" type="button" aria-label="Play" title="Play">
+          <svg id="receiver_play_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M8 5v14l11-7L8 5z"></path></svg>
+          <svg id="receiver_pause_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false" hidden><path d="M7 5h4v14H7V5zm6 0h4v14h-4V5z"></path></svg>
+        </button>
+        <button id="receiver_next" class="receiver-control-button" type="button" aria-label="Next channel" title="Next channel">
+          <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M5 19V5l11 7-11 7zm11-14h2v14h-2V5z"></path></svg>
+        </button>
+      </div>
+      <label class="desktop-volume-control">Volume
+        <input id="receiver_volume" type="range" min="0" max="100" step="1" value="100">
+      </label>
+      <div id="receiver-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_iq_recorder" class="view" hidden>
+    <section>
+      <h2>I/Q Recorder</h2>
+      <div id="iq-recorder-result" class="message"></div>
+      <div id="iq_remove_confirm" class="baseline-only" hidden></div>
+      <div id="iq_recorder_active" hidden>
+        <p id="iq_refresh_hint" class="hint baseline-only">Refresh the page to see the latest status.</p>
+        <div class="status" aria-live="off">
+          <div class="metric"><b>Status</b><span id="iq_status">Idle</span></div>
+          <div class="metric"><b>Source</b><span id="iq_source">None</span></div>
+          <div class="metric"><b>Sample rate</b><span id="iq_active_sample_rate">0 S/s</span></div>
+          <div class="metric"><b>File size</b><span id="iq_file_size">0 B</span></div>
+          <div class="metric"><b>Elapsed</b><span id="iq_elapsed">0:00</span></div>
+          <div class="metric"><b>Storage time remaining</b><span id="iq_remaining">calculating</span></div>
+          <div class="metric" id="iq_auto_stop_metric" hidden><b>Automatic stop</b><span id="iq_auto_stop_remaining">0:00</span></div>
+          <div class="metric"><b>Storage</b><span id="iq_storage">unknown</span></div>
+        </div>
+        <form id="iq_stop_form" class="actions" method="post" action="/iq-recorder/stop">
+          __FORM_TOKEN_INPUT__
+          <button id="iq_stop_recording" type="submit" data-baseline-submit>Stop recording</button>
+        </form>
+      </div>
+      <div class="actions">
+        <button id="open_iq_start" class="needs-app-inline" type="button">New recording</button>
+        <a id="open_iq_start_link" class="baseline-only button-link" href="/?view=iq_recorder_start">New recording</a>
+      </div>
+      <table class="responsive-table" role="table" aria-label="I/Q recordings">
+        <thead role="rowgroup">
+          <tr role="row">
+            <th role="columnheader">Time of recording</th>
+            <th role="columnheader">Duration</th>
+            <th role="columnheader">Sample rate</th>
+            <th role="columnheader">Frequency</th>
+            <th role="columnheader">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="iq-recordings-body" role="rowgroup" aria-live="off">
+          <tr data-row-key="empty" role="row">
+            <td colspan="5" class="hint" role="cell">No I/Q recordings.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  <div id="view_iq_recorder_start" class="view" hidden>
+    <section>
+      <h2>New I/Q Recording</h2>
+      <div id="iq-start-result" class="message"></div>
+      <form id="iq_recorder_idle" method="post" action="/iq-recorder/start">
+        __FORM_TOKEN_INPUT__
+        <fieldset id="iq_mode_choices">
+          <legend>Recording source</legend>
+          <label class="checkbox-row"><input id="iq_mode_stream" name="iq_recording_mode" type="radio" value="stream" checked> Record I/Q data from an active stream</label>
+          <label class="checkbox-row"><input id="iq_mode_spectrum" name="iq_recording_mode" type="radio" value="spectrum"> Record the entire spectrum</label>
+        </fieldset>
+        <div id="iq_stream_fields">
+          <label>Stream
+            <select id="iq_stream_select" name="stream_id"></select>
+          </label>
+          <div class="hint">Records the selected stream's 24 kHz channel before FM demodulation.</div>
+        </div>
+        <div id="iq_spectrum_fields" hidden>
+          <label>Sample rate
+            <select id="iq_sample_rate" name="sample_rate"></select>
+          </label>
+          <div class="hint">Records the radio spectrum centered at 162.475 MHz.</div>
+        </div>
+        <label>Stop recording after
+          <input id="iq_duration_minutes" name="duration_minutes" type="number" min="0" max="1440" step="1" value="0" aria-describedby="iq_duration_hint">
+        </label>
+        <div id="iq_duration_hint" class="hint">Minutes. Set to 0 to record until you manually stop it.</div>
+        <div class="actions">
+          <button id="iq_start_recording" type="submit" data-baseline-submit>Start recording</button>
+          <button id="cancel_iq_start" class="needs-app-inline" type="button">Cancel</button>
+          <a id="cancel_iq_start_link" class="baseline-only button-link" href="/?view=iq_recorder">Cancel</a>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <div id="view_iq_recording_download" class="view" hidden>
+    <section>
+      <h2>Download I/Q Recording</h2>
+      <form id="iq_download_form" method="get" action="/iq-recordings/download">
+        <input id="iq_download_recording_id" type="hidden" name="id" value="">
+        <p id="iq_download_recording_label" class="hint"></p>
+        <label>Download format
+          <select id="iq_download_format" name="format">
+            <option value="cf">Float 32 bit</option>
+            <option value="s16">Signed 16 bit</option>
+            <option value="u8">Unsigned 8-bit</option>
+          </select>
+        </label>
+        <div class="actions">
+          <button id="iq_download_recording" type="submit" data-baseline-submit>Download recording</button>
+          <button id="cancel_iq_download" class="needs-app-inline" type="button">Cancel</button>
+          <a id="cancel_iq_download_link" class="baseline-only button-link" href="/?view=iq_recorder">Cancel</a>
+        </div>
+      </form>
+      <div id="iq-download-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_logs" class="view" hidden>
+    <section>
+      <h2>Logs</h2>
+      <div class="status" aria-live="off">
+        <div class="metric"><b>Capture</b><span id="active">inactive</span></div>
+        <div class="metric"><b>Chunks</b><span id="chunks">0</span></div>
+        <div class="metric"><b>Bytes</b><span id="bytes">0</span></div>
+        <div class="metric"><b>Last IQ</b><span id="last">never</span></div>
+      </div>
+      <p id="capture-error" class="error"></p>
+      <pre id="logs" aria-live="off" aria-label="Server log output"></pre>
+      <form class="baseline-only logs-refresh" method="get" action="/">
+        <input type="hidden" name="view" value="logs">
+        <button type="submit">Refresh</button>
+      </form>
+    </section>
+  </div>
+
+  <div id="view_settings" class="view" hidden>
+    <section>
+      <h2>Settings</h2>
+      <div id="settings_layout" class="settings-layout">
+        <form id="settings_list" class="settings-list" method="get" action="/" aria-label="Settings">
+          <input type="hidden" name="view" value="settings">
+          <button id="settings_tab_accounts" type="submit" name="section" value="accounts" data-settings-section="accounts" data-baseline-submit hidden>Accounts</button>
+          <button id="settings_tab_account" type="submit" name="section" value="account" data-settings-section="account" data-baseline-submit hidden>Account</button>
+          <button id="settings_tab_sdr_sharing" type="submit" name="section" value="sdr_sharing" data-settings-section="sdr_sharing" data-baseline-submit>SDR sharing</button>
+          <button id="settings_tab_notifications" type="submit" name="section" value="notifications" data-settings-section="notifications" data-baseline-submit>Notifications</button>
+          <button id="settings_tab_fallback_audio" type="submit" name="section" value="fallback_audio" data-settings-section="fallback_audio" data-baseline-submit>Fallback audio</button>
+        </form>
+        <div class="settings-detail">
+          <form class="settings-back-form" method="get" action="/">
+            <input type="hidden" name="view" value="settings">
+            <input id="settings_back_section" type="hidden" name="section" value="">
+            <button id="settings_back" class="settings-back" type="submit" data-baseline-submit>Back to settings</button>
+          </form>
+          <p id="settings_choose" class="baseline-only hint" hidden>Choose a setting.</p>
+          <div id="settings_panel_accounts" class="settings-panel" hidden>
+            <div id="settings_accounts_page">
+              <h3>Accounts</h3>
+              <div id="account-result" class="message"></div>
+              <div id="account_confirm" class="baseline-only" hidden></div>
+              <div class="actions">
+                <button id="open_create_account" type="button" class="needs-app-inline">Create account</button>
+                <a class="baseline-only button-link" href="/?view=settings&amp;section=create_account">Create account</a>
+              </div>
+              <table class="responsive-table" role="table" aria-label="Accounts">
+                <thead role="rowgroup">
+                  <tr role="row">
+                    <th role="columnheader">Username</th>
+                    <th role="columnheader">Account type</th>
+                    <th role="columnheader">Last accessed</th>
+                    <th role="columnheader">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="accounts-body" role="rowgroup" aria-live="off">
+                  <tr data-row-key="empty" role="row"><td colspan="4" class="hint" role="cell">No accounts.</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <form id="settings_create_account_page" method="post" action="/accounts/create" hidden>
+              __FORM_TOKEN_INPUT__
+              <h3>Create account</h3>
+              <div id="create-account-result" class="message"></div>
+              <label>Username
+                <input id="new_account_username" name="username" autocomplete="off" pattern="[A-Za-z0-9_\-]{1,64}">
+              </label>
+              <label><input id="new_account_read_only" name="read_only" value="1" type="checkbox"> Read-only account</label>
+              <div class="actions">
+                <button id="create_account" type="submit" data-baseline-submit>Create account</button>
+                <button id="cancel_create_account" type="button" class="needs-app-inline">Cancel</button>
+                <a class="baseline-only button-link" href="/?view=settings&amp;section=accounts">Cancel</a>
+              </div>
+            </form>
+            <div id="settings_owner_password_page" hidden>
+              <h3>Change account password</h3>
+            </div>
+          </div>
+          <div id="settings_panel_account" class="settings-panel" hidden>
+            <h3>Account</h3>
+          </div>
+          <div id="settings_panel_sdr_sharing" class="settings-panel" hidden>
+            <div id="settings_sdr_sharing_page">
+              <h3>SDR sharing</h3>
+              <div id="sdr_sharing_confirm" class="baseline-only" hidden></div>
+              <div id="sdr_sharing_section" class="settings-group">
+                <h4>Sharing</h4>
+                <p id="remote_access_unavailable" class="hint" hidden>Sharing is available while an RTL-SDR connected to this machine is selected.</p>
+                <div id="remote_access_controls">
+                  <form id="remote_access_form" method="post" action="/sdr-sharing/settings">
+                    __FORM_TOKEN_INPUT__
+                    <label class="checkbox-row">
+                      <input id="remote_access_enabled" name="remote_access_enabled" value="1" type="checkbox" aria-describedby="remote_access_hint">
+                      Share this RTL-SDR with paired devices
+                    </label>
+                    <span id="remote_access_hint" class="hint">Paired NWR Stream Manager devices on your network can use this RTL-SDR for their streams, weather radio receiver and I/Q recordings. To pair a device, select Pair a device to show a pairing code, then enter it on the other device. Sharing uses TCP port 47432 and UDP port 47433.</span>
+                    <div class="actions baseline-only">
+                      <button id="save_remote_access" type="submit" data-baseline-submit>Save changes</button>
+                    </div>
+                  </form>
+                  <form id="remote_pairing_controls" class="actions" method="post" action="/sdr-sharing/pairing/start" hidden>
+                    __FORM_TOKEN_INPUT__
+                    <button id="start_remote_pairing" type="submit" data-baseline-submit>Pair a device</button>
+                  </form>
+                </div>
+                <div id="remote-sharing-result" class="message" aria-live="polite"></div>
+              </div>
+              <div id="remote_pair_section" class="settings-group">
+                <h4>Pair with another NWR Stream Manager</h4>
+                <p class="hint">Pair once and either device can use the other's RTL-SDR. On the device you are pairing with, turn on sharing and select Pair a device to show a pairing code, then select Find devices here.</p>
+                <div class="actions">
+                  <button id="find_remote_devices" class="needs-app-inline" type="button">Find devices</button>
+                  <a id="find_remote_devices_link" class="baseline-only button-link" href="/?view=settings&amp;section=find_devices">Find devices</a>
+                </div>
+                <div id="remote-pair-outcome" class="message" aria-live="polite"></div>
+              </div>
+              <div id="paired_devices_section" class="settings-group">
+                <h4>Paired devices</h4>
+                <table class="responsive-table" role="table" aria-label="Paired devices">
+                  <thead role="rowgroup">
+                    <tr role="row">
+                      <th role="columnheader">Name</th>
+                      <th role="columnheader">Status</th>
+                      <th role="columnheader">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="paired-devices-body" role="rowgroup" aria-live="off">
+                    <tr data-row-key="empty" role="row">
+                      <td colspan="3" class="hint" role="cell">No paired devices.</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div id="paired-devices-result" class="message" aria-live="polite"></div>
+              </div>
+            </div>
+            <div id="settings_pair_device_page" hidden>
+              <h3>Pair a device</h3>
+              <p class="hint needs-app">On the other NWR Stream Manager, open Settings, then SDR sharing, select Find devices, choose this device and enter this code. Other devices can find this one only while this page is open, and pairing stops when you leave it.</p>
+              <p class="hint baseline-only">On the other NWR Stream Manager, open Settings, then SDR sharing, select Find devices, choose this device and enter this code. Other devices can find this one until the code expires or you select Stop pairing.</p>
+              <label id="remote_pairing_code_label">Pairing code
+                <input id="remote_pairing_code" type="text" readonly autocomplete="off" spellcheck="false" aria-describedby="remote_pairing_code_hint">
+              </label>
+              <span id="remote_pairing_code_hint" class="hint"></span>
+              <form id="remote_pairing_stop_form" class="actions" method="post" action="/sdr-sharing/pairing/stop">
+                __FORM_TOKEN_INPUT__
+                <button id="copy_remote_pairing_code" class="needs-app-inline" type="button">Copy pairing code</button>
+                <button class="baseline-only" type="button" data-copy-from="remote_pairing_code" hidden>Copy pairing code</button>
+                <button id="cancel_remote_pairing" type="submit" data-baseline-submit>Stop pairing</button>
+              </form>
+              <div id="remote-pairing-copy-result" class="message" aria-live="polite"></div>
+              <div id="remote-pairing-status" class="message" aria-live="polite"></div>
+              <div id="remote_pairing_done" class="baseline-only" hidden></div>
+            </div>
+            <div id="settings_find_devices_page" hidden>
+              <h3>Find devices</h3>
+              <p class="hint needs-app">On the device you are pairing with, open Settings, then SDR sharing, turn on sharing and select Pair a device. It appears here once it shows a pairing code. Searching continues until you pair or leave this page.</p>
+              <p class="hint baseline-only">On the device you are pairing with, open Settings, then SDR sharing, turn on sharing and select Pair a device. It appears here once it shows a pairing code; select Search again if it isn't listed yet.</p>
+              <p id="remote_pair_search_status" class="hint" aria-live="polite"></p>
+              <form id="remote_pair_form" method="post" action="/sdr-sharing/pair">
+              __FORM_TOKEN_INPUT__
+              <div class="grid">
+                <label>Device
+                  <select id="remote_pair_device" name="device"></select>
+                </label>
+                <label id="remote_pair_address_label" hidden>Address
+                  <input id="remote_pair_address" name="address" type="text" autocomplete="off" spellcheck="false" aria-describedby="remote_pair_address_hint">
+                </label>
+                <span id="remote_pair_address_hint" class="hint" hidden>The IP address or host name of the other NWR Stream Manager.</span>
+                <label>Pairing code
+                  <input id="remote_pair_code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" aria-describedby="remote_pair_code_hint">
+                </label>
+                <span id="remote_pair_code_hint" class="hint">The 6-digit code shown on the other device.</span>
+              </div>
+              <div class="actions">
+                <button id="pair_remote_device" type="submit" data-baseline-submit>Pair</button>
+                <button id="cancel_find_devices" class="needs-app-inline" type="button">Cancel</button>
+                <a id="search_remote_devices_link" class="baseline-only button-link" href="/?view=settings&amp;section=find_devices">Search again</a>
+                <a id="cancel_find_devices_link" class="baseline-only button-link" href="/?view=settings&amp;section=sdr_sharing">Cancel</a>
+              </div>
+              </form>
+              <div id="remote-pair-result" class="message" aria-live="polite"></div>
+            </div>
+          </div>
+          <div id="settings_panel_fallback_audio" class="settings-panel" hidden>
+            <div id="settings_fallback_audio_page">
+            <h3>Fallback audio</h3>
+            <p class="hint">Fallback audio plays on streams whose fallback action is Play fallback audio. Choose each stream's fallback action in its stream settings. These settings apply to every stream that plays fallback audio.</p>
+            <form id="fallback_settings_form" method="post" action="/fallback-audio/settings">
+            __FORM_TOKEN_INPUT__
+            <fieldset>
+              <legend>Announcement</legend>
+              <label class="checkbox-row"><input id="fallback_audio_default" name="fallback_audio" type="radio" value="default"> Default</label>
+              <label class="checkbox-row"><input id="fallback_audio_custom" name="fallback_audio" type="radio" value="custom"> Custom</label>
+              <button id="fallback_play" class="needs-app-inline" type="button">Play announcement</button>
+              <div id="fallback_baseline_player" class="baseline-only">
+                <audio id="fallback_baseline_audio" controls preload="none" data-audio-type="audio/wav"></audio>
+                <p><a id="fallback_baseline_download" href="" download>Download announcement</a></p>
+              </div>
+              <p id="fallback_custom_status" class="hint"></p>
+            </fieldset>
+            <label class="fallback-loop-delay">Seconds before restart
+              <input id="fallback_loop_delay" name="loop_delay_seconds" type="number" min="0" max="10" step="1" aria-describedby="fallback_loop_delay_hint">
+            </label>
+            <span id="fallback_loop_delay_hint" class="hint">How long to wait after the fallback audio finishes before starting it again. Set to 0 for a continuous loop with no gap.</span>
+            <div class="actions baseline-only">
+              <button id="save_fallback_settings" type="submit" data-baseline-submit>Save changes</button>
+            </div>
+            </form>
+            <div id="fallback-result" class="message" aria-live="polite"></div>
+            <div id="fallback_custom_controls" hidden>
+              <div class="settings-group">
+                <h4>Upload an announcement</h4>
+                <span id="fallback_audio_file_hint" class="hint">An MP3, OGG or WAV file, one minute or shorter and under 10 MB.</span>
+                <div class="actions needs-app-flex">
+                  <button id="fallback_upload" type="button" aria-describedby="fallback_audio_file_hint">Upload announcement</button>
+                </div>
+                <!-- Opened by Upload announcement, so there's only one control to reach. -->
+                <input id="fallback_audio_file" type="file" accept=".mp3,.ogg,.wav,audio/mpeg,audio/ogg,audio/wav,audio/x-wav,audio/wave" hidden>
+                <form id="fallback_upload_form" class="baseline-only" method="post" action="/fallback-audio/upload" enctype="multipart/form-data">
+                  __FORM_TOKEN_INPUT__
+                  <label>Announcement file
+                    <input id="fallback_baseline_file" name="announcement" type="file" accept=".mp3,.ogg,.wav,audio/mpeg,audio/ogg,audio/wav,audio/x-wav,audio/wave" aria-describedby="fallback_audio_file_hint">
+                  </label>
+                  <div class="actions">
+                    <button id="fallback_baseline_upload" type="submit">Upload announcement</button>
+                  </div>
+                </form>
+              </div>
+              <div class="settings-group">
+                <h4>Record an announcement</h4>
+                <p id="fallback_record_insecure" class="message error" hidden>Recording isn't available because this page isn't in a secure context. To record, set up Tailscale Serve to give NWR Stream Manager a secure address. You can still upload a file. <a href="/help#secure-address" target="_blank" rel="noopener">Learn how to set up Tailscale Serve<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
+                <p id="fallback_record_unsupported" class="message error" hidden>This browser can't record audio. You can still upload a file.</p>
+                <p class="hint baseline-only">Recording an announcement needs an up-to-date browser. You can still upload a file.</p>
+                <div id="fallback_record_controls" class="needs-app">
+                  <p class="hint">Record up to one minute from your microphone, then listen to it before saving it.</p>
+                  <div class="actions">
+                    <button id="open_fallback_recording" type="button">Record an announcement</button>
+                  </div>
+                </div>
+              </div>
+              <p class="hint fallback-same-note">Announcements are checked for SAME tones, the data bursts that set off weather radios. Announcements that contain them can't be used.</p>
+            </div>
+            <div id="fallback-audio-result" class="message" aria-live="polite"></div>
+            </div>
+            <div id="settings_record_announcement_page" hidden>
+              <h3>Record an announcement</h3>
+              <p class="hint">Select Start recording when you're ready, and Stop recording when you've finished. Recording stops by itself after one minute. Wearing headphones keeps your screen reader and other sounds out of the recording.</p>
+              <div class="actions">
+                <button id="fallback_record" type="button">Start recording</button>
+                <span id="fallback_record_time" class="record-time" role="timer" hidden></span>
+              </div>
+              <div id="fallback_recording_review" class="actions" hidden>
+                <button id="fallback_recording_play" type="button">Play recording</button>
+                <button id="fallback_recording_save" type="button">Save recording</button>
+              </div>
+              <div class="actions">
+                <button id="fallback_recording_cancel" type="button">Cancel</button>
+              </div>
+              <div id="fallback-recording-result" class="message" aria-live="polite"></div>
+            </div>
+          </div>
+          <div id="settings_panel_notifications" class="settings-panel" hidden>
+            <h3>Notifications</h3>
+            <div id="notification-result" class="message" aria-live="polite"></div>
+            <div id="notification_confirm" class="baseline-only" hidden></div>
+            <div id="notification_intro">
+              <p>Get notifications on your computer or phone when a stream goes down, a sound card isn't working, or the RTL-SDR needs attention.</p>
+              <div class="actions">
+                <button id="start_notification_setup" class="needs-app-inline" type="button">Set up</button>
+                <a id="start_notification_setup_link" class="baseline-only button-link" href="/?view=settings&amp;section=notifications&amp;setup=1">Set up</a>
+              </div>
+            </div>
+            <div id="notification_configured" hidden>
+              <form id="notification_settings_form" method="post" action="/notifications/settings" novalidate>
+              __FORM_TOKEN_INPUT__
+              <label>ntfy server
+                <select id="notification_server_mode" name="server_mode" aria-describedby="notification_server_mode_hint">
+                  <option value="ntfy.sh">ntfy.sh</option>
+                  <option value="self-hosted">Self-hosted instance</option>
+                </select>
+              </label>
+              <span id="notification_server_mode_hint" class="hint">The ntfy server notifications are sent through. After changing it, subscribe to the topic on the new server in the ntfy app.</span>
+              <label id="notification_configured_server_url_label" hidden>Server URL
+                <input id="notification_configured_server_url" name="server_url" type="url" autocomplete="url" placeholder="https://ntfy.example.com" aria-describedby="notification_configured_server_url_hint">
+              </label>
+              <span id="notification_configured_server_url_hint" class="hint" hidden>The URL of your self-hosted ntfy server, starting with http:// or https://.</span>
+              <label>Topic secret
+                <input id="notification_configured_topic_secret" type="text" readonly aria-describedby="notification_configured_topic_hint">
+              </label>
+              <span id="notification_configured_topic_hint" class="hint">Subscribe to this topic in the ntfy app to receive notifications.</span>
+              <div class="actions">
+                <button id="copy_configured_notification_topic" class="needs-app-inline" type="button">Copy to clipboard</button>
+                <button class="baseline-only" type="button" data-copy-from="notification_configured_topic_secret" hidden>Copy to clipboard</button>
+                <button id="regenerate_notification_topic" class="needs-app-inline" type="button" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</button>
+                <a id="regenerate_notification_topic_link" class="baseline-only button-link" href="/?view=settings&amp;section=notifications&amp;confirm=regenerate" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</a>
+              </div>
+              <span id="regenerate_notification_topic_hint" class="hint">Regenerate the topic secret if someone has figured out the current one.</span>
+              <label>Open NWR Stream Manager from notifications
+                <select id="notification_access_url_mode" name="access_url_mode" aria-describedby="notification_access_url_hint"></select>
+              </label>
+              <span id="notification_access_url_hint" class="hint">The address your devices open when you select a notification. Choose one they can reach, such as a Tailscale address for devices away from home.</span>
+              <label id="notification_custom_access_url_label" hidden>Custom URL
+                <input id="notification_custom_access_url" name="custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_custom_access_url_hint">
+              </label>
+              <span id="notification_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
+              <div class="actions baseline-only">
+                <button id="save_notification_settings" type="submit" data-baseline-submit>Save changes</button>
+              </div>
+              </form>
+              <form id="notification_test_form" method="post" action="/notifications/test">
+                __FORM_TOKEN_INPUT__
+                <div class="actions">
+                  <button id="configured_test_notifications" type="submit" data-baseline-submit>Send test notification</button>
+                </div>
+              </form>
+            </div>
+            <form id="notification_wizard" method="post" action="/notifications/setup" novalidate hidden>
+              __FORM_TOKEN_INPUT__
+              <input id="notification_wizard_step" type="hidden" name="step" value="">
+              <input id="notification_wizard_topic" type="hidden" name="topic" value="">
+              <div id="notification_step_server_choice" class="wizard-step">
+                <p>Let's get notifications set up! NWR Stream Manager sends notifications through ntfy, a free, open-source notification service. You install the ntfy app on your phone or computer and subscribe to a private topic, and NWR Stream Manager sends a notification to that topic when something needs your attention, such as a stream going down or the RTL-SDR disconnecting.</p>
+                <p>Most people use the public ntfy.sh server, which is free and doesn't need an account. If you run your own ntfy server, you can use it instead.</p>
+                <fieldset>
+                  <legend>Do you have your own self-hosted ntfy server?</legend>
+                  <label class="checkbox-row"><input id="notification_self_hosted_no" name="notification_self_hosted" type="radio" value="no" checked> No, use ntfy.sh</label>
+                  <label class="checkbox-row"><input id="notification_self_hosted_yes" name="notification_self_hosted" type="radio" value="yes"> Yes</label>
+                </fieldset>
+              </div>
+              <div id="notification_step_server_url" class="wizard-step" hidden>
+                <p>Enter the URL of your self-hosted ntfy server.</p>
+                <label>ntfy server URL
+                  <input id="notification_server_url" name="server_url" type="url" placeholder="https://ntfy.example.com" autocomplete="url" aria-describedby="notification_server_url_hint">
+                </label>
+                <span id="notification_server_url_hint" class="hint">Starts with http:// or https://.</span>
+              </div>
+              <div id="notification_step_app_install" class="wizard-step" hidden>
+                <p>Download the ntfy app on your device, or use the ntfy web app.</p>
+                <ul>
+                  <li><a href="https://apps.apple.com/us/app/ntfy/id1625396347" target="_blank" rel="noopener noreferrer">Download ntfy from the Apple App Store</a></li>
+                  <li><a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy" target="_blank" rel="noopener noreferrer">Download ntfy from Google Play</a></li>
+                  <li><a id="notification_web_app_link" href="https://ntfy.sh/app" target="_blank" rel="noopener noreferrer">Open the ntfy web app</a></li>
+                </ul>
+              </div>
+              <div id="notification_step_topic" class="wizard-step" hidden>
+                <p>To receive notifications, subscribe to the NWR Stream Manager topic in the ntfy app. Copy the topic secret below, then paste it into the topic name field in the ntfy app. You can subscribe on as many devices as you want; notifications are sent to all of them.</p>
+                <label>Topic secret
+                  <input id="notification_topic_secret" type="text" readonly aria-describedby="notification_topic_secret_hint">
+                </label>
+                <span id="notification_topic_secret_hint" class="hint">Anyone who knows the topic secret can see and send notifications on it. If you ever receive notifications that didn't come from NWR Stream Manager, regenerate the topic secret in the notification settings.</span>
+                <div class="actions">
+                  <button id="copy_notification_topic" class="needs-app-inline" type="button">Copy to clipboard</button>
+                  <button class="baseline-only" type="button" data-copy-from="notification_topic_secret" hidden>Copy to clipboard</button>
+                </div>
+              </div>
+              <div id="notification_step_access_url" class="wizard-step" hidden>
+                <p>Selecting a notification can open NWR Stream Manager. Choose the address your devices should use to reach it.</p>
+                <label>Open NWR Stream Manager from notifications
+                  <select id="notification_wizard_access_url_mode" name="access_url_mode" aria-describedby="notification_wizard_access_url_hint"></select>
+                </label>
+                <span id="notification_wizard_access_url_hint" class="hint">Choose an address your devices can reach, such as a Tailscale address for devices away from home.</span>
+                <label id="notification_wizard_custom_access_url_label" hidden>Custom URL
+                  <input id="notification_wizard_custom_access_url" name="custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_wizard_custom_access_url_hint">
+                </label>
+                <span id="notification_wizard_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
+              </div>
+              <div id="notification_step_test" class="wizard-step" hidden>
+                <p>Send a test notification to make sure notifications from NWR Stream Manager reach your devices, then select Finish.</p>
+                <div class="actions">
+                  <button id="wizard_test_notifications" class="needs-app-inline" type="button">Send test notification</button>
+                  <span id="notification_wizard_test_actions" class="baseline-only"></span>
+                </div>
+              </div>
+              <div class="actions needs-app-flex">
+                <button id="notification_cancel" type="button">Cancel</button>
+                <button id="notification_back" type="button" hidden>Back</button>
+                <button id="notification_next" type="button">Next</button>
+                <button id="notification_finish" type="button" hidden>Finish</button>
+              </div>
+              <div id="notification_wizard_baseline_actions" class="actions baseline-only"></div>
+            </form>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="view_change_password" class="view" hidden>
+    <section>
+      <h2>Change Account Password</h2>
+      <form id="change_password_form" method="post" action="/change-password">
+        __FORM_TOKEN_INPUT__
+        <div id="change-password-result" class="message"></div>
+        <label>Current password
+          <input id="account_current_password" name="current_password" type="password" autocomplete="current-password">
+        </label>
+        <label>New password
+          <input id="account_new_password" name="new_password" type="password" autocomplete="new-password">
+        </label>
+        <label>Confirm new password
+          <input id="account_confirm_password" name="confirm_password" type="password" autocomplete="new-password">
+        </label>
+        <div class="actions">
+          <button id="change_account_password" type="submit" data-baseline-submit>Change password</button>
+          <button id="cancel_change_password" type="button" class="needs-app-inline">Cancel</button>
+          <a id="change_password_cancel_link" class="baseline-only button-link" href="/">Cancel</a>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <div id="view_streams" class="view" hidden>
+    <section>
+      <h2>Manage Streams</h2>
+      <div id="streams_confirm" class="baseline-only" hidden></div>
+      <div class="actions">
+        <button id="open_add_stream" class="needs-app-inline" type="button">Add stream</button>
+        <a id="open_add_stream_link" class="baseline-only button-link" href="/?view=add_stream">Add stream</a>
+      </div>
+      <table class="responsive-table" role="table" aria-label="Manage streams">
+        <thead role="rowgroup">
+          <tr role="row">
+            <th role="columnheader">Callsign</th>
+            <th role="columnheader">Frequency</th>
+            <th role="columnheader">Outputs</th>
+            <th role="columnheader">Signal</th>
+            <th role="columnheader">Status</th>
+            <th role="columnheader">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="active-streams-body" role="rowgroup" aria-live="off">
+          <tr id="active-streams-empty" role="row" data-row-key="empty">
+            <td colspan="6" class="hint" role="cell">No streams configured.</td>
+          </tr>
+        </tbody>
+      </table>
+      <div id="streams-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_add_stream" class="view" hidden>
+    <section>
+      <h2 id="stream_wizard_title">Add Stream</h2>
+      <form id="stream_wizard_form" method="post" action="/streams/wizard">
+      __FORM_TOKEN_INPUT__
+      <input id="wizard_form_stream" type="hidden" name="stream" value="">
+      <input id="wizard_form_step" type="hidden" name="step" value="">
+      <input id="wizard_form_output" type="hidden" name="output_id" value="">
+      <input id="wizard_form_preview" type="hidden" name="preview_id" value="">
+      <div id="wizard_step_station" class="wizard-step">
+        <p>Let's get your stream set up and running! What station would you like to stream?</p>
+        <label>Station Lookup
+          <input id="station_search" name="q" type="search" placeholder="Callsign, city, state, or frequency" autocomplete="off">
+        </label>
+        <div class="actions">
+          <button id="station_search_button" class="needs-app-inline" type="button" disabled>Search</button>
+          <span id="wizard_station_actions" class="baseline-only"></span>
+        </div>
+        <label id="station_results_label" hidden>Matching Stations
+          <select id="station_results" name="station_key" size="8"></select>
+        </label>
+        <div id="selected_station" class="hint">Enter search text to find a station.</div>
+      </div>
+      <div id="wizard_step_credentials" class="wizard-step" hidden>
+        <p id="icecast_credentials_intro">The next step is to enter your icecast credentials for the service you want to stream to. Enter them below, then click next.</p>
+        <div id="icecast_service_help" class="hint"></div>
+        <fieldset id="icecast_fields">
+          <legend>Icecast Credentials</legend>
+          <div class="grid">
+            <label id="icecast_host_label">Host
+              <input id="icecast_host" name="host" type="text" autocomplete="off" aria-describedby="icecast_host_hint">
+            </label>
+            <span id="icecast_host_hint" class="hint">The hostname, IP address, or web URL of the Icecast server.</span>
+            <label id="icecast_port_label">Port
+              <input id="icecast_port" name="port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="icecast_port_hint">
+            </label>
+            <span id="icecast_port_hint" class="hint">The port the Icecast server listens on.</span>
+            <label id="icecast_username_label">Username
+              <input id="icecast_username" name="username" type="text" autocomplete="username" aria-describedby="icecast_username_hint">
+            </label>
+            <span id="icecast_username_hint" class="hint">The username for authentication to the server.</span>
+            <label id="icecast_password_label">Password
+              <input id="icecast_password" name="password" type="password" autocomplete="current-password" aria-describedby="icecast_password_hint">
+            </label>
+            <span id="icecast_password_hint" class="hint">The password for authentication to the server.</span>
+            <label id="show_icecast_password_label" class="checkbox-row">
+              <input id="show_icecast_password" type="checkbox">
+              Show password
+            </label>
+            <label id="icecast_mount_label">Mountpoint
+              <input id="icecast_mount" name="mount" type="text" placeholder="/station.mp3" aria-describedby="icecast_mount_hint">
+            </label>
+            <span id="icecast_mount_hint" class="hint">The mountpoint where the stream will be accessible to listeners.</span>
+            <label id="icecast_alt_label" class="checkbox-row" hidden>
+              <input id="icecast_alt_enabled" name="alt_enabled" value="1" type="checkbox">
+              Alternate stream
+            </label>
+            <label id="icecast_alt_number_label" hidden>Alternate stream number
+              <input id="icecast_alt_number" name="alt_number" type="number" min="1" max="9" step="1" value="1">
+            </label>
+          </div>
+        </fieldset>
+      </div>
+      <div id="wizard_step_service" class="wizard-step" hidden>
+        <p>There are several online platforms you may stream to. You can choose to stream to one of them, or you may stream to a custom icecast server.</p>
+        <label>Streaming service
+          <select id="icecast_service" name="service">
+            <option value="custom">Custom Icecast server</option>
+            <option value="gwes">GWES Weather Radio</option>
+            <option value="weatherusa">WeatherUSA</option>
+            <option value="nwrorg">NOAA Weather Radio Org</option>
+          </select>
+        </label>
+      </div>
+      <div id="wizard_step_output_type" class="wizard-step" hidden>
+        <p>Select the output type.</p>
+        <fieldset>
+          <legend>Output type</legend>
+          <label class="checkbox-row"><input id="wizard_output_type_icecast" name="wizard_output_type" type="radio" value="icecast" checked aria-describedby="wizard_output_type_icecast_hint"> Icecast mountpoint</label>
+          <span id="wizard_output_type_icecast_hint" class="hint">Send station audio to an Icecast mountpoint, including private servers or services like GWES Weather Radio, NOAA Weather Radio Org, and WeatherUSA.</span>
+          <label class="checkbox-row"><input id="wizard_output_type_soundcard" name="wizard_output_type" type="radio" value="soundcard" aria-describedby="wizard_output_type_soundcard_hint"> Sound card</label>
+          <span id="wizard_output_type_soundcard_hint" class="hint">Send station audio to a local sound card, useful for feeding an Emergency Alert System ENDEC.</span>
+        </fieldset>
+      </div>
+      <div id="wizard_step_soundcard_device" class="wizard-step" hidden>
+        <p>Select the sound card that should play this stream.</p>
+        <p>The sound card must be connected to the machine running NWR Stream Manager, not the phone, tablet, or computer used to access this web interface.</p>
+        <label>Sound card
+          <select id="wizard_soundcard_device" name="stable_id"></select>
+        </label>
+        <div id="wizard_soundcard_device_hint" class="hint"></div>
+        <div id="wizard_soundcard_device_actions" class="actions baseline-only"></div>
+      </div>
+      <div id="wizard_step_soundcard_controls" class="wizard-step" hidden>
+        <p>Choose which output channels to use and adjust the playback volume.</p>
+        <fieldset>
+          <legend>Output channels</legend>
+          <label id="wizard_soundcard_channel_both_label" class="checkbox-row"><input id="wizard_soundcard_channel_both" name="wizard_soundcard_channel" type="radio" value="both" checked> Both left and right</label>
+          <label id="wizard_soundcard_channel_left_label" class="checkbox-row"><input id="wizard_soundcard_channel_left" name="wizard_soundcard_channel" type="radio" value="left"> Left</label>
+          <label id="wizard_soundcard_channel_right_label" class="checkbox-row"><input id="wizard_soundcard_channel_right" name="wizard_soundcard_channel" type="radio" value="right"> Right</label>
+        </fieldset>
+        <label>Volume
+          <input id="wizard_soundcard_volume" name="volume" type="range" min="0" max="2" step="0.01" value="1">
+        </label>
+        <div id="wizard_soundcard_status" class="hint"></div>
+        <div id="wizard_soundcard_controls_actions" class="actions baseline-only"></div>
+      </div>
+      <div id="wizard_step_codec" class="wizard-step" hidden>
+        <p>What audio codec would you like to use for the stream format? MP3 is generally more compatible, while OGG may give better audio quality at lower internet usage.</p>
+        <fieldset id="icecast_format_fieldset">
+          <legend>Stream Format</legend>
+          <div class="hint">Encoding format for this Icecast mountpoint.</div>
+          <label class="checkbox-row"><input id="icecast_format_mp3" name="icecast_format" type="radio" value="mp3" checked> MP3</label>
+          <label class="checkbox-row"><input id="icecast_format_ogg" name="icecast_format" type="radio" value="ogg"> OGG</label>
+        </fieldset>
+      </div>
+      <div id="wizard_step_quality" class="wizard-step" hidden>
+        <p>Adjust bitrate and sample rate to optimize audio quality and network usage. If you don't know what any of this means, click the finish button.</p>
+        <fieldset>
+          <legend>Audio Settings</legend>
+        <div class="grid">
+          <label id="icecast_sample_rate_label">Sample Rate
+            <select id="icecast_sample_rate" name="sample_rate" aria-describedby="icecast_sample_rate_hint">
+              <option value="8000">8000 Hz</option>
+              <option value="11025">11025 Hz</option>
+              <option value="16000">16000 Hz</option>
+              <option value="22050">22050 Hz</option>
+              <option value="24000" selected>24000 Hz</option>
+              <option value="32000">32000 Hz</option>
+              <option value="44100">44100 Hz</option>
+              <option value="48000">48000 Hz</option>
+            </select>
+          </label>
+          <span id="icecast_sample_rate_hint" class="hint">The audio sample rate to encode at for this Icecast mountpoint.</span>
+          <label id="icecast_bitrate_label">Bitrate
+            <select id="icecast_bitrate" name="bitrate" aria-describedby="icecast_bitrate_hint"></select>
+          </label>
+          <span id="icecast_bitrate_hint" class="hint">Encoder bitrate in Kbps for this Icecast mountpoint.</span>
+        </div>
+      </fieldset>
+      </div>
+      <div class="actions needs-app-flex">
+        <button id="cancel_wizard" type="button">Cancel</button>
+        <button id="wizard_back" type="button" hidden>Back</button>
+        <button id="wizard_next" type="button">Next</button>
+        <button id="wizard_finish" type="button" hidden>Finish</button>
+      </div>
+      <div id="wizard_baseline_actions" class="actions baseline-only"></div>
+      </form>
+      <div id="stream-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_stream_settings" class="view" hidden>
+    <section>
+      <h2 id="stream_settings_title">Stream Settings</h2>
+      <form id="stream_settings_form" method="post" action="/streams/settings">
+      __FORM_TOKEN_INPUT__
+      <input id="stream_settings_stream_id" type="hidden" name="stream" value="">
+      <input id="stream_settings_tab" type="hidden" name="tab" value="">
+      <div id="stream_settings_station" class="hint"></div>
+      <label class="checkbox-row">
+        <input id="stream_enabled" name="stream_enabled" value="1" type="checkbox">
+        Enable this stream
+      </label>
+      <div class="needs-app">
+        <label id="stream_monitor_label" class="checkbox-row">
+          <input id="stream_monitor_enabled" type="checkbox" aria-describedby="stream_monitor_hint">
+          Monitor
+        </label>
+        <span id="stream_monitor_hint" class="hint">Listen to this stream's audio in your browser.</span>
+      </div>
+      <div id="stream-settings-result" class="message"></div>
+      <dl id="stream_settings_signal" class="details-list">
+        <dt>Signal</dt><dd id="stream_settings_signal_value" class="hint">No signal data</dd>
+        <dt id="stream_settings_signal_levels_label" hidden>Levels</dt><dd id="stream_settings_signal_levels" hidden></dd>
+      </dl>
+      <div id="stream_settings_tab_links" class="tabs baseline-only" role="navigation" aria-label="Stream settings sections">
+        <a id="tab_link_outputs" class="button-link" href="">Outputs</a>
+        <a id="tab_link_eas" class="button-link" href="">EAS Recording</a>
+        <a id="tab_link_fallback_action" class="button-link" href="">Fallback Action</a>
+        <a id="tab_link_audio" class="button-link" href="">Audio Effects</a>
+        <a id="tab_link_notifications" class="button-link" href="" hidden>Notifications</a>
+      </div>
+      <div class="needs-app">
+      <div class="tabs" role="tablist" aria-label="Stream settings sections">
+        <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
+        <button id="tab_eas" type="button" role="tab" aria-selected="false" aria-controls="panel_eas" tabindex="-1">EAS Recording</button>
+        <button id="tab_fallback_action" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback_action" tabindex="-1">Fallback Action</button>
+        <button id="tab_audio" type="button" role="tab" aria-selected="false" aria-controls="panel_audio" tabindex="-1">Audio Effects</button>
+        <button id="tab_notifications" type="button" role="tab" aria-selected="false" aria-controls="panel_notifications" tabindex="-1" hidden>Notifications</button>
+        <button id="tab_test_mode" type="button" role="tab" aria-selected="false" aria-controls="panel_test_mode" tabindex="-1">Test Mode</button>
+      </div>
+      </div>
+      <div id="panel_outputs" class="tabpanel" role="tabpanel" aria-labelledby="tab_outputs">
+        <div class="actions">
+          <button id="open_add_output" class="needs-app-inline" type="button">Add output</button>
+          <a id="open_add_output_link" class="baseline-only button-link" href="">Add output</a>
+        </div>
+        <div class="needs-app">
+        <label>Show outputs
+          <select id="output_type_filter">
+            <option value="icecast">Icecast outputs</option>
+            <option value="soundcard">Sound card outputs</option>
+          </select>
+        </label>
+        </div>
+        <div id="icecast_outputs_panel">
+        <h3>Icecast outputs</h3>
+        <table class="responsive-table" role="table" aria-label="Icecast outputs">
+          <thead role="rowgroup">
+            <tr role="row">
+              <th role="columnheader">Destination</th>
+              <th role="columnheader">Format</th>
+              <th role="columnheader">Sample rate</th>
+              <th role="columnheader">Bitrate</th>
+              <th role="columnheader">Status</th>
+              <th role="columnheader">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="icecast-outputs-body" role="rowgroup" aria-live="off">
+            <tr data-row-key="empty" role="row">
+              <td colspan="6" class="hint" role="cell">No Icecast outputs configured.</td>
+            </tr>
+          </tbody>
+        </table>
+        </div>
+        <div id="soundcard_outputs_panel" hidden>
+        <h3>Sound card outputs</h3>
+        <table class="responsive-table" role="table" aria-label="Sound card outputs">
+          <thead role="rowgroup">
+            <tr role="row">
+              <th role="columnheader">Sound card name</th>
+              <th role="columnheader">Channels</th>
+              <th role="columnheader">Status</th>
+              <th role="columnheader">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="soundcard-outputs-body" role="rowgroup" aria-live="off">
+            <tr data-row-key="empty" role="row">
+              <td colspan="4" class="hint" role="cell">No sound card outputs configured.</td>
+            </tr>
+          </tbody>
+        </table>
+        </div>
+        <div id="output-list-result" class="message"></div>
+      </div>
+      <div id="panel_audio" class="tabpanel" role="tabpanel" aria-labelledby="tab_audio" hidden>
+        <h3>Audio effects</h3>
+        <div id="audio_effects_layout" class="effects-layout">
+          <div class="needs-app">
+          <div id="audio_effects_list" class="effects-list" aria-label="Audio effects">
+            <button type="button" data-audio-effect="volume">Volume multiplier</button>
+            <button type="button" data-audio-effect="comfort_noise">Comfort noise</button>
+            <button type="button" data-audio-effect="deemphasis">NWR deemphasis</button>
+            <button type="button" data-audio-effect="highpass">Highpass</button>
+            <button type="button" data-audio-effect="lowpass">Lowpass</button>
+            <button type="button" data-audio-effect="notch">Notch filter</button>
+          </div>
+          </div>
+          <div class="effects-detail">
+            <button id="audio_effects_back" class="audio-effects-back" type="button">Back to effects</button>
+            <div id="audio_effect_volume" class="audio-effect-panel">
+              <h4>Volume multiplier</h4>
+              <label class="checkbox-row">
+                <input id="audio_volume_enabled" name="audio_volume_enabled" value="1" type="checkbox" aria-describedby="audio_volume_enabled_hint">
+                Enable volume multiplier
+              </label>
+              <span id="audio_volume_enabled_hint" class="hint">Controls the stream volume.</span>
+              <label>Multiplier
+                <input id="audio_volume_multiplier" name="audio_volume_multiplier" type="number" min="0.1" max="2" step="0.1" aria-describedby="audio_volume_multiplier_hint">
+              </label>
+              <span id="audio_volume_multiplier_hint" class="hint">1 leaves the volume unchanged, 2 doubles it and 0.5 halves it. Valid range is 0.1 through 2.</span>
+            </div>
+            <div id="audio_effect_comfort_noise" class="audio-effect-panel" hidden>
+              <h4>Comfort noise</h4>
+              <label class="checkbox-row">
+                <input id="audio_comfort_noise_enabled" name="audio_comfort_noise_enabled" value="1" type="checkbox" aria-describedby="audio_comfort_noise_enabled_hint">
+                Enable comfort noise
+              </label>
+              <span id="audio_comfort_noise_enabled_hint" class="hint">Mixes very quiet white noise into demodulated audio, similar to some analog receivers.</span>
+              <label>Level
+                <input id="audio_comfort_noise_level" name="audio_comfort_noise_level" type="number" min="-60" max="-30" step="1" aria-describedby="audio_comfort_noise_level_hint">
+              </label>
+              <span id="audio_comfort_noise_level_hint" class="hint">Noise level in dB below full scale. Valid range is -60 through -30.</span>
+            </div>
+            <div id="audio_effect_deemphasis" class="audio-effect-panel" hidden>
+              <h4>NWR deemphasis</h4>
+              <label class="checkbox-row">
+                <input id="audio_deemphasis_enabled" name="audio_deemphasis_enabled" value="1" type="checkbox" aria-describedby="audio_deemphasis_enabled_hint">
+                Enable NWR deemphasis
+              </label>
+              <span id="audio_deemphasis_enabled_hint" class="hint">Reduces high-frequency audio components like an actual NOAA Weather Radio receiver would.</span>
+              <input id="audio_deemphasis_tau" type="hidden" value="300">
+            </div>
+            <div id="audio_effect_highpass" class="audio-effect-panel" hidden>
+              <h4>Highpass</h4>
+              <label class="checkbox-row">
+                <input id="audio_highpass_enabled" name="audio_highpass_enabled" value="1" type="checkbox" aria-describedby="audio_highpass_enabled_hint">
+                Enable highpass
+              </label>
+              <span id="audio_highpass_enabled_hint" class="hint">Gets rid of low-frequency audio, such as 60 Hz hums.</span>
+              <label>Frequency
+                <input id="audio_highpass_frequency" name="audio_highpass_frequency" type="number" min="1" max="900" step="1" aria-describedby="audio_highpass_frequency_hint">
+              </label>
+              <span id="audio_highpass_frequency_hint" class="hint">Frequency in Hz. Frequencies below this value will be attenuated. To protect the 1050 Hz attention tone, this cannot be set above 900 Hz.</span>
+              <label>Sharpness
+                <input id="audio_highpass_sharpness" name="audio_highpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_highpass_sharpness_hint">
+              </label>
+              <span id="audio_highpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
+            </div>
+            <div id="audio_effect_lowpass" class="audio-effect-panel" hidden>
+              <h4>Lowpass</h4>
+              <label class="checkbox-row">
+                <input id="audio_lowpass_enabled" name="audio_lowpass_enabled" value="1" type="checkbox" aria-describedby="audio_lowpass_enabled_hint">
+                Enable lowpass
+              </label>
+              <span id="audio_lowpass_enabled_hint" class="hint">Gets rid of high-frequency audio. This is separate from the standard NWR deemphasis curve.</span>
+              <label>Frequency
+                <input id="audio_lowpass_frequency" name="audio_lowpass_frequency" type="number" min="2200" max="12000" step="1" aria-describedby="audio_lowpass_frequency_hint">
+              </label>
+              <span id="audio_lowpass_frequency_hint" class="hint">Frequency in Hz. Frequencies above this value will be attenuated. To protect SAME tones, this cannot be set below 2200 Hz.</span>
+              <label>Sharpness
+                <input id="audio_lowpass_sharpness" name="audio_lowpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_lowpass_sharpness_hint">
+              </label>
+              <span id="audio_lowpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
+            </div>
+            <div id="audio_effect_notch" class="audio-effect-panel" hidden>
+              <h4>Notch filter</h4>
+              <label class="checkbox-row">
+                <input id="audio_notch_enabled" name="audio_notch_enabled" value="1" type="checkbox" aria-describedby="audio_notch_enabled_hint">
+                Enable notch filter
+              </label>
+              <span id="audio_notch_enabled_hint" class="hint">Removes a narrow band of audio around one frequency, useful for analog whines.</span>
+              <label>Frequency
+                <input id="audio_notch_frequency" name="audio_notch_frequency" type="number" min="1" max="12000" step="1" aria-describedby="audio_notch_frequency_hint">
+              </label>
+              <span id="audio_notch_frequency_hint" class="hint">Frequency in Hz. Frequencies of and near this value will be attenuated. To protect the 1050 Hz attention tone and SAME tones, this cannot be within 900-1100, 1400-1600, or 2000-2200 Hz.</span>
+              <label>Width
+                <input id="audio_notch_width" name="audio_notch_width" type="number" min="60" max="2000" step="1" aria-describedby="audio_notch_width_hint">
+              </label>
+              <span id="audio_notch_width_hint" class="hint">Width in Hz of the band that will be attenuated. Narrow widths remove just the tone; wider widths also remove the audio around it. To protect the 1050 Hz attention tone and SAME tones, the widest allowed depends on the frequency: <span id="audio_notch_width_max">2000</span> Hz at the current frequency.</span>
+            </div>
+          </div>
+        </div>
+        <div id="audio-effects-result" class="message" aria-live="polite"></div>
+      </div>
+      <div id="panel_eas" class="tabpanel" role="tabpanel" aria-labelledby="tab_eas" hidden>
+        <h3>EAS recording</h3>
+        <div class="grid">
+          <label id="eas_enabled_label" class="checkbox-row">
+            <input id="eas_enabled" name="eas_enabled" value="1" type="checkbox" aria-describedby="eas_enabled_hint">
+            Enable EAS recording
+          </label>
+          <span id="eas_enabled_hint" class="hint">Record EAS alerts received from this station.</span>
+          <span id="eas_storage_blocked_hint" class="error" hidden>Disabled due to insufficient disk space.</span>
+          <label>Pre-recording time in seconds
+            <input id="eas_pre_seconds" name="eas_pre_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_pre_seconds_hint">
+          </label>
+          <span id="eas_pre_seconds_hint" class="hint">Seconds of audio to prepend before the decoded SAME header. Valid range is 0 through 10.</span>
+          <label>Post-recording time in seconds
+            <input id="eas_post_seconds" name="eas_post_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_post_seconds_hint">
+          </label>
+          <span id="eas_post_seconds_hint" class="hint">Seconds of audio to append after EOM. Valid range is 0 through 10.</span>
+          <label>Maximum recording time in seconds
+            <input id="eas_max_seconds" name="eas_max_seconds" type="number" min="1" max="3600" step="1" aria-describedby="eas_max_seconds_hint">
+          </label>
+          <span id="eas_max_seconds_hint" class="hint">Maximum recording length for a single alert, in seconds.</span>
+          <fieldset>
+            <legend>Recording format</legend>
+            <div class="hint">Recording format for saved alert audio.</div>
+            <label class="checkbox-row"><input id="eas_format_wav" name="eas_format" type="radio" value="wav" checked> WAV</label>
+            <label class="checkbox-row"><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
+          </fieldset>
+        </div>
+        <div id="eas-result" class="message"></div>
+      </div>
+      <div id="panel_fallback_action" class="tabpanel" role="tabpanel" aria-labelledby="tab_fallback_action" hidden>
+        <h3>Fallback action</h3>
+        <fieldset>
+          <legend>When this stream stops receiving radio audio or loses the station's signal</legend>
+          <label class="checkbox-row"><input id="stream_fallback_action_none" name="stream_fallback_action" type="radio" value="none"> Do nothing</label>
+          <label class="checkbox-row"><input id="stream_fallback_action_disconnect_icecast" name="stream_fallback_action" type="radio" value="disconnect_icecast"> Disconnect from Icecast outputs</label>
+          <label class="checkbox-row"><input id="stream_fallback_action_play_fallback_audio" name="stream_fallback_action" type="radio" value="play_fallback_audio"> Play fallback audio</label>
+        </fieldset>
+        <p class="hint">Do nothing leaves the stream as it is. Disconnect from Icecast outputs disconnects this stream from all of its Icecast servers, so listeners are not left listening to dead air, and reconnects when the station returns; sound card outputs keep playing. Play fallback audio plays the fallback announcement until the station returns.</p>
+        <label id="stream_fallback_delay_label">Fallback delay in seconds
+          <input id="stream_fallback_delay" name="stream_fallback_delay" type="number" min="30" max="120" step="1" aria-describedby="stream_fallback_delay_hint">
+        </label>
+        <span id="stream_fallback_delay_hint" class="hint">How long to wait before the fallback action happens. Valid range is 30 through 120 seconds.</span>
+        <div id="stream-fallback-action-result" class="message" aria-live="polite"></div>
+      </div>
+      <div id="panel_notifications" class="tabpanel" role="tabpanel" aria-labelledby="tab_notifications" hidden>
+        <h3>Notifications</h3>
+        <p class="hint">Choose which problems for this stream should send notifications.</p>
+        <div class="grid">
+          <label class="checkbox-row">
+            <input id="stream_notify_icecast_failures" name="stream_notify_icecast_failures" value="1" type="checkbox">
+            Failed Icecast mountpoints
+          </label>
+          <label class="checkbox-row">
+            <input id="stream_notify_soundcard_failures" name="stream_notify_soundcard_failures" value="1" type="checkbox">
+            Disconnected sound cards
+          </label>
+          <label class="checkbox-row">
+            <input id="stream_notify_bad_reception" name="stream_notify_bad_reception" value="1" type="checkbox">
+            Bad reception or no signal
+          </label>
+          <label id="stream_notify_eas_alerts_label" class="checkbox-row" hidden>
+            <input id="stream_notify_eas_alerts" name="stream_notify_eas_alerts" value="1" type="checkbox" aria-describedby="stream_notify_eas_alerts_hint">
+            Recorded EAS alerts
+          </label>
+          <span id="stream_notify_eas_alerts_hint" class="hint" hidden>Send a notification when a new EAS alert recording is saved.</span>
+        </div>
+        <div id="stream-notifications-result" class="message"></div>
+      </div>
+      <div id="stream_settings_save_actions" class="baseline-only">
+        <div class="actions">
+          <button id="save_stream_settings" type="submit" data-baseline-submit>Save changes</button>
+        </div>
+        <div id="stream-settings-save-result" class="message"></div>
+      </div>
+      </form>
+      <div id="panel_test_mode" class="tabpanel" role="tabpanel" aria-labelledby="tab_test_mode" hidden>
+        <h3>Test mode</h3>
+        <p class="hint">Replace this stream's real radio channel with a simulated NOAA Weather Radio channel for testing outputs and SAME handling. Test mode can be used for up to 10 minutes in any hour, shared by all streams.</p>
+        <p id="test_mode_time" class="hint">Time left: 10:00.</p>
+        <div class="grid">
+          <label class="checkbox-row">
+            <input id="test_mode_enabled" type="checkbox">
+            Enable test mode
+          </label>
+          <label>Signal strength
+            <input id="test_mode_signal" type="range" min="-80" max="0" step="1" value="-20" aria-describedby="test_mode_signal_hint">
+          </label>
+          <span id="test_mode_signal_hint" class="hint">Signal strength in dBFS.</span>
+          <div id="test_mode_signal_value" class="hint">-20 dBFS</div>
+        </div>
+        <div id="test_tones_mute" class="test-tones-mute" hidden>
+          <label class="checkbox-row">
+            <input id="test_tones_muted" type="checkbox" aria-describedby="test_tones_muted_hint">
+            Mute tone generators
+          </label>
+          <span id="test_tones_muted_hint" class="hint">Silences every tone generator. Unmuting brings back the ones that were on.</span>
+        </div>
+        <div class="actions">
+          <button id="test_mode_same" type="button">Send SAME test</button>
+        </div>
+        <div id="test-mode-result" class="message"></div>
+        <div id="test_tones_section" hidden>
+          <h3>Tone generators</h3>
+          <p class="hint">Play tones along with the test announcements and SAME tests, to simulate buzzes and whines. Tones are sent the same way as SAME tones, so NWR deemphasis affects them the same way.</p>
+          <div id="test_tones_layout" class="effects-layout">
+            <div id="test_tones_list" class="effects-list" aria-label="Tone generators">
+              <button type="button" data-test-tone="sine">Sine wave</button>
+              <button type="button" data-test-tone="square">Square wave</button>
+              <button type="button" data-test-tone="triangle">Triangle wave</button>
+              <button type="button" data-test-tone="sawtooth">Sawtooth wave</button>
+            </div>
+            <div class="effects-detail">
+              <button id="test_tones_back" class="audio-effects-back" type="button">Back to tone generators</button>
+              <div id="test_tone_sine" class="test-tone-panel">
+                <h4>Sine wave</h4>
+                <label class="checkbox-row">
+                  <input id="test_tone_sine_enabled" type="checkbox" aria-describedby="test_tone_sine_enabled_hint">
+                  Enable sine wave generator
+                </label>
+                <span id="test_tone_sine_enabled_hint" class="hint">A pure tone, like a whine.</span>
+                <label>Frequency
+                  <input id="test_tone_sine_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sine_frequency_hint">
+                </label>
+                <span id="test_tone_sine_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                <label>Amplitude
+                  <input id="test_tone_sine_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sine_amplitude_hint">
+                </label>
+                <span id="test_tone_sine_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+              </div>
+              <div id="test_tone_square" class="test-tone-panel" hidden>
+                <h4>Square wave</h4>
+                <label class="checkbox-row">
+                  <input id="test_tone_square_enabled" type="checkbox" aria-describedby="test_tone_square_enabled_hint">
+                  Enable square wave generator
+                </label>
+                <span id="test_tone_square_enabled_hint" class="hint">A harsh, hollow buzz, like electrical interference.</span>
+                <label>Frequency
+                  <input id="test_tone_square_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_square_frequency_hint">
+                </label>
+                <span id="test_tone_square_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                <label>Amplitude
+                  <input id="test_tone_square_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_square_amplitude_hint">
+                </label>
+                <span id="test_tone_square_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+              </div>
+              <div id="test_tone_triangle" class="test-tone-panel" hidden>
+                <h4>Triangle wave</h4>
+                <label class="checkbox-row">
+                  <input id="test_tone_triangle_enabled" type="checkbox" aria-describedby="test_tone_triangle_enabled_hint">
+                  Enable triangle wave generator
+                </label>
+                <span id="test_tone_triangle_enabled_hint" class="hint">A soft tone, a little brighter than a sine wave.</span>
+                <label>Frequency
+                  <input id="test_tone_triangle_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_triangle_frequency_hint">
+                </label>
+                <span id="test_tone_triangle_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                <label>Amplitude
+                  <input id="test_tone_triangle_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_triangle_amplitude_hint">
+                </label>
+                <span id="test_tone_triangle_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+              </div>
+              <div id="test_tone_sawtooth" class="test-tone-panel" hidden>
+                <h4>Sawtooth wave</h4>
+                <label class="checkbox-row">
+                  <input id="test_tone_sawtooth_enabled" type="checkbox" aria-describedby="test_tone_sawtooth_enabled_hint">
+                  Enable sawtooth wave generator
+                </label>
+                <span id="test_tone_sawtooth_enabled_hint" class="hint">A bright, raspy buzz, like a hum with strong harmonics.</span>
+                <label>Frequency
+                  <input id="test_tone_sawtooth_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sawtooth_frequency_hint">
+                </label>
+                <span id="test_tone_sawtooth_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                <label>Amplitude
+                  <input id="test_tone_sawtooth_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sawtooth_amplitude_hint">
+                </label>
+                <span id="test_tone_sawtooth_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="view_stream_output" class="view" hidden>
+    <section>
+      <div id="output_form_panel">
+          <h2 id="output_form_title">Add output</h2>
+          <div id="output_confirm" class="baseline-only" hidden></div>
+          <div id="icecast_output_edit_panel">
+          <form id="settings_icecast_service_form" method="get" action="/">
+            <input type="hidden" name="view" value="stream_output">
+            <input id="settings_icecast_service_stream" type="hidden" name="stream" value="">
+            <input id="settings_icecast_service_output" type="hidden" name="output" value="">
+            <label>Streaming service
+              <select id="settings_icecast_service" name="service">
+                <option value="custom">Custom Icecast server</option>
+                <option value="gwes">GWES Weather Radio</option>
+                <option value="weatherusa">WeatherUSA</option>
+                <option value="nwrorg">NOAA Weather Radio Org</option>
+              </select>
+            </label>
+            <div class="actions baseline-only">
+              <button id="change_settings_icecast_service" type="submit" data-baseline-submit>Change service</button>
+            </div>
+          </form>
+          <div id="settings_icecast_service_help" class="hint"></div>
+          <form id="settings_icecast_form" method="post" action="/streams/outputs/save">
+          __FORM_TOKEN_INPUT__
+          <input id="settings_icecast_form_stream" type="hidden" name="stream" value="">
+          <input id="settings_icecast_form_output" type="hidden" name="output" value="">
+          <input id="settings_icecast_form_service" type="hidden" name="service" value="">
+          <fieldset>
+            <legend>Icecast output</legend>
+            <div class="grid">
+              <label id="settings_icecast_host_label">Host
+                <input id="settings_icecast_host" name="host" type="text" autocomplete="off" aria-describedby="settings_icecast_host_hint">
+              </label>
+              <span id="settings_icecast_host_hint" class="hint">The hostname, IP address, or web URL of the Icecast server.</span>
+              <label id="settings_icecast_port_label">Port
+                <input id="settings_icecast_port" name="port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="settings_icecast_port_hint">
+              </label>
+              <span id="settings_icecast_port_hint" class="hint">The port the Icecast server listens on.</span>
+              <label id="settings_icecast_username_label">Username
+                <input id="settings_icecast_username" name="username" type="text" autocomplete="username" aria-describedby="settings_icecast_username_hint">
+              </label>
+              <span id="settings_icecast_username_hint" class="hint">The username for authentication to the server.</span>
+              <label id="settings_icecast_password_label">Password
+                <input id="settings_icecast_password" name="password" type="password" autocomplete="current-password" aria-describedby="settings_icecast_password_hint">
+              </label>
+              <span id="settings_icecast_password_hint" class="hint">The password for authentication to the server.</span>
+              <label id="settings_show_icecast_password_label" class="checkbox-row">
+                <input id="settings_show_icecast_password" type="checkbox">
+                Show password
+              </label>
+              <label id="settings_icecast_mount_label">Mountpoint
+                <input id="settings_icecast_mount" name="mount" type="text" placeholder="/station.mp3" aria-describedby="settings_icecast_mount_hint">
+              </label>
+              <span id="settings_icecast_mount_hint" class="hint">The mountpoint where the stream will be accessible to listeners.</span>
+              <label id="settings_icecast_alt_label" class="checkbox-row" hidden>
+                <input id="settings_icecast_alt_enabled" name="alt_enabled" value="1" type="checkbox">
+                Alternate stream
+              </label>
+              <label id="settings_icecast_alt_number_label" hidden>Alternate stream number
+                <input id="settings_icecast_alt_number" name="alt_number" type="number" min="1" max="9" step="1" value="1">
+              </label>
+              <fieldset id="settings_icecast_format_fieldset">
+                <legend>Format</legend>
+                <div class="hint">Encoding format for this Icecast mountpoint.</div>
+                <label class="checkbox-row"><input id="settings_icecast_format_mp3" name="settings_icecast_format" type="radio" value="mp3" checked> MP3</label>
+                <label class="checkbox-row"><input id="settings_icecast_format_ogg" name="settings_icecast_format" type="radio" value="ogg"> OGG</label>
+              </fieldset>
+              <label id="settings_icecast_sample_rate_label">Sample rate
+                <select id="settings_icecast_sample_rate" name="sample_rate" aria-describedby="settings_icecast_sample_rate_hint">
+                  <option value="8000">8000 Hz</option>
+                  <option value="11025">11025 Hz</option>
+                  <option value="16000">16000 Hz</option>
+                  <option value="22050">22050 Hz</option>
+                  <option value="24000" selected>24000 Hz</option>
+                  <option value="32000">32000 Hz</option>
+                  <option value="44100">44100 Hz</option>
+                  <option value="48000">48000 Hz</option>
+                </select>
+              </label>
+              <span id="settings_icecast_sample_rate_hint" class="hint">The audio sample rate to encode at for this Icecast mountpoint.</span>
+              <label id="settings_icecast_bitrate_label">Bitrate
+                <select id="settings_icecast_bitrate" name="bitrate" aria-describedby="settings_icecast_bitrate_hint"></select>
+              </label>
+              <span id="settings_icecast_bitrate_hint" class="hint">Encoder bitrate in Kbps for this Icecast mountpoint.</span>
+            </div>
+          </fieldset>
+          <div class="actions">
+            <button id="save_output_settings" type="submit" data-baseline-submit hidden>Save changes</button>
+            <button id="cancel_output_form" class="needs-app-inline" type="button">Cancel</button>
+            <a id="cancel_output_form_link" class="baseline-only button-link" href="">Cancel</a>
+            <button id="add_output" class="needs-app-inline" type="button">Add output</button>
+          </div>
+          </form>
+          </div>
+          <form id="soundcard_output_edit_panel" method="post" action="/streams/outputs/save" hidden>
+            __FORM_TOKEN_INPUT__
+            <input id="settings_soundcard_form_stream" type="hidden" name="stream" value="">
+            <input id="settings_soundcard_form_output" type="hidden" name="output" value="">
+            <fieldset>
+              <legend>Sound card output</legend>
+              <div class="grid">
+                <label>Sound card
+                  <select id="settings_soundcard_device" name="stable_id"></select>
+                </label>
+                <div class="baseline-only">
+                  <a id="refresh_settings_soundcards" class="button-link" href="">Refresh sound card list</a>
+                </div>
+                <button id="reset_soundcard_device" type="button" hidden>Reset USB sound card</button>
+                <span id="settings_soundcard_device_hint" class="hint"></span>
+                <label>Volume
+                  <input id="settings_soundcard_volume" name="volume" type="range" min="0" max="2" step="0.01" value="1">
+                </label>
+                <span class="hint">This volume applies only to this sound card output.</span>
+                <fieldset>
+                  <legend>Channels</legend>
+                  <label id="settings_soundcard_channel_left_label" class="checkbox-row"><input id="settings_soundcard_channel_left" name="settings_soundcard_channel" type="radio" value="left"> Left</label>
+                  <label id="settings_soundcard_channel_both_label" class="checkbox-row"><input id="settings_soundcard_channel_both" name="settings_soundcard_channel" type="radio" value="both" checked> Both left and right</label>
+                  <label id="settings_soundcard_channel_right_label" class="checkbox-row"><input id="settings_soundcard_channel_right" name="settings_soundcard_channel" type="radio" value="right"> Right</label>
+                </fieldset>
+              </div>
+            </fieldset>
+            <div class="actions">
+              <button id="save_soundcard_output" class="baseline-only" type="submit" data-baseline-submit>Save changes</button>
+              <button id="cancel_soundcard_output_form" class="needs-app-inline" type="button">Cancel</button>
+              <a id="cancel_soundcard_output_form_link" class="baseline-only button-link" href="">Cancel</a>
+            </div>
+          </form>
+          <div id="output_actions" class="baseline-only" hidden></div>
+        </div>
+        <div id="output-result" class="message"></div>
+      </div>
+    </section>
+  </div>
+
+  <div id="view_eas_alerts" class="view" hidden>
+    <section>
+      <h2>EAS alerts</h2>
+      <p>View and manage recorded EAS alerts.</p>
+      <form id="eas_alert_stream_form" method="get" action="/">
+        <input type="hidden" name="view" value="eas_alerts">
+        <label>Stream
+          <select id="eas_alert_stream" name="stream"></select>
+        </label>
+        <div class="actions baseline-only">
+          <button id="show_eas_alert_stream" type="submit" data-baseline-submit>Show alerts</button>
+        </div>
+      </form>
+      <div class="actions">
+        <button id="open_eas_export" type="button" class="needs-app-inline">Export alerts</button>
+        <button id="open_eas_delete" type="button" class="needs-app-inline">Delete alerts</button>
+        <a id="open_eas_export_link" class="baseline-only button-link" href="/?view=eas_alert_export">Export alerts</a>
+        <a id="open_eas_delete_link" class="baseline-only button-link" href="/?view=eas_alert_delete">Delete alerts</a>
+      </div>
+      <div id="eas-alert-list" class="stream-list" aria-live="off"></div>
+      <div class="actions">
+        <button id="eas_alert_prev" type="button" class="needs-app-inline">Previous</button>
+        <a id="eas_alert_page_prev_link" class="baseline-only button-link" href="/?view=eas_alerts" hidden>Previous page</a>
+        <span id="eas_alert_page" class="hint">Page 1 of 1</span>
+        <button id="eas_alert_next" type="button" class="needs-app-inline">Next</button>
+        <a id="eas_alert_page_next_link" class="baseline-only button-link" href="/?view=eas_alerts" hidden>Next page</a>
+      </div>
+      <div id="eas-alert-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_eas_alert_export" class="view" hidden>
+    <section>
+      <h2>Export alerts</h2>
+      <form id="eas_export_form" method="get" action="/eas-alerts/export">
+        <input id="eas_export_stream" type="hidden" name="stream" value="">
+        <input id="eas_export_page" type="hidden" name="page" value="1">
+        <p id="eas_export_stream_label" class="hint"></p>
+        <fieldset>
+          <legend>Choose alerts to export</legend>
+          <div id="eas_export_options"></div>
+          <div id="eas_export_manual" hidden></div>
+        </fieldset>
+        <div class="actions">
+          <button id="eas_export_alerts" type="submit" data-baseline-submit>Export alerts</button>
+          <button id="cancel_eas_export" type="button" class="needs-app-inline">Cancel</button>
+          <a id="cancel_eas_export_link" class="baseline-only button-link" href="/?view=eas_alerts">Cancel</a>
+        </div>
+      </form>
+      <div id="eas-export-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_eas_alert_delete" class="view" hidden>
+    <section>
+      <h2>Delete alerts</h2>
+      <div id="eas_delete_confirm" class="baseline-only" hidden></div>
+      <form id="eas_delete_form" method="post" action="/eas-alerts/delete">
+        __FORM_TOKEN_INPUT__
+        <input id="eas_delete_stream" type="hidden" name="stream" value="">
+        <input id="eas_delete_page" type="hidden" name="page" value="1">
+        <p id="eas_delete_stream_label" class="hint"></p>
+        <fieldset>
+          <legend>Choose alerts to delete</legend>
+          <div id="eas_delete_options"></div>
+          <div id="eas_delete_manual" hidden></div>
+        </fieldset>
+        <div class="actions">
+          <button id="eas_delete_alerts" type="submit" data-baseline-submit>Delete alerts</button>
+          <button id="cancel_eas_delete" type="button" class="needs-app-inline">Cancel</button>
+          <a id="cancel_eas_delete_link" class="baseline-only button-link" href="/?view=eas_alerts">Cancel</a>
+        </div>
+      </form>
+      <div id="eas-delete-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_eas_alert_detail" class="view" hidden>
+    <section>
+      <h2 id="eas_alert_detail_title">EAS alert</h2>
+      <div id="eas_alert_remove_confirm" class="baseline-only" hidden></div>
+      <dl class="details-list">
+        <dt>Event type</dt><dd id="eas_detail_event">Unknown</dd>
+        <dt>Areas impacted</dt><dd id="eas_detail_areas">Unknown</dd>
+        <dt>Issued</dt><dd id="eas_detail_issued">Unknown</dd>
+        <dt>Expires</dt><dd id="eas_detail_expires">Unknown</dd>
+      </dl>
+      <p id="eas_alert_cannot_play" hidden>This browser can't play alerts. To listen to this one, select Download alert.</p>
+      <div id="eas_alert_player" class="baseline-only">
+        <audio id="eas_alert_baseline_audio" controls preload="none"></audio>
+        <!-- Not fallback content: Internet Explorer 9 to 11 read that to screen readers while the player works. -->
+        <!--[if lt IE 9]><p>This browser can't play alerts. To listen to this one, select Download alert.</p><![endif]-->
+        <label id="eas_alert_baseline_autoplay_label" class="checkbox-row" hidden><input id="eas_alert_baseline_autoplay" type="checkbox"> Autoplay</label>
+      </div>
+      <audio id="eas_alert_audio" preload="metadata"></audio>
+      <div id="eas_alert_app_player" class="needs-app">
+        <div class="receiver-controls" aria-label="EAS alert playback controls">
+          <button id="eas_alert_detail_previous" class="receiver-control-button" type="button" aria-label="Previous alert" title="Previous alert">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M19 5v14L8 12l11-7zM6 5h2v14H6V5z"></path></svg>
+          </button>
+          <button id="eas_alert_detail_play_pause" class="receiver-control-button" type="button" aria-label="Play" title="Play">
+            <svg id="eas_alert_detail_play_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M8 5v14l11-7L8 5z"></path></svg>
+            <svg id="eas_alert_detail_pause_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false" hidden><path d="M7 5h4v14H7V5zm6 0h4v14h-4V5z"></path></svg>
+          </button>
+          <button id="eas_alert_detail_next" class="receiver-control-button" type="button" aria-label="Next alert" title="Next alert">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M5 19V5l11 7-11 7zm11-14h2v14h-2V5z"></path></svg>
+          </button>
+        </div>
+        <label class="desktop-volume-control">Volume
+          <input id="eas_alert_volume" type="range" min="0" max="100" step="1" value="100">
+        </label>
+        <label class="checkbox-row"><input id="eas_alert_autoplay" type="checkbox"> Autoplay</label>
+      </div>
+      <div class="actions baseline-only">
+        <a id="eas_alert_previous_link" class="button-link" href="/?view=eas_alerts" hidden>Previous alert</a>
+        <a id="eas_alert_next_link" class="button-link" href="/?view=eas_alerts" hidden>Next alert</a>
+      </div>
+      <div class="actions">
+        <a id="eas_alert_download" role="button" href="#">Download alert</a>
+        <button id="remove_eas_alert" type="button" class="needs-app-inline">Remove alert</button>
+        <a id="remove_eas_alert_link" class="baseline-only button-link" href="/?view=eas_alerts">Remove alert</a>
+        <a id="back_to_eas_alerts" href="/?view=eas_alerts">Alert list</a>
+      </div>
+      <div id="eas-alert-detail-result" class="message"></div>
+    </section>
+  </div>
+
+  <audio id="stream_monitor_audio" class="media-session-audio" autoplay playsinline aria-hidden="true" tabindex="-1"></audio>
+  <audio id="media_session_anchor_audio" class="media-session-audio" loop preload="auto" playsinline aria-hidden="true" tabindex="-1"></audio>
+</main>
+<footer>
+  <a id="footer_help" href="/help" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
+  <p id="footer_version">NWR Stream Manager version __APP_VERSION__</p>
+</footer>
+<script>
+__BASIC_SCRIPT__</script>
+<script type="text/x-nwr-app">
+__APP_SCRIPT__</script>
+__PAGE_SCRIPT_STARTER__
+</body>
+</html>

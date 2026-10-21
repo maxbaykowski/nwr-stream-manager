@@ -1051,6 +1051,11 @@ def load_web_control():
     return module
 
 
+def part_of(wc, name):
+    """The module that holds part of web_control, for swapping out something only it uses."""
+    return sys.modules[f"{wc.__package__}.{name}"]
+
+
 class RemoteSdrServiceTests(unittest.TestCase):
     """Two full NWR Stream Manager services: one sharing an SDR, one using it."""
 
@@ -1061,11 +1066,13 @@ class RemoteSdrServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         wc = self.wc
         # Neither service may touch a real RTL-SDR on this machine.
-        originals = (wc.list_rtl_devices, wc.list_usb_rtl_devices)
-        wc.list_rtl_devices = lambda: []
-        wc.list_usb_rtl_devices = lambda: []
-        self.addCleanup(lambda: setattr(wc, "list_rtl_devices", originals[0]))
-        self.addCleanup(lambda: setattr(wc, "list_usb_rtl_devices", originals[1]))
+        for module, name in (
+            (wc, "list_rtl_devices"),
+            (wc, "list_usb_rtl_devices"),
+            (part_of(wc, "service_devices"), "list_usb_rtl_devices"),
+        ):
+            self.addCleanup(setattr, module, name, getattr(module, name))
+            setattr(module, name, lambda: [])
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
@@ -1332,9 +1339,10 @@ class RemoteSdrServiceTests(unittest.TestCase):
             ("list_usb_rtl_devices", lambda: [device] if reappears and release.is_set() else []),
             ("RTL_RESET_REAPPEAR_TIMEOUT_SECONDS", 0.5),
         ):
-            original = getattr(wc, name)
-            setattr(wc, name, value)
-            self.addCleanup(setattr, wc, name, original)
+            devices = part_of(wc, "service_devices")
+            original = getattr(devices, name)
+            setattr(devices, name, value)
+            self.addCleanup(setattr, devices, name, original)
         return release, resets
 
     def reset_in_background(self, service, serial=""):
@@ -1420,7 +1428,7 @@ class RemoteSdrServiceTests(unittest.TestCase):
         release.set()
         client.reset_rtl_device("")
         self.assertIsNotNone(self.shown_reset(client))
-        with unittest.mock.patch.object(self.wc, "RTL_RESET_RESULT_SHOW_SECONDS", 0.0):
+        with unittest.mock.patch.object(part_of(self.wc, "service_devices"), "RTL_RESET_RESULT_SHOW_SECONDS", 0.0):
             self.assertIsNone(self.shown_reset(host))
             wait_for(lambda: self.shown_reset(client) is None, timeout=3.0)
 
@@ -1788,9 +1796,9 @@ class LiveAudioUpstreamStallTests(unittest.TestCase):
 
         writer = types.SimpleNamespace(send_json=lambda payload: None, send_audio=lambda **kwargs: 0.001)
         handler = types.SimpleNamespace(service=Service())
-        original_hold = wc.LIVE_AUDIO_UPSTREAM_HOLD_SECONDS
-        wc.LIVE_AUDIO_UPSTREAM_HOLD_SECONDS = 0.3
-        self.addCleanup(setattr, wc, "LIVE_AUDIO_UPSTREAM_HOLD_SECONDS", original_hold)
+        live_audio = part_of(wc, "handler_live_audio")
+        self.addCleanup(setattr, live_audio, "LIVE_AUDIO_UPSTREAM_HOLD_SECONDS", live_audio.LIVE_AUDIO_UPSTREAM_HOLD_SECONDS)
+        live_audio.LIVE_AUDIO_UPSTREAM_HOLD_SECONDS = 0.3
         wc.RtlControlHandler._stream_live_audio_websocket(
             handler,
             writer,

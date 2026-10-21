@@ -45,7 +45,7 @@ class PackagedAudioTests(unittest.TestCase):
     def test_a_swapped_fallback_is_silent_and_the_stream_keeps_running(self) -> None:
         self.swap("fallback.wav")
 
-        with self.assertLogs(self.web_control.LOG, "ERROR") as logs:
+        with self.assertLogs("nwr_stream_manager.stream_audio", "ERROR") as logs:
             audio = self.web_control.load_web_fallback_audio()
 
         self.assertEqual(audio.pcm, b"")
