@@ -1053,17 +1053,28 @@ class StreamPageTests(unittest.TestCase):
         self.assertEqual(response.getheader("Location"), "/?view=streams&result=removed")
         self.assertEqual(self.calls[-1], ("remove_stream", "s2"))
 
-    def test_stream_settings_show_one_tab_at_a_time(self) -> None:
+    def test_stream_settings_are_laid_out_like_settings(self) -> None:
+        # Until a section is chosen, the list shows, with Outputs beside it on wider screens.
+        _, page = self.request("GET", "/?view=stream_settings&stream=s1", user=self.owner)
+        self.assertEqual(self.title(page), "Edit stream WXN99 - NWR Stream Manager")
+        self.assertIn('<div id="stream_settings_layout" class="settings-layout stream-settings-layout">', page)
+        self.assertIn('<a id="tab_link_outputs" class="button-link" href="/?view=stream_settings&amp;stream=s1&amp;tab=outputs" aria-current="page">', page)
+        self.assertIn('<div id="panel_outputs" class="tabpanel">', page)
+        self.assertIn('<input id="stream_settings_tab" type="hidden" name="tab" value="">', page)
+
         _, page = self.request("GET", "/?view=stream_settings&stream=s1&tab=audio", user=self.owner)
-        self.assertEqual(self.title(page), "Audio Effects - Edit stream WXN99 - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Audio effects - Edit stream WXN99 - NWR Stream Manager")
+        self.assertIn('<div id="stream_settings_layout" class="settings-layout stream-settings-layout settings-detail-active">', page)
+        self.assertIn('<a id="stream_settings_back_link" class="settings-back button-link baseline-only" href="/?view=stream_settings&amp;stream=s1">', page)
         self.assertIn('<a id="tab_link_audio" class="button-link" href="/?view=stream_settings&amp;stream=s1&amp;tab=audio" aria-current="page">', page)
         self.assertIn('<a id="tab_link_notifications" class="button-link" href="/?view=stream_settings&amp;stream=s1&amp;tab=notifications">', page)
         self.assertRegex(page, r'<div id="panel_eas" [^>]*hidden>')
-        self.assertRegex(page, r'<div id="panel_audio" class="tabpanel" role="tabpanel" aria-labelledby="tab_audio">')
-        # Unset filters show the page script's defaults, and every effect shows.
+        self.assertIn('<div id="panel_audio" class="tabpanel">', page)
+        # Unset filters show the page script's defaults, and every effect shows, each under its own heading.
         self.assertIn('name="audio_volume_multiplier" type="number" min="0.1" max="2" step="0.1" aria-describedby="audio_volume_multiplier_hint" value="1.5">', page)
         self.assertIn('aria-describedby="audio_notch_frequency_hint" value="3000">', page)
-        self.assertIn('<div id="audio_effect_notch" class="audio-effect-panel">', page)
+        for effect in ("volume", "comfort_noise", "deemphasis", "highpass", "lowpass", "notch"):
+            self.assertIn(f'<div id="audio_effect_{effect}" class="settings-group">', page)
         self.assertIn('<input type="hidden" name="was_audio_volume_enabled" value="1">', page)
         self.assertIn('<dd id="stream_settings_signal_value" class="status-text signal-excellent">Excellent (32 dB SNR)</dd>', page)
         self.notifications = {}
@@ -1081,7 +1092,7 @@ class StreamPageTests(unittest.TestCase):
         self.assertEqual(response.getheader("Location"), "/?view=stream_settings&stream=s1&tab=eas&result=saved")
         self.assertEqual(self.calls, [("update_eas_recording", {"stream_id": "s1", "eas_recording": {"enabled": False, "pre_seconds": 4, "post_seconds": 5, "max_seconds": 120, "format": "wav"}})])
         _, page = self.request("GET", response.getheader("Location"), user=self.owner)
-        self.assertEqual(self.title(page), "Changes saved. - EAS Recording - Edit stream WXN99 - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Changes saved. - EAS recording - Edit stream WXN99 - NWR Stream Manager")
 
         # Unchanged, nothing is saved; turning things off is a change.
         self.calls.clear()
@@ -1105,7 +1116,7 @@ class StreamPageTests(unittest.TestCase):
         ):
             response, page = self.request("POST", "/streams/settings", fields={**fields, **change}, cookie=cookie, user=self.owner)
             self.assertEqual(response.status, 400)
-            self.assertEqual(html.unescape(self.title(page)), f"Error: {message} - Audio Effects - Edit stream WXN99 - NWR Stream Manager")
+            self.assertEqual(html.unescape(self.title(page)), f"Error: {message} - Audio effects - Edit stream WXN99 - NWR Stream Manager")
         # Nothing is saved when anything is wrong, and what was entered stays.
         self.assertEqual(self.calls, [])
         self.assertIn('aria-describedby="eas_max_seconds_hint" value="0">', page)

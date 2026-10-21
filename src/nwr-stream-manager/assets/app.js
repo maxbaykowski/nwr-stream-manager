@@ -87,7 +87,6 @@ let streamTestModeClientId = "";
 let streamTestModeHeartbeatTimer = null;
 let streamTestModeSignalTimer = null;
 let sameTestWarningPreviousFocus = null;
-let selectedAudioEffect = "volume";
 const TEST_TONE_NAMES = ["sine", "square", "triangle", "sawtooth"];
 let selectedTestTone = "sine";
 let testTonesSignature = "";
@@ -3658,8 +3657,7 @@ function setTestModeControls() {
   const visible = testModeVisibleForCurrentPage();
   setHidden("tab_test_mode", !visible);
   if (!visible) {
-    setHidden("panel_test_mode", true);
-    if (activeSettingsTab() === "test_mode") showSettingsTab("outputs");
+    closeUnavailableStreamSettingsSection("test_mode");
     setTestModeResult("");
     setTestToneControls(false);
     streamTestModeSignature = "";
@@ -3918,18 +3916,6 @@ function setNotchControls(settings) {
   updateNotchWidthLimit(false);
 }
 
-function selectAudioEffect(name, showDetail = true) {
-  selectedAudioEffect = name;
-  for (const button of document.querySelectorAll("[data-audio-effect]")) {
-    const selected = button.dataset.audioEffect === name;
-    button.setAttribute("aria-current", selected ? "true" : "false");
-  }
-  for (const panel of document.querySelectorAll(".audio-effect-panel")) {
-    panel.hidden = panel.id !== `audio_effect_${name}`;
-  }
-  document.getElementById("audio_effects_layout").classList.toggle("effect-detail-active", showDetail);
-}
-
 function setEasControls(stream) {
   const settings = easSettingsForStream(stream);
   const showEnabledControl = !settings.enabled || canDisableEasRecording(stream);
@@ -3974,8 +3960,7 @@ function setStreamNotificationControls(stream) {
   const configured = notificationIsConfigured() && !accountIsReadOnly();
   setHidden("tab_notifications", !configured);
   if (!configured) {
-    setHidden("panel_notifications", true);
-    if (activeSettingsTab() === "notifications") showSettingsTab("outputs");
+    closeUnavailableStreamSettingsSection("notifications");
     return;
   }
   const settings = streamNotificationSettingsForStream(stream);
@@ -4055,36 +4040,124 @@ function scheduleStreamFallbackActionUpdate() {
   }, 250);
 }
 
-function activeSettingsTab() {
-  if (document.getElementById("tab_test_mode").getAttribute("aria-selected") === "true") return "test_mode";
-  if (document.getElementById("tab_notifications").getAttribute("aria-selected") === "true") return "notifications";
-  if (document.getElementById("tab_eas").getAttribute("aria-selected") === "true") return "eas";
-  if (document.getElementById("tab_fallback_action").getAttribute("aria-selected") === "true") return "fallback_action";
-  if (document.getElementById("tab_audio").getAttribute("aria-selected") === "true") return "audio";
-  return "outputs";
-}
+// A stream's settings are laid out like Settings: a list of sections, with the
+// chosen one beside it, or on its own on phones.
+const STREAM_SETTINGS_SECTION_TITLES = {
+  outputs: "Outputs",
+  eas: "EAS recording",
+  fallback_action: "Fallback action",
+  audio: "Audio effects",
+  notifications: "Notifications",
+  test_mode: "Test mode"
+};
+let streamSettingsSection = "";
+let streamSettingsOpenedFrom = null;
 
 function streamSettingsTabs() {
-  return [
-    {name: "outputs", button: "tab_outputs", panel: "panel_outputs"},
-    {name: "eas", button: "tab_eas", panel: "panel_eas"},
-    {name: "fallback_action", button: "tab_fallback_action", panel: "panel_fallback_action"},
-    {name: "audio", button: "tab_audio", panel: "panel_audio"},
-    {name: "notifications", button: "tab_notifications", panel: "panel_notifications"},
-    {name: "test_mode", button: "tab_test_mode", panel: "panel_test_mode"}
-  ];
+  return Array.from(document.querySelectorAll("#stream_settings_list [data-stream-section]"));
 }
 
-function showSettingsTab(name) {
-  const requested = streamSettingsTabs().find(tab => tab.name === name);
-  const effectiveName = requested && !document.getElementById(requested.button).hidden ? name : "outputs";
+function availableStreamSettingsTabs() {
+  return streamSettingsTabs().filter(tab => !tab.hidden);
+}
+
+function normalizeStreamSettingsSection(section) {
+  return availableStreamSettingsTabs().some(tab => tab.dataset.streamSection === section) ? section : "";
+}
+
+function streamSettingsPageTitle() {
+  const stream = currentSettingsStream();
+  const title = `Edit stream ${stream ? streamCallsign(stream) : ""}`.trim();
+  return streamSettingsSection ? `${STREAM_SETTINGS_SECTION_TITLES[streamSettingsSection]} - ${title}` : title;
+}
+
+function renderStreamSettingsSection() {
+  const section = streamSettingsSection;
+  const singlePane = settingsSinglePane();
+  const list = document.getElementById("stream_settings_list");
+  // As in Settings: tabs on wider screens, and on phones buttons that each open a section.
+  if (singlePane) {
+    list.setAttribute("role", "group");
+    list.removeAttribute("aria-orientation");
+  } else {
+    list.setAttribute("role", "tablist");
+    list.setAttribute("aria-orientation", "vertical");
+  }
   for (const tab of streamSettingsTabs()) {
-    const button = document.getElementById(tab.button);
-    const panel = document.getElementById(tab.panel);
-    const selected = tab.name === effectiveName && !button.hidden;
-    button.setAttribute("aria-selected", selected ? "true" : "false");
-    button.setAttribute("tabindex", selected ? "0" : "-1");
+    const name = tab.dataset.streamSection;
+    const selected = name === section;
+    const panel = document.getElementById(`panel_${name}`);
     panel.hidden = !selected;
+    if (singlePane) {
+      tab.removeAttribute("role");
+      tab.removeAttribute("aria-selected");
+      tab.removeAttribute("aria-controls");
+      tab.tabIndex = 0;
+      panel.removeAttribute("role");
+      panel.removeAttribute("aria-labelledby");
+    } else {
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+      tab.setAttribute("aria-controls", panel.id);
+      tab.tabIndex = selected ? 0 : -1;
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", tab.id);
+    }
+  }
+  document.getElementById("stream_settings_layout").classList.toggle("settings-detail-active", Boolean(section));
+  setPageTitle(streamSettingsPageTitle());
+}
+
+function streamSettingsPageHeading() {
+  const panel = streamSettingsSection ? document.getElementById(`panel_${streamSettingsSection}`) : null;
+  return panel ? Array.from(panel.querySelectorAll("h3")).find(heading => heading.getClientRects().length) || null : null;
+}
+
+function selectStreamSettingsTab(section) {
+  // Moving through the tabs on wider screens shows each section without adding
+  // every one to the browser history.
+  streamSettingsSection = section;
+  streamSettingsOpenedFrom = null;
+  replaceCurrentRoute("stream_settings", {streamId: settingsStreamId, section});
+  renderStreamSettingsSection();
+}
+
+function openStreamSettingsSection(section) {
+  if (settingsSinglePane()) {
+    navigateTo("stream_settings", {streamId: settingsStreamId, section, openedFrom: ""});
+  } else {
+    selectStreamSettingsTab(section);
+  }
+}
+
+function leaveStreamSettingsSection() {
+  if (streamSettingsOpenedFrom === "" && history.state && history.state.view === "stream_settings") {
+    history.back();
+    return;
+  }
+  navigateTo("stream_settings", {streamId: settingsStreamId}, true, true);
+}
+
+// A section that stops being available, such as Test mode when it can't be used,
+// closes, going to Outputs on wider screens or back to the list on phones.
+function closeUnavailableStreamSettingsSection(section) {
+  if (streamSettingsSection !== section || currentViewName() !== "stream_settings") return;
+  const panel = document.getElementById(`panel_${section}`);
+  const hadFocus = panel.contains(document.activeElement);
+  selectStreamSettingsTab(settingsSinglePane() ? "" : "outputs");
+  if (hadFocus) focusSettingsElement(streamSettingsPageHeading() || document.getElementById("stream_settings_title"));
+}
+
+function streamSettingsLayoutChanged() {
+  if (currentViewName() !== "stream_settings") return;
+  const hadFocus = document.activeElement;
+  if (!streamSettingsSection && !settingsSinglePane()) {
+    selectStreamSettingsTab("outputs");
+  } else {
+    renderStreamSettingsSection();
+  }
+  if (hadFocus && hadFocus !== document.body && !hadFocus.getClientRects().length) {
+    focusSettingsElement(streamSettingsPageHeading() || document.getElementById("stream_settings_title"));
   }
 }
 
@@ -4195,7 +4268,7 @@ function cancelOutputForm() {
   const streamId = settingsStreamId;
   closeOutputForm();
   if (currentViewName() === "stream_output" && streamId) {
-    navigateTo("stream_settings", {streamId}, true, true);
+    navigateTo("stream_settings", {streamId, section: "outputs"}, true, true);
   }
 }
 
@@ -4333,7 +4406,7 @@ function finishWizard(options = {}) {
   wizardSoundcardPreviewId = "";
   setStreamResult("");
   if (returnStreamId) {
-    navigateTo("stream_settings", {streamId: returnStreamId}, replace, true);
+    navigateTo("stream_settings", {streamId: returnStreamId, section: "outputs"}, replace, true);
   } else {
     navigateTo("streams", {}, replace, true);
   }
@@ -4631,7 +4704,6 @@ function showStreamSettings(streamId) {
   streamNotificationsSignature = "";
   streamFallbackActionSignature = "";
   streamTestModeSignature = "";
-  selectAudioEffect(selectedAudioEffect, false);
   selectTestTone(selectedTestTone, false);
   testTonesSignature = "";
   closeOutputForm();
@@ -7361,6 +7433,7 @@ function routeForView(name, params = {}) {
   if (name === "stream_settings") {
     query.set("view", "stream_settings");
     if (params.streamId) query.set("stream", params.streamId);
+    if (params.section) query.set("tab", params.section);
   }
   if (name === "stream_output") {
     query.set("view", "stream_output");
@@ -7409,7 +7482,9 @@ function routeFromLocation() {
       outputId: query.get("output") || "",
       alertId: query.get("alert") || "",
       recordingId: query.get("recording") || "",
-      page: Math.max(1, Number(query.get("page") || 1))
+      page: Math.max(1, Number(query.get("page") || 1)),
+      // A stream's settings section, named as it is without the page script.
+      section: view === "stream_settings" ? query.get("tab") || "" : ""
     };
   }
   return {view: "dashboard", streamId: "", outputId: "", alertId: "", page: 1};
@@ -7476,6 +7551,8 @@ function applyRoute(route) {
       if (activeTestModeBelongsToThisPage() && streamTestMode.stream_id !== streamId) {
         stopStreamTestMode({beacon: true});
       }
+      const wasShowing = currentViewName() === "stream_settings" && settingsStreamId === streamId;
+      const previous = wasShowing ? streamSettingsSection : "";
       settingsStreamId = streamId;
       icecastOutputTableSignature = "";
       soundcardOutputTableSignature = "";
@@ -7489,9 +7566,25 @@ function applyRoute(route) {
       const station = stream.station || {};
       setText("stream_settings_title", `Edit stream ${streamCallsign(stream)}`);
       setText("stream_settings_station", `${station.callsign || "Unknown"} ${station.frequency || ""} MHz`);
+      // Shows which sections this stream has, before choosing one.
       renderStreamSettings();
-      showView("stream_settings");
-      setPageTitle(`Edit stream ${streamCallsign(stream)}`);
+      let section = normalizeStreamSettingsSection(route.section);
+      if (!section && !settingsSinglePane()) section = "outputs";
+      streamSettingsSection = section;
+      streamSettingsOpenedFrom = section === route.section ? route.openedFrom : null;
+      if (section !== route.section) {
+        replaceCurrentRoute("stream_settings", {streamId, section, openedFrom: streamSettingsOpenedFrom});
+      }
+      // As in Settings: arriving goes to the page's heading, opening a section goes
+      // to its heading, and going back to the list goes to the section that was left.
+      const focusPage = Boolean(section) && (wasShowing ? section !== previous : settingsSinglePane() && Boolean(route.section));
+      showView("stream_settings", {focus: !wasShowing && !focusPage});
+      renderStreamSettingsSection();
+      if (focusPage) {
+        focusSettingsElement(streamSettingsPageHeading());
+      } else if (wasShowing && !section && previous) {
+        focusSettingsElement(document.getElementById(`tab_${previous}`));
+      }
       return;
     }
     closeOutputForm();
@@ -7523,10 +7616,7 @@ function applyRoute(route) {
     if (editingOutputId !== route.outputId || !["edit", "edit_soundcard"].includes(outputFormMode)) {
       if (!prepareEditOutput(route.outputId)) {
         closeOutputForm();
-        replaceCurrentRoute("stream_settings", {streamId});
-        renderStreamSettings();
-        showView("stream_settings");
-        setPageTitle(`Edit stream ${streamCallsign(stream)}`);
+        navigateTo("stream_settings", {streamId, section: "outputs"}, true, true);
         return;
       }
     }
@@ -7886,7 +7976,7 @@ function navigateTo(view, params = {}, replace = false, force = false) {
 function currentRouteParams() {
   const view = currentViewName();
   if (view === "add_stream" && wizardMode === "add_output") return {streamId: settingsStreamId};
-  if (view === "stream_settings") return {streamId: settingsStreamId};
+  if (view === "stream_settings") return {streamId: settingsStreamId, section: streamSettingsSection};
   if (view === "stream_output") return {streamId: settingsStreamId, outputId: editingOutputId};
   if (view === "eas_alerts") return {streamId: easAlertStreamId, page: easAlertPage};
   if (view === "eas_alert_export" || view === "eas_alert_delete") return {streamId: easAlertStreamId, page: easAlertPage};
@@ -9856,28 +9946,29 @@ document.getElementById("iq-recordings-body").addEventListener("keydown", event 
   }
 });
 
-document.getElementById("tab_outputs").addEventListener("click", () => showSettingsTab("outputs"));
-document.getElementById("tab_audio").addEventListener("click", () => showSettingsTab("audio"));
-document.getElementById("tab_eas").addEventListener("click", () => showSettingsTab("eas"));
-document.getElementById("tab_notifications").addEventListener("click", () => showSettingsTab("notifications"));
-document.getElementById("tab_fallback_action").addEventListener("click", () => showSettingsTab("fallback_action"));
-document.getElementById("tab_test_mode").addEventListener("click", () => showSettingsTab("test_mode"));
-document.querySelector(".tabs").addEventListener("keydown", event => {
-  const tabs = streamSettingsTabs()
-    .map(tab => document.getElementById(tab.button))
-    .filter(tab => tab && !tab.hidden);
+document.getElementById("stream_settings_list").addEventListener("click", event => {
+  const tab = event.target && event.target.closest ? event.target.closest("[data-stream-section]") : null;
+  if (!tab) return;
+  openStreamSettingsSection(tab.dataset.streamSection);
+});
+
+document.getElementById("stream_settings_list").addEventListener("keydown", event => {
+  const tabs = availableStreamSettingsTabs();
   const index = tabs.indexOf(event.target);
   if (index < 0) return;
   let nextIndex = index;
-  if (event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
-  else if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
+  if (event.key === "ArrowDown" || event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
+  else if (event.key === "ArrowUp" || event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
   else if (event.key === "Home") nextIndex = 0;
   else if (event.key === "End") nextIndex = tabs.length - 1;
   else return;
   event.preventDefault();
   tabs[nextIndex].focus();
-  showSettingsTab(tabs[nextIndex].id.replace(/^tab_/, ""));
+  if (!settingsSinglePane()) selectStreamSettingsTab(tabs[nextIndex].dataset.streamSection);
 });
+
+document.getElementById("stream_settings_back").addEventListener("click", leaveStreamSettingsSection);
+window.matchMedia(SETTINGS_SINGLE_PANE_QUERY).addEventListener("change", streamSettingsLayoutChanged);
 
 for (const id of ["stream_notify_icecast_failures", "stream_notify_soundcard_failures", "stream_notify_eas_alerts", "stream_notify_bad_reception"]) {
   document.getElementById(id).addEventListener("change", scheduleStreamNotificationsUpdate);
@@ -9915,27 +10006,6 @@ document.getElementById("same_test_warning_dialog").addEventListener("keydown", 
   }
 });
 document.addEventListener("focusin", guardSameTestWarningFocus);
-
-document.getElementById("audio_effects_list").addEventListener("click", event => {
-  const button = event.target && event.target.closest ? event.target.closest("[data-audio-effect]") : null;
-  if (!button) return;
-  selectAudioEffect(button.dataset.audioEffect, true);
-});
-
-document.getElementById("audio_effects_list").addEventListener("keydown", event => {
-  const buttons = Array.from(document.querySelectorAll("[data-audio-effect]"));
-  const index = buttons.indexOf(event.target);
-  if (index < 0) return;
-  let nextIndex = index;
-  if (event.key === "ArrowDown" || event.key === "ArrowRight") nextIndex = (index + 1) % buttons.length;
-  else if (event.key === "ArrowUp" || event.key === "ArrowLeft") nextIndex = (index - 1 + buttons.length) % buttons.length;
-  else if (event.key === "Home") nextIndex = 0;
-  else if (event.key === "End") nextIndex = buttons.length - 1;
-  else return;
-  event.preventDefault();
-  buttons[nextIndex].focus();
-  selectAudioEffect(buttons[nextIndex].dataset.audioEffect, false);
-});
 
 document.getElementById("test_tones_list").addEventListener("click", event => {
   const button = event.target && event.target.closest ? event.target.closest("[data-test-tone]") : null;
@@ -10013,12 +10083,6 @@ document.getElementById("settings_back").addEventListener("click", () => {
 });
 
 window.matchMedia(SETTINGS_SINGLE_PANE_QUERY).addEventListener("change", settingsLayoutChanged);
-
-document.getElementById("audio_effects_back").addEventListener("click", () => {
-  document.getElementById("audio_effects_layout").classList.remove("effect-detail-active");
-  const selected = document.querySelector(`[data-audio-effect='${selectedAudioEffect}']`);
-  if (selected) selected.focus();
-});
 
 window.addEventListener("popstate", event => {
   const nextRoute = event.state || routeFromLocation();
@@ -11398,7 +11462,6 @@ async function resumeListening() {
 (async function init() {
   populateBitrates();
   populateIqSampleRates();
-  selectAudioEffect("volume", false);
   selectTestTone("sine", false);
   renderReceiverControls();
   const data = await request("/api/status");

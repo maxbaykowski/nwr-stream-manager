@@ -93,18 +93,23 @@ class StreamPageHandlerMixin:
         page = page_rendering.set_text(page, "stream_settings_title", f"Edit stream {callsign}")
         page = page_rendering.set_text(page, "stream_settings_station", f"{station.get('callsign') or 'Unknown'} {station.get('frequency') or ''} MHz")
         page = page_rendering.set_attribute(page, "stream_settings_stream_id", "value", stream_id)
-        # Tabs are links, showing one at a time.
+        # Laid out like Settings: the sections are links, and the one chosen shows beside
+        # them, or on its own on phones. Outputs shows beside them until one is chosen.
         notifications = bool((status.get("notifications") or {}).get("topic"))
         tabs = [name for name in STREAM_SETTINGS_TABS if name != "notifications" or notifications]
-        tab = query.get("tab") if query.get("tab") in tabs else "outputs"
-        page = page_rendering.set_attribute(page, "stream_settings_tab", "value", tab)
+        chosen = query.get("tab") if query.get("tab") in tabs else ""
+        tab = chosen or "outputs"
+        page = page_rendering.set_attribute(page, "stream_settings_tab", "value", chosen)
         page = page_rendering.set_hidden(page, "tab_link_notifications", not notifications)
         for name in STREAM_SETTINGS_TABS:
-            link = page_route("stream_settings", stream=stream_id, tab=name if name != "outputs" else "")
+            link = page_route("stream_settings", stream=stream_id, tab=name)
             page = page_rendering.set_attribute(page, f"tab_link_{name}", "href", link)
             page = page_rendering.set_attribute(page, f"tab_link_{name}", "aria-current", "page" if name == tab else None)
             page = page_rendering.set_hidden(page, f"panel_{name}", name != tab)
         page = page_rendering.set_hidden(page, "panel_test_mode", True)
+        layout = "settings-layout stream-settings-layout" + (" settings-detail-active" if chosen else "")
+        page = page_rendering.set_attribute(page, "stream_settings_layout", "class", layout)
+        page = page_rendering.set_attribute(page, "stream_settings_back_link", "href", page_route("stream_settings", stream=stream_id))
         # Signal
         signal = (status.get("stream_signals") or {}).get(stream_id) if stream_enabled(stream) else None
         display = stream_signal_display(signal)
@@ -154,9 +159,6 @@ class StreamPageHandlerMixin:
         page = page_rendering.set_hidden(page, "eas_storage_blocked_hint", not (storage_critical and eas["enabled"]))
         page = page_rendering.set_hidden(page, "stream_notify_eas_alerts_label", not eas["enabled"])
         page = page_rendering.set_hidden(page, "stream_notify_eas_alerts_hint", not eas["enabled"])
-        # Every audio effect shows, one after another.
-        for effect in ("volume", "comfort_noise", "deemphasis", "highpass", "lowpass", "notch"):
-            page = page_rendering.set_hidden(page, f"audio_effect_{effect}", False)
         try:
             widest = int(notch_max_width(float(shown["audio_notch_frequency"])))
         except ValueError:
@@ -181,7 +183,7 @@ class StreamPageHandlerMixin:
             '<input type="hidden" name="form" value="stream_settings">'
             + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
         )
-        tab_title = f"{STREAM_SETTINGS_TABS[tab]} - " if tab != "outputs" else ""
+        tab_title = f"{STREAM_SETTINGS_TABS[chosen]} - " if chosen else ""
         return page, f"{tab_title}Edit stream {callsign}"
 
     def _handle_stream_form(self, path: str) -> None:

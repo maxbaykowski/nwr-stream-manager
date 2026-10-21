@@ -93,12 +93,6 @@ th { color: #526070; font-size: 12px; text-transform: uppercase; }
 .details-list dt { font-weight: 700; }
 .details-list dd { margin: 0; }
 #stream_settings_signal { margin-top: 16px; }
-.tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #d8dde6; margin: 16px 0; }
-.tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: -1px; }
-.tabs button[aria-selected="true"] { border-color: #2557a7; border-bottom-color: #fff; box-shadow: inset 0 2px 0 #2557a7; }
-.tabs a { border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: -1px; }
-.tabs a[aria-current="page"] { border-color: #2557a7; border-bottom-color: #fff; box-shadow: inset 0 2px 0 #2557a7; }
-html:not(.js-app) .audio-effect-panel + .audio-effect-panel { margin-top: 20px; }
 #stream_settings_save_actions { margin-top: 18px; }
 .tabpanel[hidden] { display: none; }
 .js-app .effects-layout { display: grid; grid-template-columns: minmax(180px, 240px) 1fr; gap: 16px; align-items: start; }
@@ -108,10 +102,18 @@ html:not(.js-app) .audio-effect-panel + .audio-effect-panel { margin-top: 20px; 
 .effects-detail { min-width: 0; }
 .settings-layout { display: grid; grid-template-columns: minmax(180px, 240px) minmax(0, 1fr); gap: 24px; align-items: start; }
 .settings-list { display: grid; gap: 8px; }
-.settings-list button { text-align: left; }
-.settings-list button[aria-selected="true"], .settings-list button[aria-current="page"] { border-color: #2557a7; box-shadow: inset 3px 0 0 #2557a7; }
+.settings-list button, .settings-list a { text-align: left; }
+.settings-list button[aria-selected="true"], .settings-list button[aria-current="page"], .settings-list a[aria-current="page"] { border-color: #2557a7; box-shadow: inset 3px 0 0 #2557a7; }
 .settings-detail { min-width: 0; }
 .settings-detail h3 { margin-top: 0; }
+.settings-detail h4 { font-size: 15px; margin: 14px 0 10px; }
+.settings-detail h5 { font-size: 14px; margin: 12px 0 8px; }
+/* A stream's settings are laid out like Settings, with what applies to the whole stream above both. */
+.stream-settings-general { grid-column: 1 / -1; }
+.settings-list.needs-app { display: none; }
+.js-app .settings-list.needs-app { display: grid; }
+/* Its Back button is for the page script; without it, the Back link does the same. */
+html:not(.js-app) #stream_settings_back { display: none !important; }
 .settings-back { display: none; }
 /* A page within a setting, such as Pair a device, has a way back at any width. */
 .settings-subpage-active .settings-back { display: inline-block; margin-bottom: 12px; }
@@ -126,7 +128,6 @@ html:not(.js-app) .audio-effect-panel + .audio-effect-panel { margin-top: 20px; 
 #fallback_custom_controls .fallback-same-note { margin-top: 16px; }
 .fallback-loop-delay { margin-top: 18px; }
 #fallback-audio-result { margin-top: 10px; }
-.audio-effect-panel[hidden] { display: none; }
 .test-tone-panel[hidden] { display: none; }
 .test-tones-mute { margin-bottom: 18px; }
 .audio-effects-back { display: none; }
@@ -173,8 +174,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .success { color: #5fd27a; }
   .stream-actions-menu { background: #181d24; border-color: #333b48; }
   .js-app .nav-more-menu { background: #181d24; border-color: #333b48; }
-  .tabs { border-color: #333b48; }
-  .tabs button[aria-selected="true"], .tabs a[aria-current="page"] { border-bottom-color: #181d24; }
   .notice-dialog { background: #181d24; border-color: #333b48; }
   .fullscreen-dialog { background: #101318; }
   .fullscreen-dialog-panel { background: #181d24; border-color: #333b48; }
@@ -213,14 +212,15 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
   .settings-layout.settings-detail-active .settings-list { display: none; }
   .settings-layout:not(.settings-detail-active) .settings-detail { display: none; }
   .settings-list { gap: 0; border: 1px solid #d8dde6; border-radius: 8px; overflow: hidden; }
-  .settings-list button { display: flex; justify-content: space-between; align-items: center; min-height: 48px; padding: 12px 14px; border: 0; border-radius: 0; border-bottom: 1px solid #d8dde6; }
-  .settings-list button:last-child { border-bottom: 0; }
-  .settings-list button::after { content: "\203A"; content: "\203A" / ""; font-size: 22px; line-height: 1; color: #526070; }
+  .settings-list button, .settings-list a { display: flex; justify-content: space-between; align-items: center; min-height: 48px; padding: 12px 14px; border: 0; border-radius: 0; border-bottom: 1px solid #d8dde6; }
+  .settings-list button:last-child, .settings-list a:last-child { border-bottom: 0; }
+  .settings-list button::after, .settings-list a::after { content: "\203A"; content: "\203A" / ""; font-size: 22px; line-height: 1; color: #526070; }
   .settings-back { display: inline-block; margin-bottom: 12px; }
+  .stream-settings-layout.settings-detail-active .stream-settings-general { display: none; }
 }
 @media (max-width: 680px) and (prefers-color-scheme: dark), (max-width: 900px) and (orientation: landscape) and (prefers-color-scheme: dark), (orientation: landscape) and (max-height: 500px) and (prefers-color-scheme: dark) {
-  .settings-list, .settings-list button { border-color: #333b48; }
-  .settings-list button::after { color: #9aa8ba; }
+  .settings-list, .settings-list button, .settings-list a { border-color: #333b48; }
+  .settings-list button::after, .settings-list a::after { color: #9aa8ba; }
 }
 @media (max-width: 680px) and (prefers-color-scheme: dark) {
   .responsive-table tr { border-color: #333b48; }

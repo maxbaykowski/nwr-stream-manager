@@ -1021,109 +1021,146 @@ __INDEX_STYLES__</style>
       __FORM_TOKEN_INPUT__
       <input id="stream_settings_stream_id" type="hidden" name="stream" value="">
       <input id="stream_settings_tab" type="hidden" name="tab" value="">
-      <div id="stream_settings_station" class="hint"></div>
-      <label class="checkbox-row">
-        <input id="stream_enabled" name="stream_enabled" value="1" type="checkbox">
-        Enable this stream
-      </label>
-      <div class="needs-app">
-        <label id="stream_monitor_label" class="checkbox-row">
-          <input id="stream_monitor_enabled" type="checkbox" aria-describedby="stream_monitor_hint">
-          Monitor
-        </label>
-        <span id="stream_monitor_hint" class="hint">Listen to this stream's audio in your browser.</span>
-      </div>
-      <div id="stream-settings-result" class="message"></div>
-      <dl id="stream_settings_signal" class="details-list">
-        <dt>Signal</dt><dd id="stream_settings_signal_value" class="hint">No signal data</dd>
-        <dt id="stream_settings_signal_levels_label" hidden>Levels</dt><dd id="stream_settings_signal_levels" hidden></dd>
-      </dl>
-      <div id="stream_settings_tab_links" class="tabs baseline-only" role="navigation" aria-label="Stream settings sections">
-        <a id="tab_link_outputs" class="button-link" href="">Outputs</a>
-        <a id="tab_link_eas" class="button-link" href="">EAS Recording</a>
-        <a id="tab_link_fallback_action" class="button-link" href="">Fallback Action</a>
-        <a id="tab_link_audio" class="button-link" href="">Audio Effects</a>
-        <a id="tab_link_notifications" class="button-link" href="" hidden>Notifications</a>
-      </div>
-      <div class="needs-app">
-      <div class="tabs" role="tablist" aria-label="Stream settings sections">
-        <button id="tab_outputs" type="button" role="tab" aria-selected="true" aria-controls="panel_outputs" tabindex="0">Outputs</button>
-        <button id="tab_eas" type="button" role="tab" aria-selected="false" aria-controls="panel_eas" tabindex="-1">EAS Recording</button>
-        <button id="tab_fallback_action" type="button" role="tab" aria-selected="false" aria-controls="panel_fallback_action" tabindex="-1">Fallback Action</button>
-        <button id="tab_audio" type="button" role="tab" aria-selected="false" aria-controls="panel_audio" tabindex="-1">Audio Effects</button>
-        <button id="tab_notifications" type="button" role="tab" aria-selected="false" aria-controls="panel_notifications" tabindex="-1" hidden>Notifications</button>
-        <button id="tab_test_mode" type="button" role="tab" aria-selected="false" aria-controls="panel_test_mode" tabindex="-1">Test Mode</button>
-      </div>
-      </div>
-      <div id="panel_outputs" class="tabpanel" role="tabpanel" aria-labelledby="tab_outputs">
-        <div class="actions">
-          <button id="open_add_output" class="needs-app-inline" type="button">Add output</button>
-          <a id="open_add_output_link" class="baseline-only button-link" href="">Add output</a>
-        </div>
-        <div class="needs-app">
-        <label>Show outputs
-          <select id="output_type_filter">
-            <option value="icecast">Icecast outputs</option>
-            <option value="soundcard">Sound card outputs</option>
-          </select>
-        </label>
-        </div>
-        <div id="icecast_outputs_panel">
-        <h3>Icecast outputs</h3>
-        <table class="responsive-table" role="table" aria-label="Icecast outputs">
-          <thead role="rowgroup">
-            <tr role="row">
-              <th role="columnheader">Destination</th>
-              <th role="columnheader">Format</th>
-              <th role="columnheader">Sample rate</th>
-              <th role="columnheader">Bitrate</th>
-              <th role="columnheader">Status</th>
-              <th role="columnheader">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="icecast-outputs-body" role="rowgroup" aria-live="off">
-            <tr data-row-key="empty" role="row">
-              <td colspan="6" class="hint" role="cell">No Icecast outputs configured.</td>
-            </tr>
-          </tbody>
-        </table>
-        </div>
-        <div id="soundcard_outputs_panel" hidden>
-        <h3>Sound card outputs</h3>
-        <table class="responsive-table" role="table" aria-label="Sound card outputs">
-          <thead role="rowgroup">
-            <tr role="row">
-              <th role="columnheader">Sound card name</th>
-              <th role="columnheader">Channels</th>
-              <th role="columnheader">Status</th>
-              <th role="columnheader">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="soundcard-outputs-body" role="rowgroup" aria-live="off">
-            <tr data-row-key="empty" role="row">
-              <td colspan="4" class="hint" role="cell">No sound card outputs configured.</td>
-            </tr>
-          </tbody>
-        </table>
-        </div>
-        <div id="output-list-result" class="message"></div>
-      </div>
-      <div id="panel_audio" class="tabpanel" role="tabpanel" aria-labelledby="tab_audio" hidden>
-        <h3>Audio effects</h3>
-        <div id="audio_effects_layout" class="effects-layout">
+      <div id="stream_settings_layout" class="settings-layout stream-settings-layout">
+        <div class="stream-settings-general">
+          <div id="stream_settings_station" class="hint"></div>
+          <label class="checkbox-row">
+            <input id="stream_enabled" name="stream_enabled" value="1" type="checkbox">
+            Enable this stream
+          </label>
           <div class="needs-app">
-          <div id="audio_effects_list" class="effects-list" aria-label="Audio effects">
-            <button type="button" data-audio-effect="volume">Volume multiplier</button>
-            <button type="button" data-audio-effect="comfort_noise">Comfort noise</button>
-            <button type="button" data-audio-effect="deemphasis">NWR deemphasis</button>
-            <button type="button" data-audio-effect="highpass">Highpass</button>
-            <button type="button" data-audio-effect="lowpass">Lowpass</button>
-            <button type="button" data-audio-effect="notch">Notch filter</button>
+            <label id="stream_monitor_label" class="checkbox-row">
+              <input id="stream_monitor_enabled" type="checkbox" aria-describedby="stream_monitor_hint">
+              Monitor
+            </label>
+            <span id="stream_monitor_hint" class="hint">Listen to this stream's audio in your browser.</span>
           </div>
+          <div id="stream-settings-result" class="message"></div>
+          <dl id="stream_settings_signal" class="details-list">
+            <dt>Signal</dt><dd id="stream_settings_signal_value" class="hint">No signal data</dd>
+            <dt id="stream_settings_signal_levels_label" hidden>Levels</dt><dd id="stream_settings_signal_levels" hidden></dd>
+          </dl>
+        </div>
+        <div id="stream_settings_list" class="settings-list needs-app" aria-label="Stream settings">
+          <button id="tab_outputs" type="button" data-stream-section="outputs">Outputs</button>
+          <button id="tab_eas" type="button" data-stream-section="eas">EAS recording</button>
+          <button id="tab_fallback_action" type="button" data-stream-section="fallback_action">Fallback action</button>
+          <button id="tab_audio" type="button" data-stream-section="audio">Audio effects</button>
+          <button id="tab_notifications" type="button" data-stream-section="notifications" hidden>Notifications</button>
+          <button id="tab_test_mode" type="button" data-stream-section="test_mode">Test mode</button>
+        </div>
+        <div id="stream_settings_links" class="settings-list baseline-only" role="navigation" aria-label="Stream settings">
+          <a id="tab_link_outputs" class="button-link" href="">Outputs</a>
+          <a id="tab_link_eas" class="button-link" href="">EAS recording</a>
+          <a id="tab_link_fallback_action" class="button-link" href="">Fallback action</a>
+          <a id="tab_link_audio" class="button-link" href="">Audio effects</a>
+          <a id="tab_link_notifications" class="button-link" href="" hidden>Notifications</a>
+        </div>
+        <div class="settings-detail">
+          <button id="stream_settings_back" class="settings-back" type="button">Back to stream settings</button>
+          <a id="stream_settings_back_link" class="settings-back button-link baseline-only" href="">Back to stream settings</a>
+          <div id="panel_outputs" class="tabpanel">
+            <h3>Outputs</h3>
+            <div class="actions">
+              <button id="open_add_output" class="needs-app-inline" type="button">Add output</button>
+              <a id="open_add_output_link" class="baseline-only button-link" href="">Add output</a>
+            </div>
+            <div class="needs-app">
+            <label>Show outputs
+              <select id="output_type_filter">
+                <option value="icecast">Icecast outputs</option>
+                <option value="soundcard">Sound card outputs</option>
+              </select>
+            </label>
+            </div>
+            <div id="icecast_outputs_panel">
+            <h4>Icecast outputs</h4>
+            <table class="responsive-table" role="table" aria-label="Icecast outputs">
+              <thead role="rowgroup">
+                <tr role="row">
+                  <th role="columnheader">Destination</th>
+                  <th role="columnheader">Format</th>
+                  <th role="columnheader">Sample rate</th>
+                  <th role="columnheader">Bitrate</th>
+                  <th role="columnheader">Status</th>
+                  <th role="columnheader">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="icecast-outputs-body" role="rowgroup" aria-live="off">
+                <tr data-row-key="empty" role="row">
+                  <td colspan="6" class="hint" role="cell">No Icecast outputs configured.</td>
+                </tr>
+              </tbody>
+            </table>
+            </div>
+            <div id="soundcard_outputs_panel" hidden>
+            <h4>Sound card outputs</h4>
+            <table class="responsive-table" role="table" aria-label="Sound card outputs">
+              <thead role="rowgroup">
+                <tr role="row">
+                  <th role="columnheader">Sound card name</th>
+                  <th role="columnheader">Channels</th>
+                  <th role="columnheader">Status</th>
+                  <th role="columnheader">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="soundcard-outputs-body" role="rowgroup" aria-live="off">
+                <tr data-row-key="empty" role="row">
+                  <td colspan="4" class="hint" role="cell">No sound card outputs configured.</td>
+                </tr>
+              </tbody>
+            </table>
+            </div>
+            <div id="output-list-result" class="message"></div>
           </div>
-          <div class="effects-detail">
-            <button id="audio_effects_back" class="audio-effects-back" type="button">Back to effects</button>
-            <div id="audio_effect_volume" class="audio-effect-panel">
+          <div id="panel_eas" class="tabpanel" hidden>
+            <h3>EAS recording</h3>
+            <div class="grid">
+              <label id="eas_enabled_label" class="checkbox-row">
+                <input id="eas_enabled" name="eas_enabled" value="1" type="checkbox" aria-describedby="eas_enabled_hint">
+                Enable EAS recording
+              </label>
+              <span id="eas_enabled_hint" class="hint">Record EAS alerts received from this station.</span>
+              <span id="eas_storage_blocked_hint" class="error" hidden>Disabled due to insufficient disk space.</span>
+              <label>Pre-recording time in seconds
+                <input id="eas_pre_seconds" name="eas_pre_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_pre_seconds_hint">
+              </label>
+              <span id="eas_pre_seconds_hint" class="hint">Seconds of audio to prepend before the decoded SAME header. Valid range is 0 through 10.</span>
+              <label>Post-recording time in seconds
+                <input id="eas_post_seconds" name="eas_post_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_post_seconds_hint">
+              </label>
+              <span id="eas_post_seconds_hint" class="hint">Seconds of audio to append after EOM. Valid range is 0 through 10.</span>
+              <label>Maximum recording time in seconds
+                <input id="eas_max_seconds" name="eas_max_seconds" type="number" min="1" max="3600" step="1" aria-describedby="eas_max_seconds_hint">
+              </label>
+              <span id="eas_max_seconds_hint" class="hint">Maximum recording length for a single alert, in seconds.</span>
+              <fieldset>
+                <legend>Recording format</legend>
+                <div class="hint">Recording format for saved alert audio.</div>
+                <label class="checkbox-row"><input id="eas_format_wav" name="eas_format" type="radio" value="wav" checked> WAV</label>
+                <label class="checkbox-row"><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
+              </fieldset>
+            </div>
+            <div id="eas-result" class="message"></div>
+          </div>
+          <div id="panel_fallback_action" class="tabpanel" hidden>
+            <h3>Fallback action</h3>
+            <fieldset>
+              <legend>When this stream stops receiving radio audio or loses the station's signal</legend>
+              <label class="checkbox-row"><input id="stream_fallback_action_none" name="stream_fallback_action" type="radio" value="none"> Do nothing</label>
+              <label class="checkbox-row"><input id="stream_fallback_action_disconnect_icecast" name="stream_fallback_action" type="radio" value="disconnect_icecast"> Disconnect from Icecast outputs</label>
+              <label class="checkbox-row"><input id="stream_fallback_action_play_fallback_audio" name="stream_fallback_action" type="radio" value="play_fallback_audio"> Play fallback audio</label>
+            </fieldset>
+            <p class="hint">Do nothing leaves the stream as it is. Disconnect from Icecast outputs disconnects this stream from all of its Icecast servers, so listeners are not left listening to dead air, and reconnects when the station returns; sound card outputs keep playing. Play fallback audio plays the fallback announcement until the station returns.</p>
+            <label id="stream_fallback_delay_label">Fallback delay in seconds
+              <input id="stream_fallback_delay" name="stream_fallback_delay" type="number" min="30" max="120" step="1" aria-describedby="stream_fallback_delay_hint">
+            </label>
+            <span id="stream_fallback_delay_hint" class="hint">How long to wait before the fallback action happens. Valid range is 30 through 120 seconds.</span>
+            <div id="stream-fallback-action-result" class="message" aria-live="polite"></div>
+          </div>
+          <div id="panel_audio" class="tabpanel" hidden>
+            <h3>Audio effects</h3>
+            <div id="audio_effect_volume" class="settings-group">
               <h4>Volume multiplier</h4>
               <label class="checkbox-row">
                 <input id="audio_volume_enabled" name="audio_volume_enabled" value="1" type="checkbox" aria-describedby="audio_volume_enabled_hint">
@@ -1135,7 +1172,7 @@ __INDEX_STYLES__</style>
               </label>
               <span id="audio_volume_multiplier_hint" class="hint">1 leaves the volume unchanged, 2 doubles it and 0.5 halves it. Valid range is 0.1 through 2.</span>
             </div>
-            <div id="audio_effect_comfort_noise" class="audio-effect-panel" hidden>
+            <div id="audio_effect_comfort_noise" class="settings-group">
               <h4>Comfort noise</h4>
               <label class="checkbox-row">
                 <input id="audio_comfort_noise_enabled" name="audio_comfort_noise_enabled" value="1" type="checkbox" aria-describedby="audio_comfort_noise_enabled_hint">
@@ -1147,7 +1184,7 @@ __INDEX_STYLES__</style>
               </label>
               <span id="audio_comfort_noise_level_hint" class="hint">Noise level in dB below full scale. Valid range is -60 through -30.</span>
             </div>
-            <div id="audio_effect_deemphasis" class="audio-effect-panel" hidden>
+            <div id="audio_effect_deemphasis" class="settings-group">
               <h4>NWR deemphasis</h4>
               <label class="checkbox-row">
                 <input id="audio_deemphasis_enabled" name="audio_deemphasis_enabled" value="1" type="checkbox" aria-describedby="audio_deemphasis_enabled_hint">
@@ -1156,7 +1193,7 @@ __INDEX_STYLES__</style>
               <span id="audio_deemphasis_enabled_hint" class="hint">Reduces high-frequency audio components like an actual NOAA Weather Radio receiver would.</span>
               <input id="audio_deemphasis_tau" type="hidden" value="300">
             </div>
-            <div id="audio_effect_highpass" class="audio-effect-panel" hidden>
+            <div id="audio_effect_highpass" class="settings-group">
               <h4>Highpass</h4>
               <label class="checkbox-row">
                 <input id="audio_highpass_enabled" name="audio_highpass_enabled" value="1" type="checkbox" aria-describedby="audio_highpass_enabled_hint">
@@ -1172,7 +1209,7 @@ __INDEX_STYLES__</style>
               </label>
               <span id="audio_highpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
             </div>
-            <div id="audio_effect_lowpass" class="audio-effect-panel" hidden>
+            <div id="audio_effect_lowpass" class="settings-group">
               <h4>Lowpass</h4>
               <label class="checkbox-row">
                 <input id="audio_lowpass_enabled" name="audio_lowpass_enabled" value="1" type="checkbox" aria-describedby="audio_lowpass_enabled_hint">
@@ -1188,7 +1225,7 @@ __INDEX_STYLES__</style>
               </label>
               <span id="audio_lowpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
             </div>
-            <div id="audio_effect_notch" class="audio-effect-panel" hidden>
+            <div id="audio_effect_notch" class="settings-group">
               <h4>Notch filter</h4>
               <label class="checkbox-row">
                 <input id="audio_notch_enabled" name="audio_notch_enabled" value="1" type="checkbox" aria-describedby="audio_notch_enabled_hint">
@@ -1204,192 +1241,147 @@ __INDEX_STYLES__</style>
               </label>
               <span id="audio_notch_width_hint" class="hint">Width in Hz of the band that will be attenuated. Narrow widths remove just the tone; wider widths also remove the audio around it. To protect the 1050 Hz attention tone and SAME tones, the widest allowed depends on the frequency: <span id="audio_notch_width_max">2000</span> Hz at the current frequency.</span>
             </div>
+            <div id="audio-effects-result" class="message" aria-live="polite"></div>
+          </div>
+          <div id="panel_notifications" class="tabpanel" hidden>
+            <h3>Notifications</h3>
+            <p class="hint">Choose which problems for this stream should send notifications.</p>
+            <div class="grid">
+              <label class="checkbox-row">
+                <input id="stream_notify_icecast_failures" name="stream_notify_icecast_failures" value="1" type="checkbox">
+                Failed Icecast mountpoints
+              </label>
+              <label class="checkbox-row">
+                <input id="stream_notify_soundcard_failures" name="stream_notify_soundcard_failures" value="1" type="checkbox">
+                Disconnected sound cards
+              </label>
+              <label class="checkbox-row">
+                <input id="stream_notify_bad_reception" name="stream_notify_bad_reception" value="1" type="checkbox">
+                Bad reception or no signal
+              </label>
+              <label id="stream_notify_eas_alerts_label" class="checkbox-row" hidden>
+                <input id="stream_notify_eas_alerts" name="stream_notify_eas_alerts" value="1" type="checkbox" aria-describedby="stream_notify_eas_alerts_hint">
+                Recorded EAS alerts
+              </label>
+              <span id="stream_notify_eas_alerts_hint" class="hint" hidden>Send a notification when a new EAS alert recording is saved.</span>
+            </div>
+            <div id="stream-notifications-result" class="message"></div>
+          </div>
+          <div id="panel_test_mode" class="tabpanel" hidden>
+            <h3>Test mode</h3>
+            <p class="hint">Replace this stream's real radio channel with a simulated NOAA Weather Radio channel for testing outputs and SAME handling. Test mode can be used for up to 10 minutes in any hour, shared by all streams.</p>
+            <p id="test_mode_time" class="hint">Time left: 10:00.</p>
+            <div class="grid">
+              <label class="checkbox-row">
+                <input id="test_mode_enabled" type="checkbox">
+                Enable test mode
+              </label>
+              <label>Signal strength
+                <input id="test_mode_signal" type="range" min="-80" max="0" step="1" value="-20" aria-describedby="test_mode_signal_hint">
+              </label>
+              <span id="test_mode_signal_hint" class="hint">Signal strength in dBFS.</span>
+              <div id="test_mode_signal_value" class="hint">-20 dBFS</div>
+            </div>
+            <div id="test_tones_mute" class="test-tones-mute" hidden>
+              <label class="checkbox-row">
+                <input id="test_tones_muted" type="checkbox" aria-describedby="test_tones_muted_hint">
+                Mute tone generators
+              </label>
+              <span id="test_tones_muted_hint" class="hint">Silences every tone generator. Unmuting brings back the ones that were on.</span>
+            </div>
+            <div class="actions">
+              <button id="test_mode_same" type="button">Send SAME test</button>
+            </div>
+            <div id="test-mode-result" class="message"></div>
+            <div id="test_tones_section" hidden>
+              <h4>Tone generators</h4>
+              <p class="hint">Play tones along with the test announcements and SAME tests, to simulate buzzes and whines. Tones are sent the same way as SAME tones, so NWR deemphasis affects them the same way.</p>
+              <div id="test_tones_layout" class="effects-layout">
+                <div id="test_tones_list" class="effects-list" aria-label="Tone generators">
+                  <button type="button" data-test-tone="sine">Sine wave</button>
+                  <button type="button" data-test-tone="square">Square wave</button>
+                  <button type="button" data-test-tone="triangle">Triangle wave</button>
+                  <button type="button" data-test-tone="sawtooth">Sawtooth wave</button>
+                </div>
+                <div class="effects-detail">
+                  <button id="test_tones_back" class="audio-effects-back" type="button">Back to tone generators</button>
+                  <div id="test_tone_sine" class="test-tone-panel">
+                    <h5>Sine wave</h5>
+                    <label class="checkbox-row">
+                      <input id="test_tone_sine_enabled" type="checkbox" aria-describedby="test_tone_sine_enabled_hint">
+                      Enable sine wave generator
+                    </label>
+                    <span id="test_tone_sine_enabled_hint" class="hint">A pure tone, like a whine.</span>
+                    <label>Frequency
+                      <input id="test_tone_sine_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sine_frequency_hint">
+                    </label>
+                    <span id="test_tone_sine_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                    <label>Amplitude
+                      <input id="test_tone_sine_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sine_amplitude_hint">
+                    </label>
+                    <span id="test_tone_sine_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+                  </div>
+                  <div id="test_tone_square" class="test-tone-panel" hidden>
+                    <h5>Square wave</h5>
+                    <label class="checkbox-row">
+                      <input id="test_tone_square_enabled" type="checkbox" aria-describedby="test_tone_square_enabled_hint">
+                      Enable square wave generator
+                    </label>
+                    <span id="test_tone_square_enabled_hint" class="hint">A harsh, hollow buzz, like electrical interference.</span>
+                    <label>Frequency
+                      <input id="test_tone_square_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_square_frequency_hint">
+                    </label>
+                    <span id="test_tone_square_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                    <label>Amplitude
+                      <input id="test_tone_square_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_square_amplitude_hint">
+                    </label>
+                    <span id="test_tone_square_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+                  </div>
+                  <div id="test_tone_triangle" class="test-tone-panel" hidden>
+                    <h5>Triangle wave</h5>
+                    <label class="checkbox-row">
+                      <input id="test_tone_triangle_enabled" type="checkbox" aria-describedby="test_tone_triangle_enabled_hint">
+                      Enable triangle wave generator
+                    </label>
+                    <span id="test_tone_triangle_enabled_hint" class="hint">A soft tone, a little brighter than a sine wave.</span>
+                    <label>Frequency
+                      <input id="test_tone_triangle_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_triangle_frequency_hint">
+                    </label>
+                    <span id="test_tone_triangle_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                    <label>Amplitude
+                      <input id="test_tone_triangle_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_triangle_amplitude_hint">
+                    </label>
+                    <span id="test_tone_triangle_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+                  </div>
+                  <div id="test_tone_sawtooth" class="test-tone-panel" hidden>
+                    <h5>Sawtooth wave</h5>
+                    <label class="checkbox-row">
+                      <input id="test_tone_sawtooth_enabled" type="checkbox" aria-describedby="test_tone_sawtooth_enabled_hint">
+                      Enable sawtooth wave generator
+                    </label>
+                    <span id="test_tone_sawtooth_enabled_hint" class="hint">A bright, raspy buzz, like a hum with strong harmonics.</span>
+                    <label>Frequency
+                      <input id="test_tone_sawtooth_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sawtooth_frequency_hint">
+                    </label>
+                    <span id="test_tone_sawtooth_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                    <label>Amplitude
+                      <input id="test_tone_sawtooth_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sawtooth_amplitude_hint">
+                    </label>
+                    <span id="test_tone_sawtooth_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="stream_settings_save_actions" class="baseline-only">
+            <div class="actions">
+              <button id="save_stream_settings" type="submit" data-baseline-submit>Save changes</button>
+            </div>
+            <div id="stream-settings-save-result" class="message"></div>
           </div>
         </div>
-        <div id="audio-effects-result" class="message" aria-live="polite"></div>
-      </div>
-      <div id="panel_eas" class="tabpanel" role="tabpanel" aria-labelledby="tab_eas" hidden>
-        <h3>EAS recording</h3>
-        <div class="grid">
-          <label id="eas_enabled_label" class="checkbox-row">
-            <input id="eas_enabled" name="eas_enabled" value="1" type="checkbox" aria-describedby="eas_enabled_hint">
-            Enable EAS recording
-          </label>
-          <span id="eas_enabled_hint" class="hint">Record EAS alerts received from this station.</span>
-          <span id="eas_storage_blocked_hint" class="error" hidden>Disabled due to insufficient disk space.</span>
-          <label>Pre-recording time in seconds
-            <input id="eas_pre_seconds" name="eas_pre_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_pre_seconds_hint">
-          </label>
-          <span id="eas_pre_seconds_hint" class="hint">Seconds of audio to prepend before the decoded SAME header. Valid range is 0 through 10.</span>
-          <label>Post-recording time in seconds
-            <input id="eas_post_seconds" name="eas_post_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_post_seconds_hint">
-          </label>
-          <span id="eas_post_seconds_hint" class="hint">Seconds of audio to append after EOM. Valid range is 0 through 10.</span>
-          <label>Maximum recording time in seconds
-            <input id="eas_max_seconds" name="eas_max_seconds" type="number" min="1" max="3600" step="1" aria-describedby="eas_max_seconds_hint">
-          </label>
-          <span id="eas_max_seconds_hint" class="hint">Maximum recording length for a single alert, in seconds.</span>
-          <fieldset>
-            <legend>Recording format</legend>
-            <div class="hint">Recording format for saved alert audio.</div>
-            <label class="checkbox-row"><input id="eas_format_wav" name="eas_format" type="radio" value="wav" checked> WAV</label>
-            <label class="checkbox-row"><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
-          </fieldset>
-        </div>
-        <div id="eas-result" class="message"></div>
-      </div>
-      <div id="panel_fallback_action" class="tabpanel" role="tabpanel" aria-labelledby="tab_fallback_action" hidden>
-        <h3>Fallback action</h3>
-        <fieldset>
-          <legend>When this stream stops receiving radio audio or loses the station's signal</legend>
-          <label class="checkbox-row"><input id="stream_fallback_action_none" name="stream_fallback_action" type="radio" value="none"> Do nothing</label>
-          <label class="checkbox-row"><input id="stream_fallback_action_disconnect_icecast" name="stream_fallback_action" type="radio" value="disconnect_icecast"> Disconnect from Icecast outputs</label>
-          <label class="checkbox-row"><input id="stream_fallback_action_play_fallback_audio" name="stream_fallback_action" type="radio" value="play_fallback_audio"> Play fallback audio</label>
-        </fieldset>
-        <p class="hint">Do nothing leaves the stream as it is. Disconnect from Icecast outputs disconnects this stream from all of its Icecast servers, so listeners are not left listening to dead air, and reconnects when the station returns; sound card outputs keep playing. Play fallback audio plays the fallback announcement until the station returns.</p>
-        <label id="stream_fallback_delay_label">Fallback delay in seconds
-          <input id="stream_fallback_delay" name="stream_fallback_delay" type="number" min="30" max="120" step="1" aria-describedby="stream_fallback_delay_hint">
-        </label>
-        <span id="stream_fallback_delay_hint" class="hint">How long to wait before the fallback action happens. Valid range is 30 through 120 seconds.</span>
-        <div id="stream-fallback-action-result" class="message" aria-live="polite"></div>
-      </div>
-      <div id="panel_notifications" class="tabpanel" role="tabpanel" aria-labelledby="tab_notifications" hidden>
-        <h3>Notifications</h3>
-        <p class="hint">Choose which problems for this stream should send notifications.</p>
-        <div class="grid">
-          <label class="checkbox-row">
-            <input id="stream_notify_icecast_failures" name="stream_notify_icecast_failures" value="1" type="checkbox">
-            Failed Icecast mountpoints
-          </label>
-          <label class="checkbox-row">
-            <input id="stream_notify_soundcard_failures" name="stream_notify_soundcard_failures" value="1" type="checkbox">
-            Disconnected sound cards
-          </label>
-          <label class="checkbox-row">
-            <input id="stream_notify_bad_reception" name="stream_notify_bad_reception" value="1" type="checkbox">
-            Bad reception or no signal
-          </label>
-          <label id="stream_notify_eas_alerts_label" class="checkbox-row" hidden>
-            <input id="stream_notify_eas_alerts" name="stream_notify_eas_alerts" value="1" type="checkbox" aria-describedby="stream_notify_eas_alerts_hint">
-            Recorded EAS alerts
-          </label>
-          <span id="stream_notify_eas_alerts_hint" class="hint" hidden>Send a notification when a new EAS alert recording is saved.</span>
-        </div>
-        <div id="stream-notifications-result" class="message"></div>
-      </div>
-      <div id="stream_settings_save_actions" class="baseline-only">
-        <div class="actions">
-          <button id="save_stream_settings" type="submit" data-baseline-submit>Save changes</button>
-        </div>
-        <div id="stream-settings-save-result" class="message"></div>
       </div>
       </form>
-      <div id="panel_test_mode" class="tabpanel" role="tabpanel" aria-labelledby="tab_test_mode" hidden>
-        <h3>Test mode</h3>
-        <p class="hint">Replace this stream's real radio channel with a simulated NOAA Weather Radio channel for testing outputs and SAME handling. Test mode can be used for up to 10 minutes in any hour, shared by all streams.</p>
-        <p id="test_mode_time" class="hint">Time left: 10:00.</p>
-        <div class="grid">
-          <label class="checkbox-row">
-            <input id="test_mode_enabled" type="checkbox">
-            Enable test mode
-          </label>
-          <label>Signal strength
-            <input id="test_mode_signal" type="range" min="-80" max="0" step="1" value="-20" aria-describedby="test_mode_signal_hint">
-          </label>
-          <span id="test_mode_signal_hint" class="hint">Signal strength in dBFS.</span>
-          <div id="test_mode_signal_value" class="hint">-20 dBFS</div>
-        </div>
-        <div id="test_tones_mute" class="test-tones-mute" hidden>
-          <label class="checkbox-row">
-            <input id="test_tones_muted" type="checkbox" aria-describedby="test_tones_muted_hint">
-            Mute tone generators
-          </label>
-          <span id="test_tones_muted_hint" class="hint">Silences every tone generator. Unmuting brings back the ones that were on.</span>
-        </div>
-        <div class="actions">
-          <button id="test_mode_same" type="button">Send SAME test</button>
-        </div>
-        <div id="test-mode-result" class="message"></div>
-        <div id="test_tones_section" hidden>
-          <h3>Tone generators</h3>
-          <p class="hint">Play tones along with the test announcements and SAME tests, to simulate buzzes and whines. Tones are sent the same way as SAME tones, so NWR deemphasis affects them the same way.</p>
-          <div id="test_tones_layout" class="effects-layout">
-            <div id="test_tones_list" class="effects-list" aria-label="Tone generators">
-              <button type="button" data-test-tone="sine">Sine wave</button>
-              <button type="button" data-test-tone="square">Square wave</button>
-              <button type="button" data-test-tone="triangle">Triangle wave</button>
-              <button type="button" data-test-tone="sawtooth">Sawtooth wave</button>
-            </div>
-            <div class="effects-detail">
-              <button id="test_tones_back" class="audio-effects-back" type="button">Back to tone generators</button>
-              <div id="test_tone_sine" class="test-tone-panel">
-                <h4>Sine wave</h4>
-                <label class="checkbox-row">
-                  <input id="test_tone_sine_enabled" type="checkbox" aria-describedby="test_tone_sine_enabled_hint">
-                  Enable sine wave generator
-                </label>
-                <span id="test_tone_sine_enabled_hint" class="hint">A pure tone, like a whine.</span>
-                <label>Frequency
-                  <input id="test_tone_sine_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sine_frequency_hint">
-                </label>
-                <span id="test_tone_sine_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
-                <label>Amplitude
-                  <input id="test_tone_sine_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sine_amplitude_hint">
-                </label>
-                <span id="test_tone_sine_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
-              </div>
-              <div id="test_tone_square" class="test-tone-panel" hidden>
-                <h4>Square wave</h4>
-                <label class="checkbox-row">
-                  <input id="test_tone_square_enabled" type="checkbox" aria-describedby="test_tone_square_enabled_hint">
-                  Enable square wave generator
-                </label>
-                <span id="test_tone_square_enabled_hint" class="hint">A harsh, hollow buzz, like electrical interference.</span>
-                <label>Frequency
-                  <input id="test_tone_square_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_square_frequency_hint">
-                </label>
-                <span id="test_tone_square_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
-                <label>Amplitude
-                  <input id="test_tone_square_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_square_amplitude_hint">
-                </label>
-                <span id="test_tone_square_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
-              </div>
-              <div id="test_tone_triangle" class="test-tone-panel" hidden>
-                <h4>Triangle wave</h4>
-                <label class="checkbox-row">
-                  <input id="test_tone_triangle_enabled" type="checkbox" aria-describedby="test_tone_triangle_enabled_hint">
-                  Enable triangle wave generator
-                </label>
-                <span id="test_tone_triangle_enabled_hint" class="hint">A soft tone, a little brighter than a sine wave.</span>
-                <label>Frequency
-                  <input id="test_tone_triangle_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_triangle_frequency_hint">
-                </label>
-                <span id="test_tone_triangle_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
-                <label>Amplitude
-                  <input id="test_tone_triangle_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_triangle_amplitude_hint">
-                </label>
-                <span id="test_tone_triangle_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
-              </div>
-              <div id="test_tone_sawtooth" class="test-tone-panel" hidden>
-                <h4>Sawtooth wave</h4>
-                <label class="checkbox-row">
-                  <input id="test_tone_sawtooth_enabled" type="checkbox" aria-describedby="test_tone_sawtooth_enabled_hint">
-                  Enable sawtooth wave generator
-                </label>
-                <span id="test_tone_sawtooth_enabled_hint" class="hint">A bright, raspy buzz, like a hum with strong harmonics.</span>
-                <label>Frequency
-                  <input id="test_tone_sawtooth_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sawtooth_frequency_hint">
-                </label>
-                <span id="test_tone_sawtooth_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
-                <label>Amplitude
-                  <input id="test_tone_sawtooth_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sawtooth_amplitude_hint">
-                </label>
-                <span id="test_tone_sawtooth_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
     </section>
   </div>
 

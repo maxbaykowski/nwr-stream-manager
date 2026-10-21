@@ -129,9 +129,9 @@ OUTPUT_RESULTS = {
 # The stream settings tabs that work without the page script, in order.
 STREAM_SETTINGS_TABS = {
     "outputs": "Outputs",
-    "eas": "EAS Recording",
-    "fallback_action": "Fallback Action",
-    "audio": "Audio Effects",
+    "eas": "EAS recording",
+    "fallback_action": "Fallback action",
+    "audio": "Audio effects",
     "notifications": "Notifications",
 }
 STREAM_RESULTS = {"started": "Stream started.", "stopped": "Stream stopped.", "removed": "Stream removed.", "created": "Stream created."}

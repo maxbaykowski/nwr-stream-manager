@@ -279,7 +279,7 @@ class StreamSignalMeterIntegrationTests(unittest.TestCase):
     def test_stream_settings_shows_signal_above_tabs(self) -> None:
         source = self.web_control.INDEX_HTML
         signal_block = source.index('<dl id="stream_settings_signal" class="details-list">')
-        tabs = source.index('<div class="tabs" role="tablist" aria-label="Stream settings sections">')
+        tabs = source.index('<div id="stream_settings_list" class="settings-list needs-app" aria-label="Stream settings">')
 
         self.assertLess(signal_block, tabs)
         self.assertLess(source.index('id="stream-settings-result"'), signal_block)
