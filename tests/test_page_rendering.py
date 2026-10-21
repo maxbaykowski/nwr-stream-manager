@@ -1276,7 +1276,7 @@ class OutputPageTests(unittest.TestCase):
         _, page = self.request("GET", "/?view=add_stream&stream=s1", user=self.owner)
         self.assertEqual(self.title(page), "Add output for WXN99 - NWR Stream Manager")
         self.assertIn('<div id="view_add_stream" class="view">', page)
-        self.assertIn('<div id="wizard_baseline_actions" class="actions baseline-only"><input type="submit" name="wizard_action" value="Next"><input type="submit" name="wizard_action" value="Cancel"></div>', page)
+        self.assertIn('<div id="wizard_baseline_actions" class="actions baseline-only"><input type="submit" name="wizard_action" value="Next" data-baseline-submit><input type="submit" name="wizard_action" value="Cancel" data-baseline-submit></div>', page)
         fields = {"form": "wizard", "stream": "s1", "step": "type", "wizard_output_type": "icecast", "service": "weatherusa", "icecast_format": "ogg"}
         _, _, step, _ = self.wizard(token, cookie, fields)
         self.assertEqual(step, "service")
@@ -1307,11 +1307,11 @@ class OutputPageTests(unittest.TestCase):
         fields = {"form": "wizard", "stream": "s1", "wizard_output_type": "soundcard", "stable_id": "usb-endec", "wizard_soundcard_channel": "right", "volume": "1"}
         _, page, step, _ = self.wizard(token, cookie, {**fields, "step": "type"})
         self.assertEqual(step, "device")
-        self.assertIn('<input type="submit" name="wizard_action" value="Refresh sound card list">', page)
+        self.assertIn('<input type="submit" name="wizard_action" value="Refresh sound card list" data-baseline-submit>', page)
         _, page, step, output = self.wizard(token, cookie, {**fields, "step": "device"})
         self.assertEqual((step, output), ("controls", "new"))
         self.assertEqual(self.calls[-1][1]["soundcard"]["stable_id"], "usb-endec")
-        self.assertIn('<input type="submit" name="wizard_action" value="Try these settings">', page)
+        self.assertIn('<input type="submit" name="wizard_action" value="Try these settings" data-baseline-submit>', page)
         _, page, step, _ = self.wizard(token, cookie, {**fields, "step": "controls", "output_id": "new", "volume": "0.5"}, "Try these settings")
         self.assertEqual(self.calls[-1][1]["soundcard"]["volume"], 0.5)
         self.assertEqual(self.title(page), "Soundcard output updated. - Add output for WXN99 - NWR Stream Manager")
@@ -1327,7 +1327,7 @@ class OutputPageTests(unittest.TestCase):
         token, cookie = self.token()
         _, page = self.request("GET", "/?view=add_stream", user=self.owner)
         self.assertEqual(self.title(page), "Add Stream - NWR Stream Manager")
-        self.assertIn('<span id="wizard_station_actions" class="baseline-only"><input type="submit" name="wizard_action" value="Search"></span>', page)
+        self.assertIn('<span id="wizard_station_actions" class="baseline-only"><input type="submit" name="wizard_action" value="Search" data-baseline-submit></span>', page)
         self.assertNotIn('value="Back"', page[page.index('id="wizard_baseline_actions"'):])
         fields = {"form": "wizard", "step": "station", "q": "cannon", "wizard_output_type": "icecast", "service": "custom"}
         _, page, step, _ = self.wizard(token, cookie, fields, "Search")
@@ -1339,7 +1339,7 @@ class OutputPageTests(unittest.TestCase):
         fields["station_key"] = "WZ2560|162.550|MI|Cannonsburg|Cannonsburg"
         _, page, step, _ = self.wizard(token, cookie, fields)
         self.assertEqual(step, "type")
-        self.assertIn('<input type="submit" name="wizard_action" value="Back">', page)
+        self.assertIn('<input type="submit" name="wizard_action" value="Back" data-baseline-submit>', page)
         _, _, step, _ = self.wizard(token, cookie, {**fields, "step": "type"}, "Back")
         self.assertEqual(step, "station")
         icecast = {**fields, "host": "icecast.example", "port": "8000", "username": "source", "password": "secret", "mount": "/wz2560.mp3", "bitrate": "64", "sample_rate": "24000"}
@@ -1492,6 +1492,141 @@ class FallbackAudioPageTests(unittest.TestCase):
         self.assertIn("The custom announcement is 0:04 long.", page)
         response, _ = self.upload(token, cookie, audio, user=self.viewer)
         self.assertEqual(response.status, 403)
+
+
+class NotificationPageTests(unittest.TestCase):
+    """Setting up and changing notifications, as a browser without the page script does it."""
+
+    request = BaselinePageServerTests.request
+    form_token = BaselinePageServerTests.form_token
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.accounts = wc.AccountStore(Path(tempdir.name) / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        account, secret = self.accounts.create_account("viewer", True)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        self.owner, self.viewer = ("owner", "password1"), ("viewer", "password2")
+        self.settings = wc.WebNotificationSettings()
+        self.calls: list[tuple] = []
+
+        def update(payload):
+            self.calls.append(("update", payload))
+            self.settings = wc.validate_notification_settings_payload(payload, current=self.settings)
+
+        service = StandInService(
+            accounts=self.accounts,
+            auth_sessions=wc.AuthSessionStore(),
+            notification_settings_snapshot=lambda: self.settings,
+            notification_access_url_options=lambda: {"options": [{"id": "lan", "label": "Local network (http://192.168.1.20:8080)"}]},
+            update_notification_settings=update,
+            test_notification_settings=lambda payload: self.calls.append(("test", payload)) or {"success": True, "message": "Test notification sent."},
+        )
+        handler = type("NotificationPageTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def token(self):
+        response, _ = self.request("GET", "/?view=settings&section=notifications", user=self.owner)
+        token = self.form_token(response)
+        return token, f"nwrstmgr_form={token}"
+
+    def setup_step(self, token, cookie, fields, action="Next"):
+        response, page = self.request("POST", "/notifications/setup", fields={"form": "notification_setup", **fields, "setup_action": action, "form_token": token}, cookie=cookie, user=self.owner)
+        step = re.search(r'name="step" value="(\w*)"', page)
+        topic = re.search(r'id="notification_wizard_topic" type="hidden" name="topic" value="([^"]*)"', page)
+        return response, page, step.group(1) if step else "", topic.group(1) if topic else ""
+
+    def test_notifications_are_set_up_one_step_at_a_time(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=settings&section=notifications", user=self.owner)
+        self.assertIn('<a id="start_notification_setup_link" class="baseline-only button-link" href="/?view=settings&amp;section=notifications&amp;setup=1">Set up</a>', page)
+        _, page = self.request("GET", "/?view=settings&section=notifications&setup=1", user=self.owner)
+        self.assertEqual(self.title(page), "Set up notifications - Notifications - Settings - NWR Stream Manager")
+        fields = {"step": "server_choice", "notification_self_hosted": "yes"}
+        _, _, step, _ = self.setup_step(token, cookie, fields)
+        self.assertEqual(step, "server_url")
+        response, page, step, _ = self.setup_step(token, cookie, {**fields, "step": "server_url", "server_url": "not a url"})
+        self.assertEqual((response.status, step), (400, "server_url"))
+        self.assertEqual(self.title(page), "Error: Enter a valid ntfy server URL, such as ntfy.example.com or https://ntfy.example.com. - Set up notifications - Notifications - Settings - NWR Stream Manager")
+        fields["server_url"] = "ntfy.example.com"
+        _, page, step, _ = self.setup_step(token, cookie, {**fields, "step": "server_url"})
+        self.assertEqual(step, "app_install")
+        self.assertIn('href="https://ntfy.example.com/app"', page)
+        _, page, step, topic = self.setup_step(token, cookie, {**fields, "step": "app_install"})
+        self.assertEqual(step, "topic")
+        self.assertRegex(topic, r"^NWRSTMGR-[A-Za-z0-9]{24}$")
+        self.assertIn(f'<input id="notification_topic_secret" type="text" readonly aria-describedby="notification_topic_secret_hint" value="{topic}">', page)
+        self.assertIn('data-copy-from="notification_topic_secret" hidden>Copy to clipboard</button>', page)
+        fields["topic"] = topic
+        _, _, step, kept = self.setup_step(token, cookie, {**fields, "step": "app_install"})
+        self.assertEqual(kept, topic)
+        _, _, step, _ = self.setup_step(token, cookie, {**fields, "step": "app_install"}, "Back")
+        self.assertEqual(step, "server_url")
+        _, page, step, _ = self.setup_step(token, cookie, {**fields, "step": "topic"})
+        self.assertEqual(step, "access_url")
+        self.assertIn('<option value="auto" selected>Automatic (Local network (http://192.168.1.20:8080))</option>', page)
+        response, _, step, _ = self.setup_step(token, cookie, {**fields, "step": "access_url", "access_url_mode": "custom", "custom_access_url": "not a url"})
+        self.assertEqual((response.status, step), (400, "access_url"))
+        fields.update(access_url_mode="custom", custom_access_url="nwr.example.com")
+        _, page, step, _ = self.setup_step(token, cookie, {**fields, "step": "access_url"})
+        self.assertEqual(step, "test")
+        self.assertIn('<input type="submit" name="setup_action" value="Send test notification" data-baseline-submit>', page)
+        _, page, step, _ = self.setup_step(token, cookie, {**fields, "step": "test"}, "Send test notification")
+        self.assertEqual(self.title(page), "Test notification sent. - Set up notifications - Notifications - Settings - NWR Stream Manager")
+        self.assertEqual((self.calls[-1][0], self.calls[-1][1]["server_url"], self.calls[-1][1]["custom_access_url"]), ("test", "https://ntfy.example.com", "https://nwr.example.com"))
+        self.assertIsNone(self.settings.topic or None)
+        _, page, _, _ = self.setup_step(token, cookie, {**fields, "step": "test"}, "Finish")
+        self.assertEqual(self.title(page), "Notifications are set up - NWR Stream Manager")
+        self.assertEqual((self.settings.enabled, self.settings.topic, self.settings.server_url), (True, topic, "https://ntfy.example.com"))
+        response, _ = self.request("POST", "/notifications/setup", fields={**fields, "step": "test", "setup_action": "Finish", "form_token": token}, cookie=cookie, user=self.viewer)
+        self.assertEqual(response.status, 403)
+
+    def configure(self):
+        self.settings = self.web_control.validate_notification_settings_payload(
+            {"enabled": True, "server_url": "https://ntfy.sh", "topic": "NWRSTMGR-existing", "access_url_mode": "auto"}
+        )
+
+    def test_the_settings_are_changed_tested_and_the_topic_regenerated(self) -> None:
+        self.configure()
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=settings&section=notifications", user=self.owner)
+        self.assertIn('<option value="ntfy.sh" selected>ntfy.sh</option>', page)
+        self.assertIn('value="NWRSTMGR-existing"', page)
+        self.assertIn('<input type="hidden" name="was_server_mode" value="ntfy.sh">', page)
+        base = {"form": "notifications", "server_mode": "ntfy.sh", "server_url": "", "access_url_mode": "auto", "custom_access_url": "",
+                "was_server_mode": "ntfy.sh", "was_server_url": "", "was_access_url_mode": "auto", "was_custom_access_url": "", "form_token": token}
+        response, _ = self.request("POST", "/notifications/settings", fields={**base, "server_mode": "self-hosted", "server_url": "http://ntfy.local"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=notifications&result=saved")
+        self.assertEqual((self.settings.server_url, self.settings.topic, self.settings.access_url_mode), ("http://ntfy.local", "NWRSTMGR-existing", "auto"))
+        response, page = self.request("POST", "/notifications/settings", fields={**base, "access_url_mode": "custom", "custom_access_url": "ftp://no"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+        self.assertIn('value="ftp://no"', page)
+        self.request("POST", "/notifications/settings", fields={**base, "access_url_mode": "custom", "custom_access_url": "nwr.example.com"}, cookie=cookie, user=self.owner)
+        # Only what changed here: the server changed earlier stays.
+        self.assertEqual((self.settings.server_url, self.settings.access_url_mode, self.settings.custom_access_url), ("http://ntfy.local", "custom", "https://nwr.example.com"))
+
+        response, _ = self.request("POST", "/notifications/test", fields={"form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=notifications&result=tested")
+        self.assertEqual(self.calls[-1][1]["topic"], "NWRSTMGR-existing")
+
+        _, page = self.request("GET", "/?view=settings&section=notifications&confirm=regenerate", user=self.owner)
+        self.assertEqual(self.title(page), "Regenerate the topic secret? - Notifications - Settings - NWR Stream Manager")
+        response, _ = self.request("POST", "/notifications/regenerate", fields={"form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=notifications&result=regenerated")
+        self.assertRegex(self.settings.topic, r"^NWRSTMGR-[A-Za-z0-9]{24}$")
+        response, _ = self.request("POST", "/notifications/regenerate", fields={"form_token": "guess"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
 
 
 if __name__ == "__main__":

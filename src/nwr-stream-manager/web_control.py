@@ -539,7 +539,7 @@ SETTINGS_PAGE_PARENTS = {
     "record_announcement": "fallback_audio",
 }
 # The settings that work without the page script.
-BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account", "fallback_audio"}
+BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account", "fallback_audio", "notifications"}
 ACCOUNT_FORM_PATHS = {"/accounts/create", "/accounts/reset-password", "/accounts/read-only", "/accounts/delete"}
 EAS_ALERT_EXPORT_PATH = "/eas-alerts/export"
 EAS_ALERT_FORM_PATHS = {"/eas-alerts/delete", "/eas-alerts/remove"}
@@ -553,6 +553,20 @@ RTL_FORM_PATHS = {"/rtl-settings", "/rtl-settings/reset"}
 STREAM_FORM_PATHS = {"/streams/settings", "/streams/enabled", "/streams/remove"}
 OUTPUT_FORM_PATHS = {"/streams/outputs/save", "/streams/outputs/enabled", "/streams/outputs/reset-soundcard", "/streams/outputs/remove"}
 WIZARD_FORM_PATH = "/streams/wizard"
+NOTIFICATION_FORM_PATHS = {"/notifications/setup", "/notifications/settings", "/notifications/test", "/notifications/regenerate"}
+NOTIFICATION_SETUP_STEPS = ("server_choice", "server_url", "app_install", "topic", "access_url", "test")
+NOTIFICATION_RESULTS = {
+    "saved": "Notification settings saved.",
+    "regenerated": "Topic regenerated. Subscribe your devices to the new topic.",
+    "tested": "Test notification sent.",
+}
+NTFY_PUBLIC_SERVER_URL = "https://ntfy.sh"
+NOTIFICATIONS_SET_UP_HTML = (
+    '<p>To get notifications for a stream, go to <a href="/?view=streams">Manage Streams</a>, '
+    "select Edit stream settings for the stream, and open the Notifications tab.</p>"
+    '<p>To get notifications when the RTL-SDR needs attention, go to <a href="/?view=rtl">Configure RTL-SDR</a> '
+    "and turn on Notify when the RTL-SDR requires attention.</p>"
+)
 FALLBACK_SETTINGS_PATH = "/fallback-audio/settings"
 FALLBACK_UPLOAD_PATH = "/fallback-audio/upload"
 # What fallback audio says once one of its forms has gone back to it: where, and what.
@@ -10043,6 +10057,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == WIZARD_FORM_PATH:
             self._handle_wizard_form()
             return
+        if path in NOTIFICATION_FORM_PATHS:
+            self._handle_notification_form(path)
+            return
         if path == FALLBACK_SETTINGS_PATH:
             self._handle_fallback_settings_form()
             return
@@ -11010,6 +11027,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             page = page_rendering.set_attribute(page, "change_password_cancel_link", "href", "/")
         if view == "settings" and isinstance(account, AccountRecord):
             page, title = self._fill_settings_view(page, account, query, form or {})
+            if query.get("section") == "notifications" and not result and query.get("result") in NOTIFICATION_RESULTS:
+                result = ("notification-result", NOTIFICATION_RESULTS[query["result"]], "success")
             if query.get("section") == "fallback_audio" and not result and query.get("result") in FALLBACK_RESULTS:
                 element_id, message = FALLBACK_RESULTS[query["result"]]
                 result = (element_id, message, "success")
@@ -11091,7 +11110,216 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 title = f"{confirm_title} - {title}"
         if section == "fallback_audio":
             page = self._fill_fallback_audio_page(page, query, form)
+        if section == "notifications":
+            page, confirm_title = self._fill_notifications_page(page, query, form)
+            if confirm_title:
+                title = f"{confirm_title} - {title}"
         return page, title
+
+    def _fill_notifications_page(self, page: str, query: dict[str, str], form: dict[str, str]) -> tuple[str, str]:
+        settings = self.service.notification_settings_snapshot().public_dict()
+        options = list(self.service.notification_access_url_options().get("options") or [])
+        configured = bool(settings.get("topic"))
+        setup = bool(query.get("setup")) or form.get("form") == "notification_setup"
+        page = page_rendering.set_hidden(page, "notification_intro", configured or setup)
+        page = page_rendering.set_hidden(page, "notification_configured", not configured or setup)
+        page = page_rendering.set_hidden(page, "notification_wizard", not setup)
+        saved_mode = str(settings.get("access_url_mode") or "auto")
+        if setup:
+            return self._fill_notification_setup(page, form, settings, options), "Set up notifications"
+        if not configured:
+            return page, ""
+        server_url = str(settings.get("server_url") or NTFY_PUBLIC_SERVER_URL)
+        loaded = {
+            "server_mode": "self-hosted" if ntfy_server_is_self_hosted(server_url) else "ntfy.sh",
+            "server_url": server_url if ntfy_server_is_self_hosted(server_url) else "",
+            "access_url_mode": saved_mode,
+            "custom_access_url": str(settings.get("custom_access_url") or ""),
+        }
+        sent = form.get("form") == "notifications"
+        shown = {name: form.get(name, value) for name, value in loaded.items()} if sent else dict(loaded)
+        if sent:
+            loaded = {name: form.get(f"was_{name}", value) for name, value in loaded.items()}
+        page = page_rendering.set_content(
+            page,
+            "notification_server_mode",
+            "".join(
+                f'<option value="{value}"{" selected" if value == shown["server_mode"] else ""}>{label}</option>'
+                for value, label in (("ntfy.sh", "ntfy.sh"), ("self-hosted", "Self-hosted instance"))
+            ),
+        )
+        page = page_rendering.set_attribute(page, "notification_configured_server_url", "value", shown["server_url"])
+        page = page_rendering.set_attribute(page, "notification_configured_topic_secret", "value", str(settings.get("topic")))
+        page = page_rendering.set_content(
+            page, "notification_access_url_mode", notification_access_url_options_html(options, saved_mode, shown["access_url_mode"])
+        )
+        page = page_rendering.set_attribute(page, "notification_custom_access_url", "value", shown["custom_access_url"])
+        # Shown here, as a page can't show them as they're chosen; a script, where one runs, does.
+        for element_id in (
+            "notification_configured_server_url_label", "notification_configured_server_url_hint",
+            "notification_custom_access_url_label", "notification_custom_access_url_hint",
+        ):
+            page = page_rendering.set_hidden(page, element_id, False)
+        page = page_rendering.append_content(
+            page,
+            "notification_settings_form",
+            '<input type="hidden" name="form" value="notifications">'
+            + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
+        )
+        if query.get("confirm") != "regenerate":
+            return page, ""
+        content = (
+            "<h4>Regenerate the topic secret?</h4>"
+            "<p>You will need to unsubscribe from the old topic and subscribe to the new one on every device.</p>"
+            f'<form method="post" action="/notifications/regenerate">{page_rendering.form_token_input(self._form_token())}'
+            '<div class="actions"><button type="submit" class="primary" autofocus>Regenerate topic secret</button>'
+            '<a class="button-link" href="/?view=settings&amp;section=notifications">Cancel</a></div></form>'
+        )
+        page = page_rendering.set_content(page, "notification_confirm", content)
+        page = page_rendering.set_hidden(page, "notification_confirm", False)
+        page = page_rendering.set_hidden(page, "notification_configured", True)
+        return page, "Regenerate the topic secret?"
+
+    def _notification_setup_state(self, form: dict[str, str], settings: dict[str, Any]) -> dict[str, str]:
+        return {
+            "step": form.get("step") if form.get("step") in NOTIFICATION_SETUP_STEPS else "server_choice",
+            "self_hosted": "yes" if form.get("notification_self_hosted") == "yes" else "no",
+            "server_url": form.get("server_url", ""),
+            "topic": form.get("topic", ""),
+            "access_url_mode": form.get("access_url_mode", str(settings.get("access_url_mode") or "auto")),
+            "custom_access_url": form.get("custom_access_url", str(settings.get("custom_access_url") or "")),
+        }
+
+    def _notification_setup_payload(self, state: dict[str, str], settings: dict[str, Any]) -> dict[str, Any]:
+        server_url = ntfy_server_url(state["server_url"]) if state["self_hosted"] == "yes" else NTFY_PUBLIC_SERVER_URL
+        custom = state["access_url_mode"] == "custom"
+        return notification_settings_payload(
+            settings,
+            server_url=server_url,
+            topic=state["topic"],
+            access_url_mode=state["access_url_mode"],
+            custom_access_url=notification_custom_access_url(state["custom_access_url"]) if custom else str(settings.get("custom_access_url") or ""),
+        )
+
+    def _fill_notification_setup(self, page: str, form: dict[str, str], settings: dict[str, Any], options: list[dict[str, str]]) -> str:
+        """Setting up notifications a step at a time; every step's answers go with the form."""
+        state = self._notification_setup_state(form if form.get("form") == "notification_setup" else {}, settings)
+        step = state["step"]
+        page = page_rendering.set_attribute(page, "notification_wizard_step", "value", step)
+        page = page_rendering.set_attribute(page, "notification_wizard_topic", "value", state["topic"])
+        page = page_rendering.append_content(page, "notification_wizard", '<input type="hidden" name="form" value="notification_setup">')
+        for name in NOTIFICATION_SETUP_STEPS:
+            page = page_rendering.set_hidden(page, f"notification_step_{name}", name != step)
+        for value in ("no", "yes"):
+            page = page_rendering.set_attribute(page, f"notification_self_hosted_{value}", "checked", "checked" if state["self_hosted"] == value else None)
+        page = page_rendering.set_attribute(page, "notification_server_url", "value", state["server_url"])
+        server = state["server_url"] if state["self_hosted"] == "yes" else NTFY_PUBLIC_SERVER_URL
+        try:
+            web_app = f"{ntfy_server_url(server)}/app"
+        except ValueError:
+            web_app = f"{NTFY_PUBLIC_SERVER_URL}/app"
+        page = page_rendering.set_attribute(page, "notification_web_app_link", "href", web_app)
+        page = page_rendering.set_attribute(page, "notification_topic_secret", "value", state["topic"])
+        saved_mode = str(settings.get("access_url_mode") or "auto")
+        page = page_rendering.set_content(page, "notification_wizard_access_url_mode", notification_access_url_options_html(options, saved_mode, state["access_url_mode"]))
+        page = page_rendering.set_attribute(page, "notification_wizard_custom_access_url", "value", state["custom_access_url"])
+        page = page_rendering.set_hidden(page, "notification_wizard_custom_access_url_label", False)
+        page = page_rendering.set_hidden(page, "notification_wizard_custom_access_url_hint", False)
+        # This step's buttons, going forward first so Enter goes forward.
+        buttons = ["Finish" if step == "test" else "Next"]
+        if step != "server_choice":
+            buttons.append("Back")
+        buttons.append("Cancel")
+        page = page_rendering.set_content(
+            page,
+            "notification_wizard_baseline_actions",
+            "".join(f'<input type="submit" name="setup_action" value="{label}" data-baseline-submit>' for label in buttons),
+        )
+        if step == "test":
+            page = page_rendering.set_content(
+                page, "notification_wizard_test_actions", '<input type="submit" name="setup_action" value="Send test notification" data-baseline-submit>'
+            )
+        return page
+
+    def _handle_notification_form(self, path: str) -> None:
+        """Sets up and changes notifications, for browsers without the page script."""
+        form: dict[str, str] = {}
+        settings_page = {"view": "settings", "section": "notifications"}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            settings = self.service.notification_settings_snapshot().public_dict()
+            if path == "/notifications/setup":
+                self._handle_notification_setup(form, settings)
+                return
+            if path == "/notifications/test":
+                self.service.test_notification_settings(notification_settings_payload(settings))
+                done = "tested"
+            elif path == "/notifications/regenerate":
+                self.service.update_notification_settings(notification_settings_payload(settings, topic=generate_notification_topic()))
+                done = "regenerated"
+            else:
+                changes: dict[str, Any] = {}
+                if any(form.get(name, "") != form.get(f"was_{name}", "") for name in ("server_mode", "server_url")):
+                    if form.get("server_mode") == "self-hosted":
+                        changes["server_url"] = ntfy_server_url(form.get("server_url", ""))
+                    else:
+                        changes["server_url"] = NTFY_PUBLIC_SERVER_URL
+                if any(form.get(name, "") != form.get(f"was_{name}", "") for name in ("access_url_mode", "custom_access_url")):
+                    changes["access_url_mode"] = form.get("access_url_mode", "auto")
+                    if changes["access_url_mode"] == "custom":
+                        changes["custom_access_url"] = notification_custom_access_url(form.get("custom_access_url", ""))
+                if changes:
+                    self.service.update_notification_settings(notification_settings_payload(settings, **changes))
+                done = "saved"
+        except Exception as exc:
+            result = ("notification-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(settings_page, result=result, form=form), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_redirect(page_route("settings", section="notifications", result=done))
+
+    def _handle_notification_setup(self, form: dict[str, str], settings: dict[str, Any]) -> None:
+        state = self._notification_setup_state(form, settings)
+        step, action = state["step"], form.get("setup_action", "")
+        settings_page = {"view": "settings", "section": "notifications"}
+        message: tuple[str, str] | None = None
+        try:
+            if action == "Cancel":
+                self._send_redirect(page_route("settings", section="notifications"))
+                return
+            if action == "Back":
+                if step == "app_install":
+                    state["step"] = "server_url" if state["self_hosted"] == "yes" else "server_choice"
+                else:
+                    state["step"] = NOTIFICATION_SETUP_STEPS[max(0, NOTIFICATION_SETUP_STEPS.index(step) - 1)]
+            elif step == "server_choice":
+                state["step"] = "server_url" if state["self_hosted"] == "yes" else "app_install"
+            elif step == "server_url":
+                ntfy_server_url(state["server_url"])
+                state["step"] = "app_install"
+            elif step == "app_install":
+                state["topic"] = state["topic"] or generate_notification_topic()
+                state["step"] = "topic"
+            elif step == "topic":
+                state["step"] = "access_url"
+            elif step == "access_url":
+                if state["access_url_mode"] == "custom":
+                    notification_custom_access_url(state["custom_access_url"])
+                state["step"] = "test"
+            elif action == "Send test notification":
+                response = self.service.test_notification_settings(self._notification_setup_payload(state, settings))
+                message = (str(response.get("message") or "Test notification sent."), "success")
+            else:
+                self.service.update_notification_settings(self._notification_setup_payload(state, settings))
+                self._send_page(render_notice_page("Notifications are set up", NOTIFICATIONS_SET_UP_HTML, settings_page))
+                return
+        except Exception as exc:
+            message = (form_message(str(exc)), "error")
+        fields = {**form, "step": state["step"], "topic": state["topic"]}
+        result = ("notification-result", message[0], message[1]) if message else None
+        status = HTTPStatus.BAD_REQUEST if message and message[1] == "error" else HTTPStatus.OK
+        self._send_page(self._render_index_page(settings_page, result=result, form=fields), status)
 
     def _fill_fallback_audio_page(self, page: str, query: dict[str, str], form: dict[str, str]) -> str:
         fallback = self.service.status().get("fallback") or {}
@@ -11857,7 +12085,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         # The station: found by searching on its own step, and kept for the others.
         page = page_rendering.set_attribute(page, "station_search", "value", state["q"])
         if step == "station":
-            page = page_rendering.set_content(page, "wizard_station_actions", '<input type="submit" name="wizard_action" value="Search">')
+            page = page_rendering.set_content(page, "wizard_station_actions", '<input type="submit" name="wizard_action" value="Search" data-baseline-submit>')
             results = self.service.search_stations(state["q"], 75)["stations"] if state["q"] else []
         else:
             results = [station] if station and stream is None else []
@@ -11897,12 +12125,12 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_content(
             page,
             "wizard_baseline_actions",
-            "".join(f'<input type="submit" name="wizard_action" value="{label}"{" disabled" if disabled else ""}>' for label, disabled in buttons),
+            "".join(f'<input type="submit" name="wizard_action" value="{label}"{" disabled" if disabled else ""} data-baseline-submit>' for label, disabled in buttons),
         )
         if step == "device":
-            page = page_rendering.set_content(page, "wizard_soundcard_device_actions", '<input type="submit" name="wizard_action" value="Refresh sound card list">')
+            page = page_rendering.set_content(page, "wizard_soundcard_device_actions", '<input type="submit" name="wizard_action" value="Refresh sound card list" data-baseline-submit>')
         if step == "controls":
-            page = page_rendering.set_content(page, "wizard_soundcard_controls_actions", '<input type="submit" name="wizard_action" value="Try these settings">')
+            page = page_rendering.set_content(page, "wizard_soundcard_controls_actions", '<input type="submit" name="wizard_action" value="Try these settings" data-baseline-submit>')
         return page, heading
 
     def _handle_wizard_form(self) -> None:
@@ -15976,6 +16204,73 @@ def stream_settings_changes(form: dict[str, str], stream: dict[str, Any]) -> dic
     return changes
 
 
+def generate_notification_topic() -> str:
+    """A topic secret, made as the page script makes them."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    return "NWRSTMGR-" + "".join(secrets.choice(alphabet) for _ in range(24))
+
+
+def notification_settings_payload(current: dict[str, Any], **changes: Any) -> dict[str, Any]:
+    """Every notification setting the server keeps, so changing one leaves the others as they are."""
+    return {
+        "enabled": True,
+        "server_url": current.get("server_url") or NTFY_PUBLIC_SERVER_URL,
+        "topic": current.get("topic") or "",
+        "priority": current.get("priority") or 3,
+        "access_url_mode": current.get("access_url_mode") or "auto",
+        "custom_access_url": current.get("custom_access_url") or "",
+        "access_token": "",
+        "keep_access_token": bool(current.get("access_token_set")),
+        "username": current.get("username") or "",
+        "password": "",
+        "keep_password": bool(current.get("password_set")),
+        **changes,
+    }
+
+
+def ntfy_server_is_self_hosted(url: str) -> bool:
+    return bool(url) and url.rstrip("/") != NTFY_PUBLIC_SERVER_URL
+
+
+def typed_web_address(value: str) -> str:
+    """A web address as typed, given https:// if it has no scheme, or "" if it isn't one,
+    as the page script checks them."""
+    try:
+        url = normalize_notification_access_url(value)
+    except ValueError:
+        return ""
+    return "" if any(character.isspace() for character in url) else url
+
+
+def ntfy_server_url(value: str) -> str:
+    if not value.strip():
+        raise ValueError("Enter the URL of your self-hosted ntfy server.")
+    url = typed_web_address(value)
+    if not url:
+        raise ValueError("Enter a valid ntfy server URL, such as ntfy.example.com or https://ntfy.example.com.")
+    return url
+
+
+def notification_custom_access_url(value: str) -> str:
+    url = typed_web_address(value)
+    if not url:
+        raise ValueError("Enter a valid custom URL, such as nwr.example.com or https://nwr.example.com.")
+    return url
+
+
+def notification_access_url_options_html(options: list[dict[str, str]], saved: str, chosen: str) -> str:
+    """The addresses notifications can open, as the page script lists them."""
+    specs = [("auto", f"Automatic ({options[0]['label']})" if options else "Automatic")]
+    specs += [(str(option.get("id")), str(option.get("label"))) for option in options]
+    if saved not in ("auto", "custom") and not any(option.get("id") == saved for option in options):
+        specs.append((saved, "Previously selected address unavailable"))
+    specs.append(("custom", "Custom URL"))
+    return "".join(
+        f'<option value="{html.escape(value)}"{" selected" if value == chosen else ""}>{html.escape(label)}</option>'
+        for value, label in specs
+    )
+
+
 def format_gain(value: float) -> str:
     return f"{float(value):g} dB"
 
@@ -17058,22 +17353,26 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
           <div id="settings_panel_notifications" class="settings-panel" hidden>
             <h3>Notifications</h3>
             <div id="notification-result" class="message" aria-live="polite"></div>
+            <div id="notification_confirm" class="baseline-only" hidden></div>
             <div id="notification_intro">
               <p>Get notifications on your computer or phone when a stream goes down, a sound card isn't working, or the RTL-SDR needs attention.</p>
               <div class="actions">
-                <button id="start_notification_setup" type="button">Set up</button>
+                <button id="start_notification_setup" class="needs-app-inline" type="button">Set up</button>
+                <a id="start_notification_setup_link" class="baseline-only button-link" href="/?view=settings&amp;section=notifications&amp;setup=1">Set up</a>
               </div>
             </div>
             <div id="notification_configured" hidden>
+              <form id="notification_settings_form" method="post" action="/notifications/settings" novalidate>
+              __FORM_TOKEN_INPUT__
               <label>ntfy server
-                <select id="notification_server_mode" aria-describedby="notification_server_mode_hint">
+                <select id="notification_server_mode" name="server_mode" aria-describedby="notification_server_mode_hint">
                   <option value="ntfy.sh">ntfy.sh</option>
                   <option value="self-hosted">Self-hosted instance</option>
                 </select>
               </label>
               <span id="notification_server_mode_hint" class="hint">The ntfy server notifications are sent through. After changing it, subscribe to the topic on the new server in the ntfy app.</span>
               <label id="notification_configured_server_url_label" hidden>Server URL
-                <input id="notification_configured_server_url" type="url" autocomplete="url" placeholder="https://ntfy.example.com" aria-describedby="notification_configured_server_url_hint">
+                <input id="notification_configured_server_url" name="server_url" type="url" autocomplete="url" placeholder="https://ntfy.example.com" aria-describedby="notification_configured_server_url_hint">
               </label>
               <span id="notification_configured_server_url_hint" class="hint" hidden>The URL of your self-hosted ntfy server, starting with http:// or https://.</span>
               <label>Topic secret
@@ -17081,23 +17380,35 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               </label>
               <span id="notification_configured_topic_hint" class="hint">Subscribe to this topic in the ntfy app to receive notifications.</span>
               <div class="actions">
-                <button id="copy_configured_notification_topic" type="button">Copy to clipboard</button>
-                <button id="regenerate_notification_topic" type="button" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</button>
+                <button id="copy_configured_notification_topic" class="needs-app-inline" type="button">Copy to clipboard</button>
+                <button class="baseline-only" type="button" data-copy-from="notification_configured_topic_secret" hidden>Copy to clipboard</button>
+                <button id="regenerate_notification_topic" class="needs-app-inline" type="button" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</button>
+                <a id="regenerate_notification_topic_link" class="baseline-only button-link" href="/?view=settings&amp;section=notifications&amp;confirm=regenerate" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</a>
               </div>
               <span id="regenerate_notification_topic_hint" class="hint">Regenerate the topic secret if someone has figured out the current one.</span>
               <label>Open NWR Stream Manager from notifications
-                <select id="notification_access_url_mode" aria-describedby="notification_access_url_hint"></select>
+                <select id="notification_access_url_mode" name="access_url_mode" aria-describedby="notification_access_url_hint"></select>
               </label>
               <span id="notification_access_url_hint" class="hint">The address your devices open when you select a notification. Choose one they can reach, such as a Tailscale address for devices away from home.</span>
               <label id="notification_custom_access_url_label" hidden>Custom URL
-                <input id="notification_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_custom_access_url_hint">
+                <input id="notification_custom_access_url" name="custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_custom_access_url_hint">
               </label>
               <span id="notification_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
-              <div class="actions">
-                <button id="configured_test_notifications" type="button">Send test notification</button>
+              <div class="actions baseline-only">
+                <button id="save_notification_settings" type="submit" data-baseline-submit>Save changes</button>
               </div>
+              </form>
+              <form id="notification_test_form" method="post" action="/notifications/test">
+                __FORM_TOKEN_INPUT__
+                <div class="actions">
+                  <button id="configured_test_notifications" type="submit" data-baseline-submit>Send test notification</button>
+                </div>
+              </form>
             </div>
-            <div id="notification_wizard" hidden>
+            <form id="notification_wizard" method="post" action="/notifications/setup" novalidate hidden>
+              __FORM_TOKEN_INPUT__
+              <input id="notification_wizard_step" type="hidden" name="step" value="">
+              <input id="notification_wizard_topic" type="hidden" name="topic" value="">
               <div id="notification_step_server_choice" class="wizard-step">
                 <p>Let's get notifications set up! NWR Stream Manager sends notifications through ntfy, a free, open-source notification service. You install the ntfy app on your phone or computer and subscribe to a private topic, and NWR Stream Manager sends a notification to that topic when something needs your attention, such as a stream going down or the RTL-SDR disconnecting.</p>
                 <p>Most people use the public ntfy.sh server, which is free and doesn't need an account. If you run your own ntfy server, you can use it instead.</p>
@@ -17110,7 +17421,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
               <div id="notification_step_server_url" class="wizard-step" hidden>
                 <p>Enter the URL of your self-hosted ntfy server.</p>
                 <label>ntfy server URL
-                  <input id="notification_server_url" type="url" placeholder="https://ntfy.example.com" autocomplete="url" aria-describedby="notification_server_url_hint">
+                  <input id="notification_server_url" name="server_url" type="url" placeholder="https://ntfy.example.com" autocomplete="url" aria-describedby="notification_server_url_hint">
                 </label>
                 <span id="notification_server_url_hint" class="hint">Starts with http:// or https://.</span>
               </div>
@@ -17129,33 +17440,36 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
                 </label>
                 <span id="notification_topic_secret_hint" class="hint">Anyone who knows the topic secret can see and send notifications on it. If you ever receive notifications that didn't come from NWR Stream Manager, regenerate the topic secret in the notification settings.</span>
                 <div class="actions">
-                  <button id="copy_notification_topic" type="button">Copy to clipboard</button>
+                  <button id="copy_notification_topic" class="needs-app-inline" type="button">Copy to clipboard</button>
+                  <button class="baseline-only" type="button" data-copy-from="notification_topic_secret" hidden>Copy to clipboard</button>
                 </div>
               </div>
               <div id="notification_step_access_url" class="wizard-step" hidden>
                 <p>Selecting a notification can open NWR Stream Manager. Choose the address your devices should use to reach it.</p>
                 <label>Open NWR Stream Manager from notifications
-                  <select id="notification_wizard_access_url_mode" aria-describedby="notification_wizard_access_url_hint"></select>
+                  <select id="notification_wizard_access_url_mode" name="access_url_mode" aria-describedby="notification_wizard_access_url_hint"></select>
                 </label>
                 <span id="notification_wizard_access_url_hint" class="hint">Choose an address your devices can reach, such as a Tailscale address for devices away from home.</span>
                 <label id="notification_wizard_custom_access_url_label" hidden>Custom URL
-                  <input id="notification_wizard_custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_wizard_custom_access_url_hint">
+                  <input id="notification_wizard_custom_access_url" name="custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_wizard_custom_access_url_hint">
                 </label>
                 <span id="notification_wizard_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
               </div>
               <div id="notification_step_test" class="wizard-step" hidden>
                 <p>Send a test notification to make sure notifications from NWR Stream Manager reach your devices, then select Finish.</p>
                 <div class="actions">
-                  <button id="wizard_test_notifications" type="button">Send test notification</button>
+                  <button id="wizard_test_notifications" class="needs-app-inline" type="button">Send test notification</button>
+                  <span id="notification_wizard_test_actions" class="baseline-only"></span>
                 </div>
               </div>
-              <div class="actions">
+              <div class="actions needs-app-flex">
                 <button id="notification_cancel" type="button">Cancel</button>
                 <button id="notification_back" type="button" hidden>Back</button>
                 <button id="notification_next" type="button">Next</button>
                 <button id="notification_finish" type="button" hidden>Finish</button>
               </div>
-            </div>
+              <div id="notification_wizard_baseline_actions" class="actions baseline-only"></div>
+            </form>
           </div>
         </div>
       </div>
@@ -18157,6 +18471,63 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     }
     var player = byId("fallback_baseline_audio");
     if (player && (!player.canPlayType || !player.canPlayType(player.getAttribute("data-audio-type")))) show(player, false);
+  })();
+
+  // Copy to clipboard, where the browser can copy.
+  (function () {
+    var copyCommand = false, clipboard = !!(window.navigator.clipboard && window.navigator.clipboard.writeText && window.isSecureContext);
+    try {
+      copyCommand = !!(d.queryCommandSupported && d.queryCommandSupported("copy"));
+    } catch (error) {}
+    if (!clipboard && !copyCommand && !window.clipboardData) return;
+    var buttons = d.getElementsByTagName("button");
+    for (var i = 0; i < buttons.length; i++) {
+      (function (button) {
+        var input = byId(button.getAttribute("data-copy-from") || "");
+        if (!input) return;
+        show(button, true);
+        listen(button, "click", function () {
+          var message = byId("notification-result");
+          function report(copied) {
+            if (!message) return;
+            message.innerHTML = "";
+            message.appendChild(d.createTextNode(copied ? "Copied to the clipboard." : "Copy failed. Select it and copy it instead."));
+            message.className = copied ? "message success" : "message error";
+          }
+          function bySelecting() {
+            var copied = false;
+            input.focus();
+            input.select();
+            try {
+              copied = window.clipboardData ? window.clipboardData.setData("Text", input.value) : d.execCommand("copy");
+            } catch (error) {}
+            button.focus();
+            return copied;
+          }
+          if (clipboard) {
+            window.navigator.clipboard.writeText(input.value).then(function () { report(true); }, function () { report(bySelecting()); });
+          } else {
+            report(bySelecting());
+          }
+        });
+      })(buttons[i]);
+    }
+  })();
+
+  // A notification setting's address shows only when it's the one chosen.
+  (function () {
+    function follow(selectId, value, ids) {
+      var select = byId(selectId);
+      if (!select) return;
+      function update() {
+        for (var i = 0; i < ids.length; i++) show(byId(ids[i]), select.value === value);
+      }
+      listen(select, "change", update);
+      update();
+    }
+    follow("notification_server_mode", "self-hosted", ["notification_configured_server_url_label", "notification_configured_server_url_hint"]);
+    follow("notification_access_url_mode", "custom", ["notification_custom_access_url_label", "notification_custom_access_url_hint"]);
+    follow("notification_wizard_access_url_mode", "custom", ["notification_wizard_custom_access_url_label", "notification_wizard_custom_access_url_hint"]);
   })();
 
   // A new I/Q recording shows the settings for the chosen source.
@@ -27832,7 +28203,7 @@ document.addEventListener("click", event => {
 
 // Buttons that submit a form only for browsers that don't run this script; here
 // they act on the page instead, and their forms aren't sent.
-for (const button of document.querySelectorAll("button[data-baseline-submit]")) {
+for (const button of document.querySelectorAll("[data-baseline-submit]")) {
   button.type = "button";
   if (button.form) button.form.addEventListener("submit", event => event.preventDefault());
 }
