@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import ParseResult, urlparse
 
 if not __package__:
     # Run as a script from the source tree: run this file as part of its package
@@ -43,32 +43,17 @@ from .accounts import (
     hash_account_password,
     verify_account_password,
 )
-from .alsa import AlsaStreamTapConfig, discover_playback_devices, playback_device_usb_node
+from .alsa import AlsaStreamTapConfig, discover_playback_devices
 from .audio_effects import AudioEffectsProcessor, deemphasis_makeup_gain
 from .baseline_pages import (
-    ACCOUNT_FORM_PATHS,
-    CHANGE_PASSWORD_FORM_PATH,
     DASHBOARD_PARTS_PATH,
-    EAS_ALERT_EXPORT_PATH,
-    EAS_ALERT_FORM_PATHS,
-    FALLBACK_SETTINGS_PATH,
-    FALLBACK_UPLOAD_PATH,
     format_account_date,
     HELP_FILE_NAME,
     INDEX_HTML,
     INDEX_VIEWS,
-    IQ_RECORDER_FORM_PATHS,
-    IQ_RECORDING_DOWNLOAD_PATH,
     MUST_CHANGE_PASSWORD_HTML,
-    NOTIFICATION_FORM_PATHS,
-    OUTPUT_FORM_PATHS,
     render_notice_page,
-    RTL_FORM_PATHS,
-    SDR_SHARING_PATHS,
-    SETUP_FORM_PATH,
     SETUP_HTML,
-    STREAM_FORM_PATHS,
-    WIZARD_FORM_PATH,
 )
 from .config import IcecastConfig, IQ_SAMPLE_RATE
 from .constants import (
@@ -111,7 +96,6 @@ from .constants import (
     REMOTE_SDR_DIRECTORY_NAME,
     REMOTE_SDR_HOST_SETTINGS,
     RTL_RESET_REAPPEAR_TIMEOUT_SECONDS,
-    RTL_RESET_RESULT_SHOW_SECONDS,
     SOUNDCARD_DEVICE_NAMES_FILE_NAME,
     SOUNDCARD_PREVIEW_CLEANUP_SECONDS,
     SOUNDCARD_PREVIEW_TIMEOUT_SECONDS,
@@ -235,12 +219,20 @@ from .remote_sdr import (
     RemoteSdrClient,
     RemoteSdrServer,
 )
+from .routes_accounts import AccountRoutesMixin
+from .routes_eas_alerts import EasAlertRoutesMixin
+from .routes_fallback import FallbackRoutesMixin
+from .routes_iq_recorder import IqRecorderRoutesMixin
+from .routes_live_audio import LiveAudioRoutesMixin
+from .routes_notifications import NotificationRoutesMixin
+from .routes_sdr import SdrRoutesMixin
+from .routes_streams import StreamRoutesMixin
+from .routing import route, route_table
 from .rtl import (
     DEFAULT_RTL_SAMPLE_RATE,
     list_rtl_devices,
     list_usb_rtl_devices,
     NWR_CENTER_FREQUENCY_HZ,
-    reset_usb_device_node,
     reset_usb_rtl_device,
     RtlCaptureSource,
     RtlConfig,
@@ -295,7 +287,6 @@ from .stream_config import (
 from .stream_worker import IcecastOutputWriter, IcecastStreamWorker, SharedSoundcardOutputManager
 from .time_budget import TEST_MODE_TIME_FILE_NAME, TestModeTimeBudget
 from .tone_generators import parse_tone_generator_settings, ToneGeneratorBank
-from .webrtc import LIVE_AUDIO_UPSTREAM_HOLD_SECONDS
 
 
 LOG = logging.getLogger(__name__)
@@ -691,6 +682,14 @@ class RtlControlService(
 
 
 class RtlControlHandler(
+    AccountRoutesMixin,
+    EasAlertRoutesMixin,
+    StreamRoutesMixin,
+    LiveAudioRoutesMixin,
+    IqRecorderRoutesMixin,
+    SdrRoutesMixin,
+    NotificationRoutesMixin,
+    FallbackRoutesMixin,
     AuthHandlerMixin,
     LiveAudioHandlerMixin,
     ResponseHandlerMixin,
@@ -703,772 +702,107 @@ class RtlControlHandler(
 ):
     protocol_version = "HTTP/1.1"
     service: RtlControlService
+    # (method, path) -> the method that answers it; set below, once the class exists.
+    ROUTES: dict[tuple[str, str], str]
 
     def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
-        if not self._auth_ok_or_setup_response(path, "GET"):
-            return
-        if path == "/api/live-audio":
-            self._handle_live_audio_websocket(parsed)
-        elif path == "/api/settings-events":
-            self._handle_settings_events_websocket()
-        elif path == "/notification":
-            target = notification_next_path(parsed.query)
-            account = getattr(self, "current_account", None)
-            if isinstance(account, AccountRecord) and account.is_read_only and notification_target_restricted_for_read_only(target):
-                self._send_notification_forbidden()
-                return
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", target)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", "0")
-            self._send_pending_auth_session_cookie()
-            self.end_headers()
-        elif path == "/":
-            self._send_index_page(parsed)
-        elif path == EAS_ALERT_EXPORT_PATH:
-            self._handle_eas_alert_export(parsed)
-        elif path == DASHBOARD_PARTS_PATH:
-            # For pages without the page script that can still update the dashboard as it changes.
-            account = getattr(self, "current_account", None)
-            self._send_json(self._dashboard_parts(isinstance(account, AccountRecord) and account.is_read_only))
-        elif path == IQ_RECORDING_DOWNLOAD_PATH:
-            self._handle_iq_recording_download(parsed)
-        elif path == "/api/status":
-            query = parse_qs(parsed.query)
-            account = getattr(self, "current_account", None)
-            read_only = isinstance(account, AccountRecord) and account.is_read_only
-            if not read_only:
-                self.service.heartbeat_soundcard_preview_stream(query.get("soundcard_preview_id", [""])[0])
-            response = self.service.status(read_only=read_only)
-            if isinstance(account, AccountRecord):
-                response["account"] = account.to_public_dict()
-                if account.is_read_only:
-                    response["iq_recorder"] = self.service.redacted_iq_recorder_status()
-            self._send_json(response)
-        elif path == "/api/account/me":
-            account = getattr(self, "current_account", None)
-            self._send_json({"account": account.to_public_dict() if isinstance(account, AccountRecord) else None})
-        elif path == "/api/accounts":
-            self._send_json({"accounts": self.service.accounts.list_accounts()})
-        elif path == "/api/rtl/diagnostics":
-            try:
-                response = self.service.rtl_diagnostics()
-            except Exception as exc:
-                LOG.warning("RTL-SDR diagnostics failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-        elif path == "/api/devices":
-            self._send_json(self.service.devices())
-        elif path == "/api/notification-settings":
-            self._send_json({"notifications": self.service.notification_settings_snapshot().public_dict()})
-        elif path == "/api/fallback-audio":
-            announcement = parse_qs(parsed.query).get("announcement", [""])[0]
-            try:
-                data = self.service.fallback_announcement_wav(announcement)
-            except ValueError as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
-                return
-            self._send_audio(data, "audio/wav")
-        elif path == "/api/remote-sdr":
-            self._send_json(self.service.remote_sdr_status())
-        elif path == "/api/notification-access-urls":
-            self._send_json(self.service.notification_access_url_options())
-        elif path == "/api/iq-test-sources":
-            try:
-                self._send_json(self.service.iq_test_sources())
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
-                return
-        elif path == "/api/stations":
-            query = parse_qs(parsed.query)
-            search = query.get("q", [""])[0]
-            try:
-                limit = int(query.get("limit", ["50"])[0])
-            except ValueError:
-                limit = 50
-            self._send_json(self.service.search_stations(search, limit))
-        elif path == "/api/streams":
-            account = getattr(self, "current_account", None)
-            self._send_json(
-                self.service.stream_status(
-                    read_only=isinstance(account, AccountRecord) and account.is_read_only,
-                    account_id=account.id if isinstance(account, AccountRecord) else None,
-                )
-            )
-        elif path == "/api/eas-alert-streams":
-            self._send_json(self.service.eas_alert_streams())
-        elif path == "/api/eas-alerts":
-            query = parse_qs(parsed.query)
-            try:
-                response = self.service.eas_alerts(
-                    query.get("stream_id", [""])[0],
-                    int(query.get("page", ["1"])[0]),
-                    int(query.get("per_page", ["25"])[0]),
-                )
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-        elif path == "/api/eas-alert-bulk-options":
-            query = parse_qs(parsed.query)
-            try:
-                response = self.service.eas_alert_bulk_options(query.get("stream_id", [""])[0])
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-        elif path == "/api/eas-alert-range-count":
-            query = parse_qs(parsed.query)
-            try:
-                response = self.service.eas_alert_range_count(
-                    query.get("stream_id", [""])[0],
-                    query.get("mode", [""])[0],
-                    query.get("start", [""])[0],
-                    query.get("end", [""])[0],
-                )
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-        elif path == "/api/eas-alert-export":
-            query = parse_qs(parsed.query)
-            try:
-                zip_path, download_name = self.service.eas_alert_export_zip(
-                    query.get("stream_id", [""])[0],
-                    query.get("mode", [""])[0],
-                    query.get("start", [""])[0],
-                    query.get("end", [""])[0],
-                )
-                self._send_file(zip_path, download_name, True, delete_after=True)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-        elif path == "/api/eas-alert":
-            query = parse_qs(parsed.query)
-            try:
-                response = self.service.eas_alert_detail(
-                    query.get("stream_id", [""])[0],
-                    query.get("alert_id", [""])[0],
-                )
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-        elif path == "/api/eas-alert-audio":
-            query = parse_qs(parsed.query)
-            try:
-                audio_path, download_name = self.service.eas_alert_audio_path(
-                    query.get("stream_id", [""])[0],
-                    query.get("alert_id", [""])[0],
-                )
-                self._send_file(audio_path, download_name, query.get("download", ["0"])[0] == "1")
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-        elif path == "/api/monitor/status":
-            query = parse_qs(parsed.query)
-            try:
-                response = self.service.monitor_status(query.get("client_id", [""])[0])
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-        elif path == "/api/receiver/status":
-            query = parse_qs(parsed.query)
-            try:
-                response = self.service.receiver_status(query.get("client_id", [""])[0])
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-        elif path == "/api/iq-recorder/status":
-            account = getattr(self, "current_account", None)
-            if isinstance(account, AccountRecord) and account.is_read_only:
-                self._send_json(self.service.redacted_iq_recorder_status())
-            else:
-                self._send_json(self.service.iq_recorder_status())
-        elif path == "/api/iq-recordings":
-            self._send_json(self.service.iq_recordings())
-        elif path == "/api/iq-recording-download":
-            query = parse_qs(parsed.query)
-            recording_id = query.get("id", [""])[0]
-            fmt = query.get("format", ["cf"])[0]
-            try:
-                recording, file_path, download_name, download_size = self.service.iq_recording_download_info(recording_id, fmt)
-                account = getattr(self, "current_account", None)
-                self._send_iq_recording(
-                    file_path,
-                    download_name,
-                    download_size,
-                    fmt,
-                    str(recording.get("id", "")),
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-        else:
-            self.send_error(HTTPStatus.NOT_FOUND)
+        self._answer("GET")
 
     def do_POST(self) -> None:
-        path = urlparse(self.path).path
-        if not self._auth_ok_or_setup_response(path, "POST"):
-            return
-        remote_sdr_actions = {
-            "/api/remote-sdr/discover": lambda payload: self.service.discover_remote_sdrs(),
-            "/api/remote-sdr/pairing/start": lambda payload: self.service.start_remote_sdr_pairing(),
-            "/api/remote-sdr/pairing/keepalive": lambda payload: self.service.keep_remote_sdr_pairing_open(),
-            "/api/remote-sdr/pairing/cancel": lambda payload: self.service.cancel_remote_sdr_pairing(),
-            "/api/remote-sdr/pair": self.service.pair_remote_sdr,
-            "/api/remote-sdr/unpair": self.service.unpair_remote_sdr_device,
-        }
-        if path in remote_sdr_actions:
-            try:
-                response = remote_sdr_actions[path](self._read_json())
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/fallback-audio":
-            self._handle_custom_fallback_audio_upload()
-            return
-        if path == SETUP_FORM_PATH:
-            self._handle_setup_form()
-            return
-        if path == CHANGE_PASSWORD_FORM_PATH:
-            self._handle_change_password_form()
-            return
-        if path in ACCOUNT_FORM_PATHS:
-            self._handle_account_form(path)
-            return
-        if path in EAS_ALERT_FORM_PATHS:
-            self._handle_eas_alert_form(path)
-            return
-        if path in IQ_RECORDER_FORM_PATHS:
-            self._handle_iq_recorder_form(path)
-            return
-        if path in RTL_FORM_PATHS:
-            self._handle_rtl_form(path)
-            return
-        if path in STREAM_FORM_PATHS:
-            self._handle_stream_form(path)
-            return
-        if path in OUTPUT_FORM_PATHS:
-            self._handle_output_form(path)
-            return
-        if path == WIZARD_FORM_PATH:
-            self._handle_wizard_form()
-            return
-        if path in SDR_SHARING_PATHS:
-            self._handle_sdr_sharing_form(path)
-            return
-        if path in NOTIFICATION_FORM_PATHS:
-            self._handle_notification_form(path)
-            return
-        if path == FALLBACK_SETTINGS_PATH:
-            self._handle_fallback_settings_form()
-            return
-        if path == FALLBACK_UPLOAD_PATH:
-            self._handle_fallback_upload_form()
-            return
-        if path == "/api/setup-account":
-            try:
-                payload = self._read_json()
-                self.service.accounts.create_admin(
-                    str(payload.get("username", "")),
-                    str(payload.get("password", "")),
-                    str(payload.get("confirm_password", "")),
-                )
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            LOG.info("created NWR Stream Manager administrator account")
-            self._send_json({"success": True})
-            return
-        if path == "/api/account/password":
-            try:
-                account = getattr(self, "current_account", None)
-                if not isinstance(account, AccountRecord):
-                    raise ValueError("authentication is required")
-                payload = self._read_json()
-                updated = self._change_own_password(
-                    account,
-                    str(payload.get("current_password", "")),
-                    str(payload.get("new_password", "")),
-                    str(payload.get("confirm_password", "")),
-                )
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json({"success": True, "account": updated})
-            return
-        if path == "/api/accounts":
-            try:
-                payload = self._read_json()
-                account, secret = self._create_account(str(payload.get("username", "")), bool(payload.get("read_only", False)))
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json({"success": True, "account": account, "secret": secret})
-            return
-        if path == "/api/account-reset-password":
-            try:
-                account, secret = self._reset_account_password(int(self._read_json().get("account_id", 0)))
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json({"success": True, "account": account, "secret": secret})
-            return
-        if path == "/api/eas-alert-delete":
-            try:
-                payload = self._read_json()
-                response = self.service.remove_eas_alert_range(
-                    str(payload.get("stream_id", "")),
-                    str(payload.get("mode", "")),
-                    str(payload.get("start", "")),
-                    str(payload.get("end", "")),
-                )
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/notification-test":
-            try:
-                payload = self._read_json()
-                response = self.service.test_notification_settings(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/client-log":
-            try:
-                payload = self._read_json()
-                level = str(payload.get("level", "info")).lower()
-                area = str(payload.get("area", "client"))[:40]
-                message = str(payload.get("message", ""))[:240]
-                details = payload.get("details", {})
-                if (
-                    area == "live-audio"
-                    and message in {
-                        "dropped live audio frame to reduce playback latency",
-                        "live audio throughput sample",
-                    }
-                    and isinstance(details, dict)
-                ):
-                    self.service.record_live_audio_feedback(
-                        str(details.get("client_id", "")),
-                        str(details.get("mode", "")),
-                        message,
-                        details,
-                    )
-                detail_text = json.dumps(details, sort_keys=True)[:1000] if isinstance(details, dict) else str(details)[:1000]
-                log_message = "client %s from %s: %s %s" % (area, self._client_address(), message, detail_text)
-                if level in {"warning", "warn", "error"}:
-                    LOG.warning("%s", log_message)
-                else:
-                    LOG.info("%s", log_message)
-            except Exception as exc:
-                LOG.warning("client log failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json({"success": True})
-            return
-        if path == "/api/monitor/stop":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.stop_monitor(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API monitor stop failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/monitor/pause":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.pause_monitor(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API monitor pause failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/monitor/resume":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.resume_monitor(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API monitor resume failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/receiver/tune":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.tune_receiver(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API receiver tune failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/receiver/pause":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.pause_receiver(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API receiver pause failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/receiver/resume":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.resume_receiver(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API receiver resume failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/receiver/stop":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.stop_receiver(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API receiver stop failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/iq-recorder/start":
-            try:
-                payload = self._read_json()
-                account = getattr(self, "current_account", None)
-                response = self.service.start_iq_recording(
-                    payload,
-                    account.id if isinstance(account, AccountRecord) else None,
-                )
-            except Exception as exc:
-                LOG.warning("API I/Q recorder start failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/iq-recorder/stop":
-            try:
-                # Read even though nothing in it is used, so it isn't taken for the next request.
-                self._read_json()
-                response = self.service.stop_iq_recording()
-            except Exception as exc:
-                LOG.warning("API I/Q recorder stop failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/rtl-reset":
-            try:
-                payload = self._read_json()
-                response = self.service.reset_rtl_device(str(payload.get("serial", "")))
-            except Exception as exc:
-                LOG.warning("API RTL-SDR reset failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/soundcard-reset":
-            try:
-                payload = self._read_json()
-                response = self.service.reset_soundcard_device(str(payload.get("stable_id", "")))
-            except Exception as exc:
-                LOG.warning("API soundcard reset failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/iq-test-source":
-            try:
-                payload = self._read_json()
-                response = self.service.start_iq_test_source(payload)
-            except Exception as exc:
-                LOG.warning("API I/Q test source start failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/iq-test-source/stop":
-            try:
-                response = self.service.stop_iq_test_source()
-            except Exception as exc:
-                LOG.warning("API I/Q test source stop failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/iq-test-source/seek":
-            try:
-                payload = self._read_json()
-                response = self.service.seek_iq_test_source(payload)
-            except Exception as exc:
-                LOG.warning("API I/Q test source seek failed for %s: %s", self._client_address(), exc)
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/icecast-auth":
-            try:
-                payload = self._read_json()
-                response = self.service.test_icecast_auth_payload(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/stream-output":
-            try:
-                payload = self._read_json()
-                response = self.service.add_stream_output(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/stream-soundcard-preview":
-            try:
-                payload = self._read_json()
-                response = self.service.upsert_soundcard_preview_stream(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/stream-soundcard-preview/discard":
-            try:
-                payload = self._read_json()
-                response = self.service.discard_soundcard_preview_stream(str(payload.get("preview_id", "")))
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/stream-test-mode":
-            try:
-                payload = self._read_json()
-                response = self.service.update_stream_test_mode(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path != "/api/streams":
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        try:
-            payload = self._read_json()
-            response = self.service.add_stream(payload)
-        except Exception as exc:
-            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
-        self._send_json(response)
+        self._answer("POST")
 
     def do_DELETE(self) -> None:
-        parsed = urlparse(self.path)
-        if not self._auth_ok_or_setup_response(parsed.path, "DELETE"):
-            return
-        if parsed.path == "/api/accounts":
-            try:
-                account = self._delete_account(int(parse_qs(parsed.query).get("account_id", ["0"])[0]))
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json({"success": True, "account": account})
-            return
-        if parsed.path == "/api/eas-alert":
-            try:
-                query = parse_qs(parsed.query)
-                response = self.service.remove_eas_alert(
-                    query.get("stream_id", [""])[0],
-                    query.get("alert_id", [""])[0],
-                )
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if parsed.path == "/api/stream-output":
-            try:
-                query = parse_qs(parsed.query)
-                stream_id = query.get("stream_id", [""])[0]
-                output_id = query.get("output_id", [""])[0]
-                response = self.service.remove_stream_output(stream_id, output_id)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if parsed.path == "/api/stream-soundcard-preview":
-            try:
-                query = parse_qs(parsed.query)
-                response = self.service.discard_soundcard_preview_stream(query.get("preview_id", [""])[0])
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if parsed.path == "/api/iq-recording":
-            try:
-                query = parse_qs(parsed.query)
-                response = self.service.remove_iq_recording(query.get("id", [""])[0])
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if parsed.path != "/api/streams":
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        try:
-            stream_id = parse_qs(parsed.query).get("id", [""])[0]
-            response = self.service.remove_stream(stream_id)
-        except Exception as exc:
-            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
-        self._send_json(response)
+        self._answer("DELETE")
 
     def do_PATCH(self) -> None:
-        path = urlparse(self.path).path
-        if not self._auth_ok_or_setup_response(path, "PATCH"):
-            return
-        if path == "/api/account-read-only":
-            try:
-                payload = self._read_json()
-                account = self._set_account_read_only(int(payload.get("account_id", 0)), bool(payload.get("read_only", False)))
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json({"success": True, "account": account})
-            return
-        if path == "/api/stream-output":
-            try:
-                payload = self._read_json()
-                response = self.service.update_stream_output(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/fallback-settings":
-            try:
-                payload = self._read_json()
-                response = self.service.update_fallback_settings(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/notification-settings":
-            try:
-                payload = self._read_json()
-                response = self.service.update_notification_settings(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/stream-notifications":
-            try:
-                payload = self._read_json()
-                response = self.service.update_stream_notifications(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/stream-fallback-action":
-            try:
-                payload = self._read_json()
-                response = self.service.update_stream_fallback_action(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/eas-recording":
-            try:
-                payload = self._read_json()
-                response = self.service.update_eas_recording(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/audio-effects":
-            try:
-                payload = self._read_json()
-                response = self.service.update_audio_effects(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path == "/api/streams":
-            try:
-                payload = self._read_json()
-                response = self.service.update_stream(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(response)
-            return
-        if path != "/api/settings":
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        try:
-            payload = self._read_json()
-            response = self.service.update(payload)
-        except Exception as exc:
-            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
-        self._send_json(response)
+        self._answer("PATCH")
 
     def do_PUT(self) -> None:
-        self.do_PATCH()
+        self._answer("PATCH")
+
+    def _answer(self, method: str) -> None:
+        """Answer a request with the method that ROUTES lists for it."""
+        parsed = urlparse(self.path)
+        if not self._auth_ok_or_setup_response(parsed.path, method):
+            return
+        name = self.ROUTES.get((method, parsed.path))
+        if name is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        getattr(self, name)(parsed)
+
+    @route("GET", "/")
+    def _get_page(self, parsed: ParseResult) -> None:
+        self._send_index_page(parsed)
+
+    @route("GET", "/notification")
+    def _get_notification_link(self, parsed: ParseResult) -> None:
+        target = notification_next_path(parsed.query)
+        account = getattr(self, "current_account", None)
+        if isinstance(account, AccountRecord) and account.is_read_only and notification_target_restricted_for_read_only(target):
+            self._send_notification_forbidden()
+            return
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", target)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self._send_pending_auth_session_cookie()
+        self.end_headers()
+
+    @route("GET", DASHBOARD_PARTS_PATH)
+    def _get_dashboard_parts(self, parsed: ParseResult) -> None:
+        # For pages without the page script that can still update the dashboard as it changes.
+        self._send_json(self._dashboard_parts(self._current_account_is_read_only()))
+
+    @route("GET", "/api/status")
+    def _get_status(self, parsed: ParseResult) -> None:
+        account = getattr(self, "current_account", None)
+        read_only = isinstance(account, AccountRecord) and account.is_read_only
+        if not read_only:
+            self.service.heartbeat_soundcard_preview_stream(self._query_value(parsed, "soundcard_preview_id"))
+        response = self.service.status(read_only=read_only)
+        if isinstance(account, AccountRecord):
+            response["account"] = account.to_public_dict()
+            if account.is_read_only:
+                response["iq_recorder"] = self.service.redacted_iq_recorder_status()
+        self._send_json(response)
+
+    @route("POST", "/api/client-log")
+    def _post_client_log(self, parsed: ParseResult) -> None:
+        try:
+            payload = self._read_json()
+            level = str(payload.get("level", "info")).lower()
+            area = str(payload.get("area", "client"))[:40]
+            message = str(payload.get("message", ""))[:240]
+            details = payload.get("details", {})
+            if (
+                area == "live-audio"
+                and message in {
+                    "dropped live audio frame to reduce playback latency",
+                    "live audio throughput sample",
+                }
+                and isinstance(details, dict)
+            ):
+                self.service.record_live_audio_feedback(
+                    str(details.get("client_id", "")),
+                    str(details.get("mode", "")),
+                    message,
+                    details,
+                )
+            detail_text = json.dumps(details, sort_keys=True)[:1000] if isinstance(details, dict) else str(details)[:1000]
+            log_message = "client %s from %s: %s %s" % (area, self._client_address(), message, detail_text)
+            if level in {"warning", "warn", "error"}:
+                LOG.warning("%s", log_message)
+            else:
+                LOG.info("%s", log_message)
+        except Exception as exc:
+            LOG.warning("client log failed for %s: %s", self._client_address(), exc)
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json({"success": True})
+
+
+RtlControlHandler.ROUTES = route_table(RtlControlHandler)
 
 
 def build_parser() -> argparse.ArgumentParser:

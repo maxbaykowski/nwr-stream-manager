@@ -284,6 +284,14 @@ class AuthHandlerMixin:
         LOG.info("created account %s", account.get("username", ""))
         return account, secret
 
+    def _current_account_id(self) -> int | None:
+        account = getattr(self, "current_account", None)
+        return account.id if isinstance(account, AccountRecord) else None
+
+    def _current_account_is_read_only(self) -> bool:
+        account = getattr(self, "current_account", None)
+        return isinstance(account, AccountRecord) and account.is_read_only
+
     def _requester(self) -> AccountRecord:
         requester = getattr(self, "current_account", None)
         if not isinstance(requester, AccountRecord):

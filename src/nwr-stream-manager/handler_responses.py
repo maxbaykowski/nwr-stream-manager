@@ -9,8 +9,8 @@ import re
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs
+from typing import Any, Callable
+from urllib.parse import parse_qs, ParseResult
 
 from . import page_rendering
 from .baseline_pages import HELP_FILE_NAME
@@ -40,6 +40,29 @@ class ResponseHandlerMixin:
         if not isinstance(payload, dict):
             raise ValueError("request body must be a JSON object")
         return payload
+
+    def _query_value(self, parsed: ParseResult, name: str, default: str = "") -> str:
+        return parse_qs(parsed.query).get(name, [default])[0]
+
+    def _send_json_result(self, action: Callable[[], Any], failure: str = "") -> None:
+        """Send what ``action`` returns, or why it failed as a bad request; ``failure`` names it in the log."""
+        try:
+            response = action()
+        except Exception as exc:
+            if failure:
+                LOG.warning("%s failed for %s: %s", failure, self._client_address(), exc)
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json(response)
+
+    def _send_json_result_ignoring_body(self, action: Callable[[], Any], failure: str = "") -> None:
+        """Like _send_json_result, for requests whose body isn't used: it is still read, so it isn't taken for the next request."""
+
+        def run() -> Any:
+            self._read_json()
+            return action()
+
+        self._send_json_result(run, failure)
 
     def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
