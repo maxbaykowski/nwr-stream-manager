@@ -84,7 +84,7 @@ class SettingsPageMarkupTests(unittest.TestCase):
         self.assertEqual(re.findall(r"<h2>([^<]+)</h2>", settings), ["Settings"])
         self.assertEqual(
             re.findall(r"<h3>([^<]+)</h3>", settings),
-            ["This setting doesn't work in this browser yet", "Accounts", "Create account", "Change account password", "Account", "SDR sharing", "Pair a device", "Find devices", "Fallback audio", "Record an announcement", "Notifications"],
+            ["Accounts", "Create account", "Change account password", "Account", "SDR sharing", "Pair a device", "Find devices", "Fallback audio", "Record an announcement", "Notifications"],
         )
         self.assertEqual(
             re.findall(r"<h4>([^<]+)</h4>", settings),

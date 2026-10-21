@@ -11023,8 +11023,18 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             result = result or ("streams-result", "Stream was not found.", "error")
         page = page_rendering.show_view(INDEX_HTML, view)
         page = page.replace("__FORM_TOKEN_INPUT__", page_rendering.form_token_input(self._form_token()))
-        page = page_rendering.set_hidden(page, "baseline_unavailable", not page_rendering.view_needs_app(page, view))
         title = VIEW_TITLES.get(view, "Dashboard")
+        # A setting that needs the page script gets the same message as a page that does.
+        section = query.get("section", "")
+        unsupported_setting = view == "settings" and section in SETTINGS_SECTION_TITLES and section not in BASELINE_SETTINGS_SECTIONS
+        unsupported = unsupported_setting or page_rendering.view_needs_app(page, view)
+        page = page_rendering.set_hidden(page, "baseline_unavailable", not unsupported)
+        if unsupported_setting:
+            page = page_rendering.set_hidden(page, "view_settings", True)
+            title = f"{SETTINGS_SECTION_TITLES[section]} - Settings"
+        if unsupported:
+            # Said first, in the title, where a browser without the page script reads it.
+            title = f"Unsupported by your browser - {title}"
         page = page_rendering.set_hidden(page, "nav_rtl", read_only)
         page = page_rendering.set_hidden(page, "nav_settings", read_only)
         page = page_rendering.set_hidden(page, "nav_change_password", not read_only)
@@ -11035,7 +11045,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             page = self._fill_logs_view(page, read_only)
         if view == "change_password" and isinstance(account, AccountRecord):
             page = page_rendering.set_attribute(page, "change_password_cancel_link", "href", "/")
-        if view == "settings" and isinstance(account, AccountRecord):
+        if view == "settings" and isinstance(account, AccountRecord) and not unsupported_setting:
             page, title = self._fill_settings_view(page, account, query, form or {})
             if query.get("section") == "notifications" and not result and query.get("result") in NOTIFICATION_RESULTS:
                 result = ("notification-result", NOTIFICATION_RESULTS[query["result"]], "success")
@@ -11113,7 +11123,6 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_text(page, "settings_back", f"Back to {SETTINGS_BACK_NAMES[parent]}" if parent else "Back to settings")
         page = page_rendering.set_attribute(page, "settings_back_section", "value", parent)
         page = page_rendering.set_hidden(page, "settings_choose", bool(section))
-        page = page_rendering.set_hidden(page, "settings_section_unavailable", not section or works)
         title = f"{SETTINGS_SECTION_TITLES[section]} - Settings" if section else "Settings"
         if section == "account":
             page = self._place_password_form(page, "settings_owner_password_page" if owner else "settings_panel_account")
@@ -17105,7 +17114,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       <span class="nav-more">
         <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false" hidden>More</button>
         <span id="nav_more_menu" class="nav-more-menu">
-          <a id="nav_receiver" href="/?view=receiver" data-view="receiver">Weather Radio Receiver</a>
+          <a id="nav_receiver" class="needs-app-inline" href="/?view=receiver" data-view="receiver">Weather Radio Receiver</a>
           <a id="nav_iq_recorder" href="/?view=iq_recorder" data-view="iq_recorder">I/Q Recorder</a>
           <a id="nav_logs" href="/?view=logs" data-view="logs">Logs</a>
           <a id="nav_settings" href="/?view=settings" data-view="settings" hidden>Settings</a>
@@ -17229,8 +17238,8 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
 <div id="same_alert_live" class="screen-reader-only" aria-live="assertive" aria-relevant="additions text" aria-atomic="false"></div>
 <main>
   <section id="baseline_unavailable" class="baseline-only" hidden>
-    <h2>This page doesn't work in this browser yet</h2>
-    <p>These pages work in every browser: <a href="/?view=logs">Logs</a> and <a href="/help">Help</a>.</p>
+    <h2>This feature is unsupported by your browser</h2>
+    <p>This feature requires an up-to-date browser, such as a current version of Firefox, Chrome, Edge or Safari. <a href="/">Go to the dashboard</a></p>
   </section>
   <div id="view_dashboard" class="view">
     <section id="dashboard_sdr_section">
@@ -17543,10 +17552,6 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             <button id="settings_back" class="settings-back" type="submit" data-baseline-submit>Back to settings</button>
           </form>
           <p id="settings_choose" class="baseline-only hint" hidden>Choose a setting.</p>
-          <section id="settings_section_unavailable" class="baseline-only" hidden>
-            <h3>This setting doesn't work in this browser yet</h3>
-            <p>Account settings work in every browser.</p>
-          </section>
           <div id="settings_panel_accounts" class="settings-panel" hidden>
             <div id="settings_accounts_page">
               <h3>Accounts</h3>

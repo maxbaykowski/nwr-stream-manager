@@ -263,8 +263,17 @@ class BaselinePageServerTests(unittest.TestCase):
         self.assertIn('<a id="nav_settings" href="/?view=settings" data-view="settings">', page)
 
         _, page = self.request("GET", "/?view=receiver", user=owner)
+        self.assertEqual(self.title(page), "Unsupported by your browser - Weather Radio Receiver - NWR Stream Manager")
         self.assertIn('<section id="baseline_unavailable" class="baseline-only">', page)
+        self.assertIn("<h2>This feature is unsupported by your browser</h2>", page)
         self.assertIn('<div id="view_receiver" class="view needs-app">', page)
+        # It isn't offered in the menu without the page script.
+        self.assertRegex(page, r'<a id="nav_receiver" class="needs-app-inline" href="/\?view=receiver" data-view="receiver"')
+        # A setting that needs the page script gets the same message, in place of Settings.
+        _, page = self.request("GET", "/?view=settings&section=record_announcement", user=owner)
+        self.assertEqual(self.title(page), "Unsupported by your browser - Record an announcement - Settings - NWR Stream Manager")
+        self.assertIn('<section id="baseline_unavailable" class="baseline-only">', page)
+        self.assertIn('<div id="view_settings" class="view" hidden>', page)
 
     def test_read_only_accounts_see_their_own_menu_and_no_settings(self) -> None:
         self.accounts.create_admin("owner", "password1", "password1")
