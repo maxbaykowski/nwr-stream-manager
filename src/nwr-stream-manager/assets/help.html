@@ -213,6 +213,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <dt>Storage</dt>
     <dd>How much disk space is left, and how much you've gobbled up with saved EAS alert recordings and I/Q recordings. A warning appears if space is running low.</dd>
   </dl>
+  <p>In an <a href="#older-browsers">older browser</a>, the dashboard shows the same information. Where your browser can run scripts, it updates by itself every few seconds; otherwise, refresh the page to see the latest.</p>
   <p>The bar across the top of every page takes you to the main areas: <strong>Dashboard</strong>, <strong>Configure RTL-SDR</strong>, <strong>Manage Streams</strong>, <strong>EAS alerts</strong> (once alerts have been recorded), and <strong>More</strong>, which holds everything else, including <a href="#settings">Settings</a>. Help is linked at the bottom of every page.</p>
   <h3 id="settings">Settings</h3>
   <p>Settings holds the settings that aren't about one stream or the RTL-SDR itself: your account or, for the owner, everyone's accounts, <a href="#remote-sdr">SDR sharing</a>, <a href="#notifications">notifications</a> and <a href="#fallback-audio">fallback audio</a>. Open it from <strong>More</strong>, then <strong>Settings</strong>. Read-only accounts don't have Settings; they change their password from <strong>More</strong>, then <strong>Change account password</strong>.</p>
@@ -723,7 +724,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 <section aria-labelledby="older-browsers">
   <h2 id="older-browsers">Older browsers</h2>
   <p>When a page opens, NWR Stream Manager checks what your browser can do. In an up-to-date browser, pages update by themselves and you can listen to streams. In an older browser, such as Internet Explorer, or with JavaScript turned off, pages work as plain pages instead: forms save when you submit them, and Refresh shows the latest information. Messages that pop up at the edge of the screen in an up-to-date browser, such as a new account's temporary password, get a page of their own instead; select <strong>Done</strong> to carry on.</p>
-  <p>Some things, such as listening to a stream, need an up-to-date browser. For now, first-time setup, accounts and passwords, Configure RTL-SDR, Manage Streams, adding streams and outputs, stream settings, notifications, SDR sharing, fallback audio, EAS alerts, the I/Q Recorder, Logs and this help work in every browser, and other pages say when they don't work in your browser yet.</p>
+  <p>Everything works in every browser except what needs an up-to-date one: listening to streams in your browser (Monitor and the Weather Radio Receiver), <a href="#test-mode">test mode</a>, and recording an announcement with your microphone. Those pages say so when your browser can't use them.</p>
 </section>
 
 </main>

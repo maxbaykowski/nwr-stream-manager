@@ -119,7 +119,7 @@ class PageScriptLoadingTests(unittest.TestCase):
         pages = __import__("sys").modules["nwr_stream_manager.page_rendering"]
         page = self.web_control.INDEX_HTML
         baseline = {
-            "logs", "settings", "change_password", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail",
+            "dashboard", "logs", "settings", "change_password", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail",
             "iq_recorder", "iq_recorder_start", "iq_recording_download", "rtl", "streams", "stream_settings", "stream_output", "add_stream",
         }
         for view in baseline:
@@ -1755,6 +1755,88 @@ class SdrSharingPageTests(unittest.TestCase):
         response, _ = self.request("POST", "/sdr-sharing/unpair", fields={"device": "host2", "form_token": token}, cookie=cookie, user=self.owner)
         self.assertEqual(response.getheader("Location"), "/?view=settings&section=sdr_sharing&result=unpaired&name=Attic+Pi")
         self.assertEqual(self.calls[-1], ("unpair", {"device_id": "host2"}))
+
+
+class DashboardPageTests(unittest.TestCase):
+    """The dashboard, filled in for a browser without the page script, and the parts that keep it up to date."""
+
+    request = BaselinePageServerTests.request
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.accounts = wc.AccountStore(Path(tempdir.name) / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        account, secret = self.accounts.create_account("viewer", True)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        self.owner, self.viewer = ("owner", "password1"), ("viewer", "password2")
+        self.status = {
+            "settings": {"serial": "00000001", "gain": 33.8, "ppm_correction": 2, "bias_tee": False, "alias_filter_strength": 90},
+            "source": {"kind": "rtl"},
+            "active": True,
+            "streams": [
+                {"id": "s1", "enabled": True, "station": {"callsign": "WXN99", "frequency": "162.425"}},
+                {"id": "s2", "enabled": True, "station": {"callsign": "WZ2560", "frequency": "162.550"}},
+                {"id": "s3", "enabled": False, "station": {"callsign": "KEC63", "frequency": "162.550"}},
+            ],
+            "active_streams": [{"id": "s1", "status": "needs-attention", "outputs": [{"type": "icecast", "status": "needs-attention"}]}],
+            "stream_signals": {"s2": {"available": True, "snr_db": 2.0, "quality": "poor", "reception_problem": "bad_reception"}},
+            "recent_eas_alerts": [{"id": "a1", "stream_id": "s1", "callsign": "WXN99", "event_name": "Required Weekly Test", "issued_at_epoch": time.time() - 3 * 3600}],
+            "storage": {"status": "ok", "filesystems": [{"used_bytes": 2.3e9, "total_bytes": 8.2e9, "used_percent": 28}], "usage": {"iq_recordings": "42.7 MB", "eas_recordings": "10.8 MB"}},
+        }
+        service = StandInService(
+            accounts=self.accounts,
+            auth_sessions=wc.AuthSessionStore(),
+            status=lambda read_only=False: self.status,
+            devices=lambda: {"devices": [{"serial": "00000001", "name": "Blog V4", "vendor": "RTL-SDR Blog"}]},
+        )
+        handler = type("DashboardPageTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def test_the_dashboard_is_filled_in_as_the_page_script_fills_it(self) -> None:
+        _, page = self.request("GET", "/", user=self.owner)
+        self.assertEqual(self.title(page), "Dashboard - NWR Stream Manager")
+        self.assertIn('<div id="view_dashboard" class="view">', page)
+        self.assertIn('<dd id="summary_sdr">RTL-SDR Blog, Blog V4, serial 00000001</dd>', page)
+        self.assertIn('<dd id="summary_gain">33.8 dB</dd>', page)
+        self.assertIn('<p id="dashboard-stream-summary">3 streams configured, 2 enabled, 1 disabled.</p>', page)
+        self.assertIn('<p class="status-text status-needs-attention" data-row-key="summary">Streams WXN99 and WZ2560 require attention.</p>', page)
+        self.assertIn('<div class="stream-item" data-row-key="stream:s1"><a href="/?view=stream_settings&amp;stream=s1" data-view="stream_settings" data-stream-id="s1">View stream details for WXN99</a>: One or more Icecast destinations failed to connect.</div>', page)
+        self.assertIn("View stream details for WZ2560</a>: Bad reception: the signal is too weak or noisy to be usable.", page)
+        self.assertIn('<a href="/?view=eas_alert_detail&amp;stream=s1&amp;alert=a1&amp;page=1">Required weekly test</a> issued 3 hours ago on WXN99. <a href="/?view=eas_alerts&amp;stream=s1&amp;page=1">View all EAS alerts for WXN99</a>', page)
+        self.assertIn('<dd id="summary_storage">2.3 GB of 8.2 GB used (28%)</dd>', page)
+        self.assertLess(page.index('id="dashboard_sdr_section"'), page.index('id="dashboard_storage_section"'))
+        # A read-only account sees the streams without links, and no Configure RTL-SDR.
+        _, page = self.request("GET", "/", user=self.viewer)
+        self.assertIn('<div class="stream-item" data-row-key="stream:s1"><strong>WXN99</strong>: One or more Icecast destinations failed to connect.</div>', page)
+        self.assertRegex(page, r'<a id="dashboard_configure_sdr" [^>]*hidden>')
+
+    def test_low_storage_comes_first_and_the_rtl_sdr_problem_shows(self) -> None:
+        self.status["storage"].update(status="low", message="Storage is running low.")
+        self.status.update(active=False, capture_error="The RTL-SDR could not be opened.")
+        _, page = self.request("GET", "/", user=self.owner)
+        self.assertLess(page.index('id="dashboard_storage_section"'), page.index('id="dashboard_sdr_section"'))
+        self.assertIn('<div id="storage-warning" class="storage-warning">Storage is running low.</div>', page)
+        self.assertIn('<p id="dashboard_sdr_attention" class="status-text status-needs-attention">RTL-SDR requires attention.', page)
+        self.assertRegex(page, r'<dl id="dashboard_sdr_details" class="details-list" hidden>')
+
+    def test_the_parts_keep_a_page_up_to_date(self) -> None:
+        response, body = self.request("GET", "/dashboard/parts", user=self.viewer)
+        self.assertEqual(response.status, 200)
+        parts = __import__("json").loads(body)
+        self.assertEqual(parts["text"]["dashboard-stream-summary"], "3 streams configured, 2 enabled, 1 disabled.")
+        self.assertIn("<strong>WXN99</strong>", parts["html"]["dashboard-stream-attention"])
+        self.assertEqual((parts["hidden"]["dashboard_configure_sdr"], parts["storage_first"]), (True, False))
 
 
 if __name__ == "__main__":

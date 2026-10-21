@@ -561,6 +561,7 @@ NOTIFICATION_RESULTS = {
     "tested": "Test notification sent.",
 }
 NTFY_PUBLIC_SERVER_URL = "https://ntfy.sh"
+DASHBOARD_PARTS_PATH = "/dashboard/parts"
 SDR_SHARING_PATHS = {"/sdr-sharing/settings", "/sdr-sharing/pairing/start", "/sdr-sharing/pairing/stop", "/sdr-sharing/pair", "/sdr-sharing/unpair"}
 NOTIFICATIONS_SET_UP_HTML = (
     '<p>To get notifications for a stream, go to <a href="/?view=streams">Manage Streams</a>, '
@@ -9486,6 +9487,7 @@ class RtlControlHandler(BaseHTTPRequestHandler):
                 "/api/eas-alert",
                 "/api/eas-alert-audio",
                 EAS_ALERT_EXPORT_PATH,
+                DASHBOARD_PARTS_PATH,
                 "/api/live-audio",
                 "/api/settings-events",
                 "/api/monitor/status",
@@ -9828,6 +9830,10 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             self._send_index_page(parsed)
         elif path == EAS_ALERT_EXPORT_PATH:
             self._handle_eas_alert_export(parsed)
+        elif path == DASHBOARD_PARTS_PATH:
+            # For pages without the page script that can still update the dashboard as it changes.
+            account = getattr(self, "current_account", None)
+            self._send_json(self._dashboard_parts(isinstance(account, AccountRecord) and account.is_read_only))
         elif path == IQ_RECORDING_DOWNLOAD_PATH:
             self._handle_iq_recording_download(parsed)
         elif path == "/api/status":
@@ -11049,6 +11055,8 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_hidden(page, "nav_eas_alerts", not eas_streams)
         if view in EAS_ALERT_VIEWS:
             page, title = self._fill_eas_alert_view(page, view, query, form or {}, eas_streams, read_only, title)
+        if view == "dashboard":
+            page = self._fill_dashboard_view(page, read_only)
         if view == "streams":
             page, title = self._fill_streams_view(page, query, read_only, title)
             if not result and query.get("result") in STREAM_RESULTS:
@@ -11846,6 +11854,30 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         page = page_rendering.set_hidden(page, "eas_delete_form", True)
         title = re.search(r"<title>(.*?)</title>", page).group(1)
         return page_rendering.set_title(page, f"{question} - {html.unescape(title)}")
+
+    def _dashboard_parts(self, read_only: bool) -> dict[str, Any]:
+        status = self.service.status(read_only=read_only) or {}
+        serial = str((status.get("settings") or {}).get("serial") or "")
+        sdr_label = "none"
+        if serial:
+            device = next((item for item in (self.service.devices() or {}).get("devices") or [] if item.get("serial") == serial), None)
+            parts = [device.get("vendor"), device.get("name") or "RTL-SDR", f"serial {serial}"] if device else []
+            sdr_label = ", ".join(str(part) for part in parts if part) if device else f"serial {serial}"
+        return dashboard_parts(status, sdr_label, read_only, time.time())
+
+    def _fill_dashboard_view(self, page: str, read_only: bool) -> str:
+        parts = self._dashboard_parts(read_only)
+        for element_id, value in parts["text"].items():
+            page = page_rendering.set_text(page, element_id, value)
+        for element_id, value in parts["html"].items():
+            page = page_rendering.set_content(page, element_id, value)
+        for element_id, value in parts["hidden"].items():
+            page = page_rendering.set_hidden(page, element_id, value)
+        if parts["storage_first"]:
+            # Storage goes first when it's low, as the page script puts it.
+            for section in ("dashboard_sdr_section", "dashboard_streams_section", "dashboard_recent_alerts_section"):
+                page = page_rendering.move_element(page, section, "view_dashboard")
+        return page
 
     def _fill_streams_view(self, page: str, query: dict[str, str], read_only: bool, title: str) -> tuple[str, str]:
         status = self.service.status(read_only=read_only)
@@ -16488,6 +16520,159 @@ def remote_pair_target(form: dict[str, str]) -> dict[str, Any]:
     return {"address": match.group(1), **({"port": int(match.group(2))} if match.group(2) else {})}
 
 
+RECEPTION_PROBLEM_REASONS = {"bad_reception": "bad reception", "no_signal": "no signal"}
+
+
+def sentence_list(items: list[str]) -> str:
+    values = [str(item).strip() for item in items if str(item).strip()]
+    if len(values) <= 1:
+        return values[0] if values else ""
+    return f"{', '.join(values[:-1])} and {values[-1]}"
+
+
+def relative_time_ago(epoch_seconds: float, now: float) -> str:
+    minutes = max(0, int((now - float(epoch_seconds or 0)) // 60))
+    if minutes < 1:
+        return "less than a minute ago"
+    if minutes < 60:
+        return f"{minutes} minute{'' if minutes == 1 else 's'} ago"
+    hours = minutes // 60
+    return f"{hours} hour{'' if hours == 1 else 's'} ago"
+
+
+def stream_attention_items(status: dict[str, Any]) -> list[dict[str, Any]]:
+    """The streams that need attention and why, as the page script's dashboard lists them."""
+    configured = {stream.get("id"): stream for stream in status.get("streams") or []}
+    items: dict[str, dict[str, Any]] = {}
+
+    def item_for(stream_id: str, station: dict[str, Any]) -> dict[str, Any]:
+        return items.setdefault(stream_id, {
+            "id": stream_id, "callsign": station.get("callsign") or "Unknown", "icecast": False, "soundcard": False,
+            "reception": None, "errors": [],
+        })
+
+    for active in status.get("active_streams") or []:
+        if str(active.get("status") or "").lower().replace("_", "-") != "needs-attention":
+            continue
+        stream = configured.get(active.get("id")) or {}
+        station = active.get("station") if (active.get("station") or {}).get("callsign") or (active.get("station") or {}).get("frequency") else stream.get("station") or {}
+        stream_id = active.get("id") or stream.get("id") or ""
+        if not stream_id:
+            continue
+        item = item_for(stream_id, station or {})
+        if active.get("error"):
+            item["errors"].append(active["error"])
+        for output in active.get("outputs") or []:
+            if str(output.get("status") or active.get("status") or "").lower().replace("_", "-") != "needs-attention":
+                continue
+            item["soundcard" if output.get("type") == "soundcard" else "icecast"] = True
+    for stream in configured.values():
+        signal = (status.get("stream_signals") or {}).get(stream.get("id")) if stream_enabled(stream) else None
+        problem = stream_reception_problem(signal)
+        if problem:
+            item_for(str(stream.get("id")), stream.get("station") or {})["reception"] = problem
+    result = []
+    for item in items.values():
+        reasons = []
+        if item["reception"]:
+            reasons.append(RECEPTION_PROBLEM_REASONS[item["reception"]])
+        if item["icecast"]:
+            reasons.append("one or more Icecast destinations failed to connect")
+        if item["soundcard"]:
+            reasons.append("one or more sound cards are not connected")
+        if not reasons:
+            detail = item["errors"][0] if item["errors"] else "This stream needs attention."
+        elif len(reasons) == 1 and item["reception"]:
+            detail = RECEPTION_PROBLEM_DETAILS[item["reception"]]
+        else:
+            sentence = sentence_list(reasons)
+            detail = f"{sentence[:1].upper()}{sentence[1:]}."
+        result.append({**item, "detail": detail})
+    return sorted(result, key=lambda item: str(item["callsign"]))
+
+
+def dashboard_parts(status: dict[str, Any], sdr_label: str, read_only: bool, now: float) -> dict[str, Any]:
+    """The dashboard, as the page script fills it in: each part's text or markup, what's hidden,
+    and whether storage comes first."""
+    settings = status.get("settings") or {}
+    source = status.get("source") or {}
+    text: dict[str, str] = {}
+    markup: dict[str, str] = {}
+    iq_file = source.get("kind") == "iq_file"
+    attention = not iq_file and bool(status.get("capture_error") or (settings.get("serial") and not status.get("active")))
+    hidden = {"dashboard_sdr_attention": not attention, "dashboard_sdr_details": attention, "dashboard_configure_sdr": read_only}
+    strength = f"{settings.get('alias_filter_strength', 100)}%"
+    capture = "active" if status.get("active") else "inactive"
+    if iq_file:
+        text.update(summary_source="I/Q file", summary_sdr=str(source.get("name") or "unknown file"), summary_ppm="not applicable",
+                    summary_gain="not applicable", summary_bias_tee="not applicable")
+    else:
+        if source.get("kind") == "remote":
+            text.update(summary_source=f"Shared by {source.get('name') or 'another NWR Stream Manager'}", summary_sdr=str(source.get("device_name") or "unknown"))
+        else:
+            text.update(summary_source="RTL-SDR", summary_sdr=sdr_label)
+        gain = settings.get("gain")
+        text.update(summary_ppm=f"{settings.get('ppm_correction') or 0} PPM", summary_gain="automatic" if gain is None else f"{gain:g} dB",
+                    summary_bias_tee="enabled" if settings.get("bias_tee") else "disabled")
+    text.update(summary_alias_filter=strength, summary_capture=capture)
+    # Streams
+    streams = list(status.get("streams") or [])
+    enabled = sum(1 for stream in streams if stream_enabled(stream))
+    text["dashboard-stream-summary"] = (
+        f"{len(streams)} stream{'' if len(streams) == 1 else 's'} configured, {enabled} enabled, {len(streams) - enabled} disabled."
+        if streams else "No streams configured."
+    )
+    items = stream_attention_items(status)
+    if not items:
+        markup["dashboard-stream-attention"] = '<div class="stream-item success" data-row-key="healthy">All streams are healthy!</div>'
+    else:
+        names = list(dict.fromkeys(item["callsign"] for item in items))
+        summary = f"Stream {names[0]} requires attention!" if len(names) == 1 else f"Streams {sentence_list(names)} require attention."
+        rows = [f'<p class="status-text status-needs-attention" data-row-key="summary">{html.escape(summary)}</p>']
+        for item in items:
+            if read_only:
+                label = f"<strong>{html.escape(item['callsign'])}</strong>"
+            else:
+                link = page_route("stream_settings", stream=item["id"])
+                label = f'<a href="{html.escape(link)}" data-view="stream_settings" data-stream-id="{html.escape(item["id"])}">View stream details for {html.escape(item["callsign"])}</a>'
+            rows.append(f'<div class="stream-item" data-row-key="stream:{html.escape(item["id"])}">{label}: {html.escape(item["detail"])}</div>')
+        markup["dashboard-stream-attention"] = "".join(rows)
+    # Recent alerts
+    alerts = list(status.get("recent_eas_alerts") or [])
+    if not alerts:
+        markup["dashboard-recent-alerts"] = '<div class="stream-item hint" data-row-key="empty">No EAS alerts issued in the last 24 hours.</div>'
+    else:
+        rows = []
+        for alert in alerts:
+            name = str(alert.get("event_name") or "Unknown alert").lower()
+            detail = page_route("eas_alert_detail", stream=alert.get("stream_id", ""), alert=alert.get("id", ""), page=1)
+            listing = page_route("eas_alerts", stream=alert.get("stream_id", ""), page=1)
+            callsign = html.escape(str(alert.get("callsign") or "Unknown"))
+            rows.append(
+                f'<div class="stream-item" data-row-key="alert:{html.escape(str(alert.get("stream_id", "")))}:{html.escape(str(alert.get("id", "")))}">'
+                f'<a href="{html.escape(detail)}">{html.escape(name[:1].upper() + name[1:])}</a>'
+                f" issued {relative_time_ago(alert.get('issued_at_epoch') or 0, now)} on {callsign}. "
+                f'<a href="{html.escape(listing)}">View all EAS alerts for {callsign if alert.get("callsign") else "this stream"}</a></div>'
+            )
+        markup["dashboard-recent-alerts"] = "".join(rows)
+    # Storage
+    storage = status.get("storage") or {}
+    filesystems = storage.get("filesystems") or []
+    primary = filesystems[0] if filesystems else None
+    text["summary_storage"] = (
+        f"{format_decimal_bytes(primary.get('used_bytes') or 0)} of {format_decimal_bytes(primary.get('total_bytes') or 0)} used ({round(float(primary.get('used_percent') or 0))}%)"
+        if primary else "unknown"
+    )
+    usage = storage.get("usage") or {}
+    text["summary_iq_storage"] = str(usage.get("iq_recordings") or "0 B")
+    text["summary_eas_storage"] = str(usage.get("eas_recordings") or "0 B")
+    state = str(storage.get("status") or "unknown")
+    warning = str(storage.get("message") or "Please free up disk space.") if storage.get("status") and state != "ok" else ""
+    text["storage-warning"] = warning
+    hidden["storage-warning"] = not warning
+    return {"text": text, "html": markup, "hidden": hidden, "storage_first": state in ("low", "critical")}
+
+
 def format_gain(value: float) -> str:
     return f"{float(value):g} dB"
 
@@ -17047,7 +17232,7 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     <h2>This page doesn't work in this browser yet</h2>
     <p>These pages work in every browser: <a href="/?view=logs">Logs</a> and <a href="/help">Help</a>.</p>
   </section>
-  <div id="view_dashboard" class="view needs-app">
+  <div id="view_dashboard" class="view">
     <section id="dashboard_sdr_section">
       <h2>Configured SDR</h2>
       <p id="dashboard_sdr_attention" class="status-text status-needs-attention" hidden>RTL-SDR requires attention. Check the SDR immediately.</p>
@@ -18791,6 +18976,54 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
     status.innerHTML = "";
     status.appendChild(d.createTextNode("This page updates when a device pairs."));
     setTimeout(check, 3000);
+  })();
+
+  // The dashboard keeps itself up to date, changing only the parts that changed.
+  (function () {
+    var dashboard = byId("view_dashboard");
+    if (!visible(dashboard) || !window.XMLHttpRequest || !window.JSON) return;
+    var request = new XMLHttpRequest(), shown = {};
+    function setText(element, text) {
+      while (element.firstChild) element.removeChild(element.firstChild);
+      element.appendChild(d.createTextNode(text));
+    }
+    function apply(parts) {
+      var id, element;
+      for (id in parts.text) {
+        element = byId(id);
+        if (element && shown[id] !== parts.text[id]) setText(element, parts.text[id]);
+        shown[id] = parts.text[id];
+      }
+      for (id in parts.html) {
+        element = byId(id);
+        // The first time, it's what the page came with.
+        if (element && shown[id] !== undefined && shown[id] !== parts.html[id]) element.innerHTML = parts.html[id];
+        shown[id] = parts.html[id];
+      }
+      for (id in parts.hidden) {
+        element = byId(id);
+        if (element && visible(element) === parts.hidden[id]) show(element, !parts.hidden[id]);
+      }
+      // Storage goes first while it's low, and last otherwise.
+      var storage = byId("dashboard_storage_section"), sections = [];
+      for (element = dashboard.firstChild; element; element = element.nextSibling) {
+        if (element.nodeType === 1) sections.push(element);
+      }
+      if (parts.storage_first && sections[0] !== storage) dashboard.insertBefore(storage, sections[0]);
+      if (!parts.storage_first && sections[sections.length - 1] !== storage) dashboard.appendChild(storage);
+    }
+    function update() {
+      request.open("GET", "/dashboard/parts?time=" + new Date().getTime(), true);
+      request.onreadystatechange = function () {
+        if (request.readyState !== 4) return;
+        try {
+          if (request.status === 200) apply(JSON.parse(request.responseText));
+        } catch (error) {}
+        setTimeout(update, 5000);
+      };
+      request.send(null);
+    }
+    update();
   })();
 
   // A new I/Q recording shows the settings for the chosen source.
