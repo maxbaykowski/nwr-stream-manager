@@ -539,7 +539,7 @@ SETTINGS_PAGE_PARENTS = {
     "record_announcement": "fallback_audio",
 }
 # The settings that work without the page script.
-BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account"}
+BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account", "fallback_audio"}
 ACCOUNT_FORM_PATHS = {"/accounts/create", "/accounts/reset-password", "/accounts/read-only", "/accounts/delete"}
 EAS_ALERT_EXPORT_PATH = "/eas-alerts/export"
 EAS_ALERT_FORM_PATHS = {"/eas-alerts/delete", "/eas-alerts/remove"}
@@ -553,6 +553,14 @@ RTL_FORM_PATHS = {"/rtl-settings", "/rtl-settings/reset"}
 STREAM_FORM_PATHS = {"/streams/settings", "/streams/enabled", "/streams/remove"}
 OUTPUT_FORM_PATHS = {"/streams/outputs/save", "/streams/outputs/enabled", "/streams/outputs/reset-soundcard", "/streams/outputs/remove"}
 WIZARD_FORM_PATH = "/streams/wizard"
+FALLBACK_SETTINGS_PATH = "/fallback-audio/settings"
+FALLBACK_UPLOAD_PATH = "/fallback-audio/upload"
+# What fallback audio says once one of its forms has gone back to it: where, and what.
+FALLBACK_RESULTS = {
+    "saved": ("fallback-result", "Fallback audio settings saved."),
+    "custom-needed": ("fallback-result", "There's no custom announcement yet. Upload one below, and fallback audio switches to it."),
+    "uploaded": ("fallback-audio-result", "Announcement uploaded. Fallback audio now plays the custom announcement."),
+}
 WIZARD_STEPS = ("station", "type", "service", "codec", "credentials", "quality", "device", "controls")
 WIZARD_STEP_PANELS = {
     "station": "wizard_step_station",
@@ -10035,6 +10043,12 @@ class RtlControlHandler(BaseHTTPRequestHandler):
         if path == WIZARD_FORM_PATH:
             self._handle_wizard_form()
             return
+        if path == FALLBACK_SETTINGS_PATH:
+            self._handle_fallback_settings_form()
+            return
+        if path == FALLBACK_UPLOAD_PATH:
+            self._handle_fallback_upload_form()
+            return
         if path == "/api/setup-account":
             try:
                 payload = self._read_json()
@@ -10996,6 +11010,9 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             page = page_rendering.set_attribute(page, "change_password_cancel_link", "href", "/")
         if view == "settings" and isinstance(account, AccountRecord):
             page, title = self._fill_settings_view(page, account, query, form or {})
+            if query.get("section") == "fallback_audio" and not result and query.get("result") in FALLBACK_RESULTS:
+                element_id, message = FALLBACK_RESULTS[query["result"]]
+                result = (element_id, message, "success")
         eas_streams = self.service.eas_alert_streams()["streams"]
         page = page_rendering.set_hidden(page, "nav_eas_alerts", not eas_streams)
         if view in EAS_ALERT_VIEWS:
@@ -11072,7 +11089,116 @@ class RtlControlHandler(BaseHTTPRequestHandler):
             page, confirm_title = self._fill_accounts_page(page, account, query)
             if confirm_title:
                 title = f"{confirm_title} - {title}"
+        if section == "fallback_audio":
+            page = self._fill_fallback_audio_page(page, query, form)
         return page, title
+
+    def _fill_fallback_audio_page(self, page: str, query: dict[str, str], form: dict[str, str]) -> str:
+        fallback = self.service.status().get("fallback") or {}
+        available = bool(fallback.get("custom_audio_available"))
+        loaded = {"fallback_audio": str(fallback.get("audio") or "default"), "loop_delay_seconds": f"{float(fallback.get('loop_delay_seconds') or 0):g}"}
+        sent = form.get("form") == "fallback"
+        shown = {name: form.get(name, value) for name, value in loaded.items()} if sent else dict(loaded)
+        if sent:
+            loaded = {name: form.get(f"was_{name}", value) for name, value in loaded.items()}
+        if query.get("result") == "custom-needed":
+            shown["fallback_audio"] = "custom"
+        custom = shown["fallback_audio"] == "custom"
+        page = page_rendering.set_attribute(page, "fallback_audio_default", "checked", None if custom else "checked")
+        page = page_rendering.set_attribute(page, "fallback_audio_custom", "checked", "checked" if custom else None)
+        page = page_rendering.set_attribute(page, "fallback_loop_delay", "value", shown["loop_delay_seconds"])
+        # The chosen announcement plays in the browser's own player, which a script hides where it can't.
+        playable = available or not custom
+        announcement = f"/api/fallback-audio?announcement={'custom' if custom else 'default'}"
+        page = page_rendering.set_hidden(page, "fallback_baseline_player", not playable)
+        if playable:
+            page = page_rendering.set_attribute(page, "fallback_baseline_audio", "src", announcement)
+            page = page_rendering.set_attribute(page, "fallback_baseline_download", "href", announcement)
+        problem = str(fallback.get("custom_audio_problem") or "")
+        if problem:
+            text = f"{problem} The default announcement is playing instead. Upload or record a new custom announcement." if fallback.get("audio") == "custom" else problem
+        elif available:
+            text = f"The custom announcement is {format_duration_hms(float(fallback.get('custom_audio_seconds') or 0))} long."
+        elif custom:
+            text = "There's no custom announcement yet. Upload a file or record one below."
+        else:
+            text = ""
+        page = page_rendering.set_text(page, "fallback_custom_status", text)
+        page = page_rendering.set_attribute(page, "fallback_custom_status", "class", "message error" if problem else "hint")
+        page = page_rendering.set_hidden(page, "fallback_custom_status", not text)
+        # Uploading shows for Custom; a script, where one runs, shows it as Custom is chosen.
+        page = page_rendering.set_hidden(page, "fallback_custom_controls", False)
+        return page_rendering.append_content(
+            page,
+            "fallback_settings_form",
+            '<input type="hidden" name="form" value="fallback">'
+            + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
+        )
+
+    def _handle_fallback_settings_form(self) -> None:
+        """Saves the fallback audio settings that were changed, for browsers without the page script."""
+        form: dict[str, str] = {}
+        query = {"view": "settings", "section": "fallback_audio"}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            changes: dict[str, Any] = {}
+            delay = form.get("loop_delay_seconds", "").strip()
+            if delay != form.get("was_loop_delay_seconds", "").strip():
+                try:
+                    changes["loop_delay_seconds"] = float(delay)
+                except ValueError:
+                    changes["loop_delay_seconds"] = -1.0
+                if not 0 <= changes["loop_delay_seconds"] <= 10:
+                    raise ValueError("Enter a number of seconds before restart from 0 to 10.")
+            audio = form.get("fallback_audio", "default")
+            done = "saved"
+            if audio != form.get("was_fallback_audio", ""):
+                fallback = self.service.status().get("fallback") or {}
+                if audio == "custom" and not fallback.get("custom_audio_available"):
+                    # Nothing to switch to yet, so the page shows how to add one.
+                    done = "custom-needed"
+                else:
+                    changes["audio"] = audio
+            if changes:
+                self.service.update_fallback_settings(changes)
+        except Exception as exc:
+            result = ("fallback-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(query, result=result, form=form), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_redirect(page_route("settings", section="fallback_audio", result=done))
+
+    def _handle_fallback_upload_form(self) -> None:
+        """Uploads a custom announcement from a plain form, for browsers without the page script."""
+        query = {"view": "settings", "section": "fallback_audio"}
+        try:
+            content_type = self.headers.get("Content-Type", "")
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                length = -1
+            # A form adds a little to the file, but not this much.
+            if length < 0 or length > MAX_CUSTOM_FALLBACK_BYTES + 64 * 1024:
+                self.close_connection = True
+                raise ValueError("The file is 10 MB or larger. Choose a file under 10 MB.")
+            data = self.rfile.read(length)
+            if not content_type.lower().startswith("multipart/form-data"):
+                raise ValueError("Choose a file to upload.")
+            fields, files = page_rendering.parse_multipart_form(data, content_type)
+            if not self._form_token_ok(fields):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            announcement = files.get("announcement", b"")
+            if not announcement:
+                raise ValueError("Choose a file to upload.")
+            if len(announcement) >= MAX_CUSTOM_FALLBACK_BYTES:
+                raise ValueError("The file is 10 MB or larger. Choose a file under 10 MB.")
+            self.service.save_custom_fallback_audio(announcement)
+        except Exception as exc:
+            result = ("fallback-audio-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(query, result=result), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_redirect(page_route("settings", section="fallback_audio", result="uploaded"))
 
     def _place_password_form(self, page: str, home_id: str) -> str:
         # One password form serves every account; the page script moves it the same way.
@@ -16855,33 +16981,53 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
             <div id="settings_fallback_audio_page">
             <h3>Fallback audio</h3>
             <p class="hint">Fallback audio plays on streams whose fallback action is Play fallback audio. Choose each stream's fallback action in its stream settings. These settings apply to every stream that plays fallback audio.</p>
+            <form id="fallback_settings_form" method="post" action="/fallback-audio/settings">
+            __FORM_TOKEN_INPUT__
             <fieldset>
               <legend>Announcement</legend>
               <label class="checkbox-row"><input id="fallback_audio_default" name="fallback_audio" type="radio" value="default"> Default</label>
               <label class="checkbox-row"><input id="fallback_audio_custom" name="fallback_audio" type="radio" value="custom"> Custom</label>
-              <button id="fallback_play" type="button">Play announcement</button>
+              <button id="fallback_play" class="needs-app-inline" type="button">Play announcement</button>
+              <div id="fallback_baseline_player" class="baseline-only">
+                <audio id="fallback_baseline_audio" controls preload="none" data-audio-type="audio/wav"></audio>
+                <p><a id="fallback_baseline_download" href="" download>Download announcement</a></p>
+              </div>
               <p id="fallback_custom_status" class="hint"></p>
             </fieldset>
             <label class="fallback-loop-delay">Seconds before restart
-              <input id="fallback_loop_delay" type="number" min="0" max="10" step="1" aria-describedby="fallback_loop_delay_hint">
+              <input id="fallback_loop_delay" name="loop_delay_seconds" type="number" min="0" max="10" step="1" aria-describedby="fallback_loop_delay_hint">
             </label>
             <span id="fallback_loop_delay_hint" class="hint">How long to wait after the fallback audio finishes before starting it again. Set to 0 for a continuous loop with no gap.</span>
+            <div class="actions baseline-only">
+              <button id="save_fallback_settings" type="submit" data-baseline-submit>Save changes</button>
+            </div>
+            </form>
             <div id="fallback-result" class="message" aria-live="polite"></div>
             <div id="fallback_custom_controls" hidden>
               <div class="settings-group">
                 <h4>Upload an announcement</h4>
                 <span id="fallback_audio_file_hint" class="hint">An MP3, OGG or WAV file, one minute or shorter and under 10 MB.</span>
-                <div class="actions">
+                <div class="actions needs-app-flex">
                   <button id="fallback_upload" type="button" aria-describedby="fallback_audio_file_hint">Upload announcement</button>
                 </div>
                 <!-- Opened by Upload announcement, so there's only one control to reach. -->
                 <input id="fallback_audio_file" type="file" accept=".mp3,.ogg,.wav,audio/mpeg,audio/ogg,audio/wav,audio/x-wav,audio/wave" hidden>
+                <form id="fallback_upload_form" class="baseline-only" method="post" action="/fallback-audio/upload" enctype="multipart/form-data">
+                  __FORM_TOKEN_INPUT__
+                  <label>Announcement file
+                    <input id="fallback_baseline_file" name="announcement" type="file" accept=".mp3,.ogg,.wav,audio/mpeg,audio/ogg,audio/wav,audio/x-wav,audio/wave" aria-describedby="fallback_audio_file_hint">
+                  </label>
+                  <div class="actions">
+                    <button id="fallback_baseline_upload" type="submit">Upload announcement</button>
+                  </div>
+                </form>
               </div>
               <div class="settings-group">
                 <h4>Record an announcement</h4>
                 <p id="fallback_record_insecure" class="message error" hidden>Recording isn't available because this page isn't in a secure context. To record, set up Tailscale Serve to give NWR Stream Manager a secure address. You can still upload a file. <a href="/help#secure-address" target="_blank" rel="noopener">Learn how to set up Tailscale Serve<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
                 <p id="fallback_record_unsupported" class="message error" hidden>This browser can't record audio. You can still upload a file.</p>
-                <div id="fallback_record_controls">
+                <p class="hint baseline-only">Recording an announcement needs an up-to-date browser. You can still upload a file.</p>
+                <div id="fallback_record_controls" class="needs-app">
                   <p class="hint">Record up to one minute from your microphone, then listen to it before saving it.</p>
                   <div class="actions">
                     <button id="open_fallback_recording" type="button">Record an announcement</button>
@@ -17998,6 +18144,19 @@ pre { margin: 0; min-height: 220px; max-height: 360px; overflow: auto; backgroun
       }
     }
     listen(select, "change", update);
+  })();
+
+  // Fallback audio's upload shows for a custom announcement, and its player only where it can play.
+  (function () {
+    var custom = byId("fallback_audio_custom"), controls = byId("fallback_custom_controls");
+    if (custom && controls) {
+      var update = function () { show(controls, custom.checked); };
+      listen(byId("fallback_audio_default"), "click", update);
+      listen(custom, "click", update);
+      update();
+    }
+    var player = byId("fallback_baseline_audio");
+    if (player && (!player.canPlayType || !player.canPlayType(player.getAttribute("data-audio-type")))) show(player, false);
   })();
 
   // A new I/Q recording shows the settings for the chosen source.
@@ -24443,8 +24602,10 @@ function applyAccountUi(account) {
     navigateTo("dashboard", {}, true, true);
   }
   if (roleChanged && ["settings", "change_password"].includes(currentViewName())) {
-    // Which settings this account has depends on its role.
-    navigateTo(currentViewName(), currentRouteParams(), true, true);
+    // Which settings this account has depends on its role. On the first load the
+    // page's address hasn't been applied yet, so it still says which setting is open.
+    const params = currentViewName() === "settings" && !settingsSection ? routeFromLocation() : currentRouteParams();
+    navigateTo(currentViewName(), params, true, true);
   }
 }
 

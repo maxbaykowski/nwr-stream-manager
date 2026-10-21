@@ -8,6 +8,8 @@ browsers, finds can run it. See PAGE_SCRIPT_LOADER.
 
 from __future__ import annotations
 
+import email.parser
+import email.policy
 import hmac
 import html
 import re
@@ -107,6 +109,30 @@ def parse_form(data: bytes) -> dict[str, str]:
         max_num_fields=MAX_FORM_FIELDS,
     )
     return {name: values[0] for name, values in fields.items()}
+
+
+def parse_multipart_form(data: bytes, content_type: str) -> tuple[dict[str, str], dict[str, bytes]]:
+    """The fields and files of a form sent as multipart/form-data, the first of each name.
+
+    Browsers send forms with a file this way, from the oldest to the newest.
+    """
+    message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+        b"Content-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + data
+    )
+    if not message.is_multipart():
+        raise ValueError("the form was not sent as multipart/form-data")
+    fields: dict[str, str] = {}
+    files: dict[str, bytes] = {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name or len(fields) + len(files) >= MAX_FORM_FIELDS:
+            continue
+        content = part.get_payload(decode=True) or b""
+        if part.get_filename() is not None:
+            files.setdefault(name, content)
+        else:
+            fields.setdefault(name, content.decode("utf-8", errors="replace"))
+    return fields, files
 
 
 def form_token_input(token: str) -> str:

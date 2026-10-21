@@ -143,7 +143,7 @@ class SdrPairingPageTests(unittest.TestCase):
         self.assertIn('document.getElementById("fallback_audio_file").addEventListener("change", uploadFallbackAnnouncementFile);', self.html)
 
     def test_one_button_plays_and_pauses_the_chosen_announcement_on_its_page_only(self) -> None:
-        self.assertIn('<button id="fallback_play" type="button">Play announcement</button>', self.html)
+        self.assertIn('<button id="fallback_play" class="needs-app-inline" type="button">Play announcement</button>', self.html)
         self.assertNotIn("fallback_play_default", self.html)
         self.assertNotIn("fallback_play_custom", self.html)
         self.assertIn('fallback_play: {play: "Play announcement", pause: "Pause announcement", page: "fallback_audio"', self.html)

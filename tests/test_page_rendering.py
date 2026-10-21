@@ -1373,5 +1373,126 @@ class OutputPageTests(unittest.TestCase):
         self.assertEqual((response.getheader("Location"), self.calls[-1]), ("/?view=streams", ("discard", "p1")))
 
 
+class FallbackAudioPageTests(unittest.TestCase):
+    """Fallback audio settings and uploads, as a browser without the page script uses them."""
+
+    request = BaselinePageServerTests.request
+    form_token = BaselinePageServerTests.form_token
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.accounts = wc.AccountStore(Path(tempdir.name) / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        account, secret = self.accounts.create_account("viewer", True)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        self.owner, self.viewer = ("owner", "password1"), ("viewer", "password2")
+        self.fallback = {"loop_delay_seconds": 5.0, "audio": "default", "custom_audio_available": False, "custom_audio_seconds": None, "custom_audio_problem": ""}
+        self.calls: list[tuple] = []
+
+        def save(data):
+            if not data.startswith(b"RIFF"):
+                raise ValueError("This isn't an MP3, OGG or WAV file, or it is damaged. Choose an MP3, OGG or WAV file.")
+            self.calls.append(("save", data))
+            self.fallback.update(audio="custom", custom_audio_available=True, custom_audio_seconds=4.0)
+
+        service = StandInService(
+            accounts=self.accounts,
+            auth_sessions=wc.AuthSessionStore(),
+            status=lambda read_only=False: {"fallback": dict(self.fallback)},
+            update_fallback_settings=lambda changes: self.calls.append(("update", changes)),
+            save_custom_fallback_audio=save,
+        )
+        handler = type("FallbackPageTestHandler", (wc.RtlControlHandler,), {"service": service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def token(self):
+        response, _ = self.request("GET", "/?view=settings&section=fallback_audio", user=self.owner)
+        token = self.form_token(response)
+        return token, f"nwrstmgr_form={token}"
+
+    def upload(self, token, cookie, data, user=None, length=None):
+        boundary = "nwrtestboundary"
+        body = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="form_token"\r\n\r\n{token}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="announcement"; filename="a.wav"\r\nContent-Type: audio/wav\r\n\r\n'
+        ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self.addCleanup(connection.close)
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(length if length is not None else len(body)),
+            "Cookie": cookie,
+            "Authorization": "Basic " + base64.b64encode(":".join(user or self.owner).encode()).decode(),
+        }
+        connection.putrequest("POST", "/fallback-audio/upload")
+        for name, value in headers.items():
+            connection.putheader(name, value)
+        connection.endheaders()
+        if length is None:
+            connection.send(body)
+        response = connection.getresponse()
+        return response, response.read().decode("utf-8")
+
+    def test_the_settings_are_filled_in_and_only_changes_saved(self) -> None:
+        token, cookie = self.token()
+        _, page = self.request("GET", "/?view=settings&section=fallback_audio", user=self.owner)
+        self.assertEqual(self.title(page), "Fallback audio - Settings - NWR Stream Manager")
+        self.assertIn('<audio id="fallback_baseline_audio" controls preload="none" data-audio-type="audio/wav" src="/api/fallback-audio?announcement=default"></audio>', page)
+        self.assertIn('<form id="fallback_upload_form" class="baseline-only" method="post" action="/fallback-audio/upload" enctype="multipart/form-data">', page)
+        self.assertIn('<input type="hidden" name="was_fallback_audio" value="default"><input type="hidden" name="was_loop_delay_seconds" value="5">', page)
+        fields = {"form": "fallback", "fallback_audio": "default", "was_fallback_audio": "default", "loop_delay_seconds": "3", "was_loop_delay_seconds": "5", "form_token": token}
+        response, _ = self.request("POST", "/fallback-audio/settings", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=fallback_audio&result=saved")
+        self.assertEqual(self.calls, [("update", {"loop_delay_seconds": 3.0})])
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "Fallback audio settings saved. - Fallback audio - Settings - NWR Stream Manager")
+        response, page = self.request("POST", "/fallback-audio/settings", fields={**fields, "loop_delay_seconds": "30"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+        self.assertIn('value="30"', page)
+        response, _ = self.request("POST", "/fallback-audio/settings", fields=fields, cookie=cookie, user=self.viewer)
+        self.assertEqual(response.status, 403)
+        # Custom with no custom announcement yet shows how to add one, and saves nothing else.
+        self.calls.clear()
+        response, _ = self.request("POST", "/fallback-audio/settings", fields={**fields, "loop_delay_seconds": "5", "fallback_audio": "custom"}, cookie=cookie, user=self.owner)
+        self.assertEqual((response.getheader("Location"), self.calls), ("/?view=settings&section=fallback_audio&result=custom-needed", []))
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertRegex(page, r'<input id="fallback_audio_custom" [^>]*checked="checked">')
+        self.assertRegex(page, r'<div id="fallback_baseline_player" class="baseline-only" hidden>')
+
+    def test_an_announcement_is_uploaded_from_a_plain_form(self) -> None:
+        token, cookie = self.token()
+        response, page = self.upload("guess", cookie, b"RIFF....")
+        self.assertEqual(response.status, 400)
+        self.assertEqual(self.calls, [])
+        response, page = self.upload(token, cookie, b"not audio")
+        self.assertTrue(html.unescape(self.title(page)).startswith("Error: This isn't an MP3, OGG or WAV file"))
+        response, page = self.upload(token, cookie, b"")
+        self.assertTrue(self.title(page).startswith("Error: Choose a file to upload."))
+        response, page = self.upload(token, cookie, b"RIFF", length=11 * 1024 * 1024)
+        self.assertEqual(response.status, 400)
+        self.assertTrue(self.title(page).startswith("Error: The file is 10 MB or larger."))
+        audio = b"RIFF\x00\r\n\x01\x02" * 100
+        response, _ = self.upload(token, cookie, audio)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=fallback_audio&result=uploaded")
+        self.assertEqual(self.calls, [("save", audio)])
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "Announcement uploaded. Fallback audio now plays the custom announcement. - Fallback audio - Settings - NWR Stream Manager")
+        self.assertIn('src="/api/fallback-audio?announcement=custom"', page)
+        self.assertIn("The custom announcement is 0:04 long.", page)
+        response, _ = self.upload(token, cookie, audio, user=self.viewer)
+        self.assertEqual(response.status, 403)
+
+
 if __name__ == "__main__":
     unittest.main()
