@@ -136,6 +136,15 @@ def validate_notification_settings_payload(
     )
 
 
+def ntfy_header_text(value: str) -> str:
+    """Text for an ntfy header. HTTP headers are sent as Latin-1, so anything that isn't plain
+    ASCII, such as an accented or emoji instance name, goes as an RFC 2047 encoded word, which
+    ntfy decodes."""
+    if value.isascii():
+        return value
+    return f"=?UTF-8?B?{base64.b64encode(value.encode('utf-8')).decode('ascii')}?="
+
+
 def send_ntfy_notification(
     settings: WebNotificationSettings,
     *,
@@ -148,7 +157,7 @@ def send_ntfy_notification(
         raise ValueError("Enter an ntfy topic before sending a notification")
     url = f"{settings.server_url}/{quote(settings.topic, safe='')}"
     headers = {
-        "Title": str(title)[:120],
+        "Title": ntfy_header_text(str(title)[:120]),
         "Priority": str(max(1, min(5, int(priority if priority is not None else settings.priority)))),
         "Content-Type": "text/plain; charset=utf-8",
     }

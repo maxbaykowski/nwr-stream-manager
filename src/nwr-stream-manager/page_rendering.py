@@ -219,7 +219,7 @@ def set_title(page: str, title: str) -> str:
 
 
 def set_site_name(page: str, name: str) -> str:
-    """Names this NWR Stream Manager by its instance name in the title, where the title names it.
+    """Names this NWR Stream Manager by its instance name in the title and the heading at the top.
 
     "Dashboard - NWR Stream Manager" becomes "Dashboard - " and the instance name. The
     page script, where a page has one, finds the name in the instance_name_meta tag.
@@ -232,6 +232,8 @@ def set_site_name(page: str, name: str) -> str:
     )
     if 'id="instance_name_meta"' in page:
         page = set_attribute(page, "instance_name_meta", "content", name)
+    if 'id="site_heading"' in page:
+        page = set_text(page, "site_heading", name)
     return page
 
 

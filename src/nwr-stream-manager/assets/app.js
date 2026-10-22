@@ -7453,6 +7453,7 @@ function setInstanceName(name) {
   if (!name || name === instanceName) return;
   instanceName = name;
   setPageTitle(pageTitle);
+  setText("site_heading", name);
 }
 
 function defaultViewTitle(name) {

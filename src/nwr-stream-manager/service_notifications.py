@@ -99,7 +99,7 @@ class NotificationServiceMixin:
             settings = reconcile_notification_access_url_selection(settings, self._notification_access_url_options())
         send_ntfy_notification(
             settings,
-            title="NWR Stream Manager",
+            title=self.instance_name,
             message="This is a test notification from NWR Stream Manager.",
             priority=settings.priority,
             click_url=notification_click_url(self.notification_effective_access_url_for_settings(settings), "/"),
@@ -437,12 +437,14 @@ class NotificationServiceMixin:
         priority = int(failure.get("priority", 4) or 4)
         if not message:
             return
+        # Titled with the instance name, so it's clear which NWR Stream Manager sent it.
+        title = self.instance_name
 
         def send() -> None:
             try:
                 send_ntfy_notification(
                     settings,
-                    title="NWR Stream Manager",
+                    title=title,
                     message=message,
                     priority=priority,
                     click_url=click_url,

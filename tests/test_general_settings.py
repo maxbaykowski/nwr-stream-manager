@@ -112,6 +112,77 @@ class DashboardUptimeTests(unittest.TestCase):
         self.assertLess(page.index('id="summary_uptime"'), page.index('id="dashboard_sdr_details"'))
 
 
+class InstanceNameInNotificationsTests(unittest.TestCase):
+    """Notifications are titled with the instance name, whatever characters it has."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.wc = load_web_control_module()
+        cls.notifications = sys.modules["nwr_stream_manager.notifications"]
+        cls.service_notifications = sys.modules["nwr_stream_manager.service_notifications"]
+
+    def test_titles_that_are_not_plain_ascii_are_encoded_for_ntfy(self) -> None:
+        from email.header import decode_header
+        encode = self.notifications.ntfy_header_text
+        self.assertEqual(encode("Kitchen Pi"), "Kitchen Pi")
+        for name in ("Cuisine \u00e9t\u00e9", "Shack \U0001F4FB"):
+            encoded = encode(name)
+            self.assertTrue(encoded.isascii())
+            ((raw, charset),) = decode_header(encoded)
+            self.assertEqual(raw.decode(charset), name)
+
+    def sent_titles(self, send):
+        sent = []
+        service = object.__new__(self.wc.RtlControlService)
+        service.general = sys.modules["nwr_stream_manager.general_settings"].GeneralSettings("Shack \U0001F4FB")
+        service.lock = threading.RLock()
+        service.notification_settings = self.wc.WebNotificationSettings(enabled=True, server_url="https://ntfy.sh", topic="NWRSTMGR-test")
+        service._notification_access_url_options = lambda: []
+        service.notification_effective_access_url_for_settings = lambda settings: "http://192.0.2.5:8080"
+        done = threading.Event()
+
+        def capture(settings, **fields):
+            sent.append(fields["title"])
+            done.set()
+
+        with mock.patch.object(self.service_notifications, "send_ntfy_notification", capture), self.assertLogs("nwr_stream_manager", "INFO"):
+            send(service)
+            done.wait(5)
+        return sent
+
+    def test_problem_notifications_are_titled_with_the_instance_name(self) -> None:
+        titles = self.sent_titles(lambda service: service._send_stream_problem_notification_async({"message": "WXN99 is down."}))
+        self.assertEqual(titles, ["Shack \U0001F4FB"])
+
+    def test_the_test_notification_is_titled_with_the_instance_name(self) -> None:
+        titles = self.sent_titles(lambda service: service.test_notification_settings({"enabled": True, "server_url": "https://ntfy.sh", "topic": "NWRSTMGR-test"}))
+        self.assertEqual(titles, ["Shack \U0001F4FB"])
+
+    def test_the_encoded_title_can_be_sent(self) -> None:
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            captured.update(request.header_items())
+            # As http.client sends it, which only takes Latin-1.
+            for value in captured.values():
+                value.encode("latin-1")
+            return FakeResponse()
+
+        settings = self.wc.WebNotificationSettings(enabled=True, server_url="https://ntfy.sh", topic="NWRSTMGR-test")
+        with mock.patch.object(self.notifications, "urlopen", fake_urlopen):
+            self.notifications.send_ntfy_notification(settings, title="Shack \U0001F4FB", message="Test")
+        self.assertEqual(captured["Title"], "=?UTF-8?B?U2hhY2sg8J+Tuw==?=")
+
+
 class GeneralPageTests(unittest.TestCase):
     """The instance name, as a browser without the page script sets it, and in titles."""
 
@@ -177,6 +248,7 @@ class GeneralPageTests(unittest.TestCase):
         self.assertIn('<div id="settings_layout" class="settings-layout">', page)
         self.assertRegex(page, r'<input id="general_instance_name" [^>]*value="NWR Stream Manager on weatherpi">')
         self.assertIn('<meta id="instance_name_meta" name="instance-name" content="NWR Stream Manager on weatherpi">', page)
+        self.assertIn('<h1 id="site_heading">NWR Stream Manager on weatherpi</h1>', page)
 
     def test_only_a_changed_name_is_saved_and_titles_change_at_once(self) -> None:
         admin = ("helper", "password2")
@@ -201,6 +273,7 @@ class GeneralPageTests(unittest.TestCase):
         self.assertEqual(self.title(page), "Changes saved. - General - Settings - Kitchen &lt;Pi&gt;")
         _, page = self.request("GET", "/", ("viewer", "password3"))
         self.assertEqual(self.title(page), "Dashboard - Kitchen &lt;Pi&gt;")
+        self.assertIn('<h1 id="site_heading">Kitchen &lt;Pi&gt;</h1>', page)
 
         # The location is saved by itself, leaving the name as it is.
         response, _ = self.request("POST", "/general-settings", admin, {**fields, "location": "Attic SDR (Grand Rapids, MI)"}, cookie)

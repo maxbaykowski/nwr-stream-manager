@@ -1773,6 +1773,7 @@ class AuthTests(unittest.TestCase):
         service.status = lambda: {}
         service._notification_access_url_options = lambda: []
         service.notification_effective_access_url_for_settings = lambda settings: "http://nwr.example"
+        service.general = __import__("sys").modules["nwr_stream_manager.general_settings"].GeneralSettings("NWR Stream Manager on test")
         with tempfile.TemporaryDirectory() as directory:
             service.notification_state_path = Path(directory) / "notifications.json"
             # Everything NWR Stream Manager logs, whichever part of it logs it.
