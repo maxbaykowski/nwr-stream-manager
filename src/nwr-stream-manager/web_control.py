@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import queue
@@ -898,6 +899,28 @@ def restore_signal_handlers(previous_handlers: dict[int, Any]) -> None:
             pass
 
 
+class WebServerBindError(RuntimeError):
+    """The web interface's address or port can't be used."""
+
+
+def bind_web_server(host: str, port: int) -> ThreadingHTTPServer:
+    try:
+        return ThreadingHTTPServer((host, port), RtlControlHandler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            message = (
+                f"port {port} is already in use by another program, perhaps another copy of NWR Stream Manager. "
+                "Stop that program, or choose another port with --port."
+            )
+        elif exc.errno == errno.EACCES:
+            message = f"permission to use port {port} was denied. Ports below 1024 need extra permission; choose another port with --port."
+        elif exc.errno == errno.EADDRNOTAVAIL:
+            message = f"{host} isn't an address of this computer. Choose another address with --host, or use 0.0.0.0 for every address."
+        else:
+            message = f"the web interface couldn't start on {host} port {port}: {exc.strerror or exc}"
+        raise WebServerBindError(message) from exc
+
+
 def run_server(host: str, port: int, state_path: Path, verbose: bool = False, log_file: Path | None = None) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -911,18 +934,27 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
         LOG.exception("NWR Stream Manager cannot start because a dependency check failed")
         raise
     LOG.info("startup dependency check passed: %s", format_dependency_summary(dependency_results))
+    # Before anything else starts, so a second copy can't take the RTL-SDR before it finds the port in use.
+    try:
+        server = bind_web_server(host, port)
+    except WebServerBindError as exc:
+        LOG.error("NWR Stream Manager cannot start: %s", exc)
+        raise
     ring_handler = RingLogHandler()
     logging.getLogger().addHandler(ring_handler)
     development_iq_sources = development_iq_sources_available()
-    service = RtlControlService(
-        state_path,
-        ring_handler,
-        development_iq_sources_enabled=development_iq_sources,
-    )
+    try:
+        service = RtlControlService(
+            state_path,
+            ring_handler,
+            development_iq_sources_enabled=development_iq_sources,
+        )
+    except BaseException:
+        server.server_close()
+        raise
     service.web_host = host
     service.web_port = port
     RtlControlHandler.service = service
-    server = ThreadingHTTPServer((host, port), RtlControlHandler)
     previous_signal_handlers = install_shutdown_signal_handlers(server, service.begin_shutdown)
     LOG.info("RTL-SDR control web interface bound to %s:%s", host, port)
     for url in access_urls(host, port):
@@ -944,7 +976,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         run_server(args.host, args.port, args.state, args.verbose, args.log_file)
-    except DependencyCheckError:
+    except (DependencyCheckError, WebServerBindError):
         return 1
     except KeyboardInterrupt:
         return 130
