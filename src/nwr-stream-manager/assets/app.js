@@ -8580,18 +8580,6 @@ function renderIqDownloadPage() {
   setPageTitle(`Download I/Q recording from ${recording.recorded_at || "unknown time"}`);
 }
 
-function startBackgroundDownload(url) {
-  const iframe = document.createElement("iframe");
-  iframe.hidden = true;
-  iframe.setAttribute("aria-hidden", "true");
-  iframe.title = "";
-  iframe.src = url;
-  document.body.appendChild(iframe);
-  setTimeout(() => {
-    iframe.remove();
-  }, 10 * 60 * 1000);
-}
-
 async function removeIqRecording(recordingId) {
   if (accountIsReadOnly()) {
     setIqRecorderResult("This account is read-only.", "error");
@@ -8609,7 +8597,12 @@ async function downloadSelectedIqRecording() {
     return;
   }
   const format = document.getElementById("iq_download_format").value || "cf";
-  startBackgroundDownload(`/api/iq-recording-download?id=${encodeURIComponent(recording.id)}&format=${encodeURIComponent(format)}`);
+  const link = document.createElement("a");
+  link.href = `/api/iq-recording-download?id=${encodeURIComponent(recording.id)}&format=${encodeURIComponent(format)}`;
+  link.download = "";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
   navigateTo("iq_recorder", {}, false, true);
   setIqRecorderResult("Download started.", "success");
   setTimeout(() => loadIqRecordings().catch(() => {}), 500);

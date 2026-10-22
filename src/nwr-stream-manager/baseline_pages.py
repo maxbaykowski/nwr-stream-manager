@@ -197,6 +197,24 @@ SIGN_IN_REQUIRED_HTML = """<!doctype html>
 """
 
 
+def render_sign_in_wait_page(message: str) -> str:
+    """Shown in place of the sign-in prompt while a username has to wait."""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Try again later - NWR Stream Manager</title>
+</head>
+<body>
+<h1>Try again later</h1>
+<p>{html.escape(message)} <a href="/">Try again</a></p>
+<p><a href="/help">Help</a></p>
+</body>
+</html>
+"""
+
+
 SETUP_HTML = pages.setup_page()
 
 
@@ -230,6 +248,9 @@ def render_setup_page(step: str, form_token: str, message: str = "", username: s
     page = page_rendering.set_hidden(page, "setup_welcome", step != "welcome")
     page = page_rendering.set_hidden(page, "setup_form", step != "account")
     page = page_rendering.set_hidden(page, "setup_done", step != "done")
+    page = page_rendering.set_hidden(page, "setup_blocked", step != "blocked")
+    if step == "blocked":
+        page = page_rendering.set_title(page, "Finish setup from your own network - NWR Stream Manager Setup")
     if username:
         page = page_rendering.set_attribute(page, "setup_username", "value", username)
     if message:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -21,11 +22,15 @@ from .baseline_pages import (
     HELP_PATH,
     IQ_RECORDING_DOWNLOAD_PATH,
     render_change_password_page,
+    render_notice_page,
     render_setup_page,
+    render_sign_in_wait_page,
     SETUP_FORM_PATH,
     SIGN_IN_REQUIRED_HTML,
 )
 from .constants import AUTH_REALM, AUTH_SESSION_COOKIE_NAME
+from .request_origin import ANOTHER_SITE_MESSAGE, SETUP_THROUGH_PROXY_MESSAGE, request_from_another_site, request_through_proxy
+from .sign_in_limits import SignInWait
 
 
 LOG = logging.getLogger(__name__)
@@ -42,7 +47,12 @@ class AuthHandlerMixin:
     def _auth_ok_or_setup_response(self, path: str, method: str) -> bool:
         # One connection can carry several requests.
         self._new_form_token = ""
-        allowed = self._check_auth_or_respond(path, method)
+        self._sign_in_wait: SignInWait | None = None
+        if request_from_another_site(method, path, self.headers):
+            self._send_another_site_refused(path)
+            allowed = False
+        else:
+            allowed = self._check_auth_or_respond(path, method)
         if not allowed and method != "GET":
             # Answered without reading the request body, which would otherwise be
             # taken for the connection's next request.
@@ -64,6 +74,15 @@ class AuthHandlerMixin:
             self._send_json({"setup_required": not has_account, "instance": self.service.instance_id})
             return False
         if not has_account:
+            if request_through_proxy(self.headers):
+                # Anyone who found a tunnel's address could create the owner account.
+                if method != "GET":
+                    LOG.warning("refused first-time setup from %s: it came through a tunnel or proxy", self._client_address())
+                if path.startswith("/api/"):
+                    self._send_json({"error": SETUP_THROUGH_PROXY_MESSAGE}, status=HTTPStatus.FORBIDDEN)
+                else:
+                    self._send_page(render_setup_page("blocked", ""), HTTPStatus.FORBIDDEN)
+                return False
             if method == "GET":
                 step = parse_qs(urlparse(self.path).query).get("step", [""])[0]
                 self._send_page(render_setup_page("account" if step == "account" else "welcome", self._form_token()))
@@ -100,6 +119,20 @@ class AuthHandlerMixin:
         self._send_auth_required()
         return False
 
+    def _send_another_site_refused(self, path: str) -> None:
+        self.current_account = None
+        LOG.warning(
+            "refused %s %s from %s: it came from another website (%s)",
+            self.command,
+            path,
+            self._client_address(),
+            self.headers.get("Origin") or self.headers.get("Sec-Fetch-Site") or "unknown",
+        )
+        if path.startswith("/api/"):
+            self._send_json({"error": ANOTHER_SITE_MESSAGE}, status=HTTPStatus.FORBIDDEN)
+        else:
+            self._send_page(render_notice_page("Nothing was changed", f"<p>{ANOTHER_SITE_MESSAGE}</p>", {}), HTTPStatus.FORBIDDEN)
+
     def _session_auth_valid(self) -> AccountRecord | None:
         cookie_header = self.headers.get("Cookie", "")
         if not cookie_header:
@@ -125,7 +158,11 @@ class AuthHandlerMixin:
         username, separator, password = decoded.partition(":")
         if not separator:
             return None
-        return self.service.accounts.verify_basic_account(username, password)
+        try:
+            return self.service.accounts.verify_basic_account(username, password)
+        except SignInWait as wait:
+            self._sign_in_wait = wait
+            return None
 
     def _account_authorized_or_response(self, path: str, method: str, account: AccountRecord) -> bool:
         if account.must_change_password:
@@ -227,6 +264,10 @@ class AuthHandlerMixin:
         )
 
     def _send_auth_required(self) -> None:
+        wait = getattr(self, "_sign_in_wait", None)
+        if wait is not None:
+            self._send_sign_in_wait(wait)
+            return
         payload = b'{"error":"authentication required"}'
         content_type = "application/json"
         if not urlparse(self.path).path.startswith("/api/"):
@@ -246,6 +287,26 @@ class AuthHandlerMixin:
             self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError, OSError):
             LOG.debug("client disconnected before auth response could be written")
+
+    def _send_sign_in_wait(self, wait: SignInWait) -> None:
+        """Too many wrong passwords: says how long to wait, without asking for a password again yet."""
+        if urlparse(self.path).path.startswith("/api/"):
+            payload = json.dumps({"error": str(wait)}).encode("utf-8")
+            content_type = "application/json"
+        else:
+            payload = render_sign_in_wait_page(str(wait)).encode("utf-8")
+            content_type = "text/html; charset=utf-8"
+        self.close_connection = True
+        self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+        self.send_header("Retry-After", str(wait.seconds))
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            LOG.debug("client disconnected before the sign-in wait could be written")
 
     def _send_notification_forbidden(self) -> None:
         data = (

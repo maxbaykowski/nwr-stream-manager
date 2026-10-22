@@ -4,6 +4,7 @@ import argparse
 import errno
 import json
 import logging
+import os
 import queue
 import secrets
 import signal
@@ -11,6 +12,7 @@ import socket
 import sys
 import threading
 import time
+import unicodedata
 from collections import deque
 from dataclasses import asdict
 from http import HTTPStatus
@@ -59,6 +61,7 @@ from .baseline_pages import (
 )
 from .config import IcecastConfig, IQ_SAMPLE_RATE
 from .constants import (
+    STATE_DIRECTORY_NAME,
     ACCOUNT_ROLE_ADMIN,
     ACCOUNT_ROLE_OWNER,
     ACCOUNT_ROLE_READ_ONLY,
@@ -272,6 +275,8 @@ from .state_files import (
     default_state_path,
     load_settings,
     load_soundcard_name_cache,
+    make_owner_only,
+    OWNER_ONLY_UMASK,
     save_settings,
     systemd_directory_path,
 )
@@ -824,9 +829,11 @@ class RtlControlHandler(
                     str(details.get("mode", "")),
                     message,
                     details,
+                    self._current_account_id(),
                 )
             detail_text = json.dumps(details, sort_keys=True)[:1000] if isinstance(details, dict) else str(details)[:1000]
-            log_message = "client %s from %s: %s %s" % (area, self._client_address(), message, detail_text)
+            # Without line breaks, so a message can't pass itself off as other lines of the log.
+            log_message = one_log_line("client %s from %s: %s %s" % (area, self._client_address(), message, detail_text))
             if level in {"warning", "warn", "error"}:
                 LOG.warning("%s", log_message)
             else:
@@ -839,6 +846,11 @@ class RtlControlHandler(
 
 
 RtlControlHandler.ROUTES = route_table(RtlControlHandler)
+
+
+def one_log_line(text: str) -> str:
+    """Text from a page, as one line of the log: line breaks and other control characters become spaces."""
+    return "".join(" " if unicodedata.category(character) in {"Cc", "Zl", "Zp"} else character for character in text)
 
 
 def port_argument(value: str) -> int:
@@ -885,6 +897,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
+
+
+def owned_state_paths(state_path: Path, log_path: Path) -> list[Path]:
+    """Everything NWR Stream Manager keeps, and nothing else that happens to share its folder."""
+    folder = state_path.parent
+    names = [
+        STREAMS_STATE_FILE_NAME, FALLBACK_STATE_FILE_NAME, CUSTOM_FALLBACK_AUDIO_FILE_NAME, NOTIFICATION_STATE_FILE_NAME,
+        TEST_MODE_TIME_FILE_NAME, SOUNDCARD_DEVICE_NAMES_FILE_NAME,
+        STREAMS_DIRECTORY_NAME, IQ_RECORDINGS_DIRECTORY_NAME, IQ_TEST_SOURCES_DIRECTORY_NAME, REMOTE_SDR_DIRECTORY_NAME,
+    ]
+    database = folder / ACCOUNTS_DATABASE_FILE_NAME
+    paths = [state_path, log_path, database, *(database.with_name(database.name + suffix) for suffix in ("-journal", "-wal", "-shm"))]
+    paths += [folder / name for name in names]
+    paths += [general_state_path(state_path), web_address_state_path(state_path)]
+    return paths
+
+
+def owned_state_folder(state_path: Path) -> Path | None:
+    """The folder NWR Stream Manager keeps its files in, when it's one of its own rather than one chosen with --state."""
+    folder = state_path.parent
+    if folder.name == STATE_DIRECTORY_NAME or folder == systemd_directory_path("STATE_DIRECTORY"):
+        return folder
+    return None
 
 
 def default_log_path(state_path: Path) -> Path:
@@ -999,12 +1034,17 @@ def run_server(
     bind_to_all_interfaces: bool = False,
 ) -> bool:
     """Runs until shut down. Returns true when it was shut down to restart."""
+    # Everything created from here on is for this account only, starting with the log.
+    os.umask(OWNER_ONLY_UMASK)
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log_path = log_file or default_log_path(state_path)
     configure_file_logging(log_path)
+    make_owner_only(owned_state_paths(state_path, log_path))
+    # Just the folder, not everything in it: once it's private, nobody else can reach what's inside.
+    make_owner_only([], folder=owned_state_folder(state_path))
     try:
         dependency_results = check_startup_dependencies()
     except DependencyCheckError:

@@ -130,6 +130,10 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("StateDirectory=nwr-stream-manager", unit)
         self.assertIn("LogsDirectory=nwr-stream-manager", unit)
         self.assertIn("SupplementaryGroups=plugdev audio", unit)
+        # Its files are for its own account only.
+        self.assertIn("StateDirectoryMode=0700", unit)
+        self.assertIn("LogsDirectoryMode=0700", unit)
+        self.assertIn("UMask=0077", unit)
         # No --host or --port, so the Advanced settings decide where it listens.
         self.assertIn("ExecStart=/usr/local/bin/nwr-stream-manager\n", unit)
 
@@ -144,8 +148,10 @@ class PackagingTests(unittest.TestCase):
         end = script.index("function updateDashboard", start)
         download_function = script[start:end]
 
-        self.assertIn("startBackgroundDownload", download_function)
+        # A download link, as the EAS alert export uses: the page stays where it is, with no frame.
+        self.assertIn('link.download = "";', download_function)
         self.assertNotIn("window.location.href", download_function)
+        self.assertNotIn("iframe", script)
 
     def test_browser_routes_preserve_deep_link_ids(self) -> None:
         script = self.web_control.INDEX_HTML

@@ -15,15 +15,45 @@ from urllib.parse import parse_qs, ParseResult
 from . import page_rendering
 from .baseline_pages import HELP_AUDIO_FILES, HELP_FILE_NAME
 from .constants import MAX_JSON_REQUEST_BYTES
+from .request_origin import request_over_https
 from .simulated_station import asset_path
 from .state_files import http_header_filename
 
 
 LOG = logging.getLogger(__name__)
+# How long a browser keeps using HTTPS for this address once it has reached it that way.
+HSTS_SECONDS = 365 * 24 * 60 * 60
 
 
 class ResponseHandlerMixin:
     """Mixed into RtlControlHandler."""
+
+    def send_header(self, keyword: str, value: str) -> None:
+        # Over HTTPS, cookies are only ever sent back over HTTPS, where nobody between the
+        # browser and here can read them. Over plain HTTP, as on a home network, a browser
+        # wouldn't keep a cookie marked that way at all.
+        if keyword.lower() == "set-cookie" and self._over_https() and "; secure" not in value.lower():
+            value = f"{value}; Secure"
+        super().send_header(keyword, value)
+
+    def _over_https(self) -> bool:
+        headers = getattr(self, "headers", None)
+        return headers is not None and request_over_https(headers)
+
+    def end_headers(self) -> None:
+        # No page may show these pages in a frame, where another website could hide them
+        # under its own and trick someone into selecting real buttons (clickjacking).
+        # X-Frame-Options is for browsers too old to know frame-ancestors.
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        self.send_header("X-Frame-Options", "DENY")
+        # Each response is only ever what its Content-Type says, never guessed at by the browser.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if self._over_https():
+            # Browsers use HTTPS for this address from then on, for a year, even if someone
+            # types http:// or follows an old link, so nothing is ever sent unencrypted.
+            # Only this address: a tunnel's address may share its domain with other sites.
+            self.send_header("Strict-Transport-Security", f"max-age={HSTS_SECONDS}")
+        super().end_headers()
 
     def log_message(self, format: str, *args) -> None:
         LOG.debug("HTTP %s - %s", self.address_string(), format % args)

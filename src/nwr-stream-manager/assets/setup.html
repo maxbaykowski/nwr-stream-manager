@@ -65,6 +65,11 @@ footer a { color: #174a98; }
       </div>
       <div id="setup_message" class="message" aria-live="polite"></div>
     </form>
+    <div id="setup_blocked" hidden>
+      <h2>Finish setup from your own network</h2>
+      <p>For your security, NWR Stream Manager can't be set up for the first time through a tunnel or proxy, such as Cloudflare Tunnel or Tailscale Funnel. Otherwise, a stranger who found its address could create the owner account before you do.</p>
+      <p>To set it up, open NWR Stream Manager on the computer it's running on, or on a device on the same network. Once the owner account exists, you can sign in through your tunnel as usual.</p>
+    </div>
     <form id="setup_done" method="get" action="/" hidden>
       <p>You're all set up! Click the finish button to log in.</p>
       <div class="actions">

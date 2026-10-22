@@ -222,6 +222,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <div class="warning">
     <p><strong>Create your account right away.</strong> Until an account exists, anyone on your network who opens NWR Stream Manager sees the setup page. This means someone else in your house could create the owner account themselves, which wouldn't be good, would it? Open up your browser and complete the setup as soon as NWR Stream Manager is running for the first time.</p>
   </div>
+  <p>Setup only works from the computer NWR Stream Manager runs on, or from a device on the same network. If you open it through a tunnel or proxy, such as Cloudflare Tunnel or Tailscale Funnel, before the owner account exists, you'll see a page asking you to finish setup from your own network instead. This keeps a stranger who finds your tunnel's address from creating the owner account. Once setup is done, the tunnel works as usual.</p>
   <h3 id="signing-in">Signing in</h3>
   <p>After setup, your browser asks for your username and password whenever you open NWR Stream Manager. This is your browser's own sign-in box, not part of the page. Your browser remembers that you're signed in for a while, so you won't be nagged to sign in every time.</p>
 </section>

@@ -20,11 +20,11 @@ class LiveAudioRoutesMixin:
 
     @route("GET", "/api/monitor/status")
     def _get_monitor_status(self, parsed: ParseResult) -> None:
-        self._send_json_result(lambda: self.service.monitor_status(self._query_value(parsed, "client_id")))
+        self._send_json_result(lambda: self.service.monitor_status(self._query_value(parsed, "client_id"), self._current_account_id()))
 
     @route("GET", "/api/receiver/status")
     def _get_receiver_status(self, parsed: ParseResult) -> None:
-        self._send_json_result(lambda: self.service.receiver_status(self._query_value(parsed, "client_id")))
+        self._send_json_result(lambda: self.service.receiver_status(self._query_value(parsed, "client_id"), self._current_account_id()))
 
     @route("POST", "/api/monitor/stop")
     def _post_monitor_stop(self, parsed: ParseResult) -> None:

@@ -195,9 +195,16 @@ def send_ntfy_notification(
 
 
 def sanitize_local_notification_path(raw: Any) -> str:
+    """A page on this server to go to, or "/" for anything that could lead to another website.
+
+    Browsers read a backslash as a slash and drop tabs and line breaks, so "/\\evil.example"
+    and "///evil.example" both go to evil.example, as "//evil.example" does.
+    """
     value = str(raw or "").strip() or "/"
+    if "\\" in value or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+        return "/"
     parsed = urlparse(value)
-    if parsed.scheme or parsed.netloc or not value.startswith("/"):
+    if parsed.scheme or parsed.netloc or not value.startswith("/") or value.startswith("//"):
         return "/"
     return value
 

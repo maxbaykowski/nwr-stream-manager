@@ -39,6 +39,46 @@ def default_state_path() -> Path:
     return base / STATE_FILE_NAME
 
 
+# Files and folders NWR Stream Manager creates can be read and changed by the account it
+# runs as, and nobody else: they hold password hashes, notification secrets and recordings.
+OWNER_ONLY_UMASK = 0o077
+
+
+def make_owner_only(paths: list[Path], *, folder: Path | None = None) -> None:
+    """Makes these files, and folders with everything in them, readable and writable by their owner only.
+
+    For files saved before NWR Stream Manager made them that way. folder is made
+    private on its own, without what's inside it. Links are left alone, and so is
+    anything this account doesn't own.
+    """
+    if folder is not None and folder.is_dir() and not folder.is_symlink():
+        _owner_only(folder, 0o700)
+    for path in paths:
+        if path.is_symlink() or not path.exists():
+            continue
+        if path.is_dir():
+            for directory, folders, files in os.walk(path):
+                _owner_only(Path(directory), 0o700)
+                for name in files:
+                    _owner_only(Path(directory) / name, 0o600)
+                folders[:] = [name for name in folders if not (Path(directory) / name).is_symlink()]
+        else:
+            _owner_only(path, 0o600)
+
+
+def _owner_only(path: Path, needed: int) -> None:
+    try:
+        status = path.lstat()
+        if status.st_uid != os.geteuid() or path.is_symlink():
+            return
+        mode = status.st_mode & 0o7777
+        private = (mode & 0o700) | needed
+        if private != mode:
+            os.chmod(path, private)
+    except OSError as exc:
+        LOG.warning("couldn't make %s private: %s", path, exc)
+
+
 def systemd_directory_path(variable: str) -> Path | None:
     value = os.environ.get(variable, "").strip()
     if not value:

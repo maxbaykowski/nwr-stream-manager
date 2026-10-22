@@ -5,9 +5,11 @@ import queue
 import sys
 import tempfile
 import threading
+import ssl
 import time
 import types
 import unittest
+from unittest import mock
 import unittest.mock
 from pathlib import Path
 
@@ -577,6 +579,35 @@ class RemoteSdrProtocolTests(unittest.TestCase):
             with self.subTest(query=wrong):
                 self.assertEqual(self.discover(paired_with=wrong), [])
 
+    def test_a_recorded_discovery_request_cant_be_replayed(self) -> None:
+        remote = self.remote
+        record = self.pair()
+        host_id = self.host_identity.fingerprint
+        client_id = self.client_identity.fingerprint
+        answer = self.server._may_answer_discovery
+        request = remote.paired_discovery_query(host_id, client_id, record["token"])
+        self.assertTrue(answer(request, "192.168.1.30"))
+        # The device sends each request more than once, as broadcasts get lost.
+        self.assertTrue(answer(request, "192.168.1.30"))
+        # The same request from anywhere else is a copy.
+        self.assertFalse(answer(request, "192.168.1.66"))
+
+    def test_old_discovery_requests_arent_answered(self) -> None:
+        remote = self.remote
+        record = self.pair()
+        host_id = self.host_identity.fingerprint
+        client_id = self.client_identity.fingerprint
+
+        def request_made(seconds_ago: float, nonce_text: str | None = None) -> dict:
+            nonce = nonce_text or f"{int(time.time() - seconds_ago)}.{'ab' * 16}"
+            return {"for": host_id, "client": client_id, "nonce": nonce, "proof": remote.discovery_proof(host_id, record["token"], nonce)}
+
+        window = remote.DISCOVERY_REQUEST_WINDOW_SECONDS
+        self.assertTrue(self.server._may_answer_discovery(request_made(window - 60), "192.168.1.30"))
+        self.assertFalse(self.server._may_answer_discovery(request_made(window + 60), "192.168.1.30"))
+        # Without the time it was made, as older versions sent it.
+        self.assertFalse(self.server._may_answer_discovery(request_made(0, "cd" * 16), "192.168.1.30"))
+
     def test_pairing_ends_when_the_page_showing_the_code_stops_checking_in(self) -> None:
         from unittest.mock import patch
 
@@ -670,6 +701,96 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         self.server.begin_pairing()
         self.server.cancel_pairing()
         self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "stopped"})
+
+    def start_pairing_attempt(self, guess: str, number: int = 0):
+        """Opens a pairing attempt up to the host's challenge, the way pair_with_host does."""
+        remote = self.remote
+        connection = remote.open_host_connection("127.0.0.1", self.server.port, expected_fingerprint=None)
+        self.addCleanup(connection.close)
+        client_id = f"{number:064x}"
+        srp = remote.SrpClient(guess, remote.pairing_context(connection.peer_fingerprint, client_id))
+        connection.send_json(
+            {"type": "hello", "v": remote.REMOTE_SDR_PROTOCOL_VERSION, "role": "pair",
+             "client_id": client_id, "client_name": f"guess {number}", "A": format(srp.public, "x")}
+        )
+        return connection, srp, connection.recv_json(timeout=10)
+
+    def finish_pairing_attempt(self, connection, srp, challenge) -> dict:
+        proof = srp.process_challenge(bytes.fromhex(challenge["salt"]), int(challenge["B"], 16))
+        connection.send_json({"type": "pair-proof", "M1": proof.hex()})
+        return connection.recv_json(timeout=10)
+
+    def test_pairing_attempts_at_once_cant_get_around_the_limit_on_wrong_codes(self) -> None:
+        code = self.server.begin_pairing()["code"]
+        wrong = "000000" if code != "000000" else "111111"
+        attempts = [self.start_pairing_attempt(wrong if i else code, i) for i in range(10)]
+        # Only one device pairs at a time; the rest are told so before any work is done for them.
+        self.assertEqual(attempts[0][2]["type"], "pair-challenge")
+        for _connection, _srp, reply in attempts[1:]:
+            self.assertEqual(reply.get("code"), "pairing-busy")
+        self.assertEqual(self.server.pairing_status()["attempts_left"], self.remote.PAIRING_MAX_ATTEMPTS - 1)
+
+    def test_a_guess_made_while_pairing_was_open_is_refused_once_it_has_ended(self) -> None:
+        code = self.server.begin_pairing()["code"]
+        connection, srp, challenge = self.start_pairing_attempt(code)
+        self.server.cancel_pairing()
+        reply = self.finish_pairing_attempt(connection, srp, challenge)
+        self.assertEqual(reply.get("code"), "pairing-closed")
+        self.assertEqual(self.server.devices.all(), {})
+
+    def test_attempts_that_give_up_still_count(self) -> None:
+        remote = self.remote
+        code = self.server.begin_pairing()["code"]
+        for i in range(remote.PAIRING_MAX_ATTEMPTS):
+            connection, _srp, challenge = self.start_pairing_attempt(code, i)
+            self.assertEqual(challenge["type"], "pair-challenge")
+            connection.close()
+            deadline = time.monotonic() + 5
+            while self.server._pairing_in_progress and time.monotonic() < deadline:
+                time.sleep(0.02)
+        with self.assertRaisesRegex(remote.RemoteSdrAuthError, "not open"):
+            remote.pair_with_host("127.0.0.1", self.server.port, code, client_id="c" * 64, client_name="x")
+        self.assertEqual(self.server.pairing_status(), {"active": False, "ended_reason": "too-many-attempts"})
+
+    def closed_by_host(self, connection, within: float) -> bool:
+        """Whether the host closes this connection, without it sending anything, within the time given."""
+        try:
+            connection.recv_frame(timeout=within)
+        except TimeoutError:
+            return False  # still open, and the host said nothing
+        except (ConnectionError, OSError, self.remote.RemoteSdrError):
+            return True
+        return False
+
+    def test_a_connection_that_never_says_who_it_is_is_dropped(self) -> None:
+        with mock.patch.object(self.remote, "HANDSHAKE_TIMEOUT_SECONDS", 0.5):
+            silent = self.remote.open_host_connection("127.0.0.1", self.server.port, expected_fingerprint=None)
+            self.addCleanup(silent.close)
+            self.assertTrue(self.closed_by_host(silent, within=5))
+
+    def test_a_device_that_isnt_paired_cant_send_large_messages(self) -> None:
+        remote = self.remote
+        connection = remote.open_host_connection("127.0.0.1", self.server.port, expected_fingerprint=None)
+        self.addCleanup(connection.close)
+        # Says it will send more than an unpaired device may; the host stops reading.
+        connection.sock.sendall(remote.FRAME_HEADER.pack(remote.UNAUTHENTICATED_MAX_FRAME_BYTES + 1, remote.FRAME_JSON))
+        self.assertTrue(self.closed_by_host(connection, within=5))
+
+    def test_only_so_many_connections_can_wait_to_sign_in(self) -> None:
+        remote = self.remote
+        with mock.patch.object(remote, "MAX_UNAUTHENTICATED_CONNECTIONS", 2), mock.patch.object(remote, "HANDSHAKE_TIMEOUT_SECONDS", 1.0):
+            waiting = [remote.open_host_connection("127.0.0.1", self.server.port, expected_fingerprint=None) for _ in range(2)]
+            for connection in waiting:
+                self.addCleanup(connection.close)
+            with self.assertRaises((ConnectionError, OSError, ssl.SSLError)):
+                extra = remote.open_host_connection("127.0.0.1", self.server.port, expected_fingerprint=None)
+                self.addCleanup(extra.close)
+                extra.recv_frame(timeout=2)
+            # Once those give up, a paired device connects as usual.
+            for connection in waiting:
+                self.assertTrue(self.closed_by_host(connection, within=5))
+        record = self.pair()
+        self.assertTrue(record["token"])
 
     def test_pairing_requires_an_open_window(self) -> None:
         with self.assertRaisesRegex(self.remote.RemoteSdrAuthError, "not open"):

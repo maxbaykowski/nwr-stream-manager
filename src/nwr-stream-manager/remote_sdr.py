@@ -16,8 +16,10 @@ Discovery
     hosts with remote access enabled answer with their identity, name, TCP
     port and a short SDR summary. A host answers anyone only while it is in
     pairing mode; otherwise it answers only devices already paired with it,
-    which prove it with their token (see discovery_proof). A paired host whose
-    address changed is found again that way, by identity.
+    which prove it with their token (see discovery_proof) in a request that
+    says when it was made. Each request is answered only if recent, and only
+    to the address that first sent it, so a recorded one can't be replayed.
+    A paired host whose address changed is found again that way, by identity.
 
 Pairing
     The host shows a short numeric code. The client proves knowledge of it with
@@ -83,6 +85,11 @@ FRAME_IQ = 2
 FRAME_HEADER = struct.Struct(">IB")
 IQ_HEADER = struct.Struct(">QIQdI")  # sequence, sample rate, center Hz, host time, generation
 MAX_FRAME_BYTES = 16 * 1024 * 1024
+# Until a device has shown it is paired, or while it pairs, its messages are small:
+# a hello, a pairing proof or a token.
+UNAUTHENTICATED_MAX_FRAME_BYTES = 64 * 1024
+# Connections still waiting to show they're paired; any more are closed at once.
+MAX_UNAUTHENTICATED_CONNECTIONS = 32
 CS16_SCALE = 32767.0
 
 HANDSHAKE_TIMEOUT_SECONDS = 10.0
@@ -121,6 +128,12 @@ TAILSCALE_STATUS_TIMEOUT_SECONDS = 3.0
 # Tailscale peers that cannot be running NWR Stream Manager.
 TAILSCALE_SKIPPED_OS = {"ios", "android", "ipados", "tvos"}
 VIRTUAL_INTERFACE_PREFIXES = ("br-", "cali", "cni", "docker", "flannel", "kube", "lxc", "podman", "veth", "virbr", "vmnet", "vboxnet")
+
+# A paired device's discovery request says when it was made. Older or newer than this,
+# by the host's clock, it isn't answered; within it, the host remembers each request
+# so a copy sent from somewhere else isn't answered either.
+DISCOVERY_REQUEST_WINDOW_SECONDS = 10 * 60.0
+MAX_REMEMBERED_DISCOVERY_REQUESTS = 10_000
 
 PAIRING_CODE_DIGITS = 6
 # Pairing mode ends when a device pairs, after this long, or after this many
@@ -500,8 +513,12 @@ class FrameConnection:
     def send_json(self, message: dict[str, Any]) -> None:
         self.send_frame(FRAME_JSON, json.dumps(message, separators=(",", ":")).encode("utf-8"))
 
-    def recv_frame(self, timeout: float | None = None) -> tuple[int, bytes]:
-        """Read one frame; raises TimeoutError, without consuming data, if none starts in time."""
+    def recv_frame(self, timeout: float | None = None, *, max_bytes: int = MAX_FRAME_BYTES, whole: bool = False) -> tuple[int, bytes]:
+        """Read one frame; raises TimeoutError, without consuming data, if none starts in time.
+
+        With whole, the frame must also finish arriving in that time, so a peer can't
+        hold the connection by sending it a little at a time.
+        """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             if self.closed:
@@ -514,11 +531,12 @@ class FrameConnection:
         with self.io_lock:
             if self.closed:
                 raise ConnectionError("remote SDR connection closed")
-            header = self._recv_exact(FRAME_HEADER.size)
+            finish_by = deadline if whole else None
+            header = self._recv_exact(FRAME_HEADER.size, finish_by)
             length, kind = FRAME_HEADER.unpack(header)
-            if length > MAX_FRAME_BYTES:
+            if length > max_bytes:
                 raise RemoteSdrProtocolError("peer sent a frame that is too large")
-            return kind, self._recv_exact(length)
+            return kind, self._recv_exact(length, finish_by)
 
     def _readable(self, timeout: float) -> bool:
         try:
@@ -529,8 +547,8 @@ class FrameConnection:
             raise ConnectionError("remote SDR connection closed") from exc
         return bool(readable)
 
-    def recv_json(self, timeout: float | None = None) -> dict[str, Any]:
-        kind, payload = self.recv_frame(timeout)
+    def recv_json(self, timeout: float | None = None, *, max_bytes: int = MAX_FRAME_BYTES, whole: bool = False) -> dict[str, Any]:
+        kind, payload = self.recv_frame(timeout, max_bytes=max_bytes, whole=whole)
         if kind != FRAME_JSON:
             raise RemoteSdrProtocolError("expected a control message")
         try:
@@ -541,9 +559,11 @@ class FrameConnection:
             raise RemoteSdrProtocolError("control messages must be JSON objects")
         return message
 
-    def _recv_exact(self, count: int) -> bytes:
+    def _recv_exact(self, count: int, finish_by: float | None = None) -> bytes:
         chunks = bytearray()
         while len(chunks) < count:
+            if finish_by is not None and time.monotonic() >= finish_by:
+                raise TimeoutError("the remote SDR message did not finish arriving in time")
             chunk = self.sock.recv(count - len(chunks))
             if not chunk:
                 raise ConnectionError("remote SDR connection closed")
@@ -797,14 +817,15 @@ def discovery_proof(host_id: str, token: str, nonce: str) -> str:
     """Proves to a host that the asker is paired with it, without sending the token.
 
     The host keeps only the SHA-256 of the token it issued, so the proof is keyed
-    by that hash; it is bound to the host and a fresh nonce from the asker.
+    by that hash; it is bound to the host and a fresh nonce from the asker, which
+    starts with the time the request was made.
     """
     key = hashlib.sha256(str(token).encode("ascii", "replace")).hexdigest().encode("ascii")
     return hmac.new(key, f"{host_id}:{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def paired_discovery_query(host_id: str, client_id: str, token: str) -> dict[str, Any]:
-    nonce = secrets.token_hex(16)
+    nonce = f"{int(time.time())}.{secrets.token_hex(16)}"
     return {"for": host_id, "client": client_id, "nonce": nonce, "proof": discovery_proof(host_id, token, nonce)}
 
 
@@ -819,7 +840,7 @@ class DiscoveryResponder:
         *,
         port: int = REMOTE_SDR_DISCOVERY_PORT,
         bind_address: str = "",
-        may_answer: Callable[[dict[str, Any]], bool] | None = None,
+        may_answer: Callable[[dict[str, Any], str], bool] | None = None,
     ) -> None:
         self.identity = identity
         self.tcp_port = tcp_port
@@ -891,7 +912,7 @@ class DiscoveryResponder:
                 continue
             if message.get("type") != "discover":
                 continue
-            if self.may_answer is not None and not self.may_answer(message):
+            if self.may_answer is not None and not self.may_answer(message, address[0]):
                 continue
             try:
                 self.sock.sendto(json.dumps(self.announcement()).encode("utf-8"), address)
@@ -1059,6 +1080,12 @@ class RemoteSdrServer:
         self.lock = threading.Lock()
         self.pairing: _PairingWindow | None = None
         self.pairing_ended_reason = ""
+        # Whether a device is partway through pairing; only one may be at a time.
+        self._pairing_in_progress = False
+        # Connections that haven't yet shown they're paired.
+        self._unauthenticated = 0
+        # Recent discovery requests from paired devices: nonce -> (the address that sent it, when it was made).
+        self._discovery_requests: dict[str, tuple[str, float]] = {}
         self.connections: dict[int, dict[str, Any]] = {}
         self._connection_ids = 0
         # One per control connection; set to send that client a status at once.
@@ -1176,7 +1203,7 @@ class RemoteSdrServer:
             self.pairing_ended_reason = "page-closed"
         return self.pairing
 
-    def _may_answer_discovery(self, message: dict[str, Any]) -> bool:
+    def _may_answer_discovery(self, message: dict[str, Any], address: str) -> bool:
         # Anyone may find this host while it shows a pairing code; otherwise only
         # the devices already paired with it, so it stays hidden from the rest.
         with self.lock:
@@ -1190,7 +1217,36 @@ class RemoteSdrServer:
             return False
         key = str(record.get("peer_token_sha256", "")).encode("ascii")
         expected = hmac.new(key, f"{self.identity.fingerprint}:{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, str(message.get("proof", "")))
+        if not hmac.compare_digest(expected, str(message.get("proof", ""))):
+            return False
+        return self._fresh_discovery_request(nonce, address)
+
+    def _fresh_discovery_request(self, nonce: str, address: str) -> bool:
+        """Whether a paired device's request is recent and not a copy sent from somewhere else.
+
+        A device sends each request a few times, as broadcasts get lost, so copies
+        from the address that first sent it are still answered. The reply goes to
+        the address a request came from, so a copy claiming that address helps nobody.
+        Remembered only in memory: a request older than the window is refused anyway.
+        """
+        try:
+            made_at = float(int(nonce.split(".", 1)[0]))
+        except ValueError:
+            return False
+        now = time.time()
+        if abs(now - made_at) > DISCOVERY_REQUEST_WINDOW_SECONDS:
+            return False
+        with self.lock:
+            requests = self._discovery_requests
+            for old in [key for key, (_where, when) in requests.items() if abs(now - when) > DISCOVERY_REQUEST_WINDOW_SECONDS]:
+                del requests[old]
+            seen = requests.get(nonce)
+            if seen is not None:
+                return seen[0] == address
+            if len(requests) >= MAX_REMEMBERED_DISCOVERY_REQUESTS:
+                del requests[min(requests, key=lambda key: requests[key][1])]
+            requests[nonce] = (address, made_at)
+        return True
 
     def unpair(self, client_id: str) -> bool:
         removed = self.devices.remove(client_id)
@@ -1233,6 +1289,17 @@ class RemoteSdrServer:
                 continue
             except OSError:
                 return
+            with self.lock:
+                full = self._unauthenticated >= MAX_UNAUTHENTICATED_CONNECTIONS
+                if not full:
+                    self._unauthenticated += 1
+            if full:
+                LOG.debug("remote SDR connection from %s refused: too many connections waiting to sign in", address[0])
+                try:
+                    raw.close()
+                except OSError:
+                    pass
+                continue
             threading.Thread(
                 target=self._handle_connection,
                 args=(raw, address),
@@ -1242,6 +1309,7 @@ class RemoteSdrServer:
 
     def _handle_connection(self, raw: socket.socket, address: tuple[str, int]) -> None:
         connection: FrameConnection | None = None
+        unauthenticated = True
         with self.lock:
             self._connection_ids += 1
             connection_id = self._connection_ids
@@ -1251,7 +1319,8 @@ class RemoteSdrServer:
             connection = FrameConnection(self.context.wrap_socket(raw, server_side=True))
             with self.lock:
                 self.connections[connection_id] = {"connection": connection, "address": address[0]}
-            hello = connection.recv_json()
+            # A device that isn't paired yet gets a little time and room to say who it is, no more.
+            hello = connection.recv_json(HANDSHAKE_TIMEOUT_SECONDS, max_bytes=UNAUTHENTICATED_MAX_FRAME_BYTES, whole=True)
             if hello.get("type") != "hello":
                 raise RemoteSdrProtocolError("expected hello")
             if int(hello.get("v", 0)) != REMOTE_SDR_PROTOCOL_VERSION:
@@ -1269,6 +1338,8 @@ class RemoteSdrServer:
                 return
             client_id = str(hello["client_id"])
             with self.lock:
+                self._unauthenticated -= 1
+                unauthenticated = False
                 self.connections[connection_id].update(
                     {"client_id": client_id, "client_name": record.get("name", ""), "role": role}
                 )
@@ -1299,6 +1370,8 @@ class RemoteSdrServer:
         finally:
             with self.lock:
                 self.connections.pop(connection_id, None)
+                if unauthenticated:
+                    self._unauthenticated -= 1
             if connection is not None:
                 connection.close()
             else:
@@ -1320,43 +1393,71 @@ class RemoteSdrServer:
             client_port = int(hello.get("client_port") or REMOTE_SDR_TCP_PORT)
         except (TypeError, ValueError):
             client_port = REMOTE_SDR_TCP_PORT
+        # One attempt at a time, each counted as it starts, so the limit on wrong codes
+        # holds however many connections try at once.
         with self.lock:
             window = self._active_pairing_locked()
-            code = window.code if window is not None else ""
-        if not code:
-            connection.send_json(
-                {
-                    "type": "error",
-                    "code": "pairing-closed",
-                    "error": "Pairing is not open on the remote SDR. Start pairing on that NWR Stream Manager first.",
-                }
-            )
+            if window is not None and window.attempts >= PAIRING_MAX_ATTEMPTS:
+                # Used up by attempts that gave up before guessing.
+                self.pairing = window = None
+                self.pairing_ended_reason = "too-many-attempts"
+            if window is None:
+                refusal = ("pairing-closed", "Pairing is not open on the remote SDR. Start pairing on that NWR Stream Manager first.")
+            elif self._pairing_in_progress:
+                refusal = ("pairing-busy", "Another device is pairing with the remote SDR right now. Try again in a moment.")
+            else:
+                refusal = None
+                self._pairing_in_progress = True
+                window.attempts += 1
+        if refusal is not None:
+            connection.send_json({"type": "error", "code": refusal[0], "error": refusal[1]})
             return
-        srp = SrpHost(code, pairing_context(self.identity.fingerprint, client_id))
+        try:
+            self._finish_pairing(connection, window, client_id, client_name, a_public, client_port, hello, address)
+        finally:
+            with self.lock:
+                self._pairing_in_progress = False
+
+    def _finish_pairing(
+        self,
+        connection: FrameConnection,
+        window: _PairingWindow,
+        client_id: str,
+        client_name: str,
+        a_public: int,
+        client_port: int,
+        hello: dict[str, Any],
+        address: tuple[str, int],
+    ) -> None:
+        srp = SrpHost(window.code, pairing_context(self.identity.fingerprint, client_id))
         srp.process_client(a_public)
         connection.send_json({"type": "pair-challenge", "salt": srp.salt.hex(), "B": format(srp.public, "x")})
-        reply = connection.recv_json()
+        reply = connection.recv_json(HANDSHAKE_TIMEOUT_SECONDS, max_bytes=UNAUTHENTICATED_MAX_FRAME_BYTES, whole=True)
         try:
             client_proof = bytes.fromhex(str(reply.get("M1", "")))
         except ValueError:
             client_proof = b""
-        host_proof = srp.verify_client(client_proof)
+        with self.lock:
+            # Pairing may have ended, or shown a new code, while this device worked out its proof.
+            still_open = self._active_pairing_locked() is window
+            host_proof = srp.verify_client(client_proof) if still_open else None
+            if still_open and host_proof is None and window.attempts >= PAIRING_MAX_ATTEMPTS:
+                self.pairing = None
+                self.pairing_ended_reason = "too-many-attempts"
+                LOG.warning("remote SDR pairing closed after %s failed attempts", PAIRING_MAX_ATTEMPTS)
+            if host_proof is not None:
+                # One pairing per code: pairing mode ends as soon as a device pairs.
+                self.pairing = None
+                self.pairing_ended_reason = "paired"
+        if not still_open:
+            connection.send_json(
+                {"type": "error", "code": "pairing-closed", "error": "Pairing ended on the remote SDR before this device finished pairing."}
+            )
+            return
         if host_proof is None:
-            with self.lock:
-                window = self._active_pairing_locked()
-                if window is not None:
-                    window.attempts += 1
-                    if window.attempts >= PAIRING_MAX_ATTEMPTS:
-                        self.pairing = None
-                        self.pairing_ended_reason = "too-many-attempts"
-                        LOG.warning("remote SDR pairing closed after %s failed attempts", PAIRING_MAX_ATTEMPTS)
             LOG.warning("remote SDR pairing attempt from %s used the wrong code", address[0])
             connection.send_json({"type": "error", "code": "wrong-code", "error": "The pairing code is incorrect."})
             return
-        with self.lock:
-            # One pairing per code: pairing mode ends as soon as a device pairs.
-            self.pairing = None
-            self.pairing_ended_reason = "paired"
         host_token = secrets.token_urlsafe(32)
         connection.send_json(
             {
@@ -1368,7 +1469,7 @@ class RemoteSdrServer:
         )
         # The client hands over its own token only after checking our proof,
         # so the pairing also lets this instance use the client's SDR later.
-        complete = connection.recv_json(timeout=HANDSHAKE_TIMEOUT_SECONDS)
+        complete = connection.recv_json(HANDSHAKE_TIMEOUT_SECONDS, max_bytes=UNAUTHENTICATED_MAX_FRAME_BYTES, whole=True)
         client_token = str(complete.get("token", "")) if complete.get("type") == "pair-complete" else ""
         if len(client_token) < 32:
             raise RemoteSdrProtocolError("the client did not complete pairing")

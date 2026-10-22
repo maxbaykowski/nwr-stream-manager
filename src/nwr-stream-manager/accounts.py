@@ -6,12 +6,14 @@ import base64
 import binascii
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,10 @@ from .constants import (
     SCRYPT_R,
     USERNAME_RE,
 )
+from .sign_in_limits import SignInLimits
+
+
+LOG = logging.getLogger(__name__)
 
 
 def validate_account_username(username: str) -> str:
@@ -180,10 +186,17 @@ class AuthSession:
     expires_at: float
 
 
+@lru_cache(maxsize=1)
+def _unknown_username_hash() -> str:
+    """A hash no password matches, checked against for usernames that don't exist."""
+    return hash_account_password(secrets.token_urlsafe(32))
+
+
 class AccountStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.lock = threading.Lock()
+        self.sign_in_limits = SignInLimits()
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -376,14 +389,28 @@ class AccountStore:
             raise ValueError("passwords do not match")
         with self.lock, self._connect() as connection:
             row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(account_id),)).fetchone()
-            record = self._row_to_record(row)
-            if record is None:
-                raise ValueError("account was not found")
-            if not verify_account_password(str(current_password), str(row["password"])):
-                raise ValueError("current password is incorrect")
+        record = self._row_to_record(row)
+        if record is None:
+            raise ValueError("account was not found")
+        # Guessing the current password here is limited as signing in is: someone using a
+        # signed-in browser could otherwise find the password, and keep the account after.
+        password_hash = str(row["password"])
+        known_wrong = not self.sign_in_limits.check(record.username, str(current_password), password_hash)
+        if known_wrong or not verify_account_password(str(current_password), password_hash):
+            if not known_wrong:
+                wait = self.sign_in_limits.wrong_password(record.username, str(current_password), password_hash)
+                if wait:
+                    LOG.warning("too many wrong passwords for %r; its next try has to wait %d seconds", record.username, wait)
+            raise ValueError("current password is incorrect")
+        self.sign_in_limits.signed_in(record.username)
+        new_hash = hash_account_password(new_password)
+        with self.lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (record.id,)).fetchone()
+            if row is None or str(row["password"]) != password_hash:
+                raise ValueError("the password was changed while this was being saved; try again")
             connection.execute(
                 "UPDATE accounts SET password = ?, must_change_password = 0 WHERE id = ?",
-                (hash_account_password(new_password), record.id),
+                (new_hash, record.id),
             )
             row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (record.id,)).fetchone()
             connection.commit()
@@ -393,15 +420,28 @@ class AccountStore:
             return updated.to_public_dict()
 
     def verify_basic_account(self, username: str, password: str) -> AccountRecord | None:
+        """The account, if the password is right. Raises SignInWait after too many wrong passwords."""
         with self.lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM accounts WHERE username = ? LIMIT 1",
                 (str(username),),
             ).fetchone()
-            if row is None:
-                return None
-            password_hash = str(row["password"])
-            if not verify_account_password(password, password_hash):
+        password_hash = str(row["password"]) if row is not None else ""
+        if not self.sign_in_limits.check(username, password, password_hash):
+            return None
+        # Checked outside the lock, which would otherwise hold up everyone else while it's worked out.
+        # A username that doesn't exist takes as long, so how long it takes doesn't say which ones do.
+        right = verify_account_password(password, password_hash or _unknown_username_hash())
+        if row is None or not right:
+            wait = self.sign_in_limits.wrong_password(username, password, password_hash)
+            if wait:
+                LOG.warning("too many wrong passwords for %r; its next try has to wait %d seconds", str(username)[:64], wait)
+            return None
+        self.sign_in_limits.signed_in(username)
+        with self.lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(row["id"]),)).fetchone()
+            if row is None or str(row["password"]) != password_hash:
+                # Changed or deleted while the password was being checked.
                 return None
             if account_password_hash_needs_upgrade(password_hash):
                 connection.execute(

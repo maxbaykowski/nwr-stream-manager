@@ -21,7 +21,9 @@ LOG = logging.getLogger(__name__)
 class LiveAudioServiceMixin:
     """Mixed into RtlControlService."""
 
-    def record_live_audio_feedback(self, client_id: str, mode: str, message: str, details: dict[str, Any]) -> None:
+    def record_live_audio_feedback(
+        self, client_id: str, mode: str, message: str, details: dict[str, Any], account_id: int | None = None
+    ) -> None:
         client_id = str(client_id or "").strip()
         mode = str(mode or "").strip().lower()
         message = str(message or "").strip()
@@ -41,6 +43,15 @@ class LiveAudioServiceMixin:
         except (TypeError, ValueError):
             media_delivery_ratio = None
         with self.lock:
+            # Only for live audio that's playing, and only from whoever is listening to it:
+            # anyone else's reports could make it worse for them.
+            running = self.monitor_streams_by_client if mode == "monitor" else self.receiver_workers
+            if client_id not in running:
+                return
+            try:
+                self._ensure_webrtc_client_owner_locked(client_id, account_id, require_existing=True)
+            except ValueError:
+                return
             feedback = self.live_audio_feedback_by_client.setdefault(
                 (mode, client_id),
                 {
@@ -182,9 +193,12 @@ class LiveAudioServiceMixin:
         LOG.info("resumed WebRTC monitor for stream %s on client %s", stream_id, client_id)
         return {"success": True, "monitoring": self.monitor_status(client_id)}
 
-    def monitor_status(self, client_id: str) -> dict[str, Any]:
+    def monitor_status(self, client_id: str, account_id: int | None = None) -> dict[str, Any]:
         with self.lock:
-            stream_id = self.monitor_streams_by_client.get(client_id, "")
+            stream_id = ""
+            # Another account's live audio reads as none at all.
+            if self._client_belongs_locked(client_id, account_id):
+                stream_id = self.monitor_streams_by_client.get(client_id, "")
             worker = None
             if stream_id:
                 for candidate in self.stream_workers.values():
@@ -293,14 +307,21 @@ class LiveAudioServiceMixin:
             LOG.info("stopped weather receiver for client %s", client_id)
         return {"success": True, "receiver": self.receiver_status(client_id)}
 
-    def receiver_status(self, client_id: str) -> dict[str, Any]:
+    def receiver_status(self, client_id: str, account_id: int | None = None) -> dict[str, Any]:
         with self.lock:
-            worker = self.receiver_workers.get(client_id)
+            worker = self.receiver_workers.get(client_id) if self._client_belongs_locked(client_id, account_id) else None
         if worker is None:
             return {"client_id": client_id, "playing": False}
         snapshot = worker.snapshot()
         snapshot["playing"] = True
         return snapshot
+
+    def _client_belongs_locked(self, client_id: str, account_id: int | None) -> bool:
+        try:
+            self._ensure_webrtc_client_owner_locked(client_id, account_id)
+        except ValueError:
+            return False
+        return True
 
     def _ensure_webrtc_client_owner_locked(
         self,

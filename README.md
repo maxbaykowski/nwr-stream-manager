@@ -106,6 +106,19 @@ python3 tools/check_ui_layout.py --url http://127.0.0.1:8080 --screenshots /tmp/
 When no account database exists, the web interface starts in setup mode and asks
 you to create the first account. That first account is the owner account.
 
+Setup has to be done directly, from the computer itself or the local network.
+Requests that arrive through a tunnel or reverse proxy (anything that adds headers
+such as `X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP` or
+`Tailscale-User-Login`) are shown a page saying so, and can't create the owner
+account. Once it exists, signing in through a tunnel works as usual.
+
+When a tunnel or proxy reports that the browser connected over HTTPS
+(`X-Forwarded-Proto: https`, `Forwarded: proto=https`, or Cloudflare's
+`CF-Visitor`), sign-in cookies are marked `Secure` and an HSTS header
+(`Strict-Transport-Security: max-age=31536000`) is sent. Browsers then use HTTPS
+for that address for a year, so don't later serve the same address over plain
+HTTP. Plain HTTP on the local network is unaffected.
+
 Account types:
 
 - Owner: the first account created. It can manage all accounts.

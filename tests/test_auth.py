@@ -215,6 +215,17 @@ class AuthTests(unittest.TestCase):
             "http://nwr.example.com:8080/notification?next=%2F%3Fview%3Dstream_output%26stream%3Dstream-1%26output%3Dicecast-1",
         )
 
+    def test_notification_links_only_lead_to_this_server(self) -> None:
+        from urllib.parse import quote
+
+        own = "/?view=eas_alert_detail&stream=stream-1&alert=alert-1"
+        self.assertEqual(self.web_control.notification_next_path(f"next={quote(own, safe='')}"), own)
+        # Browsers read each of these as another website's address.
+        for target in ("//evil.example", "///evil.example", "/\\evil.example", "/\t/evil.example", "/\n/evil.example",
+                       "https://evil.example", "evil.example", "/ /evil.example"):
+            with self.subTest(target=target):
+                self.assertEqual(self.web_control.notification_next_path(f"next={quote(target, safe='')}"), "/")
+
     def test_notification_app_url_preserves_session_for_eas_alert_detail(self) -> None:
         alert_path = self.web_control.eas_alert_detail_route_path("stream-1", "alert-1")
         url = self.web_control.notification_app_url("nwr.example.com:8080", alert_path)
@@ -1267,6 +1278,7 @@ class AuthTests(unittest.TestCase):
         handler = object.__new__(self.web_control.RtlControlHandler)
         handler.current_account = None
         handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(has_account=lambda: False), instance_id="run1")
+        handler.headers = {}
         sent = {}
         handler._send_json = lambda payload, status=self.web_control.HTTPStatus.OK: sent.update(payload=payload, status=status)
 
@@ -1277,6 +1289,7 @@ class AuthTests(unittest.TestCase):
         handler = object.__new__(self.web_control.RtlControlHandler)
         handler.current_account = None
         handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(has_account=lambda: True), instance_id="run1")
+        handler.headers = {}
         sent = {}
         handler._send_json = lambda payload, status=self.web_control.HTTPStatus.OK: sent.update(payload=payload, status=status)
 
