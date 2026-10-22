@@ -189,7 +189,8 @@ def eas_alert_detail(stream: dict[str, Any], alert: dict[str, Any], index: int) 
         "event_type": event.display_name,
         "areas": areas,
         "issued_at": format_local_datetime(issued_at),
-        "issued_at_media": issued_at.astimezone().strftime("%m/%d/%Y; %I:%M %p %Z"),
+        # The hour without a leading zero, as everywhere else: 6:00 AM, not 06:00 AM.
+        "issued_at_media": f"{issued_at.astimezone().strftime('%m/%d/%Y')}; {format_local_time(issued_at)}",
         "issued_at_epoch": issued_at.timestamp(),
         "expires_at": format_local_datetime(expires_at),
         "audio_url": f"/api/eas-alert-audio?stream_id={stream.get('id', '')}&alert_id={eas_alert_id(alert, index)}",
@@ -203,12 +204,22 @@ def format_same_location_for_alert(same_code: str) -> str:
     location = lookup_location(raw_code)
     subdivision_digit = ""
     if not location.known and re.fullmatch(r"\d{6}", raw_code) and raw_code[0] != "0":
-        location = lookup_location(f"0{raw_code[1:]}")
-        subdivision_digit = raw_code[0] if location.known else ""
+        # The first digit can name part of an area, such as 126139 for part of Ottawa County.
+        # An area that still isn't known keeps the code as it was sent.
+        whole_area = lookup_location(f"0{raw_code[1:]}")
+        if whole_area.known:
+            location, subdivision_digit = whole_area, raw_code[0]
     if not location.known:
         return location.display_name
     if location.location_type == "marine":
         text = location.name
+    elif location.location_type == "national":
+        text = "All of the United States"
+    elif location.location_type == "state":
+        text = f"All of {location.name}"
+    elif location.kind == "independent city":
+        # Census names end in a lowercase "city", as in "Alexandria city", which reads like a typo.
+        text = f"{location.name.removesuffix(' city')} (independent city), {location.state}"
     elif location.state and location.state not in location.name:
         text = f"{location.name}, {location.state}"
     else:

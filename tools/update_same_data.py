@@ -22,6 +22,31 @@ EVENT_CODES_URL = "https://www.weather.gov/nwr/eventcodes"
 COUNTIES_URL = "https://www.weather.gov/gis/Counties"
 EAS_NWR_URL = "https://www.weather.gov/gis/EasNWR"
 MARINE_ZONES_URL = "https://www.weather.gov/gis/MarineZones"
+# The Census Bureau's county lists give each county's full name ("Orleans Parish") and its class.
+# SAME codes use the 2020 counties: Connecticut's planning regions, which came later, aren't used.
+CENSUS_COUNTIES_URL = "https://www2.census.gov/geo/docs/reference/codes2020/national_county2020.txt"
+# The 2010 list names counties that have since been renamed or merged, which old receivers may still send.
+CENSUS_COUNTIES_2010_URL = "https://www2.census.gov/geo/docs/reference/codes/files/national_county.txt"
+CENSUS_STATES_URL = "https://www2.census.gov/geo/docs/reference/codes2020/national_state2020.txt"
+# The NWR list of SAME codes. It hasn't changed since 2016, so it only fills in codes the rest leave out.
+NWR_SAME_CODES_URL = "https://www.weather.gov/source/nwr/SameCode.txt"
+# In a SAME code, a county of 000 means all of a state, and 000000 all of the United States.
+NATIONAL_SAME_CODE = "000000"
+# Census class C7 is an independent city, which belongs to no county.
+CENSUS_INDEPENDENT_CITY_CLASS = "C7"
+# The kind of place a county name ends with, longest first so "City and Borough" isn't taken for "Borough".
+COUNTY_KIND_SUFFIXES = (
+    ("City and Borough", "city and borough"),
+    ("Census Area", "census area"),
+    ("Municipality", "municipality"),
+    ("Municipio", "municipio"),
+    ("Borough", "borough"),
+    ("Parish", "parish"),
+    ("County", "county"),
+    ("District", "district"),
+    ("Islands", "islands"),
+    ("Island", "island"),
+)
 EVENTS_OUTPUT = ASSETS_DIR / "events.json"
 LOCATIONS_OUTPUT = ASSETS_DIR / "locations.json"
 
@@ -211,7 +236,98 @@ def parse_dbf(data: bytes) -> list[dict[str, str]]:
     return rows
 
 
-def build_county_locations(rows: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
+@dataclass(frozen=True)
+class CensusCounty:
+    state: str
+    name: str
+    census_class: str
+
+
+def parse_census_counties(text: str) -> dict[str, CensusCounty]:
+    """The counties by 5-digit FIPS code, from the 2020 list (with "|" and a header) or the 2010 one (with ",")."""
+    counties: dict[str, CensusCounty] = {}
+    for line_number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("STATE|"):
+            continue
+        if "|" in line:
+            fields = [field.strip() for field in line.split("|")]
+            if len(fields) < 6:
+                raise SameDataError(f"Census county line {line_number} has {len(fields)} fields: {line!r}")
+            state, state_fips, county_fips, name, census_class = fields[0], fields[1], fields[2], fields[4], fields[5]
+        else:
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) < 5:
+                raise SameDataError(f"Census county line {line_number} has {len(fields)} fields: {line!r}")
+            state, state_fips, county_fips, name, census_class = fields[:5]
+        fips = state_fips + county_fips
+        if not re.fullmatch(r"\d{5}", fips) or not name:
+            raise SameDataError(f"invalid Census county line {line_number}: {line!r}")
+        counties[fips] = CensusCounty(state=state, name=name, census_class=census_class)
+    if not counties:
+        raise SameDataError("the Census county list did not contain any counties")
+    return counties
+
+
+def parse_census_states(text: str) -> dict[str, tuple[str, str]]:
+    """The states and territories by 2-digit FIPS code, as (abbreviation, name)."""
+    states: dict[str, tuple[str, str]] = {}
+    for line_number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("STATE|"):
+            continue
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) < 4 or not re.fullmatch(r"\d{2}", fields[1]) or not fields[3]:
+            raise SameDataError(f"invalid Census state line {line_number}: {line!r}")
+        states[fields[1]] = (fields[0], fields[3])
+    if not states:
+        raise SameDataError("the Census state list did not contain any states")
+    return states
+
+
+def parse_nwr_same_codes(text: str) -> dict[str, tuple[str, str]]:
+    """The NWR SAME code list, as code: (name, state). Lines look like "046113,Shannon, SD"."""
+    codes: dict[str, tuple[str, str]] = {}
+    for line_number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        match = re.fullmatch(r"(\d{6}),(.+),\s*([A-Z]{2})", line)
+        if not match:
+            raise SameDataError(f"invalid NWR SAME code line {line_number}: {line!r}")
+        # A few names end in a stray "*".
+        codes[match.group(1)] = (match.group(2).strip().rstrip("*").strip(), match.group(3))
+    if not codes:
+        raise SameDataError("the NWR SAME code list did not contain any codes")
+    return codes
+
+
+def county_kind(name: str, census_class: str = "") -> str | None:
+    """The kind of place a county is, such as "parish" or "independent city", or None when it can't be told."""
+    if census_class == CENSUS_INDEPENDENT_CITY_CLASS or name.endswith(" city") or name.endswith(" (city)"):
+        return "independent city"
+    if name == "District of Columbia":
+        return "federal district"
+    for suffix, kind in COUNTY_KIND_SUFFIXES:
+        if name.endswith(f" {suffix}"):
+            return kind
+    return None
+
+
+def name_county(entry: dict[str, Any], census: CensusCounty) -> None:
+    """Gives a county its full Census name and kind, keeping the NWS name when the state doesn't match."""
+    if census.state != entry["state"]:
+        return
+    entry["name"] = census.name
+    kind = county_kind(census.name, census.census_class)
+    if kind:
+        entry["kind"] = kind
+
+
+def build_county_locations(
+    rows: list[dict[str, str]],
+    census: dict[str, CensusCounty] | None = None,
+) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[dict[str, str]]] = {}
     for row in rows:
         require_fields(row, ["STATE", "COUNTYNAME", "FIPS"])
@@ -237,7 +353,49 @@ def build_county_locations(rows: list[dict[str, str]]) -> dict[str, dict[str, An
         }
         if len(aliases) > 1:
             entry["aliases"] = aliases
+        if census and entry["fips"] in census:
+            name_county(entry, census[entry["fips"]])
         locations[same] = entry
+    return locations
+
+
+def build_older_county_locations(
+    nwr_codes: dict[str, tuple[str, str]],
+    known: dict[str, dict[str, Any]],
+    *censuses: dict[str, CensusCounty],
+) -> dict[str, dict[str, Any]]:
+    """Counties on the NWR SAME code list that the NWS county map leaves out.
+
+    These are counties that have since been renamed or merged, such as Shannon County, SD,
+    and Pacific islands. Each is named from the first Census list that has it.
+    """
+    locations: dict[str, dict[str, Any]] = {}
+    for same, (name, state) in nwr_codes.items():
+        if same in known or not same.startswith("0") or same.endswith("000"):
+            continue
+        fips = same[1:]
+        entry: dict[str, Any] = {"same": same, "fips": fips, "state": state, "name": name, "location_type": "county"}
+        census = next((counties[fips] for counties in censuses if fips in counties), None)
+        if census:
+            name_county(entry, census)
+        else:
+            if name.endswith(" (city)"):
+                entry["name"] = name.removesuffix(" (city)") + " city"
+            kind = county_kind(entry["name"])
+            if kind:
+                entry["kind"] = kind
+        locations[same] = entry
+    return locations
+
+
+def build_statewide_locations(states: dict[str, tuple[str, str]]) -> dict[str, dict[str, Any]]:
+    """A location for all of each state, and one for all of the United States."""
+    locations: dict[str, dict[str, Any]] = {
+        NATIONAL_SAME_CODE: {"same": NATIONAL_SAME_CODE, "name": "United States", "location_type": "national"},
+    }
+    for state_fips, (state, name) in states.items():
+        same = f"0{state_fips}000"
+        locations[same] = {"same": same, "fips": state_fips, "state": state, "name": name, "location_type": "state"}
     return locations
 
 
@@ -327,6 +485,10 @@ def validate_locations(locations: dict[str, dict[str, Any]]) -> None:
             fips = entry.get("fips")
             if not isinstance(fips, str) or not re.fullmatch(r"\d{5}", fips):
                 raise SameDataError(f"invalid FIPS for {same}: {entry!r}")
+        if entry["location_type"] == "state":
+            fips = entry.get("fips")
+            if not isinstance(fips, str) or not re.fullmatch(r"\d{2}", fips) or not entry.get("state"):
+                raise SameDataError(f"invalid statewide location for {same}: {entry!r}")
         if entry["location_type"] == "marine":
             ugc = entry.get("ugc")
             if ugc is not None and not re.fullmatch(r"[A-Z]{2}Z\d{3}", str(ugc)):
@@ -359,9 +521,16 @@ def generate() -> tuple[dict[str, Any], dict[str, Any]]:
     for pattern in (r"/mz(\d{2}[a-z]{2}\d{2})\.zip$", r"/oz(\d{2}[a-z]{2}\d{2})\.zip$", r"/hz(\d{2}[a-z]{2}\d{2})\.zip$"):
         marine_zone_rows.extend(dbf_rows_from_zip(fetch_bytes(latest_link(marine_links, pattern))))
 
-    counties = build_county_locations(dbf_rows_from_zip(county_zip))
+    census_counties = parse_census_counties(fetch_text(CENSUS_COUNTIES_URL))
+    census_counties_2010 = parse_census_counties(fetch_text(CENSUS_COUNTIES_2010_URL))
+    census_states = parse_census_states(fetch_text(CENSUS_STATES_URL))
+    nwr_codes = parse_nwr_same_codes(fetch_text(NWR_SAME_CODES_URL))
+
+    counties = build_county_locations(dbf_rows_from_zip(county_zip), census_counties)
+    older_counties = build_older_county_locations(nwr_codes, counties, census_counties, census_counties_2010)
+    statewide = build_statewide_locations(census_states)
     marine = build_marine_locations(marnwr_text, marst_text, marine_zone_rows)
-    return events, merge_locations(counties, marine)
+    return events, merge_locations(counties, older_counties, statewide, marine)
 
 
 def main() -> None:

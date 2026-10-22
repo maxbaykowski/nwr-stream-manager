@@ -28,6 +28,8 @@ class SameLocation:
     fips: str | None = None
     state: str | None = None
     ugc: str | None = None
+    # The kind of place, such as "county", "parish" or "independent city", when it's known.
+    kind: str | None = None
 
     @property
     def display_name(self) -> str:
@@ -55,6 +57,7 @@ def lookup_location(same_code: str) -> SameLocation:
         fips=optional_str(entry.get("fips")),
         state=optional_str(entry.get("state")),
         ugc=optional_str(entry.get("ugc")),
+        kind=optional_str(entry.get("kind")),
     )
 
 

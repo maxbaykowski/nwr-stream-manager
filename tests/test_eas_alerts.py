@@ -1544,11 +1544,30 @@ class EasAlertTests(unittest.TestCase):
         stream = {"id": "stream-1"}
         detail = self.web_control.eas_alert_detail(stream, alert, 0)
         self.assertEqual(detail["event_type"], "Tornado Warning")
-        self.assertIn("Ottawa, MI", detail["areas"])
+        self.assertIn("Ottawa County, MI", detail["areas"])
         self.assertIn("Holland to Grand Haven MI", detail["areas"])
         self.assertIn("August 9, 2026,", detail["issued_at"])
         self.assertIn("August 9, 2026,", detail["expires_at"])
         self.assertNotIn("file_path", detail)
+
+    def test_media_session_time_has_no_leading_zero_on_the_hour(self) -> None:
+        import os
+        import time as time_module
+
+        alert = {"event_type": "TOR", "start_time_utc": "2026-08-09T10:07:00Z", "expires_at_utc": "2026-08-09T11:07:00Z"}
+        previous = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Detroit"
+        time_module.tzset()
+        try:
+            detail = self.web_control.eas_alert_detail({"id": "stream-1"}, alert, 0)
+        finally:
+            if previous is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous
+            time_module.tzset()
+        self.assertEqual(detail["issued_at_media"], "08/09/2026; 6:07 AM EDT")
+        self.assertIn("6:07 AM EDT", detail["issued_at"])
 
     def test_sample_easrecorder_alert_shape_is_pretty_printed(self) -> None:
         alert = {
@@ -1568,8 +1587,8 @@ class EasAlertTests(unittest.TestCase):
 
         self.assertEqual(detail["event_type"], "Severe Thunderstorm Watch")
         self.assertIn("Holland to Grand Haven MI", detail["areas"])
-        self.assertIn("Allegan, MI", detail["areas"])
-        self.assertIn("Ottawa, MI", detail["areas"])
+        self.assertIn("Allegan County, MI", detail["areas"])
+        self.assertIn("Ottawa County, MI", detail["areas"])
         self.assertIn("Lake Michigan from Holland to Grand Haven MI 5NM offshore to Mid Lake", detail["areas"])
         self.assertIn("Severe thunderstorm watch issued July 3, 2026 at", summary["summary"])
         self.assertIn("July 3, 2026,", detail["issued_at"])
@@ -1578,7 +1597,27 @@ class EasAlertTests(unittest.TestCase):
     def test_nonzero_same_subdivision_digit_resolves_to_whole_area(self) -> None:
         self.assertEqual(
             self.web_control.format_same_location_for_alert("126139"),
-            "Ottawa, MI, subdivision 1",
+            "Ottawa County, MI, subdivision 1",
+        )
+
+    def test_same_locations_say_what_kind_of_place_they_are(self) -> None:
+        names = {
+            "022071": "Orleans Parish, LA",
+            "051510": "Alexandria (independent city), VA",
+            "051036": "Charles City County, VA",
+            "002020": "Anchorage Municipality, AK",
+            "026000": "All of Michigan",
+            "000000": "All of the United States",
+            "046113": "Shannon County, SD",
+        }
+        for code, name in names.items():
+            with self.subTest(code=code):
+                self.assertEqual(self.web_control.format_same_location_for_alert(code), name)
+
+    def test_unknown_same_location_keeps_the_code_as_sent(self) -> None:
+        self.assertEqual(
+            self.web_control.format_same_location_for_alert("999000"),
+            "Unknown location (999000)",
         )
 
     def test_alert_audio_path_must_stay_under_alert_directory(self) -> None:

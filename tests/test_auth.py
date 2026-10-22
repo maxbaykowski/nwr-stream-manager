@@ -665,8 +665,8 @@ class AuthTests(unittest.TestCase):
         message = self.web_control.eas_alert_notification_message(stream, alert)
 
         self.assertIn("Severe Thunderstorm Warning received on WXN99", message)
-        self.assertIn("Allegan, MI", message)
-        self.assertIn("Ottawa, MI", message)
+        self.assertIn("Allegan County, MI", message)
+        self.assertIn("Ottawa County, MI", message)
         self.assertIn("until", message)
 
     def test_eas_alert_notification_id_is_independent_of_index_position(self) -> None:

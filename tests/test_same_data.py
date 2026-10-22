@@ -65,6 +65,56 @@ class SameDataGeneratorTests(unittest.TestCase):
         )
         self.assertEqual(locations["012087"]["aliases"], ["Lower Keys in Monroe", "Upper Keys in Monroe"])
 
+    def test_census_names_give_counties_their_full_name_and_kind(self) -> None:
+        census = update_same_data.parse_census_counties(
+            "STATE|STATEFP|COUNTYFP|COUNTYNS|COUNTYNAME|CLASSFP|FUNCSTAT\n"
+            "LA|22|071|00558530|Orleans Parish|H6|C\n"
+            "VA|51|036|01480109|Charles City County|H1|A\n"
+            "VA|51|510|01498415|Alexandria city|C7|F\n"
+            "NV|32|510|00863219|Carson City|C7|F\n"
+        )
+        locations = update_same_data.build_county_locations(
+            [
+                {"STATE": "LA", "COUNTYNAME": "Orleans", "FIPS": "22071"},
+                {"STATE": "VA", "COUNTYNAME": "Charles City", "FIPS": "51036"},
+                {"STATE": "VA", "COUNTYNAME": "City of Alexandria", "FIPS": "51510"},
+                {"STATE": "NV", "COUNTYNAME": "Carson City", "FIPS": "32510"},
+            ],
+            census,
+        )
+        self.assertEqual((locations["022071"]["name"], locations["022071"]["kind"]), ("Orleans Parish", "parish"))
+        self.assertEqual((locations["051036"]["name"], locations["051036"]["kind"]), ("Charles City County", "county"))
+        self.assertEqual((locations["051510"]["name"], locations["051510"]["kind"]), ("Alexandria city", "independent city"))
+        self.assertEqual((locations["032510"]["name"], locations["032510"]["kind"]), ("Carson City", "independent city"))
+
+    def test_older_census_list_reads_without_a_header(self) -> None:
+        census = update_same_data.parse_census_counties("SD,46,113,Shannon County,H1\n")
+        self.assertEqual(census["46113"], update_same_data.CensusCounty("SD", "Shannon County", "H1"))
+
+    def test_codes_left_off_the_county_map_come_from_the_nwr_list(self) -> None:
+        nwr_codes = update_same_data.parse_nwr_same_codes(
+            "026139,Ottawa, MI\n046113,Shannon, SD\n051560,Clifton Forge (city), VA\n064002,Chuuk*, FM\n"
+        )
+        known = {"026139": {"same": "026139"}}
+        census_2010 = {"46113": update_same_data.CensusCounty("SD", "Shannon County", "H1")}
+        locations = update_same_data.build_older_county_locations(nwr_codes, known, {}, census_2010)
+        self.assertNotIn("026139", locations)
+        self.assertEqual((locations["046113"]["name"], locations["046113"]["kind"]), ("Shannon County", "county"))
+        self.assertEqual(
+            (locations["051560"]["name"], locations["051560"]["kind"]),
+            ("Clifton Forge city", "independent city"),
+        )
+        self.assertEqual(locations["064002"]["name"], "Chuuk")
+        self.assertNotIn("kind", locations["064002"])
+
+    def test_statewide_locations(self) -> None:
+        states = update_same_data.parse_census_states("STATE|STATEFP|STATENS|STATE_NAME\nMI|26|01779789|Michigan\n")
+        locations = update_same_data.build_statewide_locations(states)
+        self.assertEqual(locations["026000"]["name"], "Michigan")
+        self.assertEqual(locations["026000"]["location_type"], "state")
+        self.assertEqual(locations["000000"]["location_type"], "national")
+        update_same_data.validate_locations(locations)
+
     def test_marine_zone_mapping(self) -> None:
         locations = update_same_data.build_marine_locations(
             "LM|92846|Holland to Grand Haven MI|42.915|-86.2624\n",
@@ -105,7 +155,7 @@ class SameDataLookupTests(unittest.TestCase):
         self.assertTrue(location.known)
         self.assertEqual(location.fips, "26139")
         self.assertEqual(location.state, "MI")
-        self.assertEqual(location.name, "Ottawa")
+        self.assertEqual(location.name, "Ottawa County")
 
     def test_known_marine_location_lookup(self) -> None:
         location = self.same_data.lookup_location("092846")
