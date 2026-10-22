@@ -139,6 +139,12 @@ class AccountDateTests(unittest.TestCase):
 class StandInService(types.SimpleNamespace):
     """Just what these pages use; anything else the handler looks up does nothing."""
 
+    # Named as NWR Stream Manager itself, so titles read as they would without a name.
+    instance_name = "NWR Stream Manager"
+
+    def general_settings(self):
+        return {"instance_name": self.instance_name, "location": ""}
+
     def __getattr__(self, name):
         if name == "eas_alert_streams":
             return lambda: {"streams": []}

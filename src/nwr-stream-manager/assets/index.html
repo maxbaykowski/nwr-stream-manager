@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NWR Stream Manager</title>
+<meta id="instance_name_meta" name="instance-name" content="NWR Stream Manager">
 __PAGE_SCRIPT_LOADER__
 <style>
 __INDEX_STYLES__</style>
@@ -151,6 +152,9 @@ __INDEX_STYLES__</style>
   <div id="view_dashboard" class="view">
     <section id="dashboard_sdr_section">
       <h2>Configured SDR</h2>
+      <p id="dashboard_location" hidden>Location: <span id="summary_location"></span></p>
+      <p>Version: __APP_VERSION__</p>
+      <p>Uptime: <span id="summary_uptime">less than a minute</span></p>
       <p id="dashboard_sdr_attention" class="status-text status-needs-attention" hidden>RTL-SDR requires attention. Check the SDR immediately.</p>
       <dl id="dashboard_sdr_details" class="details-list">
         <dt>Source</dt><dd id="summary_source">RTL-SDR</dd>
@@ -446,6 +450,7 @@ __INDEX_STYLES__</style>
       <div id="settings_layout" class="settings-layout">
         <form id="settings_list" class="settings-list" method="get" action="/" aria-label="Settings">
           <input type="hidden" name="view" value="settings">
+          <button id="settings_tab_general" type="submit" name="section" value="general" data-settings-section="general" data-baseline-submit>General</button>
           <button id="settings_tab_accounts" type="submit" name="section" value="accounts" data-settings-section="accounts" data-baseline-submit hidden>Accounts</button>
           <button id="settings_tab_account" type="submit" name="section" value="account" data-settings-section="account" data-baseline-submit hidden>Account</button>
           <button id="settings_tab_sdr_sharing" type="submit" name="section" value="sdr_sharing" data-settings-section="sdr_sharing" data-baseline-submit>SDR sharing</button>
@@ -460,6 +465,24 @@ __INDEX_STYLES__</style>
             <button id="settings_back" class="settings-back" type="submit" data-baseline-submit>Back to settings</button>
           </form>
           <p id="settings_choose" class="baseline-only hint" hidden>Choose a setting.</p>
+          <div id="settings_panel_general" class="settings-panel" hidden>
+            <h3>General</h3>
+            <form id="general_settings_form" method="post" action="/general-settings" novalidate>
+              __FORM_TOKEN_INPUT__
+              <label>Instance name
+                <input id="general_instance_name" name="instance_name" type="text" maxlength="64" autocomplete="off" spellcheck="false" aria-describedby="general_instance_name_hint">
+              </label>
+              <span id="general_instance_name_hint" class="hint">The name of this NWR Stream Manager, shown in your browser's title bar. Giving each one its own name makes them easy to tell apart. Up to 64 characters.</span>
+              <label>Location
+                <input id="general_location" name="location" type="text" maxlength="64" autocomplete="off" aria-describedby="general_location_hint">
+              </label>
+              <span id="general_location_hint" class="hint">Optional. Where this NWR Stream Manager or its RTL-SDR is, for your own reference, such as Attic SDR (Grand Rapids, MI). It's shown on the dashboard. Up to 64 characters.</span>
+              <div class="actions">
+                <button id="save_general_settings" type="submit" data-baseline-submit>Save changes</button>
+              </div>
+            </form>
+            <div id="general-result" class="message" aria-live="polite"></div>
+          </div>
           <div id="settings_panel_accounts" class="settings-panel" hidden>
             <div id="settings_accounts_page">
               <h3>Accounts</h3>

@@ -247,6 +247,9 @@ class ResponseHandlerMixin:
 
     def _send_page(self, page: str, status: HTTPStatus = HTTPStatus.OK) -> None:
         """Sends a page the server filled in, adjusted for this browser."""
+        # Signed in, a page is titled with the instance name. Anyone else sees only NWR Stream Manager.
+        if getattr(self, "current_account", None) is not None:
+            page = page_rendering.set_site_name(page, self.service.instance_name)
         if page_rendering.old_internet_explorer(self.headers.get("User-Agent", "")):
             page = page_rendering.mark_hidden_for_old_internet_explorer(page)
         self._send_html(page, status)

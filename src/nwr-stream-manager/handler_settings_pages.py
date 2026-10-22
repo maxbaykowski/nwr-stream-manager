@@ -513,6 +513,41 @@ class SettingsPageHandlerMixin:
             return
         self._send_redirect(page_route("settings", section="fallback_audio", result=done))
 
+    def _fill_general_page(self, page: str, form: dict[str, str]) -> str:
+        settings = self.service.general_settings()
+        loaded = {name: str(settings[name]) for name in ("instance_name", "location")}
+        sent = form.get("form") == "general"
+        shown = {name: form.get(name, value) for name, value in loaded.items()} if sent else dict(loaded)
+        if sent:
+            loaded = {name: form.get(f"was_{name}", value) for name, value in loaded.items()}
+        page = page_rendering.set_attribute(page, "general_instance_name", "value", shown["instance_name"])
+        page = page_rendering.set_attribute(page, "general_location", "value", shown["location"])
+        return page_rendering.append_content(
+            page,
+            "general_settings_form",
+            '<input type="hidden" name="form" value="general">'
+            + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
+        )
+
+    def _handle_general_settings_form(self) -> None:
+        """Saves the General settings that were changed, for browsers without the page script."""
+        form: dict[str, str] = {}
+        query = {"view": "settings", "section": "general"}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            changes = {
+                name: form.get(name, "") for name in ("instance_name", "location") if form.get(name, "") != form.get(f"was_{name}", "")
+            }
+            if changes:
+                self.service.update_general_settings(changes)
+        except Exception as exc:
+            result = ("general-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(query, result=result, form=form), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_redirect(page_route("settings", section="general", result="saved"))
+
     def _fill_advanced_page(self, page: str, form: dict[str, str]) -> str:
         settings = self.service.advanced_settings()
         loaded = {"port": str(settings["port"]), "localhost_only": "1" if settings["localhost_only"] else "0"}

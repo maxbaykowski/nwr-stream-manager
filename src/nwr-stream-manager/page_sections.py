@@ -811,6 +811,20 @@ def stream_attention_items(status: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(result, key=lambda item: str(item["callsign"]))
 
 
+def format_uptime(seconds: Any) -> str:
+    """Such as "2 days, 7 hours, 5 minutes", leaving out what's zero; the page script says the same."""
+    try:
+        minutes = int(float(seconds or 0) // 60)
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes < 1:
+        return "less than a minute"
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    parts = [(days, "day"), (hours, "hour"), (minutes, "minute")]
+    return ", ".join(f"{count} {unit}{'' if count == 1 else 's'}" for count, unit in parts if count)
+
+
 def dashboard_parts(status: dict[str, Any], sdr_label: str, read_only: bool, now: float) -> dict[str, Any]:
     """The dashboard, as the page script fills it in: each part's text or markup, what's hidden,
     and whether storage comes first."""
@@ -821,6 +835,10 @@ def dashboard_parts(status: dict[str, Any], sdr_label: str, read_only: bool, now
     iq_file = source.get("kind") == "iq_file"
     attention = not iq_file and bool(status.get("capture_error") or (settings.get("serial") and not status.get("active")))
     hidden = {"dashboard_sdr_attention": not attention, "dashboard_sdr_details": attention, "dashboard_configure_sdr": read_only}
+    location = str(status.get("location") or "")
+    text["summary_location"] = location
+    text["summary_uptime"] = format_uptime(status.get("uptime_seconds"))
+    hidden["dashboard_location"] = not location
     strength = f"{settings.get('alias_filter_strength', 100)}%"
     capture = "active" if status.get("active") else "inactive"
     if iq_file:

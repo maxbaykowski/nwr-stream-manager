@@ -138,6 +138,7 @@ from .fallback_settings import (
     validate_fallback_settings_payload,
     validate_stream_fallback_action_payload,
 )
+from .general_settings import general_state_path, load_or_initialize_general_settings
 from .handler_auth import AuthHandlerMixin
 from .handler_eas_pages import EasAlertPageHandlerMixin
 from .handler_iq_pages import IqRecorderPageHandlerMixin
@@ -225,6 +226,7 @@ from .routes_accounts import AccountRoutesMixin
 from .routes_advanced import AdvancedRoutesMixin
 from .routes_eas_alerts import EasAlertRoutesMixin
 from .routes_fallback import FallbackRoutesMixin
+from .routes_general import GeneralRoutesMixin
 from .routes_iq_recorder import IqRecorderRoutesMixin
 from .routes_live_audio import LiveAudioRoutesMixin
 from .routes_restart import RestartRoutesMixin
@@ -248,6 +250,7 @@ from .service_capture import CaptureServiceMixin
 from .service_devices import DeviceServiceMixin
 from .service_eas_alerts import EasAlertServiceMixin
 from .service_fallback import FallbackServiceMixin
+from .service_general import GeneralServiceMixin
 from .service_iq_recorder import IqRecorderServiceMixin
 from .service_live_audio import LiveAudioServiceMixin
 from .service_notifications import NotificationServiceMixin
@@ -336,6 +339,7 @@ class RtlControlService(
     SdrSharingServiceMixin,
     AdvancedServiceMixin,
     RestartServiceMixin,
+    GeneralServiceMixin,
 ):
     def __init__(
         self,
@@ -356,6 +360,8 @@ class RtlControlService(
         # Where the web interface is listening and why; run_server sets it once it knows.
         self.web_address = WebAddress(self.web_host, self.web_port)
         self.web_address_state_path = web_address_state_path(state_path)
+        self.general_state_path = general_state_path(state_path)
+        self.general = load_or_initialize_general_settings(self.general_state_path)
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.custom_fallback_audio_path = state_path.with_name(CUSTOM_FALLBACK_AUDIO_FILE_NAME)
         # One custom announcement is checked and stored at a time.
@@ -433,6 +439,8 @@ class RtlControlService(
         self.stream_eas_alert_notification_seen: dict[str, set[str]] = {}
         self.stream_test_mode: dict[str, Any] | None = None
         self.shutting_down = threading.Event()
+        # When this run of NWR Stream Manager started, for its uptime.
+        self.started_at = time.monotonic()
         # Which run of NWR Stream Manager this is, so a restart is only ever asked of the run it was meant for.
         self.instance_id = secrets.token_hex(8)
         self.restart_requested = threading.Event()
@@ -683,6 +691,9 @@ class RtlControlService(
                 "storage": self._storage_status_snapshot_locked(),
                 "iq_recorder": self._iq_recorder_status_locked(),
                 "logs": self.log_handler.snapshot()[-80:],
+                "instance_name": self.general.instance_name,
+                "location": self.general.location,
+                "uptime_seconds": time.monotonic() - self.started_at,
                 "capabilities": {
                     "development_iq_sources": self.development_iq_sources_enabled,
                 },
@@ -714,6 +725,7 @@ class RtlControlHandler(
     FallbackRoutesMixin,
     AdvancedRoutesMixin,
     RestartRoutesMixin,
+    GeneralRoutesMixin,
     AuthHandlerMixin,
     LiveAudioHandlerMixin,
     ResponseHandlerMixin,

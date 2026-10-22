@@ -6467,6 +6467,70 @@ function accountActionsCell(account) {
   return cell;
 }
 
+// General's Save changes shows once a setting has been changed, and saving hides it again.
+const GENERAL_SETTING_INPUTS = {instance_name: "general_instance_name", location: "general_location"};
+let generalSettingsLoaded = null;
+let generalSettingsShowing = false;
+
+function generalSettingsChanges() {
+  const changes = {};
+  if (!generalSettingsLoaded) return changes;
+  for (const [name, id] of Object.entries(GENERAL_SETTING_INPUTS)) {
+    const value = document.getElementById(id).value;
+    if (value !== generalSettingsLoaded[name]) changes[name] = value;
+  }
+  return changes;
+}
+
+function generalSettingsValues() {
+  return Object.values(GENERAL_SETTING_INPUTS).map(id => document.getElementById(id).value);
+}
+
+function renderGeneralSettings(data, {keepTyped = false} = {}) {
+  generalSettingsLoaded = {instance_name: String(data.instance_name || ""), location: String(data.location || "")};
+  if (!keepTyped) {
+    for (const [name, id] of Object.entries(GENERAL_SETTING_INPUTS)) setValue(id, generalSettingsLoaded[name]);
+  }
+  syncGeneralSaveButton();
+  setInstanceName(generalSettingsLoaded.instance_name);
+}
+
+function syncGeneralSaveButton() {
+  setHidden("save_general_settings", !Object.keys(generalSettingsChanges()).length);
+}
+
+async function loadGeneralSettings() {
+  setMessage("general-result", "");
+  generalSettingsLoaded = null;
+  syncGeneralSaveButton();
+  const before = generalSettingsValues().join("\n");
+  try {
+    const data = await request("/api/general-settings");
+    // Anything typed while it loaded is kept, not replaced.
+    renderGeneralSettings(data, {keepTyped: generalSettingsValues().join("\n") !== before});
+  } catch (error) {
+    setMessage("general-result", error.message, "error");
+  }
+}
+
+async function saveGeneralSettings() {
+  const changes = generalSettingsChanges();
+  if (!Object.keys(changes).length) return;
+  const hadFocus = document.activeElement;
+  try {
+    renderGeneralSettings(await request("/api/general-settings", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(changes)
+    }));
+    setMessage("general-result", "Changes saved.", "success");
+    // Save changes is gone now, so focus goes back to the first setting rather than being lost.
+    if (hadFocus && hadFocus.id === "save_general_settings") document.getElementById("general_instance_name").focus();
+  } catch (error) {
+    setMessage("general-result", error.message, "error");
+  }
+}
+
 // Advanced is saved only when Save changes is selected, not as it's changed:
 // a wrong port or address could leave nobody able to reach NWR Stream Manager.
 let advancedSettingsLoaded = null;
@@ -6501,11 +6565,13 @@ function advancedFlagText(flag) {
   return flag ? `NWR Stream Manager was started with ${flag}, which is used instead of this setting until it's started without it.` : "";
 }
 
-function renderAdvancedSettings(data) {
+function renderAdvancedSettings(data, {keepTyped = false} = {}) {
   advancedSettingsLoaded = {port: String(data.port), localhost_only: Boolean(data.localhost_only)};
   setText("advanced_listening", advancedListeningText(data));
-  setValue("advanced_port", advancedSettingsLoaded.port);
-  setChecked("advanced_localhost_only", advancedSettingsLoaded.localhost_only);
+  if (!keepTyped) {
+    setValue("advanced_port", advancedSettingsLoaded.port);
+    setChecked("advanced_localhost_only", advancedSettingsLoaded.localhost_only);
+  }
   setText("advanced_port_flag", advancedFlagText(data.port_flag));
   setHidden("advanced_port_flag", !data.port_flag);
   setText("advanced_host_flag", advancedFlagText(data.host_flag));
@@ -6514,8 +6580,13 @@ function renderAdvancedSettings(data) {
 
 async function loadAdvancedSettings() {
   setMessage("advanced-result", "");
+  const port = document.getElementById("advanced_port");
+  const localhostOnly = document.getElementById("advanced_localhost_only");
+  const before = [port.value, localhostOnly.checked];
   try {
-    renderAdvancedSettings(await request("/api/advanced-settings"));
+    const data = await request("/api/advanced-settings");
+    // Anything changed while it loaded is kept, not replaced.
+    renderAdvancedSettings(data, {keepTyped: port.value !== before[0] || localhostOnly.checked !== before[1]});
   } catch (error) {
     setMessage("advanced-result", error.message, "error");
   }
@@ -7368,10 +7439,20 @@ async function removeCurrentEasAlert() {
   }
 }
 
+// The title names this NWR Stream Manager by its instance name, as the server's pages do.
+let instanceName = (document.getElementById("instance_name_meta") || {}).content || "NWR Stream Manager";
+let pageTitle = "";
+
 function setPageTitle(title) {
-  const text = String(title || "NWR Stream Manager").trim() || "NWR Stream Manager";
-  const full = text === "NWR Stream Manager" ? text : `${text} - NWR Stream Manager`;
+  pageTitle = String(title || "").trim();
+  const full = pageTitle && pageTitle !== "NWR Stream Manager" ? `${pageTitle} - ${instanceName}` : instanceName;
   if (document.title !== full) document.title = full;
+}
+
+function setInstanceName(name) {
+  if (!name || name === instanceName) return;
+  instanceName = name;
+  setPageTitle(pageTitle);
 }
 
 function defaultViewTitle(name) {
@@ -7428,6 +7509,7 @@ function showView(name, options = {}) {
   if (name !== "settings") syncRemotePairingPage("");
   if (name !== "settings") stopAnnouncementPlaybackOffPage(name, null);
   if (name !== "settings") advancedSettingsShowing = false;
+  if (name !== "settings") generalSettingsShowing = false;
   if (options.focus !== false) focusViewHeading(name);
   const moreButton = document.getElementById("nav_more_button");
   for (const item of document.querySelectorAll("nav [data-view]")) {
@@ -7752,6 +7834,7 @@ function applyRoute(route) {
 // way back, the way phone settings apps do.
 const SETTINGS_SINGLE_PANE_QUERY = "(max-width: 680px), (max-width: 900px) and (orientation: landscape), (orientation: landscape) and (max-height: 500px)";
 const SETTINGS_SECTION_TITLES = {
+  general: "General",
   accounts: "Accounts",
   create_account: "Create account",
   account: "Account",
@@ -7783,8 +7866,8 @@ function availableSettingsTabs() {
 function settingsSectionsForAccount() {
   if (accountIsReadOnly()) return [];
   // Only the owner chooses where NWR Stream Manager can be reached.
-  if (accountIsOwner()) return ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement", "advanced"];
-  return ["account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"];
+  if (accountIsOwner()) return ["general", "accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement", "advanced"];
+  return ["general", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"];
 }
 
 function normalizeSettingsSection(section) {
@@ -7892,6 +7975,8 @@ function renderSettingsSection() {
   // Loaded on arriving, not each time Settings is redrawn, which would undo what's been typed.
   if (section === "advanced" && !advancedSettingsShowing) loadAdvancedSettings();
   advancedSettingsShowing = section === "advanced";
+  if (section === "general" && !generalSettingsShowing) loadGeneralSettings();
+  generalSettingsShowing = section === "general";
   syncRemotePairingPage(section);
   syncFallbackRecordingPage(section);
   stopAnnouncementPlaybackOffPage(currentViewName(), section);
@@ -8085,12 +8170,31 @@ function rtlRequiresAttention(data) {
   return false;
 }
 
+// Such as "2 days, 7 hours, 5 minutes", leaving out what's zero, as the server says it.
+function formatUptime(seconds) {
+  let minutes = Math.floor(Number(seconds || 0) / 60);
+  if (!(minutes >= 1)) return "less than a minute";
+  const days = Math.floor(minutes / 1440);
+  minutes -= days * 1440;
+  const hours = Math.floor(minutes / 60);
+  minutes -= hours * 60;
+  return [[days, "day"], [hours, "hour"], [minutes, "minute"]]
+    .filter(([count]) => count)
+    .map(([count, unit]) => `${count} ${unit}${count === 1 ? "" : "s"}`)
+    .join(", ");
+}
+
 function renderDashboardSdr(data) {
   const settings = data.settings || {};
   const source = data.source || {};
   const attention = rtlRequiresAttention(data);
   const attentionElement = document.getElementById("dashboard_sdr_attention");
   const detailsElement = document.getElementById("dashboard_sdr_details");
+  // Shown whether or not the SDR needs attention, and only once it's set.
+  const location = String(data.location || "");
+  setText("summary_location", location);
+  setHidden("dashboard_location", !location);
+  setText("summary_uptime", formatUptime(data.uptime_seconds));
   if (attentionElement) attentionElement.hidden = !attention;
   if (detailsElement) detailsElement.hidden = attention;
   if (attention) return;
@@ -8947,6 +9051,7 @@ function applyStatus(data, options = {}) {
   applying = true;
   try {
     if (data.account) applyAccountUi(data.account);
+    if (data.instance_name) setInstanceName(data.instance_name);
     const nextSignature = controlSignature(data);
     const controlsFresh = !options.requestNumber || options.requestNumber > sdrControlsStaleThrough;
     if (
@@ -9706,6 +9811,18 @@ document.getElementById("nav_restart").addEventListener("click", event => {
   event.preventDefault();
   requestRestart();
 });
+for (const id of Object.values(GENERAL_SETTING_INPUTS)) {
+  document.getElementById(id).addEventListener("input", () => {
+    syncGeneralSaveButton();
+    setMessage("general-result", "");
+  });
+  document.getElementById(id).addEventListener("keydown", event => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    saveGeneralSettings();
+  });
+}
+document.getElementById("save_general_settings").addEventListener("click", saveGeneralSettings);
 document.getElementById("save_advanced_settings").addEventListener("click", saveAdvancedSettings);
 // Enter in the port saves too, as it would without this script.
 document.getElementById("advanced_port").addEventListener("keydown", event => {

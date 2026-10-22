@@ -218,6 +218,23 @@ def set_title(page: str, title: str) -> str:
     return re.sub(r"<title>.*?</title>", f"<title>{html.escape(title)}</title>", page, count=1)
 
 
+def set_site_name(page: str, name: str) -> str:
+    """Names this NWR Stream Manager by its instance name in the title, where the title names it.
+
+    "Dashboard - NWR Stream Manager" becomes "Dashboard - " and the instance name. The
+    page script, where a page has one, finds the name in the instance_name_meta tag.
+    """
+    page = re.sub(
+        r"<title>((?:[^<]*? - )?)NWR Stream Manager</title>",
+        lambda match: f"<title>{match.group(1)}{html.escape(name)}</title>",
+        page,
+        count=1,
+    )
+    if 'id="instance_name_meta"' in page:
+        page = set_attribute(page, "instance_name_meta", "content", name)
+    return page
+
+
 def show_view(page: str, view: str) -> str:
     """Shows one of the main page's views and hides the rest."""
     markup, scripts = _split_markup(page)

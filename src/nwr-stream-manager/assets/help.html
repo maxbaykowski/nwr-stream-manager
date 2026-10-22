@@ -133,6 +133,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li><a href="#logs">Logs</a></li>
     <li><a href="#settings">Settings</a>
       <ol>
+        <li><a href="#general">General</a></li>
         <li><a href="#accounts">Accounts</a></li>
         <li><a href="#remote-sdr">SDR sharing</a></li>
         <li><a href="#notifications">Notifications</a></li>
@@ -230,7 +231,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>After signing in, you'll see the dashboard. It gives you a quick overview of how your RTL-SDR and your streams are doing, so you can tell at a glance whether anything needs attention.</p>
   <dl>
     <dt>Configured SDR</dt>
-    <dd>Which RTL-SDR is in use and its main settings. If the RTL-SDR throws a hissy fit and decides to freeze up or randomly disconnect, a warning appears here stating the SDR requires attention. The <strong>Configure RTL-SDR</strong> link takes you to its settings, where you can reset it.</dd>
+    <dd>Which RTL-SDR is in use and its main settings, and the <a href="#general">location</a> you've given it, if any. Below that are the version of NWR Stream Manager that's running and its uptime, how long it's been running since it last started, such as <q>2 days, 7 hours, 5 minutes</q>. If the RTL-SDR throws a hissy fit and decides to freeze up or randomly disconnect, a warning appears here stating the SDR requires attention. The <strong>Configure RTL-SDR</strong> link takes you to its settings, where you can reset it.</dd>
     <dt>Configured streams</dt>
     <dd>How many streams you have, and a short explanation of any stream that needs attention, for example because of bad reception or a streaming service it can't connect to.</dd>
     <dt>Recently issued EAS alerts</dt>
@@ -565,7 +566,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
 <section aria-labelledby="settings">
   <h2 id="settings">Settings</h2>
-  <p>Settings holds the settings that aren't about one stream or the RTL-SDR itself: your account or, for the owner, everyone's accounts, <a href="#remote-sdr">SDR sharing</a>, <a href="#notifications">notifications</a>, <a href="#fallback-audio">fallback audio</a> and, for the owner, <a href="#advanced">Advanced</a>. Open it from <strong>More</strong>, then <strong>Settings</strong>. Read-only accounts don't have Settings; they change their password from <strong>More</strong>, then <strong>Change account password</strong>.</p>
+  <p>Settings holds the settings that aren't about one stream or the RTL-SDR itself: <a href="#general">General</a>, your account or, for the owner, everyone's accounts, <a href="#remote-sdr">SDR sharing</a>, <a href="#notifications">notifications</a>, <a href="#fallback-audio">fallback audio</a> and, for the owner, <a href="#advanced">Advanced</a>. Open it from <strong>More</strong>, then <strong>Settings</strong>. Read-only accounts don't have Settings; they change their password from <strong>More</strong>, then <strong>Change account password</strong>.</p>
+
+  <h3 id="general">General</h3>
+  <p>General is the first setting in the list, and the one that opens when you open Settings. Its <strong>Instance name</strong> is the name of this NWR Stream Manager. It's shown in your browser's title bar and tabs, so if you run NWR Stream Manager on more than one computer, giving each one its own name makes it easy to tell them apart. Until you choose one, it's named after the computer it runs on, for example <q>NWR Stream Manager on raspberrypi</q>.</p>
+  <p><strong>Location</strong> is optional. It's where this NWR Stream Manager or its RTL-SDR is, in your own words, for your reference, such as <q>Attic SDR (Grand Rapids, MI)</q>. It's only stored on this computer. Once it's set, it's shown on the <a href="#dashboard">dashboard</a>, under Configured SDR.</p>
+  <p>The name and the location can each be up to 64 characters long. Once you've changed them, select <strong>Save changes</strong>; in an up-to-date browser, the button appears as soon as you change either one. Changes take effect right away, with no restart, and every open page picks them up. In an <a href="#older-browsers">older browser</a>, other open pages show it once they're refreshed. The owner and administrators can change the name.</p>
 
   <h3 id="accounts">Accounts</h3>
   <p>Everyone who uses NWR Stream Manager signs in with an account. There are three types of accounts:</p>

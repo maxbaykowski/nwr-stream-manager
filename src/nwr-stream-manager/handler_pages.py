@@ -201,6 +201,8 @@ class PageHandlerMixin:
                     "paired": ("remote-pair-outcome", f"Paired with {name}. Either device can now use the other's shared RTL-SDR.", "success"),
                     "unpaired": ("paired-devices-result", f"Unpaired {name}.", "success"),
                 }.get(query.get("result", ""))
+            if query.get("section") == "general" and not result and query.get("result") == "saved":
+                result = ("general-result", "Changes saved.", "success")
             if query.get("section") == "advanced" and not result and query.get("result") == "saved":
                 result = ("advanced-result", advanced_saved_text(self.service.advanced_settings()), "success")
             if query.get("section") == "fallback_audio" and not result and query.get("result") in FALLBACK_RESULTS:
@@ -254,13 +256,16 @@ class PageHandlerMixin:
             section = ""
         tab = settings_tab_section(section, owner)
         parent = tab if tab != section else ""
-        works = section in BASELINE_SETTINGS_SECTIONS
+        # With nothing chosen, General shows beside the list where there's room for both;
+        # on a phone the list shows on its own, as the layout leaves the detail out.
+        shown = tab or "general"
+        works = (section or "general") in BASELINE_SETTINGS_SECTIONS
         page = page_rendering.set_hidden(page, "settings_tab_accounts", not owner)
         page = page_rendering.set_hidden(page, "settings_tab_account", owner)
         page = page_rendering.set_hidden(page, "settings_tab_advanced", not owner)
         for name in SETTINGS_TABS:
-            page = page_rendering.set_attribute(page, f"settings_tab_{name}", "aria-current", "page" if name == tab else None)
-            page = page_rendering.set_hidden(page, f"settings_panel_{name}", not (works and name == tab))
+            page = page_rendering.set_attribute(page, f"settings_tab_{name}", "aria-current", "page" if name == shown else None)
+            page = page_rendering.set_hidden(page, f"settings_panel_{name}", not (works and name == shown))
         page = page_rendering.set_hidden(page, "settings_accounts_page", section != "accounts")
         page = page_rendering.set_hidden(page, "settings_create_account_page", section != "create_account")
         page = page_rendering.set_hidden(page, "settings_owner_password_page", not (section == "account" and owner))
@@ -268,7 +273,7 @@ class PageHandlerMixin:
         page = page_rendering.set_attribute(page, "settings_layout", "class", " ".join(layout))
         page = page_rendering.set_text(page, "settings_back", f"Back to {SETTINGS_BACK_NAMES[parent]}" if parent else "Back to settings")
         page = page_rendering.set_attribute(page, "settings_back_section", "value", parent)
-        page = page_rendering.set_hidden(page, "settings_choose", bool(section))
+        page = page_rendering.set_hidden(page, "settings_choose", True)
         title = f"{SETTINGS_SECTION_TITLES[section]} - Settings" if section else "Settings"
         if section == "account":
             page = self._place_password_form(page, "settings_owner_password_page" if owner else "settings_panel_account")
@@ -286,6 +291,8 @@ class PageHandlerMixin:
                 title = f"{confirm_title} - {title}"
         if section == "fallback_audio":
             page = self._fill_fallback_audio_page(page, query, form)
+        if shown == "general":
+            page = self._fill_general_page(page, form)
         if section == "advanced":
             page = self._fill_advanced_page(page, form)
         if section == "notifications":

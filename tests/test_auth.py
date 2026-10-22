@@ -1712,6 +1712,8 @@ class AuthTests(unittest.TestCase):
         service.received_chunks = 0
         service.received_bytes = 0
         service.development_iq_sources_enabled = False
+        service.general = __import__("sys").modules["nwr_stream_manager.general_settings"].GeneralSettings("NWR Stream Manager on test")
+        service.started_at = self.web_control.time.monotonic()
         service.log_handler = type("LogHandler", (), {"snapshot": lambda self: []})()
         now = self.web_control.time.time()
         service.test_mode_time = self.web_control.TestModeTimeBudget(None)
