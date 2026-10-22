@@ -1266,22 +1266,22 @@ class AuthTests(unittest.TestCase):
     def test_setup_state_reports_setup_required_before_account_exists(self) -> None:
         handler = object.__new__(self.web_control.RtlControlHandler)
         handler.current_account = None
-        handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(has_account=lambda: False))
+        handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(has_account=lambda: False), instance_id="run1")
         sent = {}
         handler._send_json = lambda payload, status=self.web_control.HTTPStatus.OK: sent.update(payload=payload, status=status)
 
         self.assertFalse(handler._auth_ok_or_setup_response("/api/setup-state", "GET"))
-        self.assertEqual(sent["payload"], {"setup_required": True})
+        self.assertEqual(sent["payload"], {"setup_required": True, "instance": "run1"})
 
     def test_setup_state_reports_setup_complete_after_owner_exists(self) -> None:
         handler = object.__new__(self.web_control.RtlControlHandler)
         handler.current_account = None
-        handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(has_account=lambda: True))
+        handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(has_account=lambda: True), instance_id="run1")
         sent = {}
         handler._send_json = lambda payload, status=self.web_control.HTTPStatus.OK: sent.update(payload=payload, status=status)
 
         self.assertFalse(handler._auth_ok_or_setup_response("/api/setup-state", "GET"))
-        self.assertEqual(sent["payload"], {"setup_required": False})
+        self.assertEqual(sent["payload"], {"setup_required": False, "instance": "run1"})
 
     def test_help_is_readable_without_signing_in_before_and_after_setup(self) -> None:
         for has_account in (False, True):

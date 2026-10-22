@@ -130,7 +130,8 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("StateDirectory=nwr-stream-manager", unit)
         self.assertIn("LogsDirectory=nwr-stream-manager", unit)
         self.assertIn("SupplementaryGroups=plugdev audio", unit)
-        self.assertIn("ExecStart=/usr/local/bin/nwr-stream-manager --host 0.0.0.0 --port 8080", unit)
+        # No --host or --port, so the Advanced settings decide where it listens.
+        self.assertIn("ExecStart=/usr/local/bin/nwr-stream-manager\n", unit)
 
     def test_systemd_unit_is_included_in_source_distribution_manifest(self) -> None:
         manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")

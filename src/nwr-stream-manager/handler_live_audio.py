@@ -150,6 +150,8 @@ class LiveAudioHandlerMixin:
                     writer.send_json({"type": "settings_changed"})
                 else:
                     writer.send_json({"type": "keepalive"})
+            if self.service.restart_requested.is_set():
+                writer.send_json({"type": "server_restarting", "instance": self.service.instance_id})
             writer.send_close(LIVE_AUDIO_SHUTDOWN_CLOSE_CODE, "server restarting")
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
@@ -191,7 +193,11 @@ class LiveAudioHandlerMixin:
         while True:
             if shutting_down is not None and shutting_down.is_set():
                 # Let the page know right away, so it can wait for the server to come back.
-                writer.send_json({"type": "server_shutdown"})
+                restart = getattr(self.service, "restart_requested", None)
+                if restart is not None and restart.is_set():
+                    writer.send_json({"type": "server_restarting", "instance": self.service.instance_id})
+                else:
+                    writer.send_json({"type": "server_shutdown"})
                 writer.send_close(LIVE_AUDIO_SHUTDOWN_CLOSE_CODE, "server shutting down")
                 return
             if source.audio_source.closed.is_set():

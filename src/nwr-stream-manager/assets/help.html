@@ -137,8 +137,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
         <li><a href="#remote-sdr">SDR sharing</a></li>
         <li><a href="#notifications">Notifications</a></li>
         <li><a href="#fallback-audio">Fallback audio</a></li>
+        <li><a href="#advanced">Advanced</a></li>
       </ol>
     </li>
+    <li><a href="#restart">Restarting NWR Stream Manager</a></li>
     <li><a href="#tailscale">Setting up Tailscale</a></li>
     <li><a href="#secure-address">Using a secure (https) address with Tailscale Serve</a></li>
     <li><a href="#storage">Storage</a></li>
@@ -178,13 +180,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <h3 id="deemphasis-examples">Hear the difference</h3>
   <p>The below recordings were taken from my local NWR station, WXN99 (West Olive, MI). The first recording is exactly as the signal was received by the SDR, without any deemphasis. The second recording, however, has NWR Stream Manager's deemphasis applied to it.</p>
   <h4 id="example-without-deemphasis">Without deemphasis</h4>
-  <audio controls preload="none" src="/help/without-deemphasis.mp3" aria-labelledby="example-without-deemphasis">
-    <a href="/help/without-deemphasis.mp3">Download</a>
-  </audio>
+  <audio controls preload="none" src="/help/without-deemphasis.mp3" aria-labelledby="example-without-deemphasis"></audio>
+  <!--[if lt IE 9]><p><a href="/help/without-deemphasis.mp3">Download</a></p><![endif]-->
   <h4 id="example-with-deemphasis">With deemphasis</h4>
-  <audio controls preload="none" src="/help/with-deemphasis.mp3" aria-labelledby="example-with-deemphasis">
-    <a href="/help/with-deemphasis.mp3">Download</a>
-  </audio>
+  <audio controls preload="none" src="/help/with-deemphasis.mp3" aria-labelledby="example-with-deemphasis"></audio>
+  <!--[if lt IE 9]><p><a href="/help/with-deemphasis.mp3">Download</a></p><![endif]-->
   <p>Contrary to what you might think, both recordings came from the exact same few seconds of station audio. One thing you'll probably notice is that the second recording seems to have far less static compared to the first. The reception of the station remained the same for both recordings; the deemphasis makes the static seem a lot less in-your-face.</p>
 </section>
 
@@ -565,7 +565,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
 <section aria-labelledby="settings">
   <h2 id="settings">Settings</h2>
-  <p>Settings holds the settings that aren't about one stream or the RTL-SDR itself: your account or, for the owner, everyone's accounts, <a href="#remote-sdr">SDR sharing</a>, <a href="#notifications">notifications</a> and <a href="#fallback-audio">fallback audio</a>. Open it from <strong>More</strong>, then <strong>Settings</strong>. Read-only accounts don't have Settings; they change their password from <strong>More</strong>, then <strong>Change account password</strong>.</p>
+  <p>Settings holds the settings that aren't about one stream or the RTL-SDR itself: your account or, for the owner, everyone's accounts, <a href="#remote-sdr">SDR sharing</a>, <a href="#notifications">notifications</a>, <a href="#fallback-audio">fallback audio</a> and, for the owner, <a href="#advanced">Advanced</a>. Open it from <strong>More</strong>, then <strong>Settings</strong>. Read-only accounts don't have Settings; they change their password from <strong>More</strong>, then <strong>Change account password</strong>.</p>
 
   <h3 id="accounts">Accounts</h3>
   <p>Everyone who uses NWR Stream Manager signs in with an account. There are three types of accounts:</p>
@@ -660,6 +660,35 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   </ul>
   <p>Every announcement is checked before it is used. Files that aren't MP3, OGG or WAV audio, that are damaged or incomplete, or that are silent are refused. Announcements that contain SAME tones are refused as well; sorry I spoiled your fun for those of you that wanted to trigger an EAN!</p>
   <p>Browsers only allow microphone access on pages opened with a secure <code>https://</code> address. To record an announcement, <a href="#secure-address">set up Tailscale Serve</a> to give NWR Stream Manager a secure address. If you're accessing the page through plain old HTTP, then your only option is uploading a file. If you decline the browser's request to use your microphone, allow it in your browser's site settings and select <strong>Record</strong> again.</p>
+
+  <h3 id="advanced">Advanced</h3>
+  <p>Advanced chooses where NWR Stream Manager can be reached. Only the owner account has it. Unlike the rest of Settings, nothing here is saved until you select <strong>Save changes</strong>, and saved changes only take effect the next time NWR Stream Manager starts, for example when you <a href="#restart">restart it</a> or the computer restarts. A wrong setting here can leave you unable to reach NWR Stream Manager at all, so double-check before you save. Advanced also says where NWR Stream Manager is listening right now.</p>
+  <dl>
+    <dt>Port</dt>
+    <dd>The number at the end of NWR Stream Manager's address, such as 8080 in <code>http://192.168.1.10:8080</code>. The default is 8080. Choose another one if something else on the computer already uses 8080. Ports below 1024 need extra permission, so pick one from 1024 to 65535. Once the new port takes effect, use it in the address you open, and in <a href="#secure-address-serve">Tailscale Serve</a> if you use it.</dd>
+    <dt>Only allow connections from this computer</dt>
+    <dd>NWR Stream Manager only accepts connections from the computer it's running on, so other devices on your network can't open it directly. This is for when something else on that computer passes connections along to it, such as <a href="#secure-address">Tailscale Serve</a> or a reverse proxy like Caddy or nginx. Only turn it on once that's set up and working, or you'll have no way in from another device.</dd>
+  </dl>
+  <h4 id="advanced-command-line">Command line options</h4>
+  <p>When NWR Stream Manager is started with any of these options, they're used instead of the Advanced settings, and Advanced tells you so:</p>
+  <ul>
+    <li><code>--port</code> followed by a number listens on that port.</li>
+    <li><code>--localhost-only</code> only accepts connections from this computer.</li>
+    <li><code>--bind-to-all-interfaces</code> accepts connections from other devices on your network.</li>
+    <li><code>--host</code> followed by an address listens on that one address.</li>
+  </ul>
+  <p>If you installed NWR Stream Manager as a service with a service file from an older version, it may still start NWR Stream Manager with <code>--host 0.0.0.0 --port 8080</code>. Remove those from the service file's <code>ExecStart</code> line to use the Advanced settings.</p>
+  <h4 id="advanced-locked-out">If you've locked yourself out</h4>
+  <p>If you run NWR Stream Manager yourself from a command line, start it with <code>--bind-to-all-interfaces</code>, and add <code>--port 8080</code> if you don't remember the port you chose. Then fix the settings in Advanced and start it the usual way next time.</p>
+  <div class="command"><code>nwr-stream-manager --bind-to-all-interfaces --port 8080</code><button type="button" class="copy-button" hidden>Copy</button></div>
+  <p>If it runs as a service, delete the <code>web-address.json</code> file in its settings folder and restart the service. NWR Stream Manager goes back to port 8080, reachable from other devices, and your other settings are kept:</p>
+  <div class="command"><code>sudo rm /var/lib/nwr-stream-manager/web-address.json &amp;&amp; sudo systemctl restart nwr-stream-manager</code><button type="button" class="copy-button" hidden>Copy</button></div>
+</section>
+
+<section aria-labelledby="restart">
+  <h2 id="restart">Restarting NWR Stream Manager</h2>
+  <p>To restart NWR Stream Manager, open <strong>More</strong>, then <strong>Restart NWR Stream Manager</strong>, and confirm. The owner and administrators can do this; read-only accounts can't. NWR Stream Manager shuts down the same way it does when it exits, then starts again by itself. Streams stop for a few seconds and then start again, and an I/Q recording in progress stops. Every open page shows that it's restarting and reloads by itself once it's back; in an <a href="#older-browsers">older browser</a>, wait a few seconds, then select <strong>Done</strong> or refresh the page.</p>
+  <p>Restarting starts the version of NWR Stream Manager that's installed now, so it's also how to start using an update after installing it, without restarting the computer or the service. It also applies <a href="#advanced">Advanced</a> settings you've saved.</p>
 </section>
 
 <section aria-labelledby="tailscale">
@@ -715,7 +744,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <h3 id="secure-address-serve">Give NWR Stream Manager a secure address</h3>
   <p>Now that we've gotten the boring stuff out of the way, we can finally enable Tailscale Serve for NWR Stream Manager! Follow the steps below to turn it on:</p>
   <ol>
-    <li>On the computer running NWR Stream Manager, open a command line and run the following. If you started NWR Stream Manager on a different port than 8080, use that number instead.
+    <li>On the computer running NWR Stream Manager, open a command line and run the following. If you changed NWR Stream Manager's port in <a href="#advanced">Advanced</a> settings, or started it with <code>--port</code>, use that number instead of 8080.
       <div class="command"><code>sudo tailscale serve --bg 8080</code><button type="button" class="copy-button" hidden>Copy</button></div>
       The first time you do this, Tailscale may show a web link asking you to allow Serve on your account. Open the link, approve it, then run the command again.
     </li>

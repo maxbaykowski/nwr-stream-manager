@@ -57,7 +57,7 @@ class SettingsPageMarkupTests(unittest.TestCase):
         # the page script makes it tabs, or buttons on phones.
         self.assertIn('<form id="settings_list" class="settings-list" method="get" action="/" aria-label="Settings">', settings)
         tabs = re.findall(r'<button id="settings_tab_(\w+)" type="submit" name="section" value="(\w+)" data-settings-section="(\w+)" data-baseline-submit', settings)
-        self.assertEqual([tab[0] for tab in tabs], ["accounts", "account", "sdr_sharing", "notifications", "fallback_audio"])
+        self.assertEqual([tab[0] for tab in tabs], ["accounts", "account", "sdr_sharing", "notifications", "fallback_audio", "advanced"])
         for name, value, section in tabs:
             self.assertEqual(name, value)
             self.assertEqual(name, section)
@@ -84,7 +84,7 @@ class SettingsPageMarkupTests(unittest.TestCase):
         self.assertEqual(re.findall(r"<h2>([^<]+)</h2>", settings), ["Settings"])
         self.assertEqual(
             re.findall(r"<h3>([^<]+)</h3>", settings),
-            ["Accounts", "Create account", "Change account password", "Account", "SDR sharing", "Pair a device", "Find devices", "Fallback audio", "Record an announcement", "Notifications"],
+            ["Accounts", "Create account", "Change account password", "Account", "SDR sharing", "Pair a device", "Find devices", "Fallback audio", "Record an announcement", "Advanced", "Notifications"],
         )
         self.assertEqual(
             re.findall(r"<h4>([^<]+)</h4>", settings),
@@ -289,7 +289,7 @@ class SettingsPageRulesTests(unittest.TestCase):
     def test_the_owner_has_accounts_and_the_others_have_their_own_account(self) -> None:
         self.assertEqual(
             self.results["owner"]["sections"],
-            ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"],
+            ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement", "advanced"],
         )
         self.assertEqual(
             self.results["administrator"]["sections"],

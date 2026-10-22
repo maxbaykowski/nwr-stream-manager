@@ -41,6 +41,7 @@ VIEW_TITLES = {
     "eas_alert_export": "Export Alerts",
     "eas_alert_delete": "Delete Alerts",
     "eas_alert_detail": "EAS Alert Details",
+    "restart": "Restart NWR Stream Manager?",
 }
 VIEW_NAV_ITEMS = {
     "add_stream": "streams",
@@ -53,7 +54,7 @@ VIEW_NAV_ITEMS = {
     "eas_alert_detail": "eas_alerts",
 }
 READ_ONLY_RESTRICTED_VIEWS = {
-    "rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "settings",
+    "rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "settings", "restart",
 }
 # Settings, as the page script has them.
 SETTINGS_SECTION_TITLES = {
@@ -66,9 +67,10 @@ SETTINGS_SECTION_TITLES = {
     "notifications": "Notifications",
     "fallback_audio": "Fallback audio",
     "record_announcement": "Record an announcement",
+    "advanced": "Advanced",
 }
 SETTINGS_BACK_NAMES = {"accounts": "accounts", "sdr_sharing": "SDR sharing", "fallback_audio": "fallback audio"}
-SETTINGS_TABS = ("accounts", "account", "sdr_sharing", "notifications", "fallback_audio")
+SETTINGS_TABS = ("accounts", "account", "sdr_sharing", "notifications", "fallback_audio", "advanced")
 SETTINGS_PAGE_PARENTS = {
     "create_account": "accounts",
     "pair_device": "sdr_sharing",
@@ -76,7 +78,7 @@ SETTINGS_PAGE_PARENTS = {
     "record_announcement": "fallback_audio",
 }
 # The settings that work without the page script.
-BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account", "fallback_audio", "notifications", "sdr_sharing", "pair_device", "find_devices"}
+BASELINE_SETTINGS_SECTIONS = {"accounts", "create_account", "account", "fallback_audio", "notifications", "sdr_sharing", "pair_device", "find_devices", "advanced"}
 ACCOUNT_FORM_PATHS = {"/accounts/create", "/accounts/reset-password", "/accounts/read-only", "/accounts/delete"}
 EAS_ALERT_EXPORT_PATH = "/eas-alerts/export"
 EAS_ALERT_FORM_PATHS = {"/eas-alerts/delete", "/eas-alerts/remove"}
@@ -105,6 +107,8 @@ NOTIFICATIONS_SET_UP_HTML = (
     '<p>To get notifications when the RTL-SDR needs attention, go to <a href="/?view=rtl">Configure RTL-SDR</a> '
     "and turn on Notify when the RTL-SDR requires attention.</p>"
 )
+ADVANCED_SETTINGS_PATH = "/advanced-settings"
+RESTART_PATH = "/restart"
 FALLBACK_SETTINGS_PATH = "/fallback-audio/settings"
 FALLBACK_UPLOAD_PATH = "/fallback-audio/upload"
 # What fallback audio says once one of its forms has gone back to it: where, and what.
@@ -152,7 +156,8 @@ IQ_RECORDER_RESULTS = {
 
 def settings_sections_for(owner: bool) -> list[str]:
     sections = ["account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"]
-    return ["accounts", "create_account", *sections] if owner else sections
+    # Only the owner chooses where NWR Stream Manager can be reached.
+    return ["accounts", "create_account", *sections, "advanced"] if owner else sections
 
 
 def settings_tab_section(section: str, owner: bool) -> str:

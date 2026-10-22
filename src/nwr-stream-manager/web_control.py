@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import queue
+import secrets
 import signal
 import socket
 import sys
@@ -221,10 +222,12 @@ from .remote_sdr import (
     RemoteSdrServer,
 )
 from .routes_accounts import AccountRoutesMixin
+from .routes_advanced import AdvancedRoutesMixin
 from .routes_eas_alerts import EasAlertRoutesMixin
 from .routes_fallback import FallbackRoutesMixin
 from .routes_iq_recorder import IqRecorderRoutesMixin
 from .routes_live_audio import LiveAudioRoutesMixin
+from .routes_restart import RestartRoutesMixin
 from .routes_notifications import NotificationRoutesMixin
 from .routes_sdr import SdrRoutesMixin
 from .routes_streams import StreamRoutesMixin
@@ -240,6 +243,7 @@ from .rtl import (
     RtlSampleBatch,
 )
 from .same_live import generate_same_message, SameEventQueue
+from .service_advanced import AdvancedServiceMixin
 from .service_capture import CaptureServiceMixin
 from .service_devices import DeviceServiceMixin
 from .service_eas_alerts import EasAlertServiceMixin
@@ -247,6 +251,7 @@ from .service_fallback import FallbackServiceMixin
 from .service_iq_recorder import IqRecorderServiceMixin
 from .service_live_audio import LiveAudioServiceMixin
 from .service_notifications import NotificationServiceMixin
+from .service_restart import restart_process, RESTART_RESPONSE_SECONDS, RestartServiceMixin
 from .service_sdr_sharing import SdrSharingServiceMixin
 from .service_streams import StreamServiceMixin
 from .service_test_mode import TestModeServiceMixin
@@ -288,6 +293,14 @@ from .stream_config import (
 from .stream_worker import IcecastOutputWriter, IcecastStreamWorker, SharedSoundcardOutputManager
 from .time_budget import TEST_MODE_TIME_FILE_NAME, TestModeTimeBudget
 from .tone_generators import parse_tone_generator_settings, ToneGeneratorBank
+from .web_address import (
+    DEFAULT_WEB_PORT,
+    load_web_address_settings,
+    resolve_web_address,
+    validate_web_port,
+    WebAddress,
+    web_address_state_path,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -321,6 +334,8 @@ class RtlControlService(
     NotificationServiceMixin,
     CaptureServiceMixin,
     SdrSharingServiceMixin,
+    AdvancedServiceMixin,
+    RestartServiceMixin,
 ):
     def __init__(
         self,
@@ -337,7 +352,10 @@ class RtlControlService(
         self.iq_test_sources_directory = state_path.parent / IQ_TEST_SOURCES_DIRECTORY_NAME
         self.development_iq_sources_enabled = bool(development_iq_sources_enabled)
         self.web_host = "0.0.0.0"
-        self.web_port = 8080
+        self.web_port = DEFAULT_WEB_PORT
+        # Where the web interface is listening and why; run_server sets it once it knows.
+        self.web_address = WebAddress(self.web_host, self.web_port)
+        self.web_address_state_path = web_address_state_path(state_path)
         self.fallback_state_path = state_path.with_name(FALLBACK_STATE_FILE_NAME)
         self.custom_fallback_audio_path = state_path.with_name(CUSTOM_FALLBACK_AUDIO_FILE_NAME)
         # One custom announcement is checked and stored at a time.
@@ -415,6 +433,9 @@ class RtlControlService(
         self.stream_eas_alert_notification_seen: dict[str, set[str]] = {}
         self.stream_test_mode: dict[str, Any] | None = None
         self.shutting_down = threading.Event()
+        # Which run of NWR Stream Manager this is, so a restart is only ever asked of the run it was meant for.
+        self.instance_id = secrets.token_hex(8)
+        self.restart_requested = threading.Event()
         self.live_audio_connections = 0
         self.iq_recorder: IqRecorderWorker | None = None
         self.iq_recorder_account_id: int | None = None
@@ -691,6 +712,8 @@ class RtlControlHandler(
     SdrRoutesMixin,
     NotificationRoutesMixin,
     FallbackRoutesMixin,
+    AdvancedRoutesMixin,
+    RestartRoutesMixin,
     AuthHandlerMixin,
     LiveAudioHandlerMixin,
     ResponseHandlerMixin,
@@ -806,17 +829,41 @@ class RtlControlHandler(
 RtlControlHandler.ROUTES = route_table(RtlControlHandler)
 
 
+def port_argument(value: str) -> int:
+    try:
+        return validate_web_port(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} isn't a port number from 1 to 65535") from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nwr-stream-manager",
         description="Run the NWR Stream Manager web interface.",
     )
-    parser.add_argument(
+    # Without any of these, the address and port come from Settings, under Advanced.
+    address = parser.add_mutually_exclusive_group()
+    address.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="address to bind; use 0.0.0.0 for LAN access",
+        default=None,
+        help="address to bind, overriding the Advanced settings; use 0.0.0.0 for LAN access",
     )
-    parser.add_argument("--port", type=int, default=8080)
+    address.add_argument(
+        "--localhost-only",
+        action="store_true",
+        help="only accept connections from this computer, overriding the Advanced settings",
+    )
+    address.add_argument(
+        "--bind-to-all-interfaces",
+        action="store_true",
+        help="accept connections on every network address, overriding the Advanced settings",
+    )
+    parser.add_argument(
+        "--port",
+        type=port_argument,
+        default=None,
+        help=f"port to listen on, overriding the Advanced settings (normally {DEFAULT_WEB_PORT})",
+    )
     parser.add_argument("--state", type=Path, default=default_state_path())
     parser.add_argument(
         "--log-file",
@@ -891,6 +938,14 @@ def install_shutdown_signal_handlers(
     return previous_handlers
 
 
+def stop_web_server_soon(server: ThreadingHTTPServer) -> None:
+    # A moment first, so the page asking for a restart hears that it's happening.
+    timer = threading.Timer(RESTART_RESPONSE_SECONDS, server.shutdown)
+    timer.name = "http-shutdown"
+    timer.daemon = True
+    timer.start()
+
+
 def restore_signal_handlers(previous_handlers: dict[int, Any]) -> None:
     for signum, handler in previous_handlers.items():
         try:
@@ -921,7 +976,17 @@ def bind_web_server(host: str, port: int) -> ThreadingHTTPServer:
         raise WebServerBindError(message) from exc
 
 
-def run_server(host: str, port: int, state_path: Path, verbose: bool = False, log_file: Path | None = None) -> None:
+def run_server(
+    host: str | None,
+    port: int | None,
+    state_path: Path,
+    verbose: bool = False,
+    log_file: Path | None = None,
+    *,
+    localhost_only: bool = False,
+    bind_to_all_interfaces: bool = False,
+) -> bool:
+    """Runs until shut down. Returns true when it was shut down to restart."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -934,6 +999,17 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
         LOG.exception("NWR Stream Manager cannot start because a dependency check failed")
         raise
     LOG.info("startup dependency check passed: %s", format_dependency_summary(dependency_results))
+    address = resolve_web_address(
+        load_web_address_settings(web_address_state_path(state_path)),
+        host=host,
+        port=port,
+        localhost_only=localhost_only,
+        bind_to_all_interfaces=bind_to_all_interfaces,
+    )
+    host, port = address.host, address.port
+    for flag in (address.host_flag, address.port_flag):
+        if flag:
+            LOG.info("%s was given, so it's used instead of the Advanced settings", flag)
     # Before anything else starts, so a second copy can't take the RTL-SDR before it finds the port in use.
     try:
         server = bind_web_server(host, port)
@@ -954,8 +1030,10 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
         raise
     service.web_host = host
     service.web_port = port
+    service.web_address = address
     RtlControlHandler.service = service
     previous_signal_handlers = install_shutdown_signal_handlers(server, service.begin_shutdown)
+    service.stop_web_server = lambda: stop_web_server_soon(server)
     LOG.info("RTL-SDR control web interface bound to %s:%s", host, port)
     for url in access_urls(host, port):
         LOG.info("RTL-SDR control web interface available at %s", url)
@@ -970,16 +1048,27 @@ def run_server(host: str, port: int, state_path: Path, verbose: bool = False, lo
         restore_signal_handlers(previous_signal_handlers)
         server.server_close()
         service.close()
+    return service.restart_requested.is_set()
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        run_server(args.host, args.port, args.state, args.verbose, args.log_file)
+        restart = run_server(
+            args.host,
+            args.port,
+            args.state,
+            args.verbose,
+            args.log_file,
+            localhost_only=args.localhost_only,
+            bind_to_all_interfaces=args.bind_to_all_interfaces,
+        )
     except (DependencyCheckError, WebServerBindError):
         return 1
     except KeyboardInterrupt:
         return 130
+    if restart:
+        return restart_process()
     return 0
 
 

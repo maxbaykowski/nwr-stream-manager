@@ -959,6 +959,10 @@ async function handleLiveAudioMessage(event) {
     enterServerUnavailable("shutdown");
     return;
   }
+  if (message.type === "server_restarting") {
+    enterServerRestarting(message.instance);
+    return;
+  }
   if (message.type === "start") {
     liveAudioCodec = message.codec || "pcm";
     await configureLiveAudioDecoder();
@@ -6344,6 +6348,8 @@ function applyAccountUi(account) {
   setHidden("nav_change_password", !readOnly);
   setHidden("settings_tab_accounts", !owner);
   setHidden("settings_tab_account", owner || readOnly);
+  setHidden("settings_tab_advanced", !owner);
+  setHidden("nav_restart", readOnly);
   placeChangePasswordForm();
   setHidden("nav_rtl", readOnly);
   setHidden("dashboard_configure_sdr", readOnly);
@@ -6459,6 +6465,82 @@ function accountActionsCell(account) {
   cell.appendChild(button);
   cell.appendChild(menu);
   return cell;
+}
+
+// Advanced is saved only when Save changes is selected, not as it's changed:
+// a wrong port or address could leave nobody able to reach NWR Stream Manager.
+let advancedSettingsLoaded = null;
+let advancedSettingsShowing = false;
+
+function describeWebHost(host) {
+  if (["0.0.0.0", "::", ""].includes(host)) return "all";
+  if (["127.0.0.1", "localhost", "::1"].includes(host) || host.startsWith("127.")) return "local";
+  return "address";
+}
+
+function advancedListeningText(data) {
+  const listening = data.listening || {};
+  const host = String(listening.host || "");
+  const where = describeWebHost(host);
+  let text = where === "local"
+    ? `Right now, NWR Stream Manager only accepts connections from this computer, on port ${listening.port}.`
+    : where === "address"
+      ? `Right now, NWR Stream Manager is listening on ${host}, port ${listening.port}.`
+      : `Right now, NWR Stream Manager accepts connections from other devices on port ${listening.port}.`;
+  if (data.restart_needed) text += " Your saved changes take effect the next time it starts.";
+  return text;
+}
+
+function advancedSavedText(data) {
+  const flags = [data.host_flag, data.port_flag].filter(Boolean);
+  if (flags.length) return `Changes saved. They take effect once NWR Stream Manager is started without ${flags.join(" or ")}.`;
+  return "Changes saved. They take effect the next time NWR Stream Manager starts.";
+}
+
+function advancedFlagText(flag) {
+  return flag ? `NWR Stream Manager was started with ${flag}, which is used instead of this setting until it's started without it.` : "";
+}
+
+function renderAdvancedSettings(data) {
+  advancedSettingsLoaded = {port: String(data.port), localhost_only: Boolean(data.localhost_only)};
+  setText("advanced_listening", advancedListeningText(data));
+  setValue("advanced_port", advancedSettingsLoaded.port);
+  setChecked("advanced_localhost_only", advancedSettingsLoaded.localhost_only);
+  setText("advanced_port_flag", advancedFlagText(data.port_flag));
+  setHidden("advanced_port_flag", !data.port_flag);
+  setText("advanced_host_flag", advancedFlagText(data.host_flag));
+  setHidden("advanced_host_flag", !data.host_flag);
+}
+
+async function loadAdvancedSettings() {
+  setMessage("advanced-result", "");
+  try {
+    renderAdvancedSettings(await request("/api/advanced-settings"));
+  } catch (error) {
+    setMessage("advanced-result", error.message, "error");
+  }
+}
+
+async function saveAdvancedSettings() {
+  if (!advancedSettingsLoaded) return;
+  const changes = {};
+  const port = document.getElementById("advanced_port").value.trim();
+  if (port !== advancedSettingsLoaded.port) changes.port = port;
+  const localhostOnly = document.getElementById("advanced_localhost_only").checked;
+  if (localhostOnly !== advancedSettingsLoaded.localhost_only) changes.localhost_only = localhostOnly;
+  try {
+    const data = Object.keys(changes).length
+      ? await request("/api/advanced-settings", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(changes)
+      })
+      : await request("/api/advanced-settings");
+    renderAdvancedSettings(data);
+    setMessage("advanced-result", advancedSavedText(data), "success");
+  } catch (error) {
+    setMessage("advanced-result", error.message, "error");
+  }
 }
 
 async function loadAccounts() {
@@ -7345,6 +7427,7 @@ function showView(name, options = {}) {
   setPageTitle(defaultViewTitle(name));
   if (name !== "settings") syncRemotePairingPage("");
   if (name !== "settings") stopAnnouncementPlaybackOffPage(name, null);
+  if (name !== "settings") advancedSettingsShowing = false;
   if (options.focus !== false) focusViewHeading(name);
   const moreButton = document.getElementById("nav_more_button");
   for (const item of document.querySelectorAll("nav [data-view]")) {
@@ -7677,7 +7760,8 @@ const SETTINGS_SECTION_TITLES = {
   find_devices: "Find devices",
   notifications: "Notifications",
   fallback_audio: "Fallback audio",
-  record_announcement: "Record an announcement"
+  record_announcement: "Record an announcement",
+  advanced: "Advanced"
 };
 // How "Back to ..." names the page a sub-page belongs to.
 const SETTINGS_BACK_NAMES = {accounts: "accounts", sdr_sharing: "SDR sharing", fallback_audio: "fallback audio"};
@@ -7698,7 +7782,8 @@ function availableSettingsTabs() {
 
 function settingsSectionsForAccount() {
   if (accountIsReadOnly()) return [];
-  if (accountIsOwner()) return ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"];
+  // Only the owner chooses where NWR Stream Manager can be reached.
+  if (accountIsOwner()) return ["accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement", "advanced"];
   return ["account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"];
 }
 
@@ -7804,6 +7889,9 @@ function renderSettingsSection() {
   if (tabSection === "notifications") renderNotificationSettings();
   if (section === "accounts") loadAccounts().catch(error => setAccountResult(error.message, "error"));
   if (section === "create_account") setCreateAccountResult("");
+  // Loaded on arriving, not each time Settings is redrawn, which would undo what's been typed.
+  if (section === "advanced" && !advancedSettingsShowing) loadAdvancedSettings();
+  advancedSettingsShowing = section === "advanced";
   syncRemotePairingPage(section);
   syncFallbackRecordingPage(section);
   stopAnnouncementPlaybackOffPage(currentViewName(), section);
@@ -7930,7 +8018,7 @@ function openNavMoreMenu(focusFirst = false) {
   menu.hidden = false;
   button.setAttribute("aria-expanded", "true");
   if (focusFirst) {
-    const first = menu.querySelector("[role='menuitem']");
+    const first = Array.from(menu.querySelectorAll("[role='menuitem']")).find(item => !item.hidden);
     if (first) first.focus();
   }
 }
@@ -9614,6 +9702,17 @@ document.addEventListener("click", event => {
   navigateTo(targetView, targetParams, replace);
 });
 
+document.getElementById("nav_restart").addEventListener("click", event => {
+  event.preventDefault();
+  requestRestart();
+});
+document.getElementById("save_advanced_settings").addEventListener("click", saveAdvancedSettings);
+// Enter in the port saves too, as it would without this script.
+document.getElementById("advanced_port").addEventListener("keydown", event => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  saveAdvancedSettings();
+});
 // Buttons that submit a form only for browsers that don't run this script; here
 // they act on the page instead, and their forms aren't sent.
 for (const button of document.querySelectorAll("[data-baseline-submit]")) {
@@ -9651,7 +9750,8 @@ document.getElementById("nav_more_menu").addEventListener("keydown", event => {
   }
   if (event.key === "ArrowDown" || event.key === "ArrowUp") {
     event.preventDefault();
-    const items = Array.from(document.querySelectorAll("#nav_more_menu [role='menuitem']"));
+    // Only the items this account has; a hidden one can't take focus, and would stop the arrows there.
+    const items = Array.from(document.querySelectorAll("#nav_more_menu [role='menuitem']")).filter(item => !item.hidden);
     const current = items.indexOf(document.activeElement);
     const step = event.key === "ArrowDown" ? 1 : -1;
     const next = items[(current + step + items.length) % items.length];
@@ -11261,6 +11361,7 @@ function startSettingsEvents() {
       return;
     }
     if (message.type === "settings_changed") refreshForSettingsChange();
+    if (message.type === "server_restarting") enterServerRestarting(message.instance);
   });
   socket.addEventListener("close", event => {
     if (settingsEventsSocket === socket) settingsEventsSocket = null;
@@ -11306,6 +11407,8 @@ let serverUnavailable = false;
 let serverFailureCount = 0;
 let serverUnreachableSince = 0;
 let serverReturnTimer = null;
+// The run of NWR Stream Manager that's restarting; until another answers, it isn't back.
+let restartingFromInstance = "";
 
 function noteServerRequestFailure(error) {
   // fetch() rejects with a TypeError when it can't reach the server at all.
@@ -11366,12 +11469,18 @@ function enterServerUnavailable(reason) {
   stopWeatherReceiver({notifyServer: false}).catch(error => console.debug("receiver stop failed", error));
   dismissMonitorUnstableDialog();
   dismissReceiverUnstableDialog();
-  setText("server_unavailable_title", reason === "shutdown" ? "NWR Stream Manager is shutting down" : "Can't reach NWR Stream Manager");
+  const titles = {
+    restart: "NWR Stream Manager is restarting",
+    shutdown: "NWR Stream Manager is shutting down"
+  };
+  const messages = {
+    restart: "This page will reload automatically as soon as it's back.",
+    shutdown: "It may be restarting. This page will reload automatically as soon as it's back."
+  };
+  setText("server_unavailable_title", titles[reason] || "Can't reach NWR Stream Manager");
   setText(
     "server_unavailable_message",
-    reason === "shutdown"
-      ? "It may be restarting. This page will reload automatically as soon as it's back."
-      : "It may be restarting, or this device may have lost its network connection. This page will reload automatically as soon as NWR Stream Manager is back."
+    messages[reason] || "It may be restarting, or this device may have lost its network connection. This page will reload automatically as soon as NWR Stream Manager is back."
   );
   setHidden("server_unavailable_reload", true);
   setServerUnavailableModalOpen(true);
@@ -11381,10 +11490,39 @@ function enterServerUnavailable(reason) {
   serverReturnTimer = setInterval(checkServerReturned, SERVER_RETURN_CHECK_MS);
 }
 
+function enterServerRestarting(instance) {
+  if (instance) restartingFromInstance = instance;
+  enterServerUnavailable("restart");
+}
+
+async function requestRestart() {
+  closeNavMoreMenu();
+  if (!window.confirm("Restart NWR Stream Manager? Your streams will go offline for a few seconds and any I/Q recordings in progress will be ended.")) {
+    document.getElementById("nav_more_button").focus();
+    return;
+  }
+  try {
+    // Names the run being restarted, so this request can never restart a later one.
+    const state = await request("/api/setup-state");
+    const data = await request("/api/restart", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({instance: state.instance})
+    });
+    enterServerRestarting(data.instance);
+  } catch (error) {
+    window.alert(`NWR Stream Manager couldn't restart: ${error.message}`);
+  }
+}
+
 async function checkServerReturned() {
   try {
     const response = await fetch("/api/setup-state", {cache: "no-store"});
     if (!response.ok) return;
+    if (restartingFromInstance) {
+      const state = await response.json();
+      if (state.instance === restartingFromInstance) return;
+    }
   } catch (error) {
     return;
   }

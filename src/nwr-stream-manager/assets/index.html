@@ -25,6 +25,7 @@ __INDEX_STYLES__</style>
           <a id="nav_logs" href="/?view=logs" data-view="logs">Logs</a>
           <a id="nav_settings" href="/?view=settings" data-view="settings" hidden>Settings</a>
           <a id="nav_change_password" href="/?view=change_password" data-view="change_password" hidden>Change account password</a>
+          <a id="nav_restart" href="/?view=restart" hidden>Restart NWR Stream Manager</a>
         </span>
       </span>
     </nav>
@@ -450,6 +451,7 @@ __INDEX_STYLES__</style>
           <button id="settings_tab_sdr_sharing" type="submit" name="section" value="sdr_sharing" data-settings-section="sdr_sharing" data-baseline-submit>SDR sharing</button>
           <button id="settings_tab_notifications" type="submit" name="section" value="notifications" data-settings-section="notifications" data-baseline-submit>Notifications</button>
           <button id="settings_tab_fallback_audio" type="submit" name="section" value="fallback_audio" data-settings-section="fallback_audio" data-baseline-submit>Fallback audio</button>
+          <button id="settings_tab_advanced" type="submit" name="section" value="advanced" data-settings-section="advanced" data-baseline-submit hidden>Advanced</button>
         </form>
         <div class="settings-detail">
           <form class="settings-back-form" method="get" action="/">
@@ -682,6 +684,26 @@ __INDEX_STYLES__</style>
               <div id="fallback-recording-result" class="message" aria-live="polite"></div>
             </div>
           </div>
+          <div id="settings_panel_advanced" class="settings-panel" hidden>
+            <h3>Advanced</h3>
+            <p class="hint">Where NWR Stream Manager can be reached. Changes are saved when you select Save changes, and take effect the next time NWR Stream Manager starts. <a href="/help#advanced" target="_blank" rel="noopener">Learn more about these settings<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
+            <p id="advanced_listening" class="hint"></p>
+            <form id="advanced_settings_form" method="post" action="/advanced-settings" novalidate>
+              __FORM_TOKEN_INPUT__
+              <label>Port
+                <input id="advanced_port" name="port" type="number" min="1" max="65535" step="1" inputmode="numeric" aria-describedby="advanced_port_hint advanced_port_flag">
+              </label>
+              <span id="advanced_port_hint" class="hint">The port in NWR Stream Manager's address, such as 8080 in http://192.168.1.10:8080. Ports below 1024 need extra permission.</span>
+              <span id="advanced_port_flag" class="hint" hidden></span>
+              <label class="checkbox-row"><input id="advanced_localhost_only" name="localhost_only" type="checkbox" value="1" aria-describedby="advanced_localhost_only_hint advanced_host_flag"> Only allow connections from this computer</label>
+              <span id="advanced_localhost_only_hint" class="hint">For a reverse proxy or Tailscale Serve running on this computer. Other devices on your network, including this one if it isn't the computer running NWR Stream Manager, won't be able to open it directly.</span>
+              <span id="advanced_host_flag" class="hint" hidden></span>
+              <div class="actions">
+                <button id="save_advanced_settings" type="submit" data-baseline-submit>Save changes</button>
+              </div>
+            </form>
+            <div id="advanced-result" class="message" aria-live="polite"></div>
+          </div>
           <div id="settings_panel_notifications" class="settings-panel" hidden>
             <h3>Notifications</h3>
             <div id="notification-result" class="message" aria-live="polite"></div>
@@ -805,6 +827,22 @@ __INDEX_STYLES__</style>
           </div>
         </div>
       </div>
+    </section>
+  </div>
+
+  <div id="view_restart" class="view" hidden>
+    <section>
+      <h2>Restart NWR Stream Manager?</h2>
+      <div id="restart-result" class="message"></div>
+      <p>Your streams will go offline for a few seconds and any I/Q recordings in progress will be ended.</p>
+      <form id="restart_form" method="post" action="/restart">
+        __FORM_TOKEN_INPUT__
+        <input id="restart_instance" type="hidden" name="instance" value="">
+        <div class="actions">
+          <button id="restart_confirm" type="submit" class="primary">Restart</button>
+          <a class="button-link" href="/">Cancel</a>
+        </div>
+      </form>
     </section>
   </div>
 

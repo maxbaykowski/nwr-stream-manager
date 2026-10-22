@@ -36,10 +36,22 @@ python3 -m pip install 'nwr-stream-manager @ git+https://github.com/maxbaykowski
 Run the web interface:
 
 ```bash
-nwr-stream-manager --host 0.0.0.0 --port 8080
+nwr-stream-manager
 ```
 
-The web interface will print the local and LAN URLs it is listening on.
+The web interface will print the local and LAN URLs it is listening on. It
+listens on port 8080 on every network address unless you change that in
+Settings, under Advanced; changes there take effect the next time it starts.
+
+These options override the Advanced settings for as long as they're given:
+
+- `--port PORT` listens on another port.
+- `--localhost-only` only accepts connections from the same computer, for use
+  behind a reverse proxy or Tailscale Serve.
+- `--bind-to-all-interfaces` accepts connections on every network address. If
+  you've locked yourself out with the Advanced settings, start with this (and
+  `--port` if needed) to get back in.
+- `--host ADDRESS` listens on one particular address.
 
 ## Browser monitoring notes
 
@@ -171,7 +183,9 @@ The example unit uses:
   are under `/var/lib/nwr-stream-manager`.
 - `LogsDirectory=nwr-stream-manager`, so the rotating server log is
   `/var/log/nwr-stream-manager/nwr-stream-manager.log`.
-- `ExecStart=/usr/local/bin/nwr-stream-manager --host 0.0.0.0 --port 8080`.
+- `ExecStart=/usr/local/bin/nwr-stream-manager`, so the port and address come
+  from Settings, under Advanced. A unit that still passes `--host` or `--port`
+  overrides those settings; remove them to use Advanced.
 - `SupplementaryGroups=plugdev audio`, so the service user can access common
   RTL-SDR udev group permissions and ALSA playback devices.
 

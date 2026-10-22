@@ -38,6 +38,7 @@ from .page_sections import (
     remote_sdr_status_text,
     rtl_settings_changes,
 )
+from .web_address import advanced_flag_text, advanced_listening_text
 
 
 class SettingsPageHandlerMixin:
@@ -511,6 +512,70 @@ class SettingsPageHandlerMixin:
             self._send_page(self._render_index_page(query, result=result, form=form), HTTPStatus.BAD_REQUEST)
             return
         self._send_redirect(page_route("settings", section="fallback_audio", result=done))
+
+    def _fill_advanced_page(self, page: str, form: dict[str, str]) -> str:
+        settings = self.service.advanced_settings()
+        loaded = {"port": str(settings["port"]), "localhost_only": "1" if settings["localhost_only"] else "0"}
+        sent = form.get("form") == "advanced"
+        shown = dict(loaded)
+        if sent:
+            shown = {"port": form.get("port", loaded["port"]), "localhost_only": form.get("localhost_only", "0")}
+            loaded = {name: form.get(f"was_{name}", value) for name, value in loaded.items()}
+        page = page_rendering.set_text(page, "advanced_listening", advanced_listening_text(settings))
+        page = page_rendering.set_attribute(page, "advanced_port", "value", shown["port"])
+        page = page_rendering.set_attribute(page, "advanced_localhost_only", "checked", "checked" if shown["localhost_only"] == "1" else None)
+        for name, flag in (("advanced_port_flag", settings["port_flag"]), ("advanced_host_flag", settings["host_flag"])):
+            page = page_rendering.set_text(page, name, advanced_flag_text(flag))
+            page = page_rendering.set_hidden(page, name, not flag)
+        return page_rendering.append_content(
+            page,
+            "advanced_settings_form",
+            '<input type="hidden" name="form" value="advanced">'
+            + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
+        )
+
+    def _handle_advanced_settings_form(self) -> None:
+        """Saves the Advanced settings that were changed, for browsers without the page script."""
+        form: dict[str, str] = {}
+        query = {"view": "settings", "section": "advanced"}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            changes: dict[str, Any] = {}
+            port = form.get("port", "").strip()
+            if port != form.get("was_port", "").strip():
+                changes["port"] = port
+            localhost_only = form.get("localhost_only") == "1"
+            if localhost_only != (form.get("was_localhost_only") == "1"):
+                changes["localhost_only"] = localhost_only
+            if changes:
+                self.service.update_advanced_settings(changes)
+        except Exception as exc:
+            result = ("advanced-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page(query, result=result, form=form), HTTPStatus.BAD_REQUEST)
+            return
+        self._send_redirect(page_route("settings", section="advanced", result="saved"))
+
+    def _handle_restart_form(self) -> None:
+        """Restarts NWR Stream Manager, for browsers without the page script."""
+        form: dict[str, str] = {}
+        try:
+            form = self._read_form()
+            if not self._form_token_ok(form):
+                raise ValueError(FORM_EXPIRED_MESSAGE)
+            self.service.request_restart({"instance": form.get("instance", "")}, self._current_account_name())
+        except Exception as exc:
+            result = ("restart-result", form_message(str(exc)), "error")
+            self._send_page(self._render_index_page({"view": "restart"}, result=result, form=form), HTTPStatus.BAD_REQUEST)
+            return
+        # Not a redirect: by the time a browser followed one, NWR Stream Manager would be gone.
+        self._send_page(render_notice_page(
+            "NWR Stream Manager is restarting",
+            "<p>It's shutting down, and will start again in a few seconds. Select Done to go back to the dashboard. "
+            "If it isn't back yet, wait a moment and refresh the page.</p>",
+            {},
+        ))
 
     def _handle_fallback_upload_form(self) -> None:
         """Uploads a custom announcement from a plain form, for browsers without the page script."""

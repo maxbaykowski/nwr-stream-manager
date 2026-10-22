@@ -38,6 +38,7 @@ from .baseline_pages import (
     VIEW_TITLES,
 )
 from .page_sections import dashboard_parts, iq_recorder_result
+from .web_address import advanced_saved_text
 
 
 LOG = logging.getLogger(__name__)
@@ -175,11 +176,16 @@ class PageHandlerMixin:
         page = page_rendering.set_hidden(page, "nav_rtl", read_only)
         page = page_rendering.set_hidden(page, "nav_settings", read_only)
         page = page_rendering.set_hidden(page, "nav_change_password", not read_only)
+        page = page_rendering.set_hidden(page, "nav_restart", read_only)
         current = VIEW_NAV_ITEMS.get(view, view)
-        for item in ("dashboard", "rtl", "streams", "eas_alerts", "receiver", "iq_recorder", "logs", "settings", "change_password"):
+        for item in ("dashboard", "rtl", "streams", "eas_alerts", "receiver", "iq_recorder", "logs", "settings", "change_password", "restart"):
             page = page_rendering.set_attribute(page, f"nav_{item}", "aria-current", "page" if item == current else None)
         if view == "logs":
             page = self._fill_logs_view(page, read_only)
+        if view == "restart":
+            # The request names this run of NWR Stream Manager, so it can't restart a later one.
+            page = page_rendering.set_attribute(page, "restart_instance", "value", self.service.instance_id)
+            page = page_rendering.set_attribute(page, "restart_confirm", "autofocus", "autofocus")
         if view == "change_password" and isinstance(account, AccountRecord):
             page = page_rendering.set_attribute(page, "change_password_cancel_link", "href", "/")
         if view == "settings" and isinstance(account, AccountRecord) and not unsupported_setting:
@@ -195,6 +201,8 @@ class PageHandlerMixin:
                     "paired": ("remote-pair-outcome", f"Paired with {name}. Either device can now use the other's shared RTL-SDR.", "success"),
                     "unpaired": ("paired-devices-result", f"Unpaired {name}.", "success"),
                 }.get(query.get("result", ""))
+            if query.get("section") == "advanced" and not result and query.get("result") == "saved":
+                result = ("advanced-result", advanced_saved_text(self.service.advanced_settings()), "success")
             if query.get("section") == "fallback_audio" and not result and query.get("result") in FALLBACK_RESULTS:
                 element_id, message = FALLBACK_RESULTS[query["result"]]
                 result = (element_id, message, "success")
@@ -249,6 +257,7 @@ class PageHandlerMixin:
         works = section in BASELINE_SETTINGS_SECTIONS
         page = page_rendering.set_hidden(page, "settings_tab_accounts", not owner)
         page = page_rendering.set_hidden(page, "settings_tab_account", owner)
+        page = page_rendering.set_hidden(page, "settings_tab_advanced", not owner)
         for name in SETTINGS_TABS:
             page = page_rendering.set_attribute(page, f"settings_tab_{name}", "aria-current", "page" if name == tab else None)
             page = page_rendering.set_hidden(page, f"settings_panel_{name}", not (works and name == tab))
@@ -277,6 +286,8 @@ class PageHandlerMixin:
                 title = f"{confirm_title} - {title}"
         if section == "fallback_audio":
             page = self._fill_fallback_audio_page(page, query, form)
+        if section == "advanced":
+            page = self._fill_advanced_page(page, form)
         if section == "notifications":
             page, confirm_title = self._fill_notifications_page(page, query, form)
             if confirm_title:

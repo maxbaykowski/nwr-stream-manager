@@ -121,6 +121,7 @@ class PageScriptLoadingTests(unittest.TestCase):
         baseline = {
             "dashboard", "logs", "settings", "change_password", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail",
             "iq_recorder", "iq_recorder_start", "iq_recording_download", "rtl", "streams", "stream_settings", "stream_output", "add_stream",
+            "restart",
         }
         for view in baseline:
             self.assertFalse(pages.view_needs_app(page, view), view)
@@ -1513,6 +1514,105 @@ class FallbackAudioPageTests(unittest.TestCase):
         self.assertIn("The custom announcement is 0:04 long.", page)
         response, _ = self.upload(token, cookie, audio, user=self.viewer)
         self.assertEqual(response.status, 403)
+
+
+class AdvancedPageTests(unittest.TestCase):
+    """The port and address settings, as a browser without the page script uses them."""
+
+    request = BaselinePageServerTests.request
+    form_token = BaselinePageServerTests.form_token
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+        cls.web_address = __import__("sys").modules["nwr_stream_manager.web_address"]
+        cls.mixin = __import__("sys").modules["nwr_stream_manager.service_advanced"].AdvancedServiceMixin
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.accounts = wc.AccountStore(Path(tempdir.name) / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        account, secret = self.accounts.create_account("helper", False)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        self.owner, self.admin = ("owner", "password1"), ("helper", "password2")
+        self.path = Path(tempdir.name) / "web-address.json"
+        service_class = type("AdvancedStandIn", (self.mixin, StandInService), {})
+        self.service = service_class(
+            accounts=self.accounts,
+            auth_sessions=wc.AuthSessionStore(),
+            status=lambda read_only=False: {},
+            lock=threading.Lock(),
+            web_address=self.web_address.WebAddress("0.0.0.0", 8080),
+            web_address_state_path=self.path,
+        )
+        handler = type("AdvancedPageTestHandler", (wc.RtlControlHandler,), {"service": self.service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def saved(self):
+        return self.web_address.load_web_address_settings(self.path)
+
+    def test_only_changes_are_saved_for_the_next_start(self) -> None:
+        response, page = self.request("GET", "/?view=settings&section=advanced", user=self.owner)
+        token = self.form_token(response)
+        cookie = f"nwrstmgr_form={token}"
+        self.assertEqual(self.title(page), "Advanced - Settings - NWR Stream Manager")
+        self.assertIn("Right now, NWR Stream Manager accepts connections from other devices on port 8080.</p>", page)
+        self.assertRegex(page, r'<input id="advanced_port" [^>]*value="8080">')
+        self.assertNotRegex(page, r'<input id="advanced_localhost_only" [^>]*checked')
+        self.assertIn('<input type="hidden" name="was_port" value="8080"><input type="hidden" name="was_localhost_only" value="0">', page)
+        self.assertRegex(page, r'<span id="advanced_host_flag" class="hint" hidden>')
+
+        fields = {"form": "advanced", "port": "9090", "was_port": "8080", "was_localhost_only": "0", "form_token": token}
+        response, _ = self.request("POST", "/advanced-settings", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=advanced&result=saved")
+        self.assertEqual(self.saved(), self.web_address.WebAddressSettings(port=9090, localhost_only=False))
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "Changes saved. They take effect the next time NWR Stream Manager starts. - Advanced - Settings - NWR Stream Manager")
+        self.assertIn("on port 8080. Your saved changes take effect the next time it starts.</p>", page)
+        self.assertRegex(page, r'<input id="advanced_port" [^>]*value="9090">')
+
+        # Turning on localhost-only leaves the port as it was saved, even from an old copy of the page.
+        response, _ = self.request("POST", "/advanced-settings", fields={**fields, "port": "8080", "localhost_only": "1"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 303)
+        self.assertEqual(self.saved(), self.web_address.WebAddressSettings(port=9090, localhost_only=True))
+
+        response, page = self.request("POST", "/advanced-settings", fields={**fields, "port": "70000"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.status, 400)
+        self.assertEqual(self.title(page), "Error: Enter a port number from 1 to 65535. - Advanced - Settings - NWR Stream Manager")
+        self.assertRegex(page, r'<input id="advanced_port" [^>]*value="70000">')
+        self.assertEqual(self.saved().port, 9090)
+
+    def test_the_command_line_is_shown_where_it_overrides_a_setting(self) -> None:
+        self.service.web_address = self.web_address.WebAddress("127.0.0.1", 8080, host_flag="--localhost-only")
+        _, page = self.request("GET", "/?view=settings&section=advanced", user=self.owner)
+        self.assertIn("Right now, NWR Stream Manager only accepts connections from this computer, on port 8080.</p>", page)
+        self.assertIn(
+            '<span id="advanced_host_flag" class="hint">NWR Stream Manager was started with --localhost-only, '
+            "which is used instead of this setting until it's started without it.</span>",
+            html.unescape(page),
+        )
+        self.assertRegex(page, r'<span id="advanced_port_flag" class="hint" hidden>')
+
+    def test_only_the_owner_has_advanced(self) -> None:
+        response, page = self.request("GET", "/?view=settings&section=advanced", user=self.admin)
+        self.assertEqual(self.title(page), "Settings - NWR Stream Manager")
+        self.assertRegex(page, r'<button id="settings_tab_advanced" [^>]*hidden>')
+        token = self.form_token(response)
+        fields = {"form": "advanced", "port": "9090", "was_port": "8080", "form_token": token}
+        response, _ = self.request("POST", "/advanced-settings", fields=fields, cookie=f"nwrstmgr_form={token}", user=self.admin)
+        self.assertEqual(response.status, 403)
+        response, _ = self.request("GET", "/api/advanced-settings", user=self.admin)
+        self.assertEqual(response.status, 403)
+        self.assertFalse(self.path.exists())
+        _, page = self.request("GET", "/?view=settings", user=self.owner)
+        self.assertRegex(page, r'<button id="settings_tab_advanced" type="submit" name="section" value="advanced" data-settings-section="advanced" data-baseline-submit>')
 
 
 class NotificationPageTests(unittest.TestCase):

@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 from .accounts import AccountRecord
 from .baseline_pages import (
     ACCOUNT_FORM_PATHS,
+    ADVANCED_SETTINGS_PATH,
     CHANGE_PASSWORD_FORM_PATH,
     DASHBOARD_PARTS_PATH,
     EAS_ALERT_EXPORT_PATH,
@@ -59,7 +60,8 @@ class AuthHandlerMixin:
             return False
         has_account = self.service.accounts.has_account()
         if path == "/api/setup-state":
-            self._send_json({"setup_required": not has_account})
+            # Which run this is lets a page waiting out a restart tell the new run from the old.
+            self._send_json({"setup_required": not has_account, "instance": self.service.instance_id})
             return False
         if not has_account:
             if method == "GET":
@@ -134,7 +136,8 @@ class AuthHandlerMixin:
                 return True
             self._send_json({"error": "password change is required"}, status=HTTPStatus.FORBIDDEN)
             return False
-        if path.startswith("/api/accounts") or path in {"/api/account-reset-password", "/api/account-read-only"} or path in ACCOUNT_FORM_PATHS:
+        owner_paths = {"/api/account-reset-password", "/api/account-read-only", "/api/advanced-settings", ADVANCED_SETTINGS_PATH}
+        if path.startswith("/api/accounts") or path in owner_paths or path in ACCOUNT_FORM_PATHS:
             if not account.is_owner:
                 self._send_json({"error": "owner account is required"}, status=HTTPStatus.FORBIDDEN)
                 return False
@@ -291,6 +294,10 @@ class AuthHandlerMixin:
     def _current_account_id(self) -> int | None:
         account = getattr(self, "current_account", None)
         return account.id if isinstance(account, AccountRecord) else None
+
+    def _current_account_name(self) -> str:
+        account = getattr(self, "current_account", None)
+        return account.username if isinstance(account, AccountRecord) else ""
 
     def _current_account_is_read_only(self) -> bool:
         account = getattr(self, "current_account", None)
