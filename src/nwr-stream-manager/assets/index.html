@@ -1184,15 +1184,6 @@ __INDEX_STYLES__</style>
               </label>
               <span id="audio_comfort_noise_level_hint" class="hint">Noise level in dB below full scale. Valid range is -60 through -30.</span>
             </div>
-            <div id="audio_effect_deemphasis" class="settings-group">
-              <h4>NWR deemphasis</h4>
-              <label class="checkbox-row">
-                <input id="audio_deemphasis_enabled" name="audio_deemphasis_enabled" value="1" type="checkbox" aria-describedby="audio_deemphasis_enabled_hint">
-                Enable NWR deemphasis
-              </label>
-              <span id="audio_deemphasis_enabled_hint" class="hint">Reduces high-frequency audio components like an actual NOAA Weather Radio receiver would.</span>
-              <input id="audio_deemphasis_tau" type="hidden" value="300">
-            </div>
             <div id="audio_effect_highpass" class="settings-group">
               <h4>Highpass</h4>
               <label class="checkbox-row">
@@ -1215,7 +1206,7 @@ __INDEX_STYLES__</style>
                 <input id="audio_lowpass_enabled" name="audio_lowpass_enabled" value="1" type="checkbox" aria-describedby="audio_lowpass_enabled_hint">
                 Enable lowpass
               </label>
-              <span id="audio_lowpass_enabled_hint" class="hint">Gets rid of high-frequency audio. This is separate from the standard NWR deemphasis curve.</span>
+              <span id="audio_lowpass_enabled_hint" class="hint">Gets rid of high-frequency audio.</span>
               <label>Frequency
                 <input id="audio_lowpass_frequency" name="audio_lowpass_frequency" type="number" min="2200" max="12000" step="1" aria-describedby="audio_lowpass_frequency_hint">
               </label>
@@ -1295,7 +1286,7 @@ __INDEX_STYLES__</style>
             <div id="test-mode-result" class="message"></div>
             <div id="test_tones_section" hidden>
               <h4>Tone generators</h4>
-              <p class="hint">Play tones along with the test announcements and SAME tests, to simulate buzzes and whines. Tones are sent the same way as SAME tones, so NWR deemphasis affects them the same way.</p>
+              <p class="hint">Play tones along with the test announcements and SAME tests, to simulate buzzes and whines. Tones are sent the same way as SAME tones, so the stream's audio processing affects them the same way.</p>
               <div id="test_tones_layout" class="effects-layout">
                 <div id="test_tones_list" class="effects-list" aria-label="Tone generators">
                   <button type="button" data-test-tone="sine">Sine wave</button>

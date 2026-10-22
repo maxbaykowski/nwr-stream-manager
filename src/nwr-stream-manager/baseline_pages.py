@@ -14,6 +14,11 @@ from .constants import IQ_RECORDER_MODE_STREAM
 
 HELP_PATH = "/help"
 HELP_FILE_NAME = "help.html"
+# The deemphasis examples in help, by the address the help page plays them from.
+HELP_AUDIO_FILES = {
+    "/help/with-deemphasis.mp3": "help_with_deemphasis.mp3",
+    "/help/without-deemphasis.mp3": "help_without_deemphasis.mp3",
+}
 # Forms that work without the page script submit to these.
 SETUP_FORM_PATH = "/setup"
 CHANGE_PASSWORD_FORM_PATH = "/change-password"

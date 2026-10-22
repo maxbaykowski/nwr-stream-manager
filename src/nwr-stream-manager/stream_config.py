@@ -113,9 +113,14 @@ def load_station_database(path: Path = STATIONS_ASSET_PATH) -> list[dict[str, st
 def load_streams(streams_directory: Path, legacy_path: Path) -> list[dict[str, Any]]:
     streams = load_stream_configs(streams_directory)
     if streams:
+        removed = False
         for stream in streams:
             migrate_stream_notch_width(stream)
             migrate_stream_volume_multiplier(stream)
+            removed = remove_stream_deemphasis_setting(stream) or removed
+        if removed:
+            LOG.info("removed the old NWR de-emphasis setting from saved streams; every stream now always has it")
+            save_streams(streams_directory, streams)
         return streams
     if (streams_directory / STREAMS_DIRECTORY_MARKER_FILE_NAME).exists():
         return []
@@ -123,6 +128,7 @@ def load_streams(streams_directory: Path, legacy_path: Path) -> list[dict[str, A
     for stream in streams:
         migrate_stream_notch_width(stream)
         migrate_stream_volume_multiplier(stream)
+        remove_stream_deemphasis_setting(stream)
     if streams:
         LOG.info("migrating %s stream configuration(s) from %s to %s", len(streams), legacy_path, streams_directory)
         save_streams(streams_directory, streams)
@@ -152,6 +158,18 @@ def migrate_stream_volume_multiplier(stream: dict[str, Any]) -> None:
     if limited != multiplier:
         LOG.info("volume multiplier %s for stream %s is out of range; using %s", multiplier, stream.get("id"), limited)
         volume["multiplier"] = limited
+
+
+def remove_stream_deemphasis_setting(stream: dict[str, Any]) -> bool:
+    """NWR de-emphasis used to be a setting that could be turned off; every stream now
+    always has it. Return whether there was a setting to remove."""
+    audio = stream.get("audio")
+    if not isinstance(audio, dict):
+        return False
+    removed = [key for key in ("deemphasis", "deemphasis_tau") if key in audio]
+    for key in removed:
+        del audio[key]
+    return bool(removed)
 
 
 def load_stream_configs(streams_directory: Path) -> list[dict[str, Any]]:

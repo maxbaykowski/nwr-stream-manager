@@ -1073,7 +1073,7 @@ class StreamPageTests(unittest.TestCase):
         # Unset filters show the page script's defaults, and every effect shows, each under its own heading.
         self.assertIn('name="audio_volume_multiplier" type="number" min="0.1" max="2" step="0.1" aria-describedby="audio_volume_multiplier_hint" value="1.5">', page)
         self.assertIn('aria-describedby="audio_notch_frequency_hint" value="3000">', page)
-        for effect in ("volume", "comfort_noise", "deemphasis", "highpass", "lowpass", "notch"):
+        for effect in ("volume", "comfort_noise", "highpass", "lowpass", "notch"):
             self.assertIn(f'<div id="audio_effect_{effect}" class="settings-group">', page)
         self.assertIn('<input type="hidden" name="was_audio_volume_enabled" value="1">', page)
         self.assertIn('<dd id="stream_settings_signal_value" class="status-text signal-excellent">Excellent (32 dB SNR)</dd>', page)

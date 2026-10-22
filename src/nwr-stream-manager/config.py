@@ -55,12 +55,6 @@ class IcecastConfig:
 
 
 @dataclass(frozen=True)
-class DeemphasisConfig:
-    enabled: bool = True
-    tau: float = 300.0
-
-
-@dataclass(frozen=True)
 class VolumeConfig:
     enabled: bool = False
     multiplier: float = 1.0
@@ -88,7 +82,8 @@ class NotchConfig:
 
 @dataclass(frozen=True)
 class AudioConfig:
-    deemphasis: DeemphasisConfig = field(default_factory=DeemphasisConfig)
+    """A stream's audio effects. NWR de-emphasis isn't one: every stream always has it."""
+
     comfort_noise: ComfortNoiseConfig = field(default_factory=ComfortNoiseConfig)
     volume: VolumeConfig = field(default_factory=VolumeConfig)
     highpass: FilterConfig = field(default_factory=FilterConfig)
@@ -96,10 +91,6 @@ class AudioConfig:
         default_factory=lambda: FilterConfig(enabled=False, frequency=3400.0, sharpness=2.0)
     )
     notch: NotchConfig = field(default_factory=NotchConfig)
-
-    @property
-    def deemphasis_tau(self) -> float:
-        return self.deemphasis.tau if self.deemphasis.enabled else 0.0
 
 
 @dataclass(frozen=True)
@@ -114,37 +105,16 @@ class EasRecordingConfig:
 
 
 def parse_audio_config(raw: dict[str, Any]) -> AudioConfig:
-    if "deemphasis_tau" in raw and "deemphasis" not in raw:
-        tau = _float(raw, "deemphasis_tau")
-        audio = AudioConfig(
-            deemphasis=DeemphasisConfig(enabled=tau > 0, tau=tau),
-            comfort_noise=parse_comfort_noise_config(raw.get("comfort_noise")),
-            volume=parse_volume_config(raw.get("volume")),
-            highpass=parse_filter_config(raw.get("highpass")),
-            lowpass=parse_filter_config(raw.get("lowpass")),
-            notch=parse_notch_config(raw.get("notch")),
-        )
-    else:
-        audio = AudioConfig(
-            deemphasis=parse_deemphasis_config(raw.get("deemphasis")),
-            comfort_noise=parse_comfort_noise_config(raw.get("comfort_noise")),
-            volume=parse_volume_config(raw.get("volume")),
-            highpass=parse_filter_config(raw.get("highpass")),
-            lowpass=parse_filter_config(raw.get("lowpass")),
-            notch=parse_notch_config(raw.get("notch")),
-        )
+    # Older settings may still have a de-emphasis setting; it no longer does anything.
+    audio = AudioConfig(
+        comfort_noise=parse_comfort_noise_config(raw.get("comfort_noise")),
+        volume=parse_volume_config(raw.get("volume")),
+        highpass=parse_filter_config(raw.get("highpass")),
+        lowpass=parse_filter_config(raw.get("lowpass")),
+        notch=parse_notch_config(raw.get("notch")),
+    )
     validate_audio_config(audio)
     return audio
-
-
-def parse_deemphasis_config(raw: Any) -> DeemphasisConfig:
-    if raw is None:
-        return DeemphasisConfig()
-    raw = _object(raw, "audio.deemphasis")
-    return DeemphasisConfig(
-        enabled=_bool(raw, "enabled", True),
-        tau=_float(raw, "tau", 530.0),
-    )
 
 
 def parse_volume_config(raw: Any) -> VolumeConfig:
@@ -210,17 +180,11 @@ def notch_max_width(frequency: float) -> float:
 
 
 def validate_audio_config(config: AudioConfig) -> None:
-    validate_deemphasis_config(config.deemphasis)
     validate_comfort_noise_config(config.comfort_noise)
     validate_volume_config(config.volume)
     validate_filter_config("highpass", config.highpass)
     validate_filter_config("lowpass", config.lowpass)
     validate_notch_config(config.notch)
-
-
-def validate_deemphasis_config(config: DeemphasisConfig) -> None:
-    if not _finite(config.tau) or not 0 <= config.tau <= 530:
-        raise ConfigError("tau must be between 0 and 530")
 
 
 def validate_volume_config(config: VolumeConfig) -> None:

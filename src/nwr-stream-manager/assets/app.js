@@ -3582,10 +3582,6 @@ function audioEffectsPayload() {
       enabled: document.getElementById("audio_comfort_noise_enabled").checked,
       level_db: numericControlValue("audio_comfort_noise_level")
     },
-    deemphasis: {
-      enabled: document.getElementById("audio_deemphasis_enabled").checked,
-      tau: numericControlValue("audio_deemphasis_tau")
-    },
     highpass: filterPayload("highpass"),
     lowpass: filterPayload("lowpass"),
     notch: notchPayload()
@@ -3854,7 +3850,6 @@ function defaultAudioEffectsSettings() {
   return {
     volume: {enabled: false, multiplier: 1.0},
     comfort_noise: {enabled: false, level_db: -40.0},
-    deemphasis: {enabled: true, tau: 300.0},
     highpass: {enabled: false, frequency: 300.0, sharpness: 0.0},
     lowpass: {enabled: false, frequency: 3400.0, sharpness: 2.0},
     notch: {enabled: false, frequency: 3000.0, width: 100.0}
@@ -3867,7 +3862,6 @@ function audioEffectsSettingsForStream(stream) {
   return {
     volume: Object.assign(defaults.volume, audio.volume || {}),
     comfort_noise: Object.assign(defaults.comfort_noise, audio.comfort_noise || {}),
-    deemphasis: Object.assign(defaults.deemphasis, audio.deemphasis || {}),
     highpass: normalizeAudioFilterSettings(defaults.highpass, audio.highpass),
     lowpass: normalizeAudioFilterSettings(defaults.lowpass, audio.lowpass),
     notch: normalizeAudioFilterSettings(defaults.notch, audio.notch)
@@ -3892,8 +3886,6 @@ function setAudioEffectsControls(stream) {
   setValue("audio_volume_multiplier", settings.volume.multiplier);
   setChecked("audio_comfort_noise_enabled", settings.comfort_noise.enabled);
   setValue("audio_comfort_noise_level", settings.comfort_noise.level_db);
-  setChecked("audio_deemphasis_enabled", settings.deemphasis.enabled);
-  setValue("audio_deemphasis_tau", settings.deemphasis.tau);
   setAudioFilterControls("highpass", settings.highpass);
   setAudioFilterControls("lowpass", settings.lowpass);
   setNotchControls(settings.notch);
@@ -9518,8 +9510,6 @@ for (const id of [
   "audio_volume_multiplier",
   "audio_comfort_noise_enabled",
   "audio_comfort_noise_level",
-  "audio_deemphasis_enabled",
-  "audio_deemphasis_tau",
   "audio_highpass_enabled",
   "audio_highpass_frequency",
   "audio_highpass_sharpness",

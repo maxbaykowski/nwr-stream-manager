@@ -43,42 +43,18 @@ DEEMPHASIS_BLOCK_SAMPLES = 480
 
 @dataclass
 class DeemphasisFilter:
+    """The NOAA Weather Radio receive de-emphasis, applied to every stream's audio."""
+
     sample_rate: int
-    tau: float
     curve: NDArray[np.float32] = field(init=False)
-    _fir: AudioFirFilter | None = field(init=False, default=None)
+    _fir: AudioFirFilter = field(init=False)
 
     def __post_init__(self) -> None:
-        self._update_curve(generate_deemphasis_curve(self.sample_rate, self.tau))
-
-    @property
-    def enabled(self) -> bool:
-        return self.tau > 0
+        self.curve = generate_nwr_deemphasis_curve(self.sample_rate)
+        self._fir = AudioFirFilter(self.curve, DEEMPHASIS_BLOCK_SAMPLES)
 
     def process_float(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        return self._filter(samples)
-
-    def update_tau(self, tau: float) -> None:
-        self.tau = float(tau)
-        self._update_curve(generate_deemphasis_curve(self.sample_rate, self.tau))
-
-    def _filter(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        if not self.enabled or self._fir is None:
-            return samples
         return self._fir.process(samples)
-
-    def _update_curve(self, curve: NDArray[np.float32]) -> None:
-        self.curve = np.asarray(curve, dtype=np.float32)
-        # Turning de-emphasis back on starts the filter from silence, as before.
-        self._fir = AudioFirFilter(self.curve, DEEMPHASIS_BLOCK_SAMPLES) if self.curve.size > 1 else None
-
-
-def generate_deemphasis_curve(sample_rate: int, tau: float) -> NDArray[np.float32]:
-    if sample_rate <= 0:
-        raise ValueError("sample_rate must be greater than 0")
-    if tau <= 0:
-        return np.array([1.0], dtype=np.float32)
-    return generate_nwr_deemphasis_curve(sample_rate)
 
 
 def generate_nwr_deemphasis_curve(

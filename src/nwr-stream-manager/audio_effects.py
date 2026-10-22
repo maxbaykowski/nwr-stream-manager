@@ -34,7 +34,6 @@ FILTER_MAX_ORDER = 40.0
 NOTCH_WINDOW_WIDTH_HZ = 50.0
 DC_BLOCK_CUTOFF_HZ = 20.0
 NWR_DEEMPHASIS_MAKEUP_GAIN = 2.0
-NWR_DEEMPHASIS_DISABLED_GAIN = 0.75
 
 
 @dataclass
@@ -79,18 +78,14 @@ class AudioEffectsProcessor:
 
     def __post_init__(self) -> None:
         self.comfort_noise = ComfortNoiseGenerator(self.config.comfort_noise, sample_rate=self.sample_rate)
-        self.deemphasis = DeemphasisFilter(
-            self.sample_rate,
-            self.config.deemphasis_tau,
-        )
+        self.deemphasis = DeemphasisFilter(self.sample_rate)
         self.dc_blocker = DcBlocker(self.sample_rate)
         # Highpass, lowpass and notch combined into one filter; None while all are off.
         self.eq_filter = _build_eq_filter(None, self.config, self.sample_rate)
 
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         audio = self.comfort_noise.process(samples)
-        audio = self.deemphasis.process_float(audio)
-        audio = audio * deemphasis_makeup_gain(self.config.deemphasis_tau)
+        audio = self.deemphasis.process_float(audio) * NWR_DEEMPHASIS_MAKEUP_GAIN
         audio = self.dc_blocker.process(audio)
         if self.eq_filter is not None:
             audio = self.eq_filter.process(audio)
@@ -107,10 +102,6 @@ class AudioEffectsProcessor:
             self.comfort_noise.config = config.comfort_noise
             changed.append("comfort_noise")
 
-        if config.deemphasis != self.config.deemphasis:
-            self.deemphasis.update_tau(config.deemphasis_tau)
-            changed.append("deemphasis")
-
         eq_changes = [kind for kind in EQ_FILTER_KINDS if getattr(config, kind) != getattr(self.config, kind)]
         if eq_changes:
             self.eq_filter = _build_eq_filter(self.eq_filter, config, self.sample_rate)
@@ -121,7 +112,6 @@ class AudioEffectsProcessor:
 
         self.config = replace(
             self.config,
-            deemphasis=config.deemphasis,
             comfort_noise=config.comfort_noise,
             volume=config.volume,
             highpass=config.highpass,
@@ -133,10 +123,6 @@ class AudioEffectsProcessor:
 
 def comfort_noise_linear_level(level_db: float) -> float:
     return float(10 ** (level_db / 20.0))
-
-
-def deemphasis_makeup_gain(tau: float) -> float:
-    return NWR_DEEMPHASIS_MAKEUP_GAIN if tau > 0 else NWR_DEEMPHASIS_DISABLED_GAIN
 
 
 def highpass_order(cutoff_hz: float, sharpness: float) -> float:

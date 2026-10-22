@@ -500,7 +500,6 @@ STREAM_SETTINGS_FIELDS: tuple[tuple[str, str, str, str], ...] = (
     ("audio_volume_multiplier", "audio", "volume.multiplier", "number"),
     ("audio_comfort_noise_enabled", "audio", "comfort_noise.enabled", "bool"),
     ("audio_comfort_noise_level", "audio", "comfort_noise.level_db", "number"),
-    ("audio_deemphasis_enabled", "audio", "deemphasis.enabled", "bool"),
     ("audio_highpass_enabled", "audio", "highpass.enabled", "bool"),
     ("audio_highpass_frequency", "audio", "highpass.frequency", "number"),
     ("audio_highpass_sharpness", "audio", "highpass.sharpness", "number"),
@@ -532,7 +531,6 @@ PROTECTED_AUDIO_BANDS_HZ = ((900, 1100), (1400, 1600), (2000, 2200))
 DEFAULT_AUDIO_EFFECTS = {
     "volume": {"enabled": False, "multiplier": 1.0},
     "comfort_noise": {"enabled": False, "level_db": -40.0},
-    "deemphasis": {"enabled": True, "tau": 300.0},
     "highpass": {"enabled": False, "frequency": 300.0, "sharpness": 0.0},
     "lowpass": {"enabled": False, "frequency": 3400.0, "sharpness": 2.0},
     "notch": {"enabled": False, "frequency": 3000.0, "width": 100.0},

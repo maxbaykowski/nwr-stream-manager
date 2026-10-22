@@ -13,7 +13,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, ParseResult
 
 from . import page_rendering
-from .baseline_pages import HELP_FILE_NAME
+from .baseline_pages import HELP_AUDIO_FILES, HELP_FILE_NAME
 from .constants import MAX_JSON_REQUEST_BYTES
 from .simulated_station import asset_path
 from .state_files import http_header_filename
@@ -97,6 +97,14 @@ class ResponseHandlerMixin:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         self._send_html(content)
+
+    def _send_help_audio(self, path: str) -> None:
+        try:
+            data = asset_path(HELP_AUDIO_FILES[path]).read_bytes()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._send_audio(data, "audio/mpeg")
 
     def _send_html(self, content: str, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = content.encode("utf-8")

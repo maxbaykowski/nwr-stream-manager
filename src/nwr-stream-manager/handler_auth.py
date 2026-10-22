@@ -16,6 +16,7 @@ from .baseline_pages import (
     CHANGE_PASSWORD_FORM_PATH,
     DASHBOARD_PARTS_PATH,
     EAS_ALERT_EXPORT_PATH,
+    HELP_AUDIO_FILES,
     HELP_PATH,
     IQ_RECORDING_DOWNLOAD_PATH,
     render_change_password_page,
@@ -52,6 +53,9 @@ class AuthHandlerMixin:
         if path == HELP_PATH and method == "GET":
             # Help holds nothing private, and people need it before and during setup too.
             self._send_help()
+            return False
+        if path in HELP_AUDIO_FILES and method == "GET":
+            self._send_help_audio(path)
             return False
         has_account = self.service.accounts.has_account()
         if path == "/api/setup-state":

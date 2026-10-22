@@ -147,7 +147,6 @@ RTL_DIAGNOSTIC_RAW_FFT_SIZE = 65_536
 RTL_DIAGNOSTIC_CHANNEL_FFT_SIZE = 2_048
 RECEIVER_AUDIO_CONFIG = parse_audio_config(
     {
-        "deemphasis": {"enabled": True, "tau": 300},
         "comfort_noise": {"enabled": False, "level_db": -40},
         "volume": {"enabled": False, "multiplier": 1.0},
         "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},

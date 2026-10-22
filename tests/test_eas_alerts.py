@@ -1875,7 +1875,6 @@ class EasAlertTests(unittest.TestCase):
     def test_audio_effects_reject_highpass_above_1050_protection(self) -> None:
         with self.assertRaisesRegex(ValueError, "highpass.frequency"):
             self.web_control.validate_audio_payload({
-                "deemphasis": {"enabled": True, "tau": 530},
                 "comfort_noise": {"enabled": False, "level_db": -40},
                 "volume": {"enabled": False, "multiplier": 1},
                 "highpass": {"enabled": True, "frequency": 950, "sharpness": 5},
@@ -1886,7 +1885,6 @@ class EasAlertTests(unittest.TestCase):
     def test_audio_effects_validate_comfort_noise_level_range(self) -> None:
         for level in (-60, -30):
             audio = self.web_control.validate_audio_payload({
-                "deemphasis": {"enabled": True, "tau": 530},
                 "comfort_noise": {"enabled": True, "level_db": level},
                 "volume": {"enabled": False, "multiplier": 1},
                 "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
@@ -1898,7 +1896,6 @@ class EasAlertTests(unittest.TestCase):
         for level in (-61, -29):
             with self.assertRaisesRegex(ValueError, "level_db"):
                 self.web_control.validate_audio_payload({
-                    "deemphasis": {"enabled": True, "tau": 530},
                     "comfort_noise": {"enabled": True, "level_db": level},
                     "volume": {"enabled": False, "multiplier": 1},
                     "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
@@ -1909,7 +1906,6 @@ class EasAlertTests(unittest.TestCase):
     def test_audio_effects_reject_lowpass_below_same_mark_tone(self) -> None:
         with self.assertRaisesRegex(ValueError, "lowpass.frequency"):
             self.web_control.validate_audio_payload({
-                "deemphasis": {"enabled": True, "tau": 530},
                 "comfort_noise": {"enabled": False, "level_db": -40},
                 "volume": {"enabled": False, "multiplier": 1},
                 "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
@@ -1920,7 +1916,6 @@ class EasAlertTests(unittest.TestCase):
     def test_audio_effects_reject_notch_inside_protected_same_band(self) -> None:
         with self.assertRaisesRegex(ValueError, "protected"):
             self.web_control.validate_audio_payload({
-                "deemphasis": {"enabled": True, "tau": 530},
                 "comfort_noise": {"enabled": False, "level_db": -40},
                 "volume": {"enabled": False, "multiplier": 1},
                 "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
@@ -1932,7 +1927,6 @@ class EasAlertTests(unittest.TestCase):
         # A notch the highpass or lowpass already covers does nothing harmful, so saving
         # it must not be refused (a refusal blocked every later audio change).
         base = {
-            "deemphasis": {"enabled": True, "tau": 300},
             "comfort_noise": {"enabled": False, "level_db": -40},
             "volume": {"enabled": True, "multiplier": 1},
         }
@@ -1955,7 +1949,6 @@ class EasAlertTests(unittest.TestCase):
 
     def test_audio_effects_allow_lowpass_and_notch_up_to_24khz_nyquist(self) -> None:
         audio = self.web_control.validate_audio_payload({
-            "deemphasis": {"enabled": True, "tau": 530},
             "comfort_noise": {"enabled": False, "level_db": -40},
             "volume": {"enabled": False, "multiplier": 1},
             "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
@@ -1963,7 +1956,6 @@ class EasAlertTests(unittest.TestCase):
             "notch": {"enabled": False, "frequency": 12000, "sharpness": 1},
         })
         notch_audio = self.web_control.validate_audio_payload({
-            "deemphasis": {"enabled": True, "tau": 530},
             "comfort_noise": {"enabled": False, "level_db": -40},
             "volume": {"enabled": False, "multiplier": 1},
             "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
@@ -1977,8 +1969,6 @@ class EasAlertTests(unittest.TestCase):
     def test_audio_config_defaults_are_stream_creation_defaults(self) -> None:
         audio = self.config.AudioConfig()
 
-        self.assertTrue(audio.deemphasis.enabled)
-        self.assertEqual(audio.deemphasis.tau, 300.0)
         self.assertFalse(audio.lowpass.enabled)
         self.assertEqual(audio.lowpass.frequency, 3400.0)
         self.assertEqual(audio.lowpass.sharpness, 2.0)
@@ -1987,7 +1977,6 @@ class EasAlertTests(unittest.TestCase):
         receiver_audio = self.web_control.RECEIVER_AUDIO_CONFIG
         processor = self.web_control.AudioEffectsProcessor(receiver_audio)
 
-        self.assertTrue(receiver_audio.deemphasis.enabled)
         self.assertFalse(receiver_audio.lowpass.enabled)
         self.assertGreater(len(processor.deemphasis.curve), 1)
         self.assertIsNone(processor.eq_filter)
@@ -2037,7 +2026,6 @@ class EasAlertTests(unittest.TestCase):
             response = service.update_audio_effects({
                 "stream_id": "stream-1",
                 "audio": {
-                    "deemphasis": {"enabled": True, "tau": 530},
                     "comfort_noise": {"enabled": False, "level_db": -40},
                     "volume": {"enabled": True, "multiplier": 1.2},
                     "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
@@ -2112,27 +2100,39 @@ class EasAlertTests(unittest.TestCase):
         self.assertIs(processor.comfort_noise, comfort_noise)
         self.assertIs(processor.deemphasis, deemphasis)
 
-    def test_audio_effects_processor_updates_deemphasis_enabled_in_place(self) -> None:
-        config = self.config
-        processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
-            deemphasis=config.DeemphasisConfig(enabled=True, tau=300),
-        ))
-        deemphasis = processor.deemphasis
-        curve = deemphasis.curve.copy()
+    def test_nwr_deemphasis_is_always_applied_and_is_not_a_setting(self) -> None:
+        # Settings from before it was always on, as an older page might still send them.
+        old = {"deemphasis": {"enabled": False, "tau": 0}, "deemphasis_tau": 0, "volume": {"enabled": False, "multiplier": 1}}
 
-        changed = processor.update_config(config.AudioConfig(
-            deemphasis=config.DeemphasisConfig(enabled=False, tau=300),
-        ))
+        audio = self.web_control.validate_audio_payload(old)
+        processor = self.web_control.AudioEffectsProcessor(self.config.parse_audio_config(old))
 
-        self.assertEqual(changed, ("deemphasis",))
-        self.assertIs(processor.deemphasis, deemphasis)
-        self.assertNotEqual(processor.deemphasis.curve.tobytes(), curve.tobytes())
-        self.assertEqual(processor.deemphasis.tau, 0.0)
+        self.assertNotIn("deemphasis", audio)
+        self.assertNotIn("deemphasis_tau", audio)
+        self.assertFalse(hasattr(self.config.AudioConfig(), "deemphasis"))
+        np.testing.assert_array_equal(processor.deemphasis.curve, self.deemphasis.generate_nwr_deemphasis_curve(24_000))
+
+    def test_saved_streams_lose_the_old_deemphasis_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            streams_directory = Path(directory) / "streams"
+            stream = {
+                "id": "stream-1",
+                "station": {"callsign": "WXN99", "frequency": "162.425"},
+                "audio": {"deemphasis": {"enabled": False, "tau": 0}, "volume": {"enabled": True, "multiplier": 1.5}},
+            }
+            stream_config = importlib.import_module("nwr_stream_manager.stream_config")
+            stream_config.save_streams(streams_directory, [stream])
+
+            loaded = stream_config.load_streams(streams_directory, Path(directory) / "streams.json")
+            saved = json.loads(next(streams_directory.glob("*/config.json")).read_text(encoding="utf-8"))
+
+        self.assertEqual(loaded[0]["audio"], {"volume": {"enabled": True, "multiplier": 1.5}})
+        self.assertEqual(saved["audio"], {"volume": {"enabled": True, "multiplier": 1.5}})
 
     def test_deemphasis_matches_direct_filtering_for_any_mix_of_frame_sizes(self) -> None:
         rng = np.random.default_rng(21)
         samples = (0.3 * rng.standard_normal(24_000)).astype(np.float32)
-        deemphasis = self.deemphasis.DeemphasisFilter(24_000, 300)
+        deemphasis = self.deemphasis.DeemphasisFilter(24_000)
         expected = np.convolve(samples, deemphasis.curve)[: samples.size]
 
         # Whole 20 ms frames use the FFT filter; odd sizes are filtered directly, and the
@@ -2149,13 +2149,11 @@ class EasAlertTests(unittest.TestCase):
         np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-5)
 
     def test_nwr_deemphasis_curve_follows_fixed_weather_radio_slope(self) -> None:
-        curve = self.deemphasis.generate_deemphasis_curve(24_000, 300)
-        disabled = self.deemphasis.generate_deemphasis_curve(24_000, 0)
+        curve = self.deemphasis.generate_nwr_deemphasis_curve(24_000)
 
         self.assertGreater(len(curve), 1)
         self.assertEqual(len(curve) % 2, 1)
         self.assertTrue(np.all(np.isfinite(curve)))
-        self.assertEqual(disabled.tolist(), [1.0])
 
         response = np.abs(np.fft.rfft(curve, n=8192))
         freqs = np.fft.rfftfreq(8192, d=1.0 / 24_000.0)
@@ -2284,7 +2282,6 @@ class EasAlertTests(unittest.TestCase):
 
     def _notch_audio_payload(self, notch: dict) -> dict:
         return {
-            "deemphasis": {"enabled": True, "tau": 530},
             "comfort_noise": {"enabled": False, "level_db": -40},
             "volume": {"enabled": False, "multiplier": 1},
             "highpass": {"enabled": False, "frequency": 300, "sharpness": 0},
@@ -2413,7 +2410,6 @@ class EasAlertTests(unittest.TestCase):
     def test_notch_filter_near_nyquist_does_not_raise_or_emit_nan(self) -> None:
         config = self.config
         processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
-            deemphasis=config.DeemphasisConfig(enabled=False, tau=0),
             volume=config.VolumeConfig(enabled=False, multiplier=1.0),
             lowpass=config.FilterConfig(enabled=False, frequency=3400, sharpness=0),
             notch=config.NotchConfig(enabled=True, frequency=12000, width=60),
@@ -2425,52 +2421,23 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(output.shape, samples.shape)
         self.assertFalse(np.any(np.isnan(output)))
 
-    def test_deemphasis_makeup_gain_is_fixed_for_enabled_deemphasis(self) -> None:
-        self.assertEqual(self.web_control.deemphasis_makeup_gain(0), 0.75)
-        self.assertEqual(self.web_control.deemphasis_makeup_gain(300), 2.0)
-        self.assertEqual(self.web_control.deemphasis_makeup_gain(500), 2.0)
-
-    def test_deemphasis_makeup_uses_fixed_gain_without_auto_normalizing_when_enabled(self) -> None:
+    def test_deemphasis_makeup_uses_fixed_gain_without_auto_normalizing(self) -> None:
         config = self.config
         processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
-            deemphasis=config.DeemphasisConfig(enabled=True, tau=300),
             volume=config.VolumeConfig(enabled=False, multiplier=1.0),
             lowpass=config.FilterConfig(enabled=False, frequency=3400, sharpness=0),
         ))
-        reference = self.web_control.AudioEffectsProcessor(config.AudioConfig(
-            deemphasis=config.DeemphasisConfig(enabled=True, tau=300),
-            volume=config.VolumeConfig(enabled=False, multiplier=1.0),
-            lowpass=config.FilterConfig(enabled=False, frequency=3400, sharpness=0),
-        ))
+        reference = self.deemphasis.DeemphasisFilter(config.IQ_SAMPLE_RATE)
         times = np.arange(2048, dtype=np.float32) / config.IQ_SAMPLE_RATE
         samples = (0.1 * np.sin(2 * np.pi * 1000.0 * times)).astype(np.float32)
 
-        filtered_without_makeup = reference.deemphasis.process_float(samples)
-        deemphasized_with_makeup = (
-            processor.deemphasis.process_float(samples)
-            * self.web_control.deemphasis_makeup_gain(processor.config.deemphasis_tau)
-        )
+        filtered_without_makeup = reference.process_float(samples)
         output = processor.process(samples)
 
-        self.assertFalse(np.allclose(output, samples))
-        ratio = float(np.max(np.abs(deemphasized_with_makeup)) / np.max(np.abs(filtered_without_makeup)))
+        # The DC blocker barely touches 1 kHz, so the output is the filtered tone at twice the level.
+        ratio = float(np.max(np.abs(output[1024:])) / np.max(np.abs(filtered_without_makeup[1024:])))
         self.assertGreater(ratio, 1.95)
         self.assertLess(ratio, 2.05)
-
-    def test_disabled_deemphasis_applies_fixed_volume_reduction(self) -> None:
-        config = self.config
-        processor = self.web_control.AudioEffectsProcessor(config.AudioConfig(
-            deemphasis=config.DeemphasisConfig(enabled=False, tau=0),
-            volume=config.VolumeConfig(enabled=False, multiplier=1.0),
-            lowpass=config.FilterConfig(enabled=False, frequency=3400, sharpness=0),
-        ))
-        times = np.arange(2048, dtype=np.float32) / config.IQ_SAMPLE_RATE
-        samples = (0.4 * np.sin(2 * np.pi * 1000.0 * times)).astype(np.float32)
-
-        output = processor.process(samples)
-
-        self.assertLess(float(np.max(np.abs(output))), 0.32)
-        self.assertGreater(float(np.max(np.abs(output))), 0.28)
 
     def test_nfm_demodulator_accepts_empty_streaming_blocks(self) -> None:
         demodulator = self.web_control.NfmDemodulator()

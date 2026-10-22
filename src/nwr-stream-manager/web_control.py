@@ -44,7 +44,7 @@ from .accounts import (
     verify_account_password,
 )
 from .alsa import AlsaStreamTapConfig, discover_playback_devices
-from .audio_effects import AudioEffectsProcessor, deemphasis_makeup_gain
+from .audio_effects import AudioEffectsProcessor
 from .baseline_pages import (
     DASHBOARD_PARTS_PATH,
     format_account_date,
