@@ -76,7 +76,7 @@ class SettingsPageMarkupTests(unittest.TestCase):
             self.assertNotIn(f'id="{element}"', stream_settings)
         for element in ("fallback_enabled", "fallback_delay"):
             self.assertNotIn(f'id="{element}"', self.html)
-        self.assertIn("These settings apply to every stream that plays fallback audio.", settings)
+        self.assertIn("Plays on streams whose fallback action is Play fallback audio.", settings)
 
     def test_settings_has_its_own_heading_and_each_setting_a_heading_below_it(self) -> None:
         settings = view_markup(self.html, "settings")

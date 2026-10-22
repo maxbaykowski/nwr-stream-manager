@@ -17,9 +17,9 @@ const STREAM_SERVICE_NAMES = {
   nwrorg: "NOAA Weather Radio Org"
 };
 const STREAM_SERVICE_HELP = {
-  gwes: `If you do not yet have icecast credentials for streaming this station to this service, you'll need to <a href="https://forms.office.com/r/MLx6hKmnCe" target="_blank" rel="noopener noreferrer">submit your stream</a> to GWES Weather Radio and receive icecast credentials.`,
-  weatherusa: `If you do not yet have icecast credentials for streaming this station to this service, you must <a href="https://www.weatherusa.net/members/new" target="_blank" rel="noopener noreferrer">create an account on WeatherUSA</a> and <a href="https://www.weatherusa.net/members/services/radio" target="_blank" rel="noopener noreferrer">create a stream</a>. Once your stream is created, you must enter the icecast credentials into this page.`,
-  nwrorg: `Use the <a href="https://noaaweatherradio.org/N2radio-finder.php" target="_blank" rel="noopener noreferrer">Weather Radio Station Lookup Utility</a> from NOAA Weather Radio Org to determine what the mountpoint should be.`
+  gwes: `No credentials yet? <a href="https://forms.office.com/r/MLx6hKmnCe" target="_blank" rel="noopener noreferrer">Submit your stream</a> to GWES Weather Radio.`,
+  weatherusa: `No credentials yet? <a href="https://www.weatherusa.net/members/new" target="_blank" rel="noopener noreferrer">Create a WeatherUSA account</a>, then <a href="https://www.weatherusa.net/members/services/radio" target="_blank" rel="noopener noreferrer">create a stream</a>.`,
+  nwrorg: `Find the mountpoint with the <a href="https://noaaweatherradio.org/N2radio-finder.php" target="_blank" rel="noopener noreferrer">Weather Radio Station Lookup Utility</a>.`
 };
 const SAME_TEST_ACK_STORAGE_KEY = "nwr-stream-manager:same-test-warning-ack";
 const ADD_OUTPUT_TYPE_STEP = 10;
@@ -1972,7 +1972,7 @@ function renderWizardSoundcardDevices() {
   }
   setText(
     "wizard_soundcard_device_hint",
-    options[0] && options[0].value ? "NWR Stream Manager will open the hardware device directly." : "No sound cards have available channels."
+    options[0] && options[0].value ? "Used directly, not shared with other programs." : "No sound cards have available channels."
   );
   const selectedStableId = select.value || "";
   setSoundcardChannelOptions("wizard", selectedStableId, ignoreOutputId);
@@ -2005,7 +2005,7 @@ function renderSettingsSoundcardDevices(selectedStableId = "") {
     selectedStableId && !selectedDevice
       ? "The configured sound card is not connected."
       : options[0] && options[0].value
-        ? "NWR Stream Manager will open the hardware device directly."
+        ? "Used directly, not shared with other programs."
         : "No sound cards have available channels."
   );
   setSoundcardChannelOptions("settings", select.value || "", ignoreOutputId);
@@ -8714,7 +8714,7 @@ function renderRemotePairing(sharing, devices) {
   setValue("remote_pairing_code", active ? String(pairing.code || "") : "");
   setText(
     "remote_pairing_code_hint",
-    active ? `Enter this code on the other NWR Stream Manager before ${formatClockTime(pairing.expires_at)}. It works for one device.` : ""
+    active ? `Works for one device, until ${formatClockTime(pairing.expires_at)}.` : ""
   );
   if (!active) setMessage("remote-pairing-copy-result", "");
   if (remotePairingWasActive && !active) {

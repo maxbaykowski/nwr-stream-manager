@@ -267,7 +267,7 @@ class StreamPageHandlerMixin:
             connected = any(device.get("stable_id") == values["stable_id"] for device in soundcards)
             hint = (
                 "The configured sound card is not connected." if values["stable_id"] and not connected
-                else "NWR Stream Manager will open the hardware device directly." if chosen
+                else "Used directly, not shared with other programs." if chosen
                 else "No sound cards have available channels."
             )
             page = page_rendering.set_text(page, "settings_soundcard_device_hint", hint)
@@ -493,7 +493,7 @@ class StreamPageHandlerMixin:
         page = fill_icecast_fields(page, "icecast", state, state["service"], station)
         options, chosen = soundcard_device_options_html(self.service.streams, list(self.service.devices().get("soundcards") or []), state["stable_id"], state["output_id"], False)
         page = page_rendering.set_content(page, "wizard_soundcard_device", options)
-        page = page_rendering.set_text(page, "wizard_soundcard_device_hint", "NWR Stream Manager will open the hardware device directly." if chosen else "No sound cards have available channels.")
+        page = page_rendering.set_text(page, "wizard_soundcard_device_hint", "Used directly, not shared with other programs." if chosen else "No sound cards have available channels.")
         page = fill_soundcard_channels(page, "wizard", available_soundcard_channels(self.service.streams, chosen, state["output_id"]), state["channel_mode"])
         page = page_rendering.set_attribute(page, "wizard_soundcard_volume", "value", state["volume"])
         if state["preview_id"]:

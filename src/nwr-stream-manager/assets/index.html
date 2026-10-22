@@ -197,7 +197,7 @@ __INDEX_STYLES__</style>
       <label>Active SDR
         <select id="serial" name="serial" aria-describedby="serial_hint"></select>
       </label>
-      <span id="serial_hint" class="hint">Choose an RTL-SDR connected to this machine, or one shared over the network by a paired NWR Stream Manager. To add a shared one, pair with it in Settings, under SDR sharing.</span>
+      <span id="serial_hint" class="hint">An RTL-SDR on this computer, or one shared by a paired device.</span>
       <div class="actions">
         <button id="rescan_devices" class="needs-app-inline" type="button">Rescan</button>
         <a id="rescan_devices_link" class="baseline-only button-link" href="/?view=rtl">Rescan</a>
@@ -211,7 +211,7 @@ __INDEX_STYLES__</style>
         <label>Network buffer in seconds
           <input id="remote_buffer_seconds" name="remote_buffer_seconds" type="number" min="0.1" max="10" step="0.1" aria-describedby="remote_buffer_seconds_hint">
         </label>
-        <span id="remote_buffer_seconds_hint" class="hint">How much radio data to hold back to ride out Wi-Fi congestion and network dropouts. Higher values are more reliable on weak connections but put audio further behind real time; raising it pauses audio while the buffer fills, and lowering it skips ahead. Valid range is 0.1 through 10 seconds. This delay applies to everything using the shared RTL-SDR, including stream monitoring and the weather radio receiver, whose own playback buffering in the browser adds to it.</span>
+        <span id="remote_buffer_seconds_hint" class="hint">Rides out network dropouts, but adds delay. 0.1 to 10 seconds.</span>
       </div>
       <div id="sdr-reset-status" class="message" aria-live="polite"></div>
       <div id="sdr-source-result" class="message" aria-live="polite"></div>
@@ -228,26 +228,26 @@ __INDEX_STYLES__</style>
           <select id="gain_choice" class="baseline-only" name="gain" aria-describedby="gain_hint gain_auto_hint">
             <option value="auto">Automatic gain control</option>
           </select>
-          <span id="gain_hint" class="hint">Controls how strongly the SDR amplifies received signals. Generally this should be kept around 30-35 dB. Setting gain too high can cause interference, setting it too low can significantly degrade reception.</span>
+          <span id="gain_hint" class="hint">Usually 30 to 35 dB. Too high causes interference.</span>
           <div class="needs-app">
             <label class="checkbox-row"><input id="gain_auto" type="checkbox" aria-describedby="gain_auto_hint"> Automatic gain control</label>
           </div>
-          <span id="gain_auto_hint" class="hint">Automatically adjusts the tuner gain based on signal strength. It is best to keep this setting switched off as it can increase the gain too high, causing interference.</span>
+          <span id="gain_auto_hint" class="hint">Best left off; it can set the gain too high.</span>
         </div>
         <div class="sdr-setting">
           <label for="ppm_correction">PPM correction</label>
           <input id="ppm_correction" name="ppm_correction" type="number" min="-200" max="200" step="1" aria-describedby="ppm_correction_hint">
-          <span id="ppm_correction_hint" class="hint">Controls hardware frequency correction for dongles that experience frequency drift.</span>
+          <span id="ppm_correction_hint" class="hint">Corrects frequency drift.</span>
         </div>
         <div class="sdr-setting">
           <label for="alias_filter_strength">Alias filter strength</label>
           <input id="alias_filter_strength" name="alias_filter_strength" type="range" min="0" max="100" step="1" value="100" aria-describedby="alias_filter_strength_hint">
           <span id="alias_filter_strength_label" class="sdr-value" aria-hidden="true">100%</span>
-          <span id="alias_filter_strength_hint" class="hint">Controls alias filtering when decimating IQ data. Higher values reject more out-of-band signals; lower values can save CPU but may allow more aliasing near the sides of the passband.</span>
+          <span id="alias_filter_strength_hint" class="hint">Higher rejects more interference; lower uses less CPU.</span>
         </div>
         <div class="sdr-setting">
           <label class="checkbox-row"><input id="bias_tee" name="bias_tee" value="1" type="checkbox" aria-describedby="bias_tee_hint"> Bias tee</label>
-          <span id="bias_tee_hint" class="hint">Enable the RTL-SDR bias tee. Only enable this if attached hardware expects DC power.</span>
+          <span id="bias_tee_hint" class="hint">Only for hardware powered through the antenna cable.</span>
         </div>
       </div>
       <div id="sdr-settings-result" class="message" aria-live="polite"></div>
@@ -264,12 +264,12 @@ __INDEX_STYLES__</style>
         <input id="notify_sdr_failures" name="notify_sdr_failures" value="1" type="checkbox" aria-describedby="notify_sdr_failures_hint">
         Notify when the RTL-SDR requires attention
       </label>
-      <span id="notify_sdr_failures_hint" class="hint">Send an ntfy notification when the configured RTL-SDR disconnects, cannot be opened, or stops sending radio data.</span>
+      <span id="notify_sdr_failures_hint" class="hint">If it disconnects or stops sending data.</span>
     </section>
     </form>
     <section id="iq_test_source_section" class="needs-app" hidden>
       <h3>I/Q test source</h3>
-      <p class="hint">Use an interleaved complex float32 I/Q file as the receiver source for testing. Files loop until you switch back to the RTL-SDR.</p>
+      <p class="hint">Use a float32 I/Q file instead of the RTL-SDR, for testing.</p>
       <div class="grid">
         <label>Source file
           <select id="iq_test_source_file"></select>
@@ -279,9 +279,7 @@ __INDEX_STYLES__</style>
         </label>
       </div>
       <div id="iq_test_source_directory" class="hint"></div>
-      <div id="iq_test_source_seek_controls" class="hint" tabindex="0" role="group" aria-label="I/Q file seek controls">
-        Use Up Arrow to seek forward 10 seconds, Down Arrow to seek backward 10 seconds, Page Up to seek forward 1 minute, and Page Down to seek backward 1 minute.
-      </div>
+      <div id="iq_test_source_seek_controls" class="hint" tabindex="0" role="group" aria-label="I/Q file seek controls">Up and Down Arrow seek 10 seconds; Page Up and Page Down seek 1 minute.</div>
       <div id="iq_test_source_position" class="hint"></div>
       <div id="iq-test-source-result" class="message"></div>
       <div class="actions iq-test-source-actions">
@@ -328,7 +326,7 @@ __INDEX_STYLES__</style>
       <div id="iq-recorder-result" class="message"></div>
       <div id="iq_remove_confirm" class="baseline-only" hidden></div>
       <div id="iq_recorder_active" hidden>
-        <p id="iq_refresh_hint" class="hint baseline-only">Refresh the page to see the latest status.</p>
+        <p id="iq_refresh_hint" class="hint baseline-only">Refresh the page for the latest status.</p>
         <div class="status" aria-live="off">
           <div class="metric"><b>Status</b><span id="iq_status">Idle</span></div>
           <div class="metric"><b>Source</b><span id="iq_source">None</span></div>
@@ -382,18 +380,18 @@ __INDEX_STYLES__</style>
           <label>Stream
             <select id="iq_stream_select" name="stream_id"></select>
           </label>
-          <div class="hint">Records the selected stream's 24 kHz channel before FM demodulation.</div>
+          <div class="hint">Just the selected stream's channel.</div>
         </div>
         <div id="iq_spectrum_fields" hidden>
           <label>Sample rate
             <select id="iq_sample_rate" name="sample_rate"></select>
           </label>
-          <div class="hint">Records the radio spectrum centered at 162.475 MHz.</div>
+          <div class="hint">All the weather radio channels.</div>
         </div>
         <label>Stop recording after
           <input id="iq_duration_minutes" name="duration_minutes" type="number" min="0" max="1440" step="1" value="0" aria-describedby="iq_duration_hint">
         </label>
-        <div id="iq_duration_hint" class="hint">Minutes. Set to 0 to record until you manually stop it.</div>
+        <div id="iq_duration_hint" class="hint">Minutes. 0 records until you stop it.</div>
         <div class="actions">
           <button id="iq_start_recording" type="submit" data-baseline-submit>Start recording</button>
           <button id="cancel_iq_start" class="needs-app-inline" type="button">Cancel</button>
@@ -472,11 +470,11 @@ __INDEX_STYLES__</style>
               <label>Instance name
                 <input id="general_instance_name" name="instance_name" type="text" maxlength="64" autocomplete="off" spellcheck="false" aria-describedby="general_instance_name_hint">
               </label>
-              <span id="general_instance_name_hint" class="hint">The name of this NWR Stream Manager, shown at the top of each page, in your browser's title bar and on its notifications. Giving each one its own name makes them easy to tell apart. Up to 64 characters.</span>
+              <span id="general_instance_name_hint" class="hint">Shown in page titles, headings and notifications.</span>
               <label>Location
                 <input id="general_location" name="location" type="text" maxlength="64" autocomplete="off" aria-describedby="general_location_hint">
               </label>
-              <span id="general_location_hint" class="hint">Optional. Where this NWR Stream Manager or its RTL-SDR is, for your own reference, such as Attic SDR (Grand Rapids, MI). It's shown on the dashboard. Up to 64 characters.</span>
+              <span id="general_location_hint" class="hint">Optional. Shown on the dashboard.</span>
               <div class="actions">
                 <button id="save_general_settings" type="submit" data-baseline-submit>Save changes</button>
               </div>
@@ -533,7 +531,7 @@ __INDEX_STYLES__</style>
               <div id="sdr_sharing_confirm" class="baseline-only" hidden></div>
               <div id="sdr_sharing_section" class="settings-group">
                 <h4>Sharing</h4>
-                <p id="remote_access_unavailable" class="hint" hidden>Sharing is available while an RTL-SDR connected to this machine is selected.</p>
+                <p id="remote_access_unavailable" class="hint" hidden>Only an RTL-SDR on this computer can be shared.</p>
                 <div id="remote_access_controls">
                   <form id="remote_access_form" method="post" action="/sdr-sharing/settings">
                     __FORM_TOKEN_INPUT__
@@ -541,7 +539,7 @@ __INDEX_STYLES__</style>
                       <input id="remote_access_enabled" name="remote_access_enabled" value="1" type="checkbox" aria-describedby="remote_access_hint">
                       Share this RTL-SDR with paired devices
                     </label>
-                    <span id="remote_access_hint" class="hint">Paired NWR Stream Manager devices on your network can use this RTL-SDR for their streams, weather radio receiver and I/Q recordings. To pair a device, select Pair a device to show a pairing code, then enter it on the other device. Sharing uses TCP port 47432 and UDP port 47433.</span>
+                    <span id="remote_access_hint" class="hint">Lets paired devices use this RTL-SDR.</span>
                     <div class="actions baseline-only">
                       <button id="save_remote_access" type="submit" data-baseline-submit>Save changes</button>
                     </div>
@@ -555,7 +553,7 @@ __INDEX_STYLES__</style>
               </div>
               <div id="remote_pair_section" class="settings-group">
                 <h4>Pair with another NWR Stream Manager</h4>
-                <p class="hint">Pair once and either device can use the other's RTL-SDR. On the device you are pairing with, turn on sharing and select Pair a device to show a pairing code, then select Find devices here.</p>
+                <p class="hint">Pair once, and either device can use the other's RTL-SDR.</p>
                 <div class="actions">
                   <button id="find_remote_devices" class="needs-app-inline" type="button">Find devices</button>
                   <a id="find_remote_devices_link" class="baseline-only button-link" href="/?view=settings&amp;section=find_devices">Find devices</a>
@@ -583,8 +581,8 @@ __INDEX_STYLES__</style>
             </div>
             <div id="settings_pair_device_page" hidden>
               <h3>Pair a device</h3>
-              <p class="hint needs-app">On the other NWR Stream Manager, open Settings, then SDR sharing, select Find devices, choose this device and enter this code. Other devices can find this one only while this page is open, and pairing stops when you leave it.</p>
-              <p class="hint baseline-only">On the other NWR Stream Manager, open Settings, then SDR sharing, select Find devices, choose this device and enter this code. Other devices can find this one until the code expires or you select Stop pairing.</p>
+              <p class="hint needs-app">On the other device, select Find devices, then enter this code.</p>
+              <p class="hint baseline-only">On the other device, select Find devices, then enter this code.</p>
               <label id="remote_pairing_code_label">Pairing code
                 <input id="remote_pairing_code" type="text" readonly autocomplete="off" spellcheck="false" aria-describedby="remote_pairing_code_hint">
               </label>
@@ -601,8 +599,8 @@ __INDEX_STYLES__</style>
             </div>
             <div id="settings_find_devices_page" hidden>
               <h3>Find devices</h3>
-              <p class="hint needs-app">On the device you are pairing with, open Settings, then SDR sharing, turn on sharing and select Pair a device. It appears here once it shows a pairing code. Searching continues until you pair or leave this page.</p>
-              <p class="hint baseline-only">On the device you are pairing with, open Settings, then SDR sharing, turn on sharing and select Pair a device. It appears here once it shows a pairing code; select Search again if it isn't listed yet.</p>
+              <p class="hint needs-app">On the other device, select Pair a device. It appears here when ready.</p>
+              <p class="hint baseline-only">On the other device, select Pair a device, then Search again here.</p>
               <p id="remote_pair_search_status" class="hint" aria-live="polite"></p>
               <form id="remote_pair_form" method="post" action="/sdr-sharing/pair">
               __FORM_TOKEN_INPUT__
@@ -613,7 +611,7 @@ __INDEX_STYLES__</style>
                 <label id="remote_pair_address_label" hidden>Address
                   <input id="remote_pair_address" name="address" type="text" autocomplete="off" spellcheck="false" aria-describedby="remote_pair_address_hint">
                 </label>
-                <span id="remote_pair_address_hint" class="hint" hidden>The IP address or host name of the other NWR Stream Manager.</span>
+                <span id="remote_pair_address_hint" class="hint" hidden>Its IP address or host name.</span>
                 <label>Pairing code
                   <input id="remote_pair_code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" aria-describedby="remote_pair_code_hint">
                 </label>
@@ -632,7 +630,7 @@ __INDEX_STYLES__</style>
           <div id="settings_panel_fallback_audio" class="settings-panel" hidden>
             <div id="settings_fallback_audio_page">
             <h3>Fallback audio</h3>
-            <p class="hint">Fallback audio plays on streams whose fallback action is Play fallback audio. Choose each stream's fallback action in its stream settings. These settings apply to every stream that plays fallback audio.</p>
+            <p class="hint">Plays on streams whose fallback action is Play fallback audio.</p>
             <form id="fallback_settings_form" method="post" action="/fallback-audio/settings">
             __FORM_TOKEN_INPUT__
             <fieldset>
@@ -649,7 +647,7 @@ __INDEX_STYLES__</style>
             <label class="fallback-loop-delay">Seconds before restart
               <input id="fallback_loop_delay" name="loop_delay_seconds" type="number" min="0" max="10" step="1" aria-describedby="fallback_loop_delay_hint">
             </label>
-            <span id="fallback_loop_delay_hint" class="hint">How long to wait after the fallback audio finishes before starting it again. Set to 0 for a continuous loop with no gap.</span>
+            <span id="fallback_loop_delay_hint" class="hint">Pause between repeats. 0 for none.</span>
             <div class="actions baseline-only">
               <button id="save_fallback_settings" type="submit" data-baseline-submit>Save changes</button>
             </div>
@@ -658,7 +656,7 @@ __INDEX_STYLES__</style>
             <div id="fallback_custom_controls" hidden>
               <div class="settings-group">
                 <h4>Upload an announcement</h4>
-                <span id="fallback_audio_file_hint" class="hint">An MP3, OGG or WAV file, one minute or shorter and under 10 MB.</span>
+                <span id="fallback_audio_file_hint" class="hint">MP3, OGG or WAV, up to 1 minute and 10 MB.</span>
                 <div class="actions needs-app-flex">
                   <button id="fallback_upload" type="button" aria-describedby="fallback_audio_file_hint">Upload announcement</button>
                 </div>
@@ -678,21 +676,21 @@ __INDEX_STYLES__</style>
                 <h4>Record an announcement</h4>
                 <p id="fallback_record_insecure" class="message error" hidden>Recording isn't available because this page isn't in a secure context. To record, set up Tailscale Serve to give NWR Stream Manager a secure address. You can still upload a file. <a href="/help#secure-address" target="_blank" rel="noopener">Learn how to set up Tailscale Serve<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
                 <p id="fallback_record_unsupported" class="message error" hidden>This browser can't record audio. You can still upload a file.</p>
-                <p class="hint baseline-only">Recording an announcement needs an up-to-date browser. You can still upload a file.</p>
+                <p class="hint baseline-only">Recording needs an up-to-date browser.</p>
                 <div id="fallback_record_controls" class="needs-app">
-                  <p class="hint">Record up to one minute from your microphone, then listen to it before saving it.</p>
+                  <p class="hint">Up to one minute from your microphone.</p>
                   <div class="actions">
                     <button id="open_fallback_recording" type="button">Record an announcement</button>
                   </div>
                 </div>
               </div>
-              <p class="hint fallback-same-note">Announcements are checked for SAME tones, the data bursts that set off weather radios. Announcements that contain them can't be used.</p>
+              <p class="hint fallback-same-note">Announcements with SAME tones can't be used.</p>
             </div>
             <div id="fallback-audio-result" class="message" aria-live="polite"></div>
             </div>
             <div id="settings_record_announcement_page" hidden>
               <h3>Record an announcement</h3>
-              <p class="hint">Select Start recording when you're ready, and Stop recording when you've finished. Recording stops by itself after one minute. Wearing headphones keeps your screen reader and other sounds out of the recording.</p>
+              <p class="hint">Recording stops by itself after one minute.</p>
               <div class="actions">
                 <button id="fallback_record" type="button">Start recording</button>
                 <span id="fallback_record_time" class="record-time" role="timer" hidden></span>
@@ -709,17 +707,17 @@ __INDEX_STYLES__</style>
           </div>
           <div id="settings_panel_advanced" class="settings-panel" hidden>
             <h3>Advanced</h3>
-            <p class="hint">Where NWR Stream Manager can be reached. Changes are saved when you select Save changes, and take effect the next time NWR Stream Manager starts. <a href="/help#advanced" target="_blank" rel="noopener">Learn more about these settings<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
+            <p class="hint">Changes take effect after a restart. <a href="/help#advanced" target="_blank" rel="noopener">Learn more about these settings<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
             <p id="advanced_listening" class="hint"></p>
             <form id="advanced_settings_form" method="post" action="/advanced-settings" novalidate>
               __FORM_TOKEN_INPUT__
               <label>Port
                 <input id="advanced_port" name="port" type="number" min="1" max="65535" step="1" inputmode="numeric" aria-describedby="advanced_port_hint advanced_port_flag">
               </label>
-              <span id="advanced_port_hint" class="hint">The port in NWR Stream Manager's address, such as 8080 in http://192.168.1.10:8080. Ports below 1024 need extra permission.</span>
+              <span id="advanced_port_hint" class="hint">Such as 8080. Ports below 1024 need extra permission.</span>
               <span id="advanced_port_flag" class="hint" hidden></span>
               <label class="checkbox-row"><input id="advanced_localhost_only" name="localhost_only" type="checkbox" value="1" aria-describedby="advanced_localhost_only_hint advanced_host_flag"> Only allow connections from this computer</label>
-              <span id="advanced_localhost_only_hint" class="hint">For a reverse proxy or Tailscale Serve running on this computer. Other devices on your network, including this one if it isn't the computer running NWR Stream Manager, won't be able to open it directly.</span>
+              <span id="advanced_localhost_only_hint" class="hint">For a reverse proxy or Tailscale Serve. Other devices can't connect directly.</span>
               <span id="advanced_host_flag" class="hint" hidden></span>
               <div class="actions">
                 <button id="save_advanced_settings" type="submit" data-baseline-submit>Save changes</button>
@@ -747,30 +745,30 @@ __INDEX_STYLES__</style>
                   <option value="self-hosted">Self-hosted instance</option>
                 </select>
               </label>
-              <span id="notification_server_mode_hint" class="hint">The ntfy server notifications are sent through. After changing it, subscribe to the topic on the new server in the ntfy app.</span>
+              <span id="notification_server_mode_hint" class="hint">The server notifications are sent through.</span>
               <label id="notification_configured_server_url_label" hidden>Server URL
                 <input id="notification_configured_server_url" name="server_url" type="url" autocomplete="url" placeholder="https://ntfy.example.com" aria-describedby="notification_configured_server_url_hint">
               </label>
-              <span id="notification_configured_server_url_hint" class="hint" hidden>The URL of your self-hosted ntfy server, starting with http:// or https://.</span>
+              <span id="notification_configured_server_url_hint" class="hint" hidden>Starts with http:// or https://.</span>
               <label>Topic secret
                 <input id="notification_configured_topic_secret" type="text" readonly aria-describedby="notification_configured_topic_hint">
               </label>
-              <span id="notification_configured_topic_hint" class="hint">Subscribe to this topic in the ntfy app to receive notifications.</span>
+              <span id="notification_configured_topic_hint" class="hint">Subscribe to it in the ntfy app.</span>
               <div class="actions">
                 <button id="copy_configured_notification_topic" class="needs-app-inline" type="button">Copy to clipboard</button>
                 <button class="baseline-only" type="button" data-copy-from="notification_configured_topic_secret" hidden>Copy to clipboard</button>
                 <button id="regenerate_notification_topic" class="needs-app-inline" type="button" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</button>
                 <a id="regenerate_notification_topic_link" class="baseline-only button-link" href="/?view=settings&amp;section=notifications&amp;confirm=regenerate" aria-describedby="regenerate_notification_topic_hint">Regenerate topic secret</a>
               </div>
-              <span id="regenerate_notification_topic_hint" class="hint">Regenerate the topic secret if someone has figured out the current one.</span>
+              <span id="regenerate_notification_topic_hint" class="hint">If someone else knows the current one.</span>
               <label>Open NWR Stream Manager from notifications
                 <select id="notification_access_url_mode" name="access_url_mode" aria-describedby="notification_access_url_hint"></select>
               </label>
-              <span id="notification_access_url_hint" class="hint">The address your devices open when you select a notification. Choose one they can reach, such as a Tailscale address for devices away from home.</span>
+              <span id="notification_access_url_hint" class="hint">What a notification opens. Choose one your devices can reach.</span>
               <label id="notification_custom_access_url_label" hidden>Custom URL
                 <input id="notification_custom_access_url" name="custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_custom_access_url_hint">
               </label>
-              <span id="notification_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
+              <span id="notification_custom_access_url_hint" class="hint" hidden>Such as a domain name that forwards here.</span>
               <div class="actions baseline-only">
                 <button id="save_notification_settings" type="submit" data-baseline-submit>Save changes</button>
               </div>
@@ -815,7 +813,7 @@ __INDEX_STYLES__</style>
                 <label>Topic secret
                   <input id="notification_topic_secret" type="text" readonly aria-describedby="notification_topic_secret_hint">
                 </label>
-                <span id="notification_topic_secret_hint" class="hint">Anyone who knows the topic secret can see and send notifications on it. If you ever receive notifications that didn't come from NWR Stream Manager, regenerate the topic secret in the notification settings.</span>
+                <span id="notification_topic_secret_hint" class="hint">Keep it private: anyone who knows it can see your notifications.</span>
                 <div class="actions">
                   <button id="copy_notification_topic" class="needs-app-inline" type="button">Copy to clipboard</button>
                   <button class="baseline-only" type="button" data-copy-from="notification_topic_secret" hidden>Copy to clipboard</button>
@@ -826,11 +824,11 @@ __INDEX_STYLES__</style>
                 <label>Open NWR Stream Manager from notifications
                   <select id="notification_wizard_access_url_mode" name="access_url_mode" aria-describedby="notification_wizard_access_url_hint"></select>
                 </label>
-                <span id="notification_wizard_access_url_hint" class="hint">Choose an address your devices can reach, such as a Tailscale address for devices away from home.</span>
+                <span id="notification_wizard_access_url_hint" class="hint">Choose one your devices can reach.</span>
                 <label id="notification_wizard_custom_access_url_label" hidden>Custom URL
                   <input id="notification_wizard_custom_access_url" name="custom_access_url" type="url" autocomplete="url" placeholder="https://weather-radio.example.com" aria-describedby="notification_wizard_custom_access_url_hint">
                 </label>
-                <span id="notification_wizard_custom_access_url_hint" class="hint" hidden>For example, a domain name that forwards to NWR Stream Manager.</span>
+                <span id="notification_wizard_custom_access_url_hint" class="hint" hidden>Such as a domain name that forwards here.</span>
               </div>
               <div id="notification_step_test" class="wizard-step" hidden>
                 <p>Send a test notification to make sure notifications from NWR Stream Manager reach your devices, then select Finish.</p>
@@ -954,19 +952,19 @@ __INDEX_STYLES__</style>
             <label id="icecast_host_label">Host
               <input id="icecast_host" name="host" type="text" autocomplete="off" aria-describedby="icecast_host_hint">
             </label>
-            <span id="icecast_host_hint" class="hint">The hostname, IP address, or web URL of the Icecast server.</span>
+            <span id="icecast_host_hint" class="hint">Host name, IP address or URL.</span>
             <label id="icecast_port_label">Port
               <input id="icecast_port" name="port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="icecast_port_hint">
             </label>
-            <span id="icecast_port_hint" class="hint">The port the Icecast server listens on.</span>
+            <span id="icecast_port_hint" class="hint">The Icecast server's port.</span>
             <label id="icecast_username_label">Username
               <input id="icecast_username" name="username" type="text" autocomplete="username" aria-describedby="icecast_username_hint">
             </label>
-            <span id="icecast_username_hint" class="hint">The username for authentication to the server.</span>
+            <span id="icecast_username_hint" class="hint">From your streaming service.</span>
             <label id="icecast_password_label">Password
               <input id="icecast_password" name="password" type="password" autocomplete="current-password" aria-describedby="icecast_password_hint">
             </label>
-            <span id="icecast_password_hint" class="hint">The password for authentication to the server.</span>
+            <span id="icecast_password_hint" class="hint">From your streaming service.</span>
             <label id="show_icecast_password_label" class="checkbox-row">
               <input id="show_icecast_password" type="checkbox">
               Show password
@@ -974,7 +972,7 @@ __INDEX_STYLES__</style>
             <label id="icecast_mount_label">Mountpoint
               <input id="icecast_mount" name="mount" type="text" placeholder="/station.mp3" aria-describedby="icecast_mount_hint">
             </label>
-            <span id="icecast_mount_hint" class="hint">The mountpoint where the stream will be accessible to listeners.</span>
+            <span id="icecast_mount_hint" class="hint">Where listeners find the stream.</span>
             <label id="icecast_alt_label" class="checkbox-row" hidden>
               <input id="icecast_alt_enabled" name="alt_enabled" value="1" type="checkbox">
               Alternate stream
@@ -1001,9 +999,9 @@ __INDEX_STYLES__</style>
         <fieldset>
           <legend>Output type</legend>
           <label class="checkbox-row"><input id="wizard_output_type_icecast" name="wizard_output_type" type="radio" value="icecast" checked aria-describedby="wizard_output_type_icecast_hint"> Icecast mountpoint</label>
-          <span id="wizard_output_type_icecast_hint" class="hint">Send station audio to an Icecast mountpoint, including private servers or services like GWES Weather Radio, NOAA Weather Radio Org, and WeatherUSA.</span>
+          <span id="wizard_output_type_icecast_hint" class="hint">Stream online, such as to GWES, NOAA Weather Radio Org or WeatherUSA.</span>
           <label class="checkbox-row"><input id="wizard_output_type_soundcard" name="wizard_output_type" type="radio" value="soundcard" aria-describedby="wizard_output_type_soundcard_hint"> Sound card</label>
-          <span id="wizard_output_type_soundcard_hint" class="hint">Send station audio to a local sound card, useful for feeding an Emergency Alert System ENDEC.</span>
+          <span id="wizard_output_type_soundcard_hint" class="hint">Play through a sound card, such as into an EAS ENDEC.</span>
         </fieldset>
       </div>
       <div id="wizard_step_soundcard_device" class="wizard-step" hidden>
@@ -1033,7 +1031,7 @@ __INDEX_STYLES__</style>
         <p>What audio codec would you like to use for the stream format? MP3 is generally more compatible, while OGG may give better audio quality at lower internet usage.</p>
         <fieldset id="icecast_format_fieldset">
           <legend>Stream Format</legend>
-          <div class="hint">Encoding format for this Icecast mountpoint.</div>
+          <div class="hint">The audio format to stream in.</div>
           <label class="checkbox-row"><input id="icecast_format_mp3" name="icecast_format" type="radio" value="mp3" checked> MP3</label>
           <label class="checkbox-row"><input id="icecast_format_ogg" name="icecast_format" type="radio" value="ogg"> OGG</label>
         </fieldset>
@@ -1055,11 +1053,11 @@ __INDEX_STYLES__</style>
               <option value="48000">48000 Hz</option>
             </select>
           </label>
-          <span id="icecast_sample_rate_hint" class="hint">The audio sample rate to encode at for this Icecast mountpoint.</span>
+          <span id="icecast_sample_rate_hint" class="hint">The sample rate to encode at.</span>
           <label id="icecast_bitrate_label">Bitrate
             <select id="icecast_bitrate" name="bitrate" aria-describedby="icecast_bitrate_hint"></select>
           </label>
-          <span id="icecast_bitrate_hint" class="hint">Encoder bitrate in Kbps for this Icecast mountpoint.</span>
+          <span id="icecast_bitrate_hint" class="hint">The bitrate to encode at, in Kbps.</span>
         </div>
       </fieldset>
       </div>
@@ -1094,7 +1092,7 @@ __INDEX_STYLES__</style>
               <input id="stream_monitor_enabled" type="checkbox" aria-describedby="stream_monitor_hint">
               Monitor
             </label>
-            <span id="stream_monitor_hint" class="hint">Listen to this stream's audio in your browser.</span>
+            <span id="stream_monitor_hint" class="hint">Listen in your browser.</span>
           </div>
           <div id="stream-settings-result" class="message"></div>
           <dl id="stream_settings_signal" class="details-list">
@@ -1181,23 +1179,23 @@ __INDEX_STYLES__</style>
                 <input id="eas_enabled" name="eas_enabled" value="1" type="checkbox" aria-describedby="eas_enabled_hint">
                 Enable EAS recording
               </label>
-              <span id="eas_enabled_hint" class="hint">Record EAS alerts received from this station.</span>
+              <span id="eas_enabled_hint" class="hint">Record alerts from this station.</span>
               <span id="eas_storage_blocked_hint" class="error" hidden>Disabled due to insufficient disk space.</span>
               <label>Pre-recording time in seconds
                 <input id="eas_pre_seconds" name="eas_pre_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_pre_seconds_hint">
               </label>
-              <span id="eas_pre_seconds_hint" class="hint">Seconds of audio to prepend before the decoded SAME header. Valid range is 0 through 10.</span>
+              <span id="eas_pre_seconds_hint" class="hint">Audio kept before the alert. 0 to 10 seconds.</span>
               <label>Post-recording time in seconds
                 <input id="eas_post_seconds" name="eas_post_seconds" type="number" min="0" max="10" step="1" aria-describedby="eas_post_seconds_hint">
               </label>
-              <span id="eas_post_seconds_hint" class="hint">Seconds of audio to append after EOM. Valid range is 0 through 10.</span>
+              <span id="eas_post_seconds_hint" class="hint">Audio kept after the alert. 0 to 10 seconds.</span>
               <label>Maximum recording time in seconds
                 <input id="eas_max_seconds" name="eas_max_seconds" type="number" min="1" max="3600" step="1" aria-describedby="eas_max_seconds_hint">
               </label>
-              <span id="eas_max_seconds_hint" class="hint">Maximum recording length for a single alert, in seconds.</span>
+              <span id="eas_max_seconds_hint" class="hint">The longest a recording can be, in seconds.</span>
               <fieldset>
                 <legend>Recording format</legend>
-                <div class="hint">Recording format for saved alert audio.</div>
+                <div class="hint">The format for saved alerts.</div>
                 <label class="checkbox-row"><input id="eas_format_wav" name="eas_format" type="radio" value="wav" checked> WAV</label>
                 <label class="checkbox-row"><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
               </fieldset>
@@ -1212,11 +1210,11 @@ __INDEX_STYLES__</style>
               <label class="checkbox-row"><input id="stream_fallback_action_disconnect_icecast" name="stream_fallback_action" type="radio" value="disconnect_icecast"> Disconnect from Icecast outputs</label>
               <label class="checkbox-row"><input id="stream_fallback_action_play_fallback_audio" name="stream_fallback_action" type="radio" value="play_fallback_audio"> Play fallback audio</label>
             </fieldset>
-            <p class="hint">Do nothing leaves the stream as it is. Disconnect from Icecast outputs disconnects this stream from all of its Icecast servers, so listeners are not left listening to dead air, and reconnects when the station returns; sound card outputs keep playing. Play fallback audio plays the fallback announcement until the station returns.</p>
+            <p class="hint">What the stream does when the station's audio stops.</p>
             <label id="stream_fallback_delay_label">Fallback delay in seconds
               <input id="stream_fallback_delay" name="stream_fallback_delay" type="number" min="30" max="120" step="1" aria-describedby="stream_fallback_delay_hint">
             </label>
-            <span id="stream_fallback_delay_hint" class="hint">How long to wait before the fallback action happens. Valid range is 30 through 120 seconds.</span>
+            <span id="stream_fallback_delay_hint" class="hint">How long to wait first. 30 to 120 seconds.</span>
             <div id="stream-fallback-action-result" class="message" aria-live="polite"></div>
           </div>
           <div id="panel_audio" class="tabpanel" hidden>
@@ -1227,11 +1225,11 @@ __INDEX_STYLES__</style>
                 <input id="audio_volume_enabled" name="audio_volume_enabled" value="1" type="checkbox" aria-describedby="audio_volume_enabled_hint">
                 Enable volume multiplier
               </label>
-              <span id="audio_volume_enabled_hint" class="hint">Controls the stream volume.</span>
+              <span id="audio_volume_enabled_hint" class="hint">Changes the stream's volume.</span>
               <label>Multiplier
                 <input id="audio_volume_multiplier" name="audio_volume_multiplier" type="number" min="0.1" max="2" step="0.1" aria-describedby="audio_volume_multiplier_hint">
               </label>
-              <span id="audio_volume_multiplier_hint" class="hint">1 leaves the volume unchanged, 2 doubles it and 0.5 halves it. Valid range is 0.1 through 2.</span>
+              <span id="audio_volume_multiplier_hint" class="hint">1 is unchanged, 2 is double. 0.1 to 2.</span>
             </div>
             <div id="audio_effect_comfort_noise" class="settings-group">
               <h4>Comfort noise</h4>
@@ -1239,11 +1237,11 @@ __INDEX_STYLES__</style>
                 <input id="audio_comfort_noise_enabled" name="audio_comfort_noise_enabled" value="1" type="checkbox" aria-describedby="audio_comfort_noise_enabled_hint">
                 Enable comfort noise
               </label>
-              <span id="audio_comfort_noise_enabled_hint" class="hint">Mixes very quiet white noise into demodulated audio, similar to some analog receivers.</span>
+              <span id="audio_comfort_noise_enabled_hint" class="hint">Adds a quiet background hiss.</span>
               <label>Level
                 <input id="audio_comfort_noise_level" name="audio_comfort_noise_level" type="number" min="-60" max="-30" step="1" aria-describedby="audio_comfort_noise_level_hint">
               </label>
-              <span id="audio_comfort_noise_level_hint" class="hint">Noise level in dB below full scale. Valid range is -60 through -30.</span>
+              <span id="audio_comfort_noise_level_hint" class="hint">-60 dB (quietest) to -30 dB.</span>
             </div>
             <div id="audio_effect_highpass" class="settings-group">
               <h4>Highpass</h4>
@@ -1255,11 +1253,11 @@ __INDEX_STYLES__</style>
               <label>Frequency
                 <input id="audio_highpass_frequency" name="audio_highpass_frequency" type="number" min="1" max="900" step="1" aria-describedby="audio_highpass_frequency_hint">
               </label>
-              <span id="audio_highpass_frequency_hint" class="hint">Frequency in Hz. Frequencies below this value will be attenuated. To protect the 1050 Hz attention tone, this cannot be set above 900 Hz.</span>
+              <span id="audio_highpass_frequency_hint" class="hint">Cuts below this many Hz. Up to 900.</span>
               <label>Sharpness
                 <input id="audio_highpass_sharpness" name="audio_highpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_highpass_sharpness_hint">
               </label>
-              <span id="audio_highpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
+              <span id="audio_highpass_sharpness_hint" class="hint">0 (gentle) to 10 (sharp).</span>
             </div>
             <div id="audio_effect_lowpass" class="settings-group">
               <h4>Lowpass</h4>
@@ -1271,11 +1269,11 @@ __INDEX_STYLES__</style>
               <label>Frequency
                 <input id="audio_lowpass_frequency" name="audio_lowpass_frequency" type="number" min="2200" max="12000" step="1" aria-describedby="audio_lowpass_frequency_hint">
               </label>
-              <span id="audio_lowpass_frequency_hint" class="hint">Frequency in Hz. Frequencies above this value will be attenuated. To protect SAME tones, this cannot be set below 2200 Hz.</span>
+              <span id="audio_lowpass_frequency_hint" class="hint">Cuts above this many Hz. 2200 or more.</span>
               <label>Sharpness
                 <input id="audio_lowpass_sharpness" name="audio_lowpass_sharpness" type="number" min="0" max="10" step="0.1" aria-describedby="audio_lowpass_sharpness_hint">
               </label>
-              <span id="audio_lowpass_sharpness_hint" class="hint">Filter sharpness from 0 through 10. 0 is more gentle; 10 cuts off frequencies much more aggressively.</span>
+              <span id="audio_lowpass_sharpness_hint" class="hint">0 (gentle) to 10 (sharp).</span>
             </div>
             <div id="audio_effect_notch" class="settings-group">
               <h4>Notch filter</h4>
@@ -1283,21 +1281,21 @@ __INDEX_STYLES__</style>
                 <input id="audio_notch_enabled" name="audio_notch_enabled" value="1" type="checkbox" aria-describedby="audio_notch_enabled_hint">
                 Enable notch filter
               </label>
-              <span id="audio_notch_enabled_hint" class="hint">Removes a narrow band of audio around one frequency, useful for analog whines.</span>
+              <span id="audio_notch_enabled_hint" class="hint">Removes one narrow frequency, such as a whine.</span>
               <label>Frequency
                 <input id="audio_notch_frequency" name="audio_notch_frequency" type="number" min="1" max="12000" step="1" aria-describedby="audio_notch_frequency_hint">
               </label>
-              <span id="audio_notch_frequency_hint" class="hint">Frequency in Hz. Frequencies of and near this value will be attenuated. To protect the 1050 Hz attention tone and SAME tones, this cannot be within 900-1100, 1400-1600, or 2000-2200 Hz.</span>
+              <span id="audio_notch_frequency_hint" class="hint">In Hz. Can't be on the alert tones.</span>
               <label>Width
                 <input id="audio_notch_width" name="audio_notch_width" type="number" min="60" max="2000" step="1" aria-describedby="audio_notch_width_hint">
               </label>
-              <span id="audio_notch_width_hint" class="hint">Width in Hz of the band that will be attenuated. Narrow widths remove just the tone; wider widths also remove the audio around it. To protect the 1050 Hz attention tone and SAME tones, the widest allowed depends on the frequency: <span id="audio_notch_width_max">2000</span> Hz at the current frequency.</span>
+              <span id="audio_notch_width_hint" class="hint">In Hz. Up to <span id="audio_notch_width_max">2000</span> here, to protect the alert tones.</span>
             </div>
             <div id="audio-effects-result" class="message" aria-live="polite"></div>
           </div>
           <div id="panel_notifications" class="tabpanel" hidden>
             <h3>Notifications</h3>
-            <p class="hint">Choose which problems for this stream should send notifications.</p>
+            <p class="hint">Choose which problems notify you.</p>
             <div class="grid">
               <label class="checkbox-row">
                 <input id="stream_notify_icecast_failures" name="stream_notify_icecast_failures" value="1" type="checkbox">
@@ -1315,13 +1313,13 @@ __INDEX_STYLES__</style>
                 <input id="stream_notify_eas_alerts" name="stream_notify_eas_alerts" value="1" type="checkbox" aria-describedby="stream_notify_eas_alerts_hint">
                 Recorded EAS alerts
               </label>
-              <span id="stream_notify_eas_alerts_hint" class="hint" hidden>Send a notification when a new EAS alert recording is saved.</span>
+              <span id="stream_notify_eas_alerts_hint" class="hint" hidden>When a new alert is recorded.</span>
             </div>
             <div id="stream-notifications-result" class="message"></div>
           </div>
           <div id="panel_test_mode" class="tabpanel" hidden>
             <h3>Test mode</h3>
-            <p class="hint">Replace this stream's real radio channel with a simulated NOAA Weather Radio channel for testing outputs and SAME handling. Test mode can be used for up to 10 minutes in any hour, shared by all streams.</p>
+            <p class="hint">Replaces the station with a simulated one. Up to 10 minutes an hour.</p>
             <p id="test_mode_time" class="hint">Time left: 10:00.</p>
             <div class="grid">
               <label class="checkbox-row">
@@ -1339,7 +1337,7 @@ __INDEX_STYLES__</style>
                 <input id="test_tones_muted" type="checkbox" aria-describedby="test_tones_muted_hint">
                 Mute tone generators
               </label>
-              <span id="test_tones_muted_hint" class="hint">Silences every tone generator. Unmuting brings back the ones that were on.</span>
+              <span id="test_tones_muted_hint" class="hint">Silences every tone generator.</span>
             </div>
             <div class="actions">
               <button id="test_mode_same" type="button">Send SAME test</button>
@@ -1347,7 +1345,7 @@ __INDEX_STYLES__</style>
             <div id="test-mode-result" class="message"></div>
             <div id="test_tones_section" hidden>
               <h4>Tone generators</h4>
-              <p class="hint">Play tones along with the test announcements and SAME tests, to simulate buzzes and whines. Tones are sent the same way as SAME tones, so the stream's audio processing affects them the same way.</p>
+              <p class="hint">Adds tones to simulate buzzes and whines.</p>
               <div id="test_tones_layout" class="effects-layout">
                 <div id="test_tones_list" class="effects-list" aria-label="Tone generators">
                   <button type="button" data-test-tone="sine">Sine wave</button>
@@ -1367,11 +1365,11 @@ __INDEX_STYLES__</style>
                     <label>Frequency
                       <input id="test_tone_sine_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sine_frequency_hint">
                     </label>
-                    <span id="test_tone_sine_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                    <span id="test_tone_sine_frequency_hint" class="hint">20 to 7000 Hz.</span>
                     <label>Amplitude
                       <input id="test_tone_sine_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sine_amplitude_hint">
                     </label>
-                    <span id="test_tone_sine_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+                    <span id="test_tone_sine_amplitude_hint" class="hint">Percent of full deviation.</span>
                   </div>
                   <div id="test_tone_square" class="test-tone-panel" hidden>
                     <h5>Square wave</h5>
@@ -1383,11 +1381,11 @@ __INDEX_STYLES__</style>
                     <label>Frequency
                       <input id="test_tone_square_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_square_frequency_hint">
                     </label>
-                    <span id="test_tone_square_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                    <span id="test_tone_square_frequency_hint" class="hint">20 to 7000 Hz.</span>
                     <label>Amplitude
                       <input id="test_tone_square_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_square_amplitude_hint">
                     </label>
-                    <span id="test_tone_square_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+                    <span id="test_tone_square_amplitude_hint" class="hint">Percent of full deviation.</span>
                   </div>
                   <div id="test_tone_triangle" class="test-tone-panel" hidden>
                     <h5>Triangle wave</h5>
@@ -1399,11 +1397,11 @@ __INDEX_STYLES__</style>
                     <label>Frequency
                       <input id="test_tone_triangle_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_triangle_frequency_hint">
                     </label>
-                    <span id="test_tone_triangle_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                    <span id="test_tone_triangle_frequency_hint" class="hint">20 to 7000 Hz.</span>
                     <label>Amplitude
                       <input id="test_tone_triangle_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_triangle_amplitude_hint">
                     </label>
-                    <span id="test_tone_triangle_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+                    <span id="test_tone_triangle_amplitude_hint" class="hint">Percent of full deviation.</span>
                   </div>
                   <div id="test_tone_sawtooth" class="test-tone-panel" hidden>
                     <h5>Sawtooth wave</h5>
@@ -1415,11 +1413,11 @@ __INDEX_STYLES__</style>
                     <label>Frequency
                       <input id="test_tone_sawtooth_frequency" type="number" min="20" max="7000" step="1" aria-describedby="test_tone_sawtooth_frequency_hint">
                     </label>
-                    <span id="test_tone_sawtooth_frequency_hint" class="hint">Frequency in Hz, from 20 through 7000. Higher frequencies would not fit in the NOAA Weather Radio channel at full deviation.</span>
+                    <span id="test_tone_sawtooth_frequency_hint" class="hint">20 to 7000 Hz.</span>
                     <label>Amplitude
                       <input id="test_tone_sawtooth_amplitude" type="number" min="0" max="100" step="1" aria-describedby="test_tone_sawtooth_amplitude_hint">
                     </label>
-                    <span id="test_tone_sawtooth_amplitude_hint" class="hint">Percent of full FM deviation (5 kHz). If the tones and test audio together would go past full deviation, everything is turned down to fit.</span>
+                    <span id="test_tone_sawtooth_amplitude_hint" class="hint">Percent of full deviation.</span>
                   </div>
                 </div>
               </div>
@@ -1471,19 +1469,19 @@ __INDEX_STYLES__</style>
               <label id="settings_icecast_host_label">Host
                 <input id="settings_icecast_host" name="host" type="text" autocomplete="off" aria-describedby="settings_icecast_host_hint">
               </label>
-              <span id="settings_icecast_host_hint" class="hint">The hostname, IP address, or web URL of the Icecast server.</span>
+              <span id="settings_icecast_host_hint" class="hint">Host name, IP address or URL.</span>
               <label id="settings_icecast_port_label">Port
                 <input id="settings_icecast_port" name="port" type="number" min="1" max="65535" step="1" placeholder="8000" aria-describedby="settings_icecast_port_hint">
               </label>
-              <span id="settings_icecast_port_hint" class="hint">The port the Icecast server listens on.</span>
+              <span id="settings_icecast_port_hint" class="hint">The Icecast server's port.</span>
               <label id="settings_icecast_username_label">Username
                 <input id="settings_icecast_username" name="username" type="text" autocomplete="username" aria-describedby="settings_icecast_username_hint">
               </label>
-              <span id="settings_icecast_username_hint" class="hint">The username for authentication to the server.</span>
+              <span id="settings_icecast_username_hint" class="hint">From your streaming service.</span>
               <label id="settings_icecast_password_label">Password
                 <input id="settings_icecast_password" name="password" type="password" autocomplete="current-password" aria-describedby="settings_icecast_password_hint">
               </label>
-              <span id="settings_icecast_password_hint" class="hint">The password for authentication to the server.</span>
+              <span id="settings_icecast_password_hint" class="hint">From your streaming service.</span>
               <label id="settings_show_icecast_password_label" class="checkbox-row">
                 <input id="settings_show_icecast_password" type="checkbox">
                 Show password
@@ -1491,7 +1489,7 @@ __INDEX_STYLES__</style>
               <label id="settings_icecast_mount_label">Mountpoint
                 <input id="settings_icecast_mount" name="mount" type="text" placeholder="/station.mp3" aria-describedby="settings_icecast_mount_hint">
               </label>
-              <span id="settings_icecast_mount_hint" class="hint">The mountpoint where the stream will be accessible to listeners.</span>
+              <span id="settings_icecast_mount_hint" class="hint">Where listeners find the stream.</span>
               <label id="settings_icecast_alt_label" class="checkbox-row" hidden>
                 <input id="settings_icecast_alt_enabled" name="alt_enabled" value="1" type="checkbox">
                 Alternate stream
@@ -1501,7 +1499,7 @@ __INDEX_STYLES__</style>
               </label>
               <fieldset id="settings_icecast_format_fieldset">
                 <legend>Format</legend>
-                <div class="hint">Encoding format for this Icecast mountpoint.</div>
+                <div class="hint">The audio format to stream in.</div>
                 <label class="checkbox-row"><input id="settings_icecast_format_mp3" name="settings_icecast_format" type="radio" value="mp3" checked> MP3</label>
                 <label class="checkbox-row"><input id="settings_icecast_format_ogg" name="settings_icecast_format" type="radio" value="ogg"> OGG</label>
               </fieldset>
@@ -1517,11 +1515,11 @@ __INDEX_STYLES__</style>
                   <option value="48000">48000 Hz</option>
                 </select>
               </label>
-              <span id="settings_icecast_sample_rate_hint" class="hint">The audio sample rate to encode at for this Icecast mountpoint.</span>
+              <span id="settings_icecast_sample_rate_hint" class="hint">The sample rate to encode at.</span>
               <label id="settings_icecast_bitrate_label">Bitrate
                 <select id="settings_icecast_bitrate" name="bitrate" aria-describedby="settings_icecast_bitrate_hint"></select>
               </label>
-              <span id="settings_icecast_bitrate_hint" class="hint">Encoder bitrate in Kbps for this Icecast mountpoint.</span>
+              <span id="settings_icecast_bitrate_hint" class="hint">The bitrate to encode at, in Kbps.</span>
             </div>
           </fieldset>
           <div class="actions">
@@ -1550,7 +1548,7 @@ __INDEX_STYLES__</style>
                 <label>Volume
                   <input id="settings_soundcard_volume" name="volume" type="range" min="0" max="2" step="0.01" value="1">
                 </label>
-                <span class="hint">This volume applies only to this sound card output.</span>
+                <span class="hint">Only for this sound card output.</span>
                 <fieldset>
                   <legend>Channels</legend>
                   <label id="settings_soundcard_channel_left_label" class="checkbox-row"><input id="settings_soundcard_channel_left" name="settings_soundcard_channel" type="radio" value="left"> Left</label>

@@ -131,8 +131,7 @@ class SettingsPageHandlerMixin:
             page = page_rendering.set_text(
                 page,
                 "remote_pairing_code_hint",
-                f"Enter this code on the other NWR Stream Manager before {expires}. It works for one device. "
-                "Pairing stays open until then, or until you select Stop pairing.",
+                f"Works for one device, until {expires}.",
             )
             page = page_rendering.set_text(page, "remote-pairing-status", "Refresh this page to see whether a device has paired.")
             return page_rendering.set_attribute(page, "remote-pairing-status", "data-pairing", "active")

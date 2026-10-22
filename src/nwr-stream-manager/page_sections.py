@@ -227,19 +227,16 @@ def stream_output_row_html(stream: dict[str, Any], output: dict[str, Any], statu
 
 STREAM_SERVICE_HELP_HTML = {
     STREAM_SERVICE_GWES: (
-        "If you do not yet have icecast credentials for streaming this station to this service, you'll need to "
-        '<a href="https://forms.office.com/r/MLx6hKmnCe" target="_blank" rel="noopener noreferrer">submit your stream</a> '
-        "to GWES Weather Radio and receive icecast credentials."
+        'No credentials yet? <a href="https://forms.office.com/r/MLx6hKmnCe" target="_blank" rel="noopener noreferrer">Submit your stream</a> '
+        "to GWES Weather Radio."
     ),
     STREAM_SERVICE_WEATHERUSA: (
-        "If you do not yet have icecast credentials for streaming this station to this service, you must "
-        '<a href="https://www.weatherusa.net/members/new" target="_blank" rel="noopener noreferrer">create an account on WeatherUSA</a> and '
-        '<a href="https://www.weatherusa.net/members/services/radio" target="_blank" rel="noopener noreferrer">create a stream</a>. '
-        "Once your stream is created, you must enter the icecast credentials into this page."
+        'No credentials yet? <a href="https://www.weatherusa.net/members/new" target="_blank" rel="noopener noreferrer">Create a WeatherUSA account</a>, '
+        'then <a href="https://www.weatherusa.net/members/services/radio" target="_blank" rel="noopener noreferrer">create a stream</a>.'
     ),
     STREAM_SERVICE_NWRORG: (
-        'Use the <a href="https://noaaweatherradio.org/N2radio-finder.php" target="_blank" rel="noopener noreferrer">'
-        "Weather Radio Station Lookup Utility</a> from NOAA Weather Radio Org to determine what the mountpoint should be."
+        'Find the mountpoint with the <a href="https://noaaweatherradio.org/N2radio-finder.php" target="_blank" rel="noopener noreferrer">'
+        "Weather Radio Station Lookup Utility</a>."
     ),
 }
 NWRORG_SUBMISSION_HTML = (
