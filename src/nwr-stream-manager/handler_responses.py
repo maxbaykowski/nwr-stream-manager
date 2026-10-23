@@ -26,6 +26,51 @@ LOG = logging.getLogger(__name__)
 HSTS_SECONDS = 365 * 24 * 60 * 60
 
 
+# What's left of a request's body once it's answered is read away, up to this much;
+# with more left than that, the connection is closed instead.
+LEFTOVER_BODY_LIMIT_BYTES = 64 * 1024
+
+
+class RequestBody:
+    """A request's body, and nothing after it.
+
+    One connection carries request after request. Whatever of a body a route leaves
+    unread would be taken for the start of the next request, which then fails, so
+    it's read away once the request is answered. Routes can't read past it either.
+    """
+
+    def __init__(self, stream: Any, length: int) -> None:
+        self.stream = stream
+        self.remaining = max(0, length)
+
+    def read(self, size: int | None = -1) -> bytes:
+        if size is None or size < 0 or size > self.remaining:
+            size = self.remaining
+        if size == 0:
+            return b""
+        data = self.stream.read(size)
+        self.remaining -= len(data)
+        return data
+
+    def readline(self, size: int | None = -1) -> bytes:
+        if size is None or size < 0 or size > self.remaining:
+            size = self.remaining
+        if size == 0:
+            return b""
+        data = self.stream.readline(size)
+        self.remaining -= len(data)
+        return data
+
+    def finish(self) -> bool:
+        """Reads away what's left. False if too much was left, so the connection has to close."""
+        if self.remaining > LEFTOVER_BODY_LIMIT_BYTES:
+            return False
+        while self.remaining:
+            if not self.read(min(self.remaining, 64 * 1024)):
+                return False
+        return True
+
+
 class ResponseHandlerMixin:
     """Mixed into RtlControlHandler."""
 

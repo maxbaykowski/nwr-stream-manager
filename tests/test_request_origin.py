@@ -228,6 +228,49 @@ class HttpsCookieTests(unittest.TestCase):
         self.assertIsNone(response.getheader("Strict-Transport-Security"))
 
 
+class LeftoverBodyTests(unittest.TestCase):
+    """A body a route doesn't read can't be taken for the next request on the same connection."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.wc = load_web_control_module()
+
+    def setUp(self) -> None:
+        RestartPageTests.setUp(self)  # type: ignore[arg-type]
+
+    def exchange(self, body_size: int) -> list[int]:
+        """A DELETE whose route ignores its body, then a GET, on one connection: the statuses that come back."""
+        auth = "Basic " + base64.b64encode(b"owner:password1").decode()
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        self.addCleanup(connection.close)
+        statuses = []
+        connection.request("DELETE", "/api/iq-recording?id=nothing", body=b"x" * body_size,
+                           headers={"Authorization": auth, "Content-Type": "application/json"})
+        response = connection.getresponse()
+        response.read()
+        statuses.append(response.status)
+        if response.will_close:
+            return statuses
+        connection.request("GET", "/api/account/me", headers={"Authorization": auth})
+        response = connection.getresponse()
+        response.read()
+        statuses.append(response.status)
+        return statuses
+
+    def test_the_next_request_is_answered_normally(self) -> None:
+        # The way the I/Q recorder's Stop once left "{}" behind, and the request after it failed.
+        first, then = self.exchange(2)
+        self.assertEqual(then, 200)
+
+    def test_a_large_leftover_closes_the_connection_instead(self) -> None:
+        # Closed rather than read: either the reply says so, or it closes while the rest is still being sent.
+        try:
+            statuses = self.exchange(200 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        self.assertEqual(len(statuses), 1)
+
+
 class SetupThroughProxyTests(unittest.TestCase):
     """The owner account can't be created through a tunnel, where anyone who found its address could."""
 

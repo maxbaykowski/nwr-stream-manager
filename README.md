@@ -26,6 +26,9 @@ need:
   Raspberry Pi OS, `soxr` on Fedora)
 - `libsndfile` runtime library for custom fallback announcements (`libsndfile1`
   on Debian and Raspberry Pi OS, `libsndfile` on Fedora)
+- `libmicrohttpd` runtime library for the web interface (`libmicrohttpd12` on
+  Debian and Raspberry Pi OS, `libmicrohttpd12t64` on newer Debian releases,
+  `libmicrohttpd` on Fedora)
 
 Then install the Python package directly from GitHub:
 
@@ -38,6 +41,10 @@ Run the web interface:
 ```bash
 nwr-stream-manager
 ```
+
+The web interface is served with GNU libmicrohttpd. It closes a connection that
+sends nothing for 60 seconds and accepts up to 256 connections at once, live
+audio included.
 
 The web interface will print the local and LAN URLs it is listening on. It
 listens on port 8080 on every network address unless you change that in

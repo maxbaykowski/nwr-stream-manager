@@ -147,7 +147,7 @@ from .handler_eas_pages import EasAlertPageHandlerMixin
 from .handler_iq_pages import IqRecorderPageHandlerMixin
 from .handler_live_audio import LiveAudioHandlerMixin
 from .handler_pages import PageHandlerMixin
-from .handler_responses import ResponseHandlerMixin
+from .handler_responses import RequestBody, ResponseHandlerMixin
 from .handler_settings_pages import SettingsPageHandlerMixin
 from .handler_stream_pages import StreamPageHandlerMixin
 from .icecast import IcecastSource
@@ -178,6 +178,7 @@ from .iq_recorder import (
     validate_iq_recording_duration,
 )
 from .live_audio import LiveAudioSource, LiveAudioWebSocketWriter
+from .microhttpd_server import MicrohttpdServer
 from .models import (
     IqFileSourceConfig,
     IqSampleBatch,
@@ -763,14 +764,27 @@ class RtlControlHandler(
 
     def _answer(self, method: str) -> None:
         """Answer a request with the method that ROUTES lists for it."""
-        parsed = urlparse(self.path)
-        if not self._auth_ok_or_setup_response(parsed.path, method):
-            return
-        name = self.ROUTES.get((method, parsed.path))
-        if name is None:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        getattr(self, name)(parsed)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            # Where this body ends, and so where the next request starts, can't be known.
+            self.close_connection = True
+            length = 0
+        stream, self.rfile = self.rfile, RequestBody(self.rfile, length)
+        body = self.rfile
+        try:
+            parsed = urlparse(self.path)
+            if not self._auth_ok_or_setup_response(parsed.path, method):
+                return
+            name = self.ROUTES.get((method, parsed.path))
+            if name is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            getattr(self, name)(parsed)
+        finally:
+            self.rfile = stream
+            if not self.close_connection and not body.finish():
+                self.close_connection = True
 
     @route("GET", "/")
     def _get_page(self, parsed: ParseResult) -> None:
@@ -959,7 +973,7 @@ def development_iq_sources_available(argv0: str | None = None) -> bool:
 
 
 def install_shutdown_signal_handlers(
-    server: ThreadingHTTPServer,
+    server: MicrohttpdServer,
     on_shutdown: Callable[[], None] | None = None,
 ) -> dict[int, Any]:
     if threading.current_thread() is not threading.main_thread():
@@ -985,7 +999,7 @@ def install_shutdown_signal_handlers(
     return previous_handlers
 
 
-def stop_web_server_soon(server: ThreadingHTTPServer) -> None:
+def stop_web_server_soon(server: MicrohttpdServer) -> None:
     # A moment first, so the page asking for a restart hears that it's happening.
     timer = threading.Timer(RESTART_RESPONSE_SECONDS, server.shutdown)
     timer.name = "http-shutdown"
@@ -1005,9 +1019,9 @@ class WebServerBindError(RuntimeError):
     """The web interface's address or port can't be used."""
 
 
-def bind_web_server(host: str, port: int) -> ThreadingHTTPServer:
+def bind_web_server(host: str, port: int) -> MicrohttpdServer:
     try:
-        return ThreadingHTTPServer((host, port), RtlControlHandler)
+        return MicrohttpdServer((host, port), RtlControlHandler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             message = (
