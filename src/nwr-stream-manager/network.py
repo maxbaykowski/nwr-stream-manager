@@ -35,7 +35,7 @@ TAILSCALE_SERVE_STATUS_TIMEOUT_SECONDS = 3.0
 # tailscale command that often.
 TAILSCALE_SERVE_CACHE_SECONDS = 30.0
 LOCAL_PROXY_HOSTS = {"127.0.0.1", "localhost", "::1"}
-_tailscale_serve_cache: dict[int, tuple[float, dict[str, Any] | None]] = {}
+_tailscale_serve_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
 _tailscale_serve_cache_lock = threading.Lock()
 DNS_TYPE_PTR = 12
 DNS_CLASS_IN = 1
@@ -190,9 +190,16 @@ def tailscale_serve_address(serve_status: dict[str, Any], port: int) -> dict[str
 
     serve_status is the output of `tailscale serve status --json`.
     """
+    addresses = tailscale_serve_addresses(serve_status, port)
+    return addresses[0] if addresses else None
+
+
+def tailscale_serve_addresses(serve_status: dict[str, Any], port: int) -> list[dict[str, Any]]:
+    """Every https address Tailscale Serve proxies to this NWR Stream Manager, and whether Funnel makes it public."""
+    found: list[dict[str, Any]] = []
     web = serve_status.get("Web") if isinstance(serve_status, dict) else None
     if not isinstance(web, dict):
-        return None
+        return found
     funnel = serve_status.get("AllowFunnel") if isinstance(serve_status.get("AllowFunnel"), dict) else {}
     for host_port, config in web.items():
         handlers = config.get("Handlers") if isinstance(config, dict) else None
@@ -215,17 +222,28 @@ def tailscale_serve_address(serve_status: dict[str, Any], port: int) -> dict[str
         if not host or not serve_port.isdigit():
             continue
         url = f"https://{host}" if serve_port == "443" else f"https://{host}:{serve_port}"
-        return {"url": url, "host": host, "public": bool(funnel.get(host_port))}
-    return None
+        found.append({"url": url, "host": host, "public": bool(funnel.get(host_port))})
+    return found
 
 
 def tailscale_serve_url_for_port(port: int) -> dict[str, Any] | None:
+    addresses = tailscale_serve_addresses_for_port(port)
+    return addresses[0] if addresses else None
+
+
+def tailscale_funnel_serves(host: str, port: int) -> bool:
+    """Whether Tailscale Funnel makes this name public on the internet, leading to this NWR Stream Manager."""
+    wanted = host.lower().rstrip(".")
+    return any(address["public"] and address["host"].lower().rstrip(".") == wanted for address in tailscale_serve_addresses_for_port(port))
+
+
+def tailscale_serve_addresses_for_port(port: int) -> list[dict[str, Any]]:
     now = time.monotonic()
     with _tailscale_serve_cache_lock:
         cached = _tailscale_serve_cache.get(port)
         if cached is not None and now - cached[0] < TAILSCALE_SERVE_CACHE_SECONDS:
             return cached[1]
-    found = None
+    found: list[dict[str, Any]] = []
     try:
         result = subprocess.run(
             ["tailscale", "serve", "status", "--json"],
@@ -235,9 +253,9 @@ def tailscale_serve_url_for_port(port: int) -> dict[str, Any] | None:
             check=False,
         )
         if result.returncode == 0 and result.stdout.strip():
-            found = tailscale_serve_address(json.loads(result.stdout), port)
+            found = tailscale_serve_addresses(json.loads(result.stdout), port)
     except (OSError, subprocess.SubprocessError, ValueError):
-        found = None  # Tailscale isn't installed, isn't running, or answered oddly.
+        found = []  # Tailscale isn't installed, isn't running, or answered oddly.
     with _tailscale_serve_cache_lock:
         _tailscale_serve_cache[port] = (now, found)
     return found
@@ -271,7 +289,11 @@ def notification_access_url_options(host: str, port: int) -> list[dict[str, str]
     seen_urls: set[str] = set()
     default_route_address = default_route_ipv4_address()
     # A secure Tailscale Serve address comes first, so Automatic uses it when there is one.
+    serve = tailscale_serve_url_for_port(port)
     serve_option = tailscale_serve_option(port)
+    # While Funnel makes the name public, browsers that open it are told to use HTTPS for that
+    # name from then on (HSTS), so the plain-HTTP MagicDNS address on it wouldn't load for them.
+    funnel_public = bool(serve and serve.get("public"))
     if host not in {"0.0.0.0", "::", ""}:
         url = f"http://{host}:{port}"
         bound = {"id": "auto", "label": f"Server bind address ({url})", "url": url, "interface": ""}
@@ -290,7 +312,7 @@ def notification_access_url_options(host: str, port: int) -> list[dict[str, str]
             lowered = name.lower()
             if lowered.startswith("tailscale"):
                 magicdns = tailscale_magicdns_name(address)
-                if magicdns:
+                if magicdns and not funnel_public:
                     magic_url = f"http://{magicdns}:{port}"
                     if magic_url not in seen_urls:
                         seen_urls.add(magic_url)

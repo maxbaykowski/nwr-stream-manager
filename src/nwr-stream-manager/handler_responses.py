@@ -15,7 +15,8 @@ from urllib.parse import parse_qs, ParseResult
 from . import page_rendering
 from .baseline_pages import HELP_AUDIO_FILES, HELP_FILE_NAME
 from .constants import MAX_JSON_REQUEST_BYTES
-from .request_origin import request_over_https
+from .network import tailscale_funnel_serves
+from .request_origin import browser_host_name, request_over_https
 from .simulated_station import asset_path
 from .state_files import http_header_filename
 
@@ -40,6 +41,19 @@ class ResponseHandlerMixin:
         headers = getattr(self, "headers", None)
         return headers is not None and request_over_https(headers)
 
+    def _hsts_wanted(self) -> bool:
+        """Whether to keep browsers on HTTPS for the name this request used.
+
+        A Tailscale name reached through Tailscale Serve is only reachable on the tailnet,
+        which Tailscale already encrypts, and the same name is often used over plain HTTP
+        on NWR Stream Manager's own port too, which HSTS would stop working. Through
+        Tailscale Funnel, the name is public on the internet, so it gets HSTS like any other.
+        """
+        host = browser_host_name(self.headers)
+        if host.endswith(".ts.net"):
+            return tailscale_funnel_serves(host, self.server.server_address[1])
+        return True
+
     def end_headers(self) -> None:
         # No page may show these pages in a frame, where another website could hide them
         # under its own and trick someone into selecting real buttons (clickjacking).
@@ -48,7 +62,7 @@ class ResponseHandlerMixin:
         self.send_header("X-Frame-Options", "DENY")
         # Each response is only ever what its Content-Type says, never guessed at by the browser.
         self.send_header("X-Content-Type-Options", "nosniff")
-        if self._over_https():
+        if self._over_https() and self._hsts_wanted():
             # Browsers use HTTPS for this address from then on, for a year, even if someone
             # types http:// or follows an old link, so nothing is ever sent unencrypted.
             # Only this address: a tunnel's address may share its domain with other sites.

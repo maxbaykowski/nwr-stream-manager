@@ -59,6 +59,8 @@ let stationResults = [];
 let selectedStationKey = "";
 let wizardStationOverride = null;
 let soundcardDevices = [];
+// Why sound cards can't be used, such as missing permission, or "" when they can.
+let soundcardProblem = "";
 let configuredStreams = [];
 let developmentIqSourcesEnabled = false;
 let editingStreamId = "";
@@ -1952,6 +1954,19 @@ function setSoundcardChannelOptions(prefix, stableId, ignoreOutputId = "") {
   }
 }
 
+// What the sound card choice says under it; the server says the same on pages without this script.
+function soundcardDeviceHint(chosen, configuredMissing = false) {
+  if (soundcardProblem && soundcardDevices.length === 0) return soundcardProblem;
+  if (configuredMissing) return "The configured sound card is not connected.";
+  if (chosen) return "Used directly, not shared with other programs.";
+  if (soundcardDevices.length) return "Every sound card's channels are in use.";
+  return "No sound cards found on this computer.";
+}
+
+function emptySoundcardOption() {
+  return {value: "", label: soundcardDevices.length ? "No sound cards with free channels" : "No sound cards found"};
+}
+
 function renderWizardSoundcardDevices() {
   const select = document.getElementById("wizard_soundcard_device");
   if (!select) return;
@@ -1963,17 +1978,14 @@ function renderWizardSoundcardDevices() {
       label: friendlySoundcardLabel(device)
     }));
   if (options.length === 0) {
-    options.push({value: "", label: "No sound cards found"});
+    options.push(emptySoundcardOption());
   }
   const signature = JSON.stringify(options);
   if (select.dataset.signature !== signature) {
     syncSelectOptions(select, options);
     select.dataset.signature = signature;
   }
-  setText(
-    "wizard_soundcard_device_hint",
-    options[0] && options[0].value ? "Used directly, not shared with other programs." : "No sound cards have available channels."
-  );
+  setText("wizard_soundcard_device_hint", soundcardDeviceHint(options[0] && options[0].value));
   const selectedStableId = select.value || "";
   setSoundcardChannelOptions("wizard", selectedStableId, ignoreOutputId);
 }
@@ -1992,7 +2004,7 @@ function renderSettingsSoundcardDevices(selectedStableId = "") {
     options.push({value: device.stable_id, label: friendlySoundcardLabel(device)});
   }
   if (options.length === 0) {
-    options.push({value: "", label: "No sound cards found"});
+    options.push(emptySoundcardOption());
   }
   const signature = JSON.stringify(options);
   if (select.dataset.signature !== signature) {
@@ -2002,11 +2014,7 @@ function renderSettingsSoundcardDevices(selectedStableId = "") {
   setValue("settings_soundcard_device", selectedStableId || (options[0] ? options[0].value : ""));
   setText(
     "settings_soundcard_device_hint",
-    selectedStableId && !selectedDevice
-      ? "The configured sound card is not connected."
-      : options[0] && options[0].value
-        ? "Used directly, not shared with other programs."
-        : "No sound cards have available channels."
+    soundcardDeviceHint(options[0] && options[0].value, Boolean(selectedStableId && !selectedDevice))
   );
   setSoundcardChannelOptions("settings", select.value || "", ignoreOutputId);
   updateSettingsSoundcardResetButton();
@@ -2082,6 +2090,7 @@ async function chooseActiveSdr(value) {
 async function loadDevices(selected, options = {}) {
   const data = await request("/api/devices");
   soundcardDevices = Array.isArray(data.soundcards) ? data.soundcards : [];
+  soundcardProblem = String(data.soundcard_problem || "");
   localSdrDevices = Array.isArray(data.devices) ? data.devices : [];
   configuredLocalSerial = selected || "";
   if (options.force) document.getElementById("serial").dataset.signature = "";

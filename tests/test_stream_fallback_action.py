@@ -326,5 +326,65 @@ class IcecastOutputHeldOffTests(unittest.TestCase):
             wait_for(lambda: writer.status == "enabled" and len(connections) == 2)
 
 
+class IcecastOutputRetryLogTests(unittest.TestCase):
+    """A server that stays down is logged once, not every few seconds, so the log stays readable."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def test_a_failure_that_repeats_is_logged_once_and_reconnecting_is_logged_too(self) -> None:
+        wc = self.web_control
+        module = sys.modules[wc.IcecastOutputWriter.__module__]
+        attempts = []
+
+        class Sink:
+            def write(self, data) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        class Source:
+            def __init__(self, config, content_type) -> None:
+                pass
+
+            def connect(self):
+                attempts.append(True)
+                if len(attempts) <= 4:
+                    raise ConnectionRefusedError(111, "Connection refused")
+                return Sink()
+
+            def close(self) -> None:
+                pass
+
+        encoder_group = types.SimpleNamespace(header=lambda: b"", add_output=lambda output: None, remove_output=lambda output: None)
+        runtime = types.SimpleNamespace(
+            id="stream-1",
+            lock=threading.Lock(),
+            icecast_disconnected=threading.Event(),
+            encoder_group_for=lambda config: encoder_group,
+            _stop_unused_encoder_groups=lambda: None,
+        )
+        output = {
+            "id": "icecast-1",
+            "type": "icecast",
+            "enabled": True,
+            "icecast": {"host": "icecast.example.com", "port": 8000, "mount": "/wxn99", "username": "source",
+                        "password": "secret", "format": "mp3", "sample_rate": 24000, "bitrate": 64},
+        }
+        with mock.patch.object(module, "IcecastSource", Source), mock.patch.object(module, "STREAM_RECONNECT_SECONDS", 0.05), \
+                self.assertLogs(module.LOG, level="DEBUG") as logs:
+            writer = wc.IcecastOutputWriter(runtime, output)
+            writer.start()
+            self.addCleanup(writer.stop)
+            wait_for(lambda: writer.status == "enabled")
+        warnings = [line for line in logs.output if line.startswith("WARNING")]
+        self.assertEqual(len(warnings), 1, logs.output)
+        self.assertIn("Icecast output failed for icecast-1", warnings[0])
+        self.assertEqual(sum("still failing" in line for line in logs.output), 3)
+        self.assertTrue(any("Icecast output icecast-1 reconnected" in line for line in logs.output))
+
+
 if __name__ == "__main__":
     unittest.main()

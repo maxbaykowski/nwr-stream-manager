@@ -446,6 +446,19 @@ def fill_icecast_fields(page: str, prefix: str, values: dict[str, str], service:
     return page
 
 
+def soundcard_device_hint(devices: list[dict[str, Any]], chosen: str, problem: str, configured_missing: bool = False) -> str:
+    """What the sound card choice says under it; the page script says the same."""
+    if problem and not devices:
+        return problem
+    if configured_missing:
+        return "The configured sound card is not connected."
+    if chosen:
+        return "Used directly, not shared with other programs."
+    if devices:
+        return "Every sound card's channels are in use."
+    return "No sound cards found on this computer."
+
+
 def soundcard_device_options_html(
     streams: list[dict[str, Any]], devices: list[dict[str, Any]], selected: str, ignore_output_id: str, keep_configured: bool
 ) -> tuple[str, str]:
@@ -462,7 +475,8 @@ def soundcard_device_options_html(
             continue
         options.append((stable_id, soundcard_label({"stable_id": stable_id}, devices), channels))
     if not options:
-        return '<option value="">No sound cards found</option>', ""
+        empty = "No sound cards with free channels" if devices else "No sound cards found"
+        return f'<option value="">{empty}</option>', ""
     chosen = selected if any(value == selected for value, _label, _channels in options) else options[0][0]
     return "".join(
         f'<option value="{html.escape(value)}" data-channels="{" ".join(channels)}"{" selected" if value == chosen else ""}>{html.escape(label)}</option>'

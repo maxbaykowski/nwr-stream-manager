@@ -78,6 +78,57 @@ class AlsaDiscoveryTests(unittest.TestCase):
             subdevices_available=1,
         )
 
+    def discover_default(self, library_cards: dict, listed_cards: dict, dev_snd: Path):
+        """Discovery as it runs for real: ALSA itself, then /proc/asound, with this /dev/snd."""
+        alsa = self.alsa
+        library = lambda: FakeAlsaBackend(alsa, library_cards, {index: [self.pcm()] for index in library_cards})
+        procfs = lambda: FakeAlsaBackend(alsa, listed_cards, {index: [self.pcm()] for index in listed_cards})
+        return alsa._discover_default(library, procfs, dev_snd)
+
+    def setUp(self) -> None:
+        self.alsa._last_discovery_outcome = ""
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.dev_snd = Path(tempdir.name) / "snd"
+        self.dev_snd.mkdir()
+
+    def test_no_sound_cards_is_said_once_not_every_look(self) -> None:
+        with self.assertLogs(self.alsa.LOG, level="INFO") as logs:
+            for _ in range(5):
+                self.assertEqual(self.discover_default({}, {}, self.dev_snd), [])
+            self.alsa.LOG.info("end")
+        self.assertEqual([line for line in logs.output if "no sound cards found" in line], ["INFO:nwr_stream_manager.alsa:no sound cards found"])
+        # A card appearing is a change, so it's logged.
+        with self.assertLogs(self.alsa.LOG, level="INFO") as logs:
+            self.assertEqual(len(self.discover_default({2: self.card(2)}, {}, self.dev_snd)), 1)
+        self.assertIn("found 1 sound card playback device(s)", logs.output[0])
+
+    @unittest.skipIf(hasattr(__import__("os"), "geteuid") and __import__("os").geteuid() == 0, "root can open any device")
+    def test_sound_cards_this_account_cant_open_are_a_permission_problem_not_none_found(self) -> None:
+        # ALSA skips a card it can't open, but /proc/asound still lists it.
+        control = self.dev_snd / "controlC2"
+        control.write_text("")
+        control.chmod(0o000)
+        self.addCleanup(control.chmod, 0o600)
+        with self.assertLogs(self.alsa.LOG, level="WARNING") as logs:
+            with self.assertRaises(self.alsa.SoundCardAccessError) as raised:
+                self.discover_default({}, {2: self.card(2)}, self.dev_snd)
+            with self.assertRaises(self.alsa.SoundCardAccessError):
+                self.discover_default({}, {2: self.card(2)}, self.dev_snd)
+        self.assertIn("isn't allowed to use this computer's sound cards", str(raised.exception))
+        self.assertIn("audio group", str(raised.exception))
+        self.assertIn(self.alsa._account_name(), str(raised.exception))
+        self.assertEqual(len(logs.output), 1)
+
+    def test_sound_cards_with_no_device_files_here_arent_available(self) -> None:
+        # As in a container that sees the computer's /proc/asound but not its /dev/snd.
+        with self.assertRaisesRegex(self.alsa.SoundCardAccessError, "aren't available to NWR Stream Manager"):
+            self.discover_default({}, {2: self.card(2)}, self.dev_snd)
+
+    def test_sound_cards_listed_only_in_proc_asound_are_still_offered_when_usable(self) -> None:
+        (self.dev_snd / "controlC2").write_text("")
+        self.assertEqual(len(self.discover_default({}, {2: self.card(2)}, self.dev_snd)), 1)
+
     def test_discovery_returns_hw_devices_not_plughw(self) -> None:
         backend = FakeAlsaBackend(self.alsa, {2: self.card(2)}, {2: [self.pcm()]})
 

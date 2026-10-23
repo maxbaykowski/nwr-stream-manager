@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from test_auth import load_web_control_module
@@ -202,6 +203,21 @@ class HttpsCookieTests(unittest.TestCase):
         response = self.get("/", password="wrong", X_Forwarded_Proto="https")
         self.assertEqual(response.status, 401)
         self.assertTrue(all(cookie.endswith("; Secure") for cookie in self.cookies(response)))
+
+    def test_tailscale_names_get_hsts_only_when_funnel_makes_them_public(self) -> None:
+        network = sys.modules["nwr_stream_manager.network"]
+        name = "max-pi5.example.ts.net"
+        serve_only = [{"url": f"https://{name}", "host": name, "public": False}]
+        funnel = [{"url": f"https://{name}", "host": name, "public": True}]
+        for addresses, expected in ((serve_only, None), (funnel, "max-age=31536000")):
+            with self.subTest(public=addresses[0]["public"]), mock.patch.object(network, "tailscale_serve_addresses_for_port", return_value=addresses):
+                response = self.get("/", X_Forwarded_Proto="https", Host=name, X_Forwarded_For="100.64.0.7")
+                self.assertEqual(response.getheader("Strict-Transport-Security"), expected)
+                # Cookies stay on HTTPS either way.
+                self.assertTrue(all(cookie.endswith("; Secure") for cookie in self.cookies(response)))
+        # Any other name reached over HTTPS, such as through Cloudflare Tunnel, gets it as before.
+        response = self.get("/", X_Forwarded_Proto="https", Host="radio.example.com")
+        self.assertEqual(response.getheader("Strict-Transport-Security"), "max-age=31536000")
 
     def test_over_plain_http_cookies_still_work(self) -> None:
         response = self.get("/")

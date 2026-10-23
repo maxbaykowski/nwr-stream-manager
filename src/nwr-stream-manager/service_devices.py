@@ -60,8 +60,8 @@ class DeviceServiceMixin:
             errors.append(f"librtlsdr probe failed: {snapshot.error('rtl')}")
         if snapshot.error("rtl_usb"):
             errors.append(f"USB probe failed: {snapshot.error('rtl_usb')}")
-        if snapshot.error("alsa_playback"):
-            errors.append(f"ALSA probe failed: {snapshot.error('alsa_playback')}")
+        # Shown with the sound card choices, where it matters, rather than with the RTL-SDR's.
+        soundcard_problem = snapshot.error("alsa_playback")
 
         by_serial: dict[str, dict[str, Any]] = {}
         for device in usb_devices:
@@ -97,6 +97,7 @@ class DeviceServiceMixin:
         return {
             "devices": devices,
             "soundcards": soundcard_payloads,
+            "soundcard_problem": soundcard_problem,
             "errors": errors,
             "probed_at": snapshot.probed_at,
         }

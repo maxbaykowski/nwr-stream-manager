@@ -1399,6 +1399,8 @@ class IcecastOutputWriter:
 
     def _run(self) -> None:
         disconnected = getattr(self.runtime, "icecast_disconnected", None)
+        # The last connection failure logged, so the same one isn't logged again on every retry.
+        last_failure = ""
         while not self.stop_event.is_set():
             if disconnected is not None and disconnected.is_set():
                 # The stream's fallback action: stay off the Icecast server until
@@ -1420,6 +1422,9 @@ class IcecastOutputWriter:
                     sink.write(header)
                 encoder_group.add_output(self)
                 self._set_status("enabled")
+                if last_failure:
+                    LOG.info("Icecast output %s reconnected", self.output.get("id"))
+                    last_failure = ""
                 while not self.stop_event.is_set():
                     if disconnected is not None and disconnected.is_set():
                         LOG.info("disconnected Icecast output %s until station audio returns", self.output.get("id"))
@@ -1436,7 +1441,14 @@ class IcecastOutputWriter:
                 if self.stop_event.is_set():
                     break
                 self._set_status("needs-attention", friendly_stream_error(exc))
-                LOG.warning("Icecast output failed for %s: %s", self.output.get("id"), exc)
+                # Retried every few seconds: said once, and again only if it fails differently,
+                # so a server that stays down doesn't push everything else out of the log.
+                failure = str(exc)
+                if failure != last_failure:
+                    LOG.warning("Icecast output failed for %s: %s", self.output.get("id"), exc)
+                else:
+                    LOG.debug("Icecast output still failing for %s: %s", self.output.get("id"), exc)
+                last_failure = failure
                 self.stop_event.wait(STREAM_RECONNECT_SECONDS)
             finally:
                 if encoder_group is not None:

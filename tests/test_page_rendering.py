@@ -1967,3 +1967,32 @@ class DashboardPageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SoundcardHintTests(unittest.TestCase):
+    """What the sound card choice says under it, without the page script; the page script says the same."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        load_web_control_module()
+        import sys
+
+        cls.sections = sys.modules["nwr_stream_manager.page_sections"]
+
+    def test_each_reason_for_no_choice_is_told_apart(self) -> None:
+        hint = self.sections.soundcard_device_hint
+        card = {"stable_id": "usb-1234"}
+        problem = "NWR Stream Manager isn't allowed to use this computer's sound cards."
+        self.assertEqual(hint([], "", ""), "No sound cards found on this computer.")
+        self.assertEqual(hint([], "", problem), problem)
+        self.assertEqual(hint([card], "", ""), "Every sound card's channels are in use.")
+        self.assertEqual(hint([card], "usb-1234", ""), "Used directly, not shared with other programs.")
+        self.assertEqual(hint([], "usb-1234", "", True), "The configured sound card is not connected.")
+        # Without permission no card is listed, so the configured one shows the real reason.
+        self.assertEqual(hint([], "usb-1234", problem, True), problem)
+
+    def test_the_empty_choice_says_whether_there_are_any_sound_cards(self) -> None:
+        options = self.sections.soundcard_device_options_html
+        self.assertIn("No sound cards found", options([], [], "", "", False)[0])
+        stream = {"outputs": [{"type": "soundcard", "enabled": True, "soundcard": {"stable_id": "usb-1234", "channel_mode": "both"}}]}
+        self.assertIn("No sound cards with free channels", options([stream], [{"stable_id": "usb-1234"}], "", "", False)[0])

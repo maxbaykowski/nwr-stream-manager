@@ -3,6 +3,8 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
+import os
+import pwd
 import re
 import threading
 import time
@@ -60,6 +62,10 @@ ALSA_PLAYBACK_FORMATS = (
 
 class AlsaError(RuntimeError):
     """Raised when ALSA hardware discovery cannot be completed."""
+
+
+class SoundCardAccessError(AlsaError):
+    """The computer has sound cards, but NWR Stream Manager can't use them."""
 
 
 @dataclass(frozen=True)
@@ -130,18 +136,84 @@ class AlsaDiscoveryBackend(Protocol):
         ...
 
 
+DEV_SND_ROOT = Path("/dev/snd")
+
+# What discovery last found, so each change is logged once rather than on every look.
+_last_discovery_outcome = ""
+_discovery_outcome_lock = threading.Lock()
+
+
 def discover_playback_devices(
     backend: AlsaDiscoveryBackend | None = None,
 ) -> list[AlsaPlaybackDevice]:
+    """The sound cards that can play audio.
+
+    Raises SoundCardAccessError when the computer has sound cards this account isn't allowed to use.
+    """
     if backend is None:
-        devices = _discover_with_backend(CtypesAlsaBackend())
-        if devices:
-            return devices
-        LOG.info(
-            "ALSA libasound discovery returned no playback devices; falling back to /proc/asound"
-        )
-        return _discover_with_backend(ProcfsAlsaBackend())
+        return _discover_default(CtypesAlsaBackend, ProcfsAlsaBackend, DEV_SND_ROOT)
     return _discover_with_backend(backend)
+
+
+def _discover_default(
+    library_backend: Callable[[], AlsaDiscoveryBackend],
+    procfs_backend: Callable[[], AlsaDiscoveryBackend],
+    dev_snd_root: Path,
+) -> list[AlsaPlaybackDevice]:
+    devices = _discover_with_backend(library_backend())
+    if devices:
+        _note_discovery_outcome(f"found {len(devices)}", logging.INFO, f"found {len(devices)} sound card playback device(s)")
+        return devices
+    # ALSA skips a card whose control device this account can't open, as if it weren't
+    # there. /proc/asound lists every card to anyone, so it tells the two apart.
+    listed = _discover_with_backend(procfs_backend())
+    if not listed:
+        _note_discovery_outcome("none", logging.INFO, "no sound cards found")
+        return []
+    problem = sound_card_access_problem(sorted({device.card_index for device in listed}), dev_snd_root)
+    if problem:
+        _note_discovery_outcome(problem, logging.WARNING, problem)
+        raise SoundCardAccessError(problem)
+    _note_discovery_outcome(
+        f"listed {len(listed)}", logging.INFO, f"found {len(listed)} sound card playback device(s) in /proc/asound only"
+    )
+    return listed
+
+
+def sound_card_access_problem(card_indices: list[int], dev_snd_root: Path = DEV_SND_ROOT) -> str:
+    """Why these sound cards can't be used by this account, or "" if they can."""
+    denied = False
+    missing = False
+    for card_index in card_indices:
+        control = dev_snd_root / f"controlC{int(card_index)}"
+        if not control.exists():
+            missing = True
+        elif not os.access(control, os.R_OK | os.W_OK):
+            denied = True
+    if denied:
+        return (
+            f"NWR Stream Manager isn't allowed to use this computer's sound cards. Add the account it runs as "
+            f"({_account_name()}) to the audio group, then restart NWR Stream Manager."
+        )
+    if missing:
+        return f"This computer's sound cards aren't available to NWR Stream Manager: {dev_snd_root} doesn't have them."
+    return ""
+
+
+def _account_name() -> str:
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (KeyError, OSError):
+        return str(os.geteuid())
+
+
+def _note_discovery_outcome(outcome: str, level: int, message: str) -> None:
+    global _last_discovery_outcome
+    with _discovery_outcome_lock:
+        if outcome == _last_discovery_outcome:
+            return
+        _last_discovery_outcome = outcome
+    LOG.log(level, "%s", message)
 
 
 def _discover_with_backend(backend: AlsaDiscoveryBackend) -> list[AlsaPlaybackDevice]:

@@ -53,6 +53,16 @@ def request_over_https(headers: Mapping[str, str]) -> bool:
     return '"https"' in str(headers.get("CF-Visitor", "")).replace(" ", "").lower()
 
 
+def browser_host_name(headers: Mapping[str, str]) -> str:
+    """The name the browser used for this server, as a tunnel or proxy passes it on, without the port."""
+    for header in ("X-Forwarded-Host", "Host"):
+        value = str(headers.get(header, "")).split(",", 1)[0].strip()
+        found = host_header_address(value) if value else None
+        if found is not None:
+            return found[0]
+    return ""
+
+
 def request_through_proxy(headers: Mapping[str, str]) -> bool:
     """Whether a request came through a tunnel or proxy rather than straight from the browser.
 

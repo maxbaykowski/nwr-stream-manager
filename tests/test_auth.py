@@ -1212,6 +1212,39 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(options[0]["label"], "Tailscale Serve (https://max-pi5.example.ts.net)")
         self.assertTrue(any(option["url"] == "http://100.108.97.122:8080" for option in options))
 
+    def test_while_funnel_makes_the_name_public_the_plain_magicdns_address_isnt_offered(self) -> None:
+        # Browsers that open the Funnel address are kept on HTTPS for that name, so its plain-HTTP address wouldn't load.
+        serve = {"url": "https://max-pi5.example.ts.net", "host": "max-pi5.example.ts.net", "public": True}
+        with (
+            patch.object(self.network, "tailscale_serve_url_for_port", return_value=serve),
+            patch.object(self.web_control.socket, "if_nameindex", return_value=[(1, "tailscale0")]),
+            patch.object(self.network, "interface_is_up", return_value=True),
+            patch.object(self.network, "interface_is_physical_or_tailscale", return_value=True),
+            patch.object(self.network, "interface_ipv4_address", return_value="100.108.97.122"),
+            patch.object(self.network, "tailscale_magicdns_name", return_value="max-pi5.example.ts.net"),
+        ):
+            options = self.web_control.notification_access_url_options("0.0.0.0", 8080)
+
+        self.assertEqual(options[0]["url"], "https://max-pi5.example.ts.net")
+        self.assertFalse(any(option["id"].startswith("tailscale-magicdns:") for option in options))
+        self.assertTrue(any(option["url"] == "http://100.108.97.122:8080" for option in options))
+
+    def test_funnel_is_told_apart_for_each_name_that_leads_here(self) -> None:
+        status = {
+            "Web": {
+                "max-pi5.example.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080"}}},
+                "max-pi5.example.ts.net:8443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080"}}},
+            },
+            "AllowFunnel": {"max-pi5.example.ts.net:8443": True},
+        }
+        addresses = self.network.tailscale_serve_addresses(status, 8080)
+        self.assertEqual([address["public"] for address in addresses], [False, True])
+        with patch.object(self.network, "tailscale_serve_addresses_for_port", return_value=addresses):
+            self.assertTrue(self.network.tailscale_funnel_serves("MAX-PI5.example.ts.net", 8080))
+            self.assertFalse(self.network.tailscale_funnel_serves("other.example.ts.net", 8080))
+        with patch.object(self.network, "tailscale_serve_addresses_for_port", return_value=addresses[:1]):
+            self.assertFalse(self.network.tailscale_funnel_serves("max-pi5.example.ts.net", 8080))
+
     def test_notification_access_urls_include_tailscale_magicdns_when_detected(self) -> None:
         with (
             patch.object(self.network, "tailscale_serve_url_for_port", return_value=None),

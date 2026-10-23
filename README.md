@@ -119,6 +119,13 @@ When a tunnel or proxy reports that the browser connected over HTTPS
 for that address for a year, so don't later serve the same address over plain
 HTTP. Plain HTTP on the local network is unaffected.
 
+Tailscale names (`.ts.net`) only get HSTS through Tailscale Funnel, which makes
+them public on the internet. Through Tailscale Serve alone they're reachable only
+on the tailnet, which Tailscale already encrypts, so the same name keeps working
+over plain HTTP on NWR Stream Manager's own port (`http://name.ts.net:8080`).
+While Funnel is on, that plain-HTTP MagicDNS address isn't offered for
+notifications, since browsers that opened the Funnel address won't load it.
+
 Account types:
 
 - Owner: the first account created. It can manage all accounts.

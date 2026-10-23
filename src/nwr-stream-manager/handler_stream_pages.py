@@ -37,6 +37,7 @@ from .page_sections import (
     icecast_service,
     NWRORG_SUBMISSION_HTML,
     RECEPTION_PROBLEM_DETAILS,
+    soundcard_device_hint,
     soundcard_device_options_html,
     soundcard_label,
     station_choice_label,
@@ -265,11 +266,8 @@ class StreamPageHandlerMixin:
             options, chosen = soundcard_device_options_html(self.service.streams, soundcards, values["stable_id"], output_id, True)
             page = page_rendering.set_content(page, "settings_soundcard_device", options)
             connected = any(device.get("stable_id") == values["stable_id"] for device in soundcards)
-            hint = (
-                "The configured sound card is not connected." if values["stable_id"] and not connected
-                else "Used directly, not shared with other programs." if chosen
-                else "No sound cards have available channels."
-            )
+            problem = str(self.service.devices().get("soundcard_problem") or "")
+            hint = soundcard_device_hint(soundcards, chosen, problem, bool(values["stable_id"]) and not connected)
             page = page_rendering.set_text(page, "settings_soundcard_device_hint", hint)
             page = fill_soundcard_channels(page, "settings", available_soundcard_channels(self.service.streams, chosen, output_id), values["channel_mode"])
             page = page_rendering.set_attribute(page, "settings_soundcard_volume", "value", values["volume"])
@@ -491,9 +489,12 @@ class StreamPageHandlerMixin:
         for value in ("icecast", "soundcard"):
             page = page_rendering.set_attribute(page, f"wizard_output_type_{value}", "checked", "checked" if state["output_type"] == value else None)
         page = fill_icecast_fields(page, "icecast", state, state["service"], station)
-        options, chosen = soundcard_device_options_html(self.service.streams, list(self.service.devices().get("soundcards") or []), state["stable_id"], state["output_id"], False)
+        found = self.service.devices()
+        soundcards = list(found.get("soundcards") or [])
+        options, chosen = soundcard_device_options_html(self.service.streams, soundcards, state["stable_id"], state["output_id"], False)
         page = page_rendering.set_content(page, "wizard_soundcard_device", options)
-        page = page_rendering.set_text(page, "wizard_soundcard_device_hint", "Used directly, not shared with other programs." if chosen else "No sound cards have available channels.")
+        hint = soundcard_device_hint(soundcards, chosen, str(found.get("soundcard_problem") or ""))
+        page = page_rendering.set_text(page, "wizard_soundcard_device_hint", hint)
         page = fill_soundcard_channels(page, "wizard", available_soundcard_channels(self.service.streams, chosen, state["output_id"]), state["channel_mode"])
         page = page_rendering.set_attribute(page, "wizard_soundcard_volume", "value", state["volume"])
         if state["preview_id"]:
