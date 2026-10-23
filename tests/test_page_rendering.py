@@ -133,7 +133,7 @@ class AccountDateTests(unittest.TestCase):
     def test_dates_read_as_the_page_script_shows_them(self) -> None:
         wc = load_web_control_module()
         self.assertEqual(wc.format_account_date(None), "Never")
-        self.assertRegex(wc.format_account_date(1792375834), r"^[A-Z][a-z]+ \d{1,2}, \d{4}$")
+        self.assertRegex(wc.format_account_date(1792375834), r"^[A-Z][a-z]+ \d{1,2}, \d{4}, \d{1,2}:\d{2} [AP]M \S+$")
 
 
 class StandInService(types.SimpleNamespace):

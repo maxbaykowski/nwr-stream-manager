@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import html
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 
 from . import __version__ as APP_VERSION
 from . import page_rendering, pages
 from .constants import IQ_RECORDER_MODE_STREAM
+from .eas_alerts import format_local_datetime
 
 
 HELP_PATH = "/help"
@@ -177,8 +178,7 @@ def format_account_date(epoch_seconds: Any) -> str:
         seconds = 0
     if not seconds:
         return "Never"
-    moment = datetime.fromtimestamp(seconds)
-    return f"{moment:%B} {moment.day}, {moment.year}"
+    return format_local_datetime(datetime.fromtimestamp(seconds, timezone.utc))
 
 
 SIGN_IN_REQUIRED_HTML = """<!doctype html>

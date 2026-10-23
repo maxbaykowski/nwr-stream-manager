@@ -5845,7 +5845,10 @@ function accountIsReadOnly() {
 function formatAccountDate(epochSeconds) {
   const seconds = Number(epochSeconds || 0);
   if (!seconds) return "Never";
-  return new Intl.DateTimeFormat(undefined, {month: "long", day: "numeric", year: "numeric"}).format(new Date(seconds * 1000));
+  const moment = new Date(seconds * 1000);
+  const date = new Intl.DateTimeFormat(undefined, {month: "long", day: "numeric", year: "numeric"}).format(moment);
+  const time = moment.toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit", timeZoneName: "short"});
+  return `${date}, ${time}`;
 }
 
 function setAccountResult(message, kind = "") {
