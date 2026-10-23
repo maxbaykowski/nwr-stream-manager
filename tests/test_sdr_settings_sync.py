@@ -11,6 +11,8 @@ from test_live_audio_playback import load_web_control_module
 
 
 PAGE_FUNCTIONS = (
+    # Status updates also keep General's uptime current.
+    "formatUptime",
     "controlSignature",
     "numberFieldIsBeingTyped",
     "sdrSettingIsBeingChanged",

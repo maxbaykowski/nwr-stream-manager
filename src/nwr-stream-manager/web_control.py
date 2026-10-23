@@ -601,6 +601,10 @@ class RtlControlService(
             self._cleanup_expired_soundcard_previews()
             self._cleanup_expired_stream_test_mode()
 
+    def uptime_seconds(self) -> float:
+        """How long this run of NWR Stream Manager has been running."""
+        return time.monotonic() - self.started_at
+
     def status(self, *, read_only: bool = False) -> dict[str, Any]:
         self._cleanup_expired_soundcard_previews()
         with self.lock:
@@ -699,7 +703,7 @@ class RtlControlService(
                 "logs": self.log_handler.snapshot()[-80:],
                 "instance_name": self.general.instance_name,
                 "location": self.general.location,
-                "uptime_seconds": time.monotonic() - self.started_at,
+                "uptime_seconds": self.uptime_seconds(),
                 "capabilities": {
                     "development_iq_sources": self.development_iq_sources_enabled,
                 },

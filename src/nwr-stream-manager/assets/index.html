@@ -153,8 +153,6 @@ __INDEX_STYLES__</style>
     <section id="dashboard_sdr_section">
       <h2>Configured SDR</h2>
       <p id="dashboard_location" hidden>Location: <span id="summary_location"></span></p>
-      <p>Version: __APP_VERSION__</p>
-      <p>Uptime: <span id="summary_uptime">less than a minute</span></p>
       <p id="dashboard_sdr_attention" class="status-text status-needs-attention" hidden>RTL-SDR requires attention. Check the SDR immediately.</p>
       <dl id="dashboard_sdr_details" class="details-list">
         <dt>Source</dt><dd id="summary_source">RTL-SDR</dd>
@@ -480,6 +478,8 @@ __INDEX_STYLES__</style>
               </div>
             </form>
             <div id="general-result" class="message" aria-live="polite"></div>
+            <p>Version: __APP_VERSION__</p>
+            <p>Uptime: <span id="general_uptime">less than a minute</span></p>
           </div>
           <div id="settings_panel_accounts" class="settings-panel" hidden>
             <div id="settings_accounts_page">

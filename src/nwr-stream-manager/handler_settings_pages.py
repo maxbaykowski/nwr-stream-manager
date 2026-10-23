@@ -24,6 +24,7 @@ from .custom_fallback_audio import MAX_CUSTOM_FALLBACK_BYTES
 from .iq_recorder import format_duration_hms
 from .page_sections import (
     active_sdr_choices,
+    format_uptime,
     format_gain,
     generate_notification_topic,
     notification_access_url_options_html,
@@ -521,6 +522,9 @@ class SettingsPageHandlerMixin:
             loaded = {name: form.get(f"was_{name}", value) for name, value in loaded.items()}
         page = page_rendering.set_attribute(page, "general_instance_name", "value", shown["instance_name"])
         page = page_rendering.set_attribute(page, "general_location", "value", shown["location"])
+        uptime = self.service.uptime_seconds()
+        if isinstance(uptime, (int, float)):
+            page = page_rendering.set_text(page, "general_uptime", format_uptime(uptime))
         return page_rendering.append_content(
             page,
             "general_settings_form",

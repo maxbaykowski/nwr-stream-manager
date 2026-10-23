@@ -8204,7 +8204,6 @@ function renderDashboardSdr(data) {
   const location = String(data.location || "");
   setText("summary_location", location);
   setHidden("dashboard_location", !location);
-  setText("summary_uptime", formatUptime(data.uptime_seconds));
   if (attentionElement) attentionElement.hidden = !attention;
   if (detailsElement) detailsElement.hidden = attention;
   if (attention) return;
@@ -9080,6 +9079,7 @@ function applyStatus(data, options = {}) {
     setStreamTestModeStatus(data.test_mode || {});
     syncConfiguredStreamsFromStatus(data);
     updateDashboard(data);
+    setText("general_uptime", formatUptime(data.uptime_seconds));
     const now = Date.now();
     if (now - lastEasAlertRefreshAt > 10000) {
       lastEasAlertRefreshAt = now;

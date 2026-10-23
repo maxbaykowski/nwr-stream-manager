@@ -848,7 +848,6 @@ def dashboard_parts(status: dict[str, Any], sdr_label: str, read_only: bool, now
     hidden = {"dashboard_sdr_attention": not attention, "dashboard_sdr_details": attention, "dashboard_configure_sdr": read_only}
     location = str(status.get("location") or "")
     text["summary_location"] = location
-    text["summary_uptime"] = format_uptime(status.get("uptime_seconds"))
     hidden["dashboard_location"] = not location
     strength = f"{settings.get('alias_filter_strength', 100)}%"
     capture = "active" if status.get("active") else "inactive"

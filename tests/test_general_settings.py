@@ -78,7 +78,7 @@ class DashboardLocationTests(unittest.TestCase):
         self.assertTrue(parts({}, "none", True, 0)["hidden"]["dashboard_location"])
 
 
-class DashboardUptimeTests(unittest.TestCase):
+class UptimeTests(unittest.TestCase):
     CASES = {0: "less than a minute", 59: "less than a minute", 60: "1 minute", 3600: "1 hour", 3660: "1 hour, 1 minute",
              86460: "1 day, 1 minute", 2 * 86400 + 7 * 3600 + 5 * 60 + 59: "2 days, 7 hours, 5 minutes"}
 
@@ -90,7 +90,6 @@ class DashboardUptimeTests(unittest.TestCase):
     def test_uptime_reads_in_days_hours_and_minutes(self) -> None:
         for seconds, text in self.CASES.items():
             self.assertEqual(self.sections.format_uptime(seconds), text, seconds)
-        self.assertEqual(self.sections.dashboard_parts({"uptime_seconds": 7260}, "none", False, 0)["text"]["summary_uptime"], "2 hours, 1 minute")
 
     def test_the_page_script_says_it_the_same_way(self) -> None:
         import shutil, subprocess
@@ -103,13 +102,19 @@ class DashboardUptimeTests(unittest.TestCase):
         result = subprocess.run([node, "-e", program], capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(result.stdout), list(self.CASES.values()))
 
-    def test_the_dashboard_shows_the_version_below_the_location(self) -> None:
+    def test_general_settings_shows_the_version_and_uptime_below_its_form(self) -> None:
         page = self.wc.INDEX_HTML
         version = sys.modules["nwr_stream_manager"].__version__
-        location = page.index('id="dashboard_location"')
-        self.assertLess(location, page.index(f"<p>Version: {version}</p>"))
-        self.assertLess(page.index(f"<p>Version: {version}</p>"), page.index('<p>Uptime: <span id="summary_uptime">'))
-        self.assertLess(page.index('id="summary_uptime"'), page.index('id="dashboard_sdr_details"'))
+        general = page.index('id="settings_panel_general"')
+        version_at = page.index(f"<p>Version: {version}</p>")
+        self.assertLess(general, page.index('id="general-result"'))
+        self.assertLess(page.index('id="general-result"'), version_at)
+        self.assertLess(version_at, page.index('<p>Uptime: <span id="general_uptime">'))
+        self.assertLess(page.index('id="general_uptime"'), page.index('id="settings_panel_accounts"'))
+        # No longer on the dashboard.
+        dashboard = page[page.index('id="view_dashboard"'):page.index('id="dashboard_sdr_details"')]
+        self.assertNotIn("Version:", dashboard)
+        self.assertNotIn("Uptime:", dashboard)
 
 
 class InstanceNameInNotificationsTests(unittest.TestCase):
