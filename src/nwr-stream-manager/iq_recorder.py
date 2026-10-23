@@ -6,8 +6,11 @@ import json
 import logging
 import os
 import queue
+import struct
+import tarfile
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +55,7 @@ from .iq_pipeline import (
 from .rtl import NWR_CENTER_FREQUENCY_HZ, RtlSampleBatch
 from .state_files import atomic_write_json
 from .storage import storage_status_message, StorageMonitor
+from .version import package_version
 
 
 LOG = logging.getLogger(__name__)
@@ -395,6 +399,9 @@ def iq_recording_summary(recording: dict[str, Any]) -> dict[str, Any]:
         "mode": str(recording.get("mode", "")),
         "stream_label": str(recording.get("stream_label", "")),
         "bytes": int(recording.get("bytes", 0) or 0),
+        "download_formats": iq_download_formats(
+            int(recording.get("bytes", 0) or 0), int(recording.get("sample_rate", 0) or 0)
+        ),
     }
 
 
@@ -406,6 +413,27 @@ def format_duration_hms(seconds: float) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{remaining:02d}"
     return f"{minutes}:{remaining:02d}"
+
+
+# Each download format, as offered on the download page.
+IQ_DOWNLOAD_FORMATS = (
+    ("cf", "Float 32 bit raw"),
+    ("s16", "Signed 16 bit raw"),
+    ("u8", "Unsigned 8-bit raw"),
+    ("wav_cf", "Float 32 bit WAV"),
+    ("wav_s16", "Signed 16 bit WAV"),
+    ("wav_u8", "Unsigned 8-bit WAV"),
+    ("sdriq", "Signed 16 bit SDRangel"),
+    ("sigmf_cf", "Float 32 bit SigMF"),
+    ("sigmf_s16", "Signed 16 bit SigMF"),
+    ("sigmf_u8", "Unsigned 8-bit SigMF"),
+)
+IQ_SAMPLE_BYTES = {"cf": 4, "s16": 2, "u8": 1}
+# A WAV file gives its own size in 32 bits, so it can't be any larger than this
+# (less the 8 bytes that come before that size).
+WAV_MAX_FILE_BYTES = 0xFFFFFFFF + 8
+# Unsigned 8-bit WAV is mainly for SDR Touch, which only plays these rates at the right pitch.
+WAV_U8_SAMPLE_RATES = (256_000, 512_000, 1_024_000)
 
 
 def validate_iq_download_format(raw: Any) -> str:
@@ -420,22 +448,222 @@ def validate_iq_download_format(raw: Any) -> str:
         "uint8": "u8",
     }
     fmt = aliases.get(fmt, fmt)
-    if fmt not in {"cf", "s16", "u8"}:
+    if fmt not in dict(IQ_DOWNLOAD_FORMATS):
         raise ValueError("select a valid I/Q download format")
     return fmt
 
 
-def iq_recording_download_size(path: Path, fmt: str) -> int:
+def iq_sample_format(fmt: str) -> str:
+    """The sample format of a download format, whatever file it's in."""
+    if fmt == "sdriq":
+        return "s16"
+    return fmt.removeprefix("wav_").removeprefix("sigmf_")
+
+
+def _systemtime(epoch_seconds: float) -> bytes:
+    """A time as Windows' SYSTEMTIME, in local time, the way SDRangel writes the auxi chunk."""
+    moment = datetime.fromtimestamp(max(0.0, epoch_seconds), timezone.utc).astimezone()
+    return struct.pack(
+        "<8H",
+        moment.year,
+        moment.month,
+        moment.isoweekday() % 7,
+        moment.day,
+        moment.hour,
+        moment.minute,
+        moment.second,
+        moment.microsecond // 1000,
+    )
+
+
+def iq_wav_auxi_chunk(recording: dict[str, Any]) -> bytes:
+    """The "auxi" chunk SDR#, HDSDR and SpectraVue read a WAV file's centre frequency and times from."""
+    started_at = float(recording.get("started_at", 0.0) or 0.0)
+    stopped_at = float(recording.get("stopped_at", 0.0) or 0.0) or started_at + float(
+        recording.get("duration_seconds", 0.0) or 0.0
+    )
+    frequency_hz = int(recording.get("frequency_hz", NWR_CENTER_FREQUENCY_HZ) or NWR_CENTER_FREQUENCY_HZ)
+    sample_rate = int(recording.get("sample_rate", 0) or 0)
+    payload = (
+        _systemtime(started_at)
+        + _systemtime(stopped_at)
+        # Centre frequency, A/D sample rate, IF frequency, bandwidth, I/Q offset and four unused fields.
+        + struct.pack("<9I", frequency_hz, sample_rate, 0, 0, 0, 0, 0, 0, 0)
+        # HDSDR's name for the next file of a split recording; there's never one.
+        + bytes(96)
+    )
+    return b"auxi" + struct.pack("<I", len(payload)) + payload
+
+
+def _wav_size(size: int) -> int:
+    # A header for a file too large for WAV is only ever measured, never sent: such a
+    # download is refused (see iq_download_format_problem).
+    return min(size, 0xFFFFFFFF)
+
+
+def iq_wav_header(fmt: str, recording: dict[str, Any], data_bytes: int) -> bytes:
+    """A WAV header for I/Q samples: I in the left channel, Q in the right."""
+    sample_rate = int(recording.get("sample_rate", 0) or 0)
+    sample_bytes = IQ_SAMPLE_BYTES[iq_sample_format(fmt)]
+    block = 2 * sample_bytes
+    float_samples = iq_sample_format(fmt) == "cf"
+    fmt_chunk = struct.pack(
+        "<HHIIHH", 3 if float_samples else 1, 2, sample_rate, sample_rate * block, block, sample_bytes * 8
+    )
+    chunks = b""
+    if float_samples:
+        # Formats other than plain PCM have an extra size field and a "fact" chunk.
+        fmt_chunk += struct.pack("<H", 0)
+        chunks = b"fact" + struct.pack("<II", 4, _wav_size(data_bytes // block))
+    chunks = (
+        b"fmt "
+        + struct.pack("<I", len(fmt_chunk))
+        + fmt_chunk
+        + chunks
+        + iq_wav_auxi_chunk(recording)
+        + b"data"
+        + struct.pack("<I", _wav_size(data_bytes))
+    )
+    return b"RIFF" + struct.pack("<I", _wav_size(4 + len(chunks) + data_bytes)) + b"WAVE" + chunks
+
+
+def iq_sdriq_header(recording: dict[str, Any]) -> bytes:
+    """The header of SDRangel's .sdriq file, as its FileRecord writes it.
+
+    Sample rate, centre frequency, start time (milliseconds since 1970), sample size
+    (16 bit; the samples are signed 16 bit I/Q pairs), a filler, then a CRC-32 of the rest.
+    """
+    started_at = float(recording.get("started_at", 0.0) or 0.0)
+    header = struct.pack(
+        "<IQQII",
+        int(recording.get("sample_rate", 0) or 0),
+        int(recording.get("frequency_hz", NWR_CENTER_FREQUENCY_HZ) or NWR_CENTER_FREQUENCY_HZ),
+        max(0, round(started_at * 1000)),
+        16,
+        0,
+    )
+    return header + struct.pack("<I", zlib.crc32(header))
+
+
+SIGMF_VERSION = "1.2.0"
+SIGMF_DATATYPES = {"cf": "cf32_le", "s16": "ci16_le", "u8": "cu8"}
+
+
+def iq_sigmf_metadata(fmt: str, recording: dict[str, Any]) -> bytes:
+    """The .sigmf-meta file: what SigMF software needs to know about the samples."""
+    started_at = datetime.fromtimestamp(float(recording.get("started_at", 0.0) or 0.0), timezone.utc)
+    label = str(recording.get("stream_label", "") or "").strip()
+    metadata = {
+        "global": {
+            "core:datatype": SIGMF_DATATYPES[iq_sample_format(fmt)],
+            "core:sample_rate": int(recording.get("sample_rate", 0) or 0),
+            "core:version": SIGMF_VERSION,
+            "core:description": f"I/Q recording of {label}" if label else "I/Q recording",
+            "core:recorder": f"NWR Stream Manager {package_version()}",
+        },
+        "captures": [
+            {
+                "core:sample_start": 0,
+                "core:frequency": int(recording.get("frequency_hz", NWR_CENTER_FREQUENCY_HZ) or NWR_CENTER_FREQUENCY_HZ),
+                "core:datetime": started_at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{started_at.microsecond // 1000:03d}Z",
+            }
+        ],
+        "annotations": [],
+    }
+    return (json.dumps(metadata, indent=4) + "\n").encode("utf-8")
+
+
+def _tar_entry(name: str, size: int, mtime: float, directory: bool = False) -> bytes:
+    entry = tarfile.TarInfo(name)
+    entry.type = tarfile.DIRTYPE if directory else tarfile.REGTYPE
+    entry.mode = 0o755 if directory else 0o644
+    entry.size = 0 if directory else size
+    entry.mtime = int(mtime)
+    # POSIX.1-2001 (pax), as SigMF requires; it adds a size record only for files of 8 GiB and over.
+    return entry.tobuf(tarfile.PAX_FORMAT, "utf-8", "strict")
+
+
+def _tar_padding(size: int) -> bytes:
+    return bytes(-size % tarfile.BLOCKSIZE)
+
+
+def iq_sigmf_archive_parts(fmt: str, recording: dict[str, Any], data_bytes: int) -> tuple[bytes, bytes]:
+    """A SigMF archive, less the samples: what comes before them and what comes after.
+
+    A tar file holding a folder named after the recording, with its .sigmf-meta and
+    .sigmf-data files inside. Every part's size is known up front, so the download's is too.
+    """
+    base = iq_recording_download_name(recording, fmt).removesuffix(".sigmf")
+    mtime = float(recording.get("started_at", 0.0) or 0.0)
+    metadata = iq_sigmf_metadata(fmt, recording)
+    header = (
+        _tar_entry(f"{base}/", 0, mtime, directory=True)
+        + _tar_entry(f"{base}/{base}.sigmf-meta", len(metadata), mtime)
+        + metadata
+        + _tar_padding(len(metadata))
+        + _tar_entry(f"{base}/{base}.sigmf-data", data_bytes, mtime)
+    )
+    # The data's padding, the two empty blocks that end a tar file, then padding to a whole record.
+    trailer_size = len(_tar_padding(data_bytes)) + 2 * tarfile.BLOCKSIZE
+    total = len(header) + data_bytes + trailer_size
+    return header, bytes(trailer_size + (-total % tarfile.RECORDSIZE))
+
+
+def iq_download_parts(fmt: str, recording: dict[str, Any], recording_bytes: int) -> tuple[bytes, int, bytes]:
+    """A download, of a recording that takes ``recording_bytes`` as stored (float 32 bit):
+    what comes before the samples, how many bytes of samples, and what comes after them."""
+    data_bytes = recording_bytes // 4 * IQ_SAMPLE_BYTES[iq_sample_format(fmt)]
+    if fmt.startswith("wav_"):
+        return iq_wav_header(fmt, recording, data_bytes), data_bytes, b""
+    if fmt == "sdriq":
+        return iq_sdriq_header(recording), data_bytes, b""
+    if fmt.startswith("sigmf_"):
+        header, trailer = iq_sigmf_archive_parts(fmt, recording, data_bytes)
+        return header, data_bytes, trailer
+    return b"", data_bytes, b""
+
+
+def iq_download_bytes(fmt: str, recording: dict[str, Any], recording_bytes: int) -> int:
+    header, data_bytes, trailer = iq_download_parts(fmt, recording, recording_bytes)
+    return len(header) + data_bytes + len(trailer)
+
+
+def iq_download_format_problem(recording_bytes: int, sample_rate: int, fmt: str) -> str:
+    """Why a recording can't be downloaded in ``fmt``, or "" if it can."""
+    if fmt == "sdriq" or fmt.startswith("sigmf_"):
+        if sample_rate <= 0:
+            return "This recording's sample rate isn't known, so it can't be downloaded in that format. Choose a raw format."
+        return ""
+    if not fmt.startswith("wav_"):
+        return ""
+    if sample_rate <= 0:
+        return "This recording's sample rate isn't known, so it can't be downloaded as a WAV file. Choose a raw format."
+    if fmt == "wav_u8" and sample_rate not in WAV_U8_SAMPLE_RATES:
+        return "Unsigned 8-bit WAV is only available for recordings at 256,000, 512,000 or 1,024,000 samples per second."
+    if iq_download_bytes(fmt, {"sample_rate": sample_rate}, recording_bytes) > WAV_MAX_FILE_BYTES:
+        return "This recording is too large for a WAV file in that format. Choose a smaller sample size or a raw format."
+    return ""
+
+
+def iq_download_formats(recording_bytes: int, sample_rate: int) -> list[dict[str, str]]:
+    """The formats a recording can be downloaded in."""
+    return [
+        {"value": value, "label": label}
+        for value, label in IQ_DOWNLOAD_FORMATS
+        if not iq_download_format_problem(recording_bytes, sample_rate, value)
+    ]
+
+
+def iq_recording_download_size(path: Path, fmt: str, recording: dict[str, Any] | None = None) -> int:
+    recording = recording or {}
     cf_size = path.stat().st_size
     if cf_size % 4:
         raise ValueError("I/Q recording file is not a valid float32 stream")
-    if fmt == "cf":
-        return cf_size
-    if fmt == "s16":
-        return cf_size // 2
-    if fmt == "u8":
-        return cf_size // 4
-    raise ValueError("select a valid I/Q download format")
+    fmt = validate_iq_download_format(fmt)
+    problem = iq_download_format_problem(cf_size, int(recording.get("sample_rate", 0) or 0), fmt)
+    if problem:
+        raise ValueError(problem)
+    return iq_download_bytes(fmt, recording, cf_size)
 
 
 def iq_recording_download_name(recording: dict[str, Any], fmt: str) -> str:
@@ -444,7 +672,15 @@ def iq_recording_download_name(recording: dict[str, Any], fmt: str) -> str:
     started_at = datetime.fromtimestamp(float(recording.get("started_at", time.time()) or time.time()), timezone.utc).astimezone()
     date_text = started_at.strftime("%m%d%Y")
     time_text = started_at.strftime("%H%M")
-    return f"nwrstmgr-s{sample_rate}-f{frequency_hz}-{date_text}-{time_text}-{fmt}.raw"
+    extension = "raw"
+    if fmt.startswith("wav_"):
+        extension = "wav"
+    elif fmt.startswith("sigmf_"):
+        extension = "sigmf"
+    elif fmt == "sdriq":
+        extension = "sdriq"
+    # SDR++ finds the frequency in a file name as "<frequency>Hz", and other SDR software often does too.
+    return f"nwrstmgr-s{sample_rate}-{frequency_hz}Hz-{date_text}-{time_text}-{iq_sample_format(fmt)}.{extension}"
 
 
 def estimate_iq_storage_remaining_seconds(
@@ -514,8 +750,10 @@ def smooth_iq_storage_remaining_seconds(
     return expected
 
 
-def convert_iq_recording_chunks(source, fmt: str):
-    fmt = validate_iq_download_format(fmt)
+def convert_iq_recording_chunks(source, fmt: str, header: bytes = b"", trailer: bytes = b""):
+    fmt = iq_sample_format(validate_iq_download_format(fmt))
+    if header:
+        yield header
     carry = b""
     while True:
         raw = carry + source.read(IQ_DOWNLOAD_CHUNK_BYTES)
@@ -538,6 +776,8 @@ def convert_iq_recording_chunks(source, fmt: str):
         time.sleep(IQ_DOWNLOAD_YIELD_SECONDS)
     if carry:
         raise ValueError("I/Q recording file ended with a partial float32 sample")
+    if trailer:
+        yield trailer
 
 
 def validate_iq_recording_duration(raw: Any) -> float:

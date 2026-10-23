@@ -3326,7 +3326,7 @@ class EasAlertTests(unittest.TestCase):
                 "started_at": datetime(2026, 8, 13, 17, 17, tzinfo=timezone.utc).timestamp(),
             }
             name = web_control.iq_recording_download_name(recording, "cf")
-            self.assertTrue(name.startswith("nwrstmgr-s240000-f162475000-"))
+            self.assertTrue(name.startswith("nwrstmgr-s240000-162475000Hz-"))
             self.assertTrue(name.endswith("-cf.raw"))
 
     def test_iq_recording_duration_allows_manual_stop_zero(self) -> None:

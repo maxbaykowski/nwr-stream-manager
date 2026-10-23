@@ -8574,6 +8574,20 @@ function selectedIqRecording() {
   return iqRecordings.find(recording => recording.id === selectedIqRecordingId) || null;
 }
 
+// Only the formats this recording fits in: WAV files can't be larger than 4 GB.
+function renderIqDownloadFormats(formats) {
+  const select = document.getElementById("iq_download_format");
+  if (!select || !formats.length) return;
+  const selected = select.value;
+  select.replaceChildren(...formats.map(format => {
+    const option = document.createElement("option");
+    option.value = format.value;
+    option.textContent = format.label;
+    return option;
+  }));
+  select.value = formats.some(format => format.value === selected) ? selected : formats[0].value;
+}
+
 function renderIqDownloadPage() {
   const recording = selectedIqRecording();
   if (!recording) {
@@ -8585,6 +8599,7 @@ function renderIqDownloadPage() {
     "iq_download_recording_label",
     `${recording.recorded_at || "Unknown"}; ${recording.sample_rate || 0} S/s; ${recording.frequency_hz || 0} Hz`
   );
+  renderIqDownloadFormats(recording.download_formats || []);
   setPageTitle(`Download I/Q recording from ${recording.recorded_at || "unknown time"}`);
 }
 

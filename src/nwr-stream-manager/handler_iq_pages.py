@@ -14,7 +14,13 @@ from . import page_rendering
 from .accounts import AccountRecord
 from .baseline_pages import FORM_EXPIRED_MESSAGE, form_message, format_decimal_bytes, iq_recorder_source_text
 from .constants import IQ_RECORDER_MODE_SPECTRUM, IQ_RECORDER_SAMPLE_RATES
-from .iq_recorder import convert_iq_recording_chunks, format_duration_hms
+from .iq_recorder import (
+    IQ_DOWNLOAD_FORMATS,
+    convert_iq_recording_chunks,
+    format_duration_hms,
+    iq_download_parts,
+    validate_iq_download_format,
+)
 from .page_sections import iq_recording_payload_from_form, iq_recording_row_html
 from .state_files import http_header_filename
 
@@ -31,9 +37,11 @@ class IqRecorderPageHandlerMixin:
         download_name: str,
         data_length: int,
         fmt: str,
-        recording_id: str,
+        recording: dict[str, Any],
         account_id: int | None = None,
     ) -> None:
+        recording_id = str(recording.get("id", ""))
+        header, _, trailer = iq_download_parts(fmt, recording, path.stat().st_size)
         download_id = self.service.begin_iq_recording_download(recording_id, account_id)
         try:
             self.send_response(HTTPStatus.OK)
@@ -44,7 +52,7 @@ class IqRecorderPageHandlerMixin:
             self._send_pending_auth_session_cookie()
             self.end_headers()
             with path.open("rb") as source:
-                for chunk in convert_iq_recording_chunks(source, fmt):
+                for chunk in convert_iq_recording_chunks(source, fmt, header, trailer):
                     if self.service.iq_recording_download_aborted(download_id):
                         LOG.info("I/Q recording download aborted after account revoke: %s", recording_id)
                         break
@@ -87,12 +95,18 @@ class IqRecorderPageHandlerMixin:
             recording = next((item for item in recordings if item.get("id") == recording_id), None)
             page = page_rendering.set_attribute(page, "iq_download_recording_id", "value", recording_id)
             fmt = form.get("format", "cf")
+            # Only the formats this recording fits in; WAV files can't be larger than 4 GB.
+            formats = (
+                recording["download_formats"]
+                if recording
+                else [{"value": value, "label": label} for value, label in IQ_DOWNLOAD_FORMATS]
+            )
             page = page_rendering.set_content(
                 page,
                 "iq_download_format",
                 "".join(
-                    f'<option value="{value}"{" selected" if value == fmt else ""}>{label}</option>'
-                    for value, label in (("cf", "Float 32 bit"), ("s16", "Signed 16 bit"), ("u8", "Unsigned 8-bit"))
+                    f'<option value="{item["value"]}"{" selected" if item["value"] == fmt else ""}>{item["label"]}</option>'
+                    for item in formats
                 ),
             )
             if recording is None:
@@ -224,7 +238,7 @@ class IqRecorderPageHandlerMixin:
             file_path,
             download_name,
             download_size,
-            query.get("format", "cf"),
-            str(recording.get("id", "")),
+            validate_iq_download_format(query.get("format", "cf")),
+            recording,
             account.id if isinstance(account, AccountRecord) else None,
         )

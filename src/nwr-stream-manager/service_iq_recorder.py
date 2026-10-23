@@ -99,7 +99,7 @@ class IqRecorderServiceMixin:
             raise ValueError("I/Q recording id is required")
         recording = find_iq_recording(self.iq_recordings_index_path, recording_id)
         path = safe_iq_recording_file_path(self.iq_recordings_directory, recording)
-        return recording, path, iq_recording_download_name(recording, fmt), iq_recording_download_size(path, fmt)
+        return recording, path, iq_recording_download_name(recording, fmt), iq_recording_download_size(path, fmt, recording)
 
     def begin_iq_recording_download(self, recording_id: str, account_id: int | None = None) -> str:
         download_id = uuid.uuid4().hex

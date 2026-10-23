@@ -6,6 +6,7 @@ from http import HTTPStatus
 from urllib.parse import ParseResult
 
 from .baseline_pages import IQ_RECORDER_FORM_PATHS, IQ_RECORDING_DOWNLOAD_PATH
+from .iq_recorder import validate_iq_download_format
 from .routing import route
 
 
@@ -52,8 +53,8 @@ class IqRecorderRoutesMixin:
                 file_path,
                 download_name,
                 download_size,
-                fmt,
-                str(recording.get("id", "")),
+                validate_iq_download_format(fmt),
+                recording,
                 self._current_account_id(),
             )
         except Exception as exc:
