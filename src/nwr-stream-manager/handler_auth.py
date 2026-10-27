@@ -27,6 +27,8 @@ from .baseline_pages import (
     render_sign_in_wait_page,
     SETUP_FORM_PATH,
     SIGN_IN_REQUIRED_HTML,
+    STREAM_ARCHIVE_DOWNLOAD_PATH,
+    STREAM_ARCHIVE_PLAY_PATH,
 )
 from .constants import AUTH_REALM, AUTH_SESSION_COOKIE_NAME
 from .request_origin import ANOTHER_SITE_MESSAGE, SETUP_THROUGH_PROXY_MESSAGE, request_from_another_site, request_through_proxy
@@ -222,6 +224,11 @@ class AuthHandlerMixin:
                 "/api/eas-alert-export",
                 "/api/eas-alert",
                 "/api/eas-alert-audio",
+                "/api/stream-archives",
+                "/api/stream-archive-player",
+                "/api/stream-archive-player-time",
+                STREAM_ARCHIVE_DOWNLOAD_PATH,
+                STREAM_ARCHIVE_PLAY_PATH,
                 EAS_ALERT_EXPORT_PATH,
                 DASHBOARD_PARTS_PATH,
                 "/api/live-audio",

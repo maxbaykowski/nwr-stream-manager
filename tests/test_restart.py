@@ -147,8 +147,8 @@ class RestartPageTests(unittest.TestCase):
         viewer = ("viewer", "password3")
         _, page = self.request("GET", "/", viewer)
         self.assertRegex(page, r'<a id="nav_restart" href="/\?view=restart" hidden>')
-        _, page = self.request("GET", "/?view=restart", viewer)
-        self.assertNotIn("Restart NWR Stream Manager? - ", self.title(page))
+        response, _ = self.request("GET", "/?view=restart", viewer)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
         for path, body in (("/restart", {"instance": "run1"}), ("/api/restart", None)):
             connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
             self.addCleanup(connection.close)

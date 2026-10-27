@@ -1418,6 +1418,7 @@ function startMonitorPacketStats() {
 
 async function startStreamMonitor(streamId) {
   pauseCurrentEasAlert();
+  pauseStreamArchive({forOther: true});
   if (monitorStreamId === streamId && monitorPeerConnection) {
     if (!liveAudioPeerIsUnusable(monitorPeerConnection)) {
       if (monitorPaused) {
@@ -1720,6 +1721,7 @@ function clearReceiverMediaSession() {
 
 async function startWeatherReceiver() {
   pauseCurrentEasAlert();
+  pauseStreamArchive({forOther: true});
   if (receiverPeerConnection) {
     if (liveAudioPeerIsUnusable(receiverPeerConnection) || !receiverRemoteStream) {
       logClientEvent("info", "receiver", "restarting stale receiver live-audio session", {frequency: currentReceiverChannel().label});
@@ -2442,7 +2444,8 @@ function streamIsEnabled(stream) {
 }
 
 function streamOutputCount(stream) {
-  return enabledStreamOutputCount(stream);
+  // As the streams list counts them: stream archiving isn't one of them.
+  return enabledConfiguredOutputCount(stream) + (easRecordingEnabled(stream) ? 1 : 0);
 }
 
 function enabledConfiguredOutputCount(stream) {
@@ -2453,8 +2456,13 @@ function easRecordingEnabled(stream) {
   return Boolean(stream && stream.eas_recording && stream.eas_recording.enabled);
 }
 
+function archiveEnabled(stream) {
+  return Boolean(stream && stream.archive && stream.archive.enabled);
+}
+
+// Everything that keeps a stream running. Stream archiving does, like an output.
 function enabledStreamOutputCount(stream) {
-  return enabledConfiguredOutputCount(stream) + (easRecordingEnabled(stream) ? 1 : 0);
+  return enabledConfiguredOutputCount(stream) + (easRecordingEnabled(stream) ? 1 : 0) + (archiveEnabled(stream) ? 1 : 0);
 }
 
 function canDisableOutput(stream, output) {
@@ -3363,6 +3371,564 @@ function setFallbackResult(message, kind = "") {
   if (element.textContent !== text) element.textContent = text;
 }
 
+function setArchiveResult(message, kind = "") {
+  const element = document.getElementById("archive-result");
+  const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  if (element.className !== className) element.className = className;
+  const text = String(message || "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+// Stream archives: play a stream's archive, or choose a time and download it. Where the
+// browser can't play MP3, downloading is all there is, as it is without the page script.
+let streamArchiveStreamId = "";
+let streamArchives = [];
+let streamArchiveDownloadMode = false;
+// The player: its address, length, and the times in it, as /api/stream-archive-player gives.
+let streamArchivePlayer = null;
+let streamArchivePlayerStreamId = "";
+let streamArchiveIsPlaying = false;
+// Whether the lock screen's controls are the archive's; another player starting takes them.
+let streamArchiveOwnsMediaSession = false;
+let streamArchivePlaybackVolume = 100;
+// Where to be once the audio has loaded enough to go there.
+let streamArchiveWantedSeconds = 0;
+let streamArchiveSliderActive = false;
+let streamArchiveRecovering = false;
+// The lock screen's title and controls, set once when the archive takes them: iOS drops a
+// paused page's Now Playing if they're set anew.
+let streamArchiveMediaSessionSet = false;
+// The audio failed while the page was hidden, such as when iOS cut its connection after a
+// pause; a new player is opened when it's played again, not while the phone is locked.
+let streamArchiveNeedsRecovery = false;
+const STREAM_ARCHIVE_SKIP_SECONDS = 10;
+const STREAM_ARCHIVE_PAGE_SECONDS = 600;
+const STREAM_ARCHIVE_MP3_BYTES_PER_SECOND = 8000; // 64 kbps
+// At the end of a player, newer audio than this goes on playing; less, and it's caught up.
+const STREAM_ARCHIVE_CAUGHT_UP_SECONDS = 15;
+
+function setStreamArchiveResult(message, kind = "") {
+  const element = document.getElementById("stream-archive-result");
+  element.className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  element.textContent = String(message || "");
+}
+
+function setStreamArchivePlayerResult(message, kind = "") {
+  const element = document.getElementById("stream-archive-player-result");
+  element.className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  element.textContent = String(message || "");
+}
+
+function streamArchivePlaybackSupported() {
+  const audio = document.getElementById("stream_archive_audio");
+  return Boolean(audio && audio.canPlayType && audio.canPlayType("audio/mpeg"));
+}
+
+function streamArchivePlayerShown() {
+  return streamArchivePlaybackSupported() && !streamArchiveDownloadMode;
+}
+
+async function loadStreamArchives() {
+  const data = await request("/api/stream-archives");
+  streamArchives = data.streams || [];
+  renderStreamArchives(true);
+}
+
+function renderStreamArchives(resetTimes) {
+  const select = document.getElementById("stream_archive_stream");
+  const form = document.getElementById("stream_archive_download_form");
+  const playing = streamArchivePlayerShown();
+  // The download page of a player's stream: the stream is chosen on the player.
+  const downloadOfPlayer = streamArchivePlaybackSupported() && streamArchiveDownloadMode;
+  if (!streamArchives.length) {
+    select.replaceChildren();
+    setText("stream_archive_available", "No stream has archived audio yet.");
+    setHidden("stream_archive_gaps_section", true);
+    setHidden("stream_archive_player", true);
+    setHidden("stream_archive_stream_form", false);
+    setHidden("stream_archive_delete_actions", true);
+    form.hidden = true;
+    if (streamArchiveDeletedMessage) setStreamArchiveResult(streamArchiveDeletedMessage, "success");
+    streamArchiveDeletedMessage = "";
+    return;
+  }
+  form.hidden = false;
+  if (!streamArchives.some(item => item.id === streamArchiveStreamId)) streamArchiveStreamId = streamArchives[0].id;
+  select.replaceChildren(...streamArchives.map(item => {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = item.label;
+    return option;
+  }));
+  select.value = streamArchiveStreamId;
+  const archive = streamArchives.find(item => item.id === streamArchiveStreamId);
+  setText("stream_archives_heading", downloadOfPlayer ? `Download archived audio from ${archive.callsign || "stream"}` : "Stream archives");
+  setText("stream_archives_intro", playing
+    ? "Listen to a stream's archived audio, or download it."
+    : downloadOfPlayer ? "Download up to 12 hours at a time." : "Download archived audio from a stream, up to 12 hours at a time.");
+  if (downloadOfPlayer) setPageTitle(`Download archived audio from ${archive.callsign || "stream"}`);
+  setHidden("stream_archive_stream_form", downloadOfPlayer);
+  setHidden("stream_archive_player", !playing);
+  setHidden("stream_archive_download_section", playing);
+  setHidden("stream_archive_back_to_player", !downloadOfPlayer);
+  document.getElementById("stream_archive_open_download").href = routeForView("stream_archives", {streamId: archive.id, mode: "download"});
+  document.getElementById("stream_archive_back_to_player").href = routeForView("stream_archives", {streamId: archive.id});
+  // Deleting is on the player, or on the download page where that's the first page.
+  const deleteLink = routeForView("stream_archive_delete", {streamId: archive.id});
+  document.getElementById("stream_archive_open_delete").href = deleteLink;
+  document.getElementById("stream_archive_open_delete_link").href = deleteLink;
+  // Not for read-only accounts, nor until it's known the account isn't one.
+  const mayDelete = Boolean(currentAccount) && !currentAccount.read_only;
+  setHidden("stream_archive_open_delete", !mayDelete);
+  setHidden("stream_archive_delete_actions", !mayDelete || downloadOfPlayer);
+  // Where the player's shown, it says so once it's open again.
+  if (streamArchiveDeletedMessage && !playing) {
+    setStreamArchiveResult(streamArchiveDeletedMessage, "success");
+    streamArchiveDeletedMessage = "";
+  }
+  setText("stream_archive_available", `Archived audio from ${archive.from_text} to ${archive.to_text} (${archive.storage}).`);
+  const gaps = document.getElementById("stream_archive_gaps");
+  gaps.replaceChildren(...archive.gaps.map(gap => {
+    const item = document.createElement("li");
+    item.textContent = gap;
+    return item;
+  }));
+  setHidden("stream_archive_gaps", !archive.gaps.length);
+  setText("stream_archive_gaps_note", archive.gaps_note);
+  setHidden("stream_archive_gaps_note", !archive.gaps_note);
+  setHidden("stream_archive_gaps_section", !archive.gap_count);
+  document.getElementById("stream_archive_download_stream").value = archive.id;
+  setText("stream_archive_time_zone", archive.time_zone || "this computer's time zone");
+  setText("stream_archive_jump_zone", archive.time_zone || "this computer's time zone");
+  if (resetTimes) {
+    // Starts at the last hour archived, in the server's time, as the download takes it.
+    for (const field of ["start_date", "start_time", "end_date", "end_time"]) {
+      document.getElementById(`stream_archive_${field}`).value = archive[`default_${field}`];
+    }
+  }
+  if (playing && streamArchivePlayerStreamId !== archive.id) {
+    openStreamArchivePlayer(archive.id).catch(error => setStreamArchivePlayerResult(error.message, "error"));
+  }
+}
+
+function streamArchiveCallsign() {
+  const archive = streamArchives.find(item => item.id === streamArchivePlayerStreamId);
+  return (archive && archive.callsign) || "stream";
+}
+
+function streamArchiveDuration(player = streamArchivePlayer) {
+  return player ? Number(player.bytes || 0) / STREAM_ARCHIVE_MP3_BYTES_PER_SECOND : 0;
+}
+
+// When the audio at a place in the player was heard, from the marks the server gives:
+// the times between them run on at one second a second.
+function streamArchiveTimeAt(seconds, player = streamArchivePlayer) {
+  const marks = player.marks || [];
+  const position = Math.min(Math.max(0, seconds - player.delay_seconds), player.seconds);
+  let mark = marks[0] || {seconds: 0, ms: 0};
+  for (const candidate of marks) {
+    if (candidate.seconds > position) break;
+    mark = candidate;
+  }
+  // To the millisecond: a browser keeps where it's playing a hair short, and a time a hair
+  // short of a second would be named as the second before.
+  return Math.round(mark.ms + (position - mark.seconds) * 1000);
+}
+
+// The place in a player for a time; a time after the end of a stretch of audio is where the
+// next one starts, so a newer player carries on from where an older one ended.
+function streamArchiveSecondsAt(player, ms) {
+  const marks = player.marks || [];
+  for (let index = marks.length - 1; index >= 0; index -= 1) {
+    if (marks[index].ms > ms) continue;
+    const limit = index + 1 < marks.length ? marks[index + 1].seconds : player.seconds;
+    return Math.min(marks[index].seconds + (ms - marks[index].ms) / 1000, limit) + player.delay_seconds;
+  }
+  return player.delay_seconds;
+}
+
+function streamArchiveTimeOptions() {
+  const zone = streamArchivePlayer && streamArchivePlayer.time_zone_name;
+  if (!zone) return {};
+  try {
+    new Intl.DateTimeFormat(undefined, {timeZone: zone});
+    return {timeZone: zone};
+  } catch (error) {
+    return {};
+  }
+}
+
+// In the server's time zone, as times are typed and as downloads name them.
+function streamArchiveTimeText(ms) {
+  const moment = new Date(ms);
+  const options = streamArchiveTimeOptions();
+  const date = new Intl.DateTimeFormat(undefined, {...options, month: "long", day: "numeric", year: "numeric"}).format(moment);
+  const time = new Intl.DateTimeFormat(undefined, {...options, hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short"}).format(moment);
+  return `${date}, ${time}`;
+}
+
+// The date and time fields' values for a time, in the server's time zone.
+function streamArchiveFieldValues(ms) {
+  const parts = {};
+  const format = new Intl.DateTimeFormat("en-US", {
+    ...streamArchiveTimeOptions(),
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+  });
+  for (const part of format.formatToParts(new Date(ms))) parts[part.type] = part.value;
+  return {date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}:${parts.second}`};
+}
+
+function streamArchiveCurrentSeconds() {
+  const audio = document.getElementById("stream_archive_audio");
+  return audio.readyState >= 1 ? audio.currentTime : streamArchiveWantedSeconds;
+}
+
+function renderStreamArchivePosition(seconds, options = {}) {
+  if (!streamArchivePlayer) return;
+  const slider = document.getElementById("stream_archive_position");
+  const text = streamArchiveTimeText(streamArchiveTimeAt(seconds));
+  setText("stream_archive_now", text);
+  // Kept up to date even with focus, for speech and braille alike, but only while it's not
+  // being dragged; just its value and text change, only when they do.
+  if (options.fromUser || !streamArchiveSliderActive) {
+    const value = String(seconds);
+    if (slider.value !== value) slider.value = value;
+    if (slider.getAttribute("aria-valuetext") !== text) slider.setAttribute("aria-valuetext", text);
+  }
+}
+
+function useStreamArchivePlayer(streamId, player, seconds) {
+  const audio = document.getElementById("stream_archive_audio");
+  streamArchivePlayer = player;
+  streamArchivePlayerStreamId = streamId;
+  const duration = streamArchiveDuration(player);
+  const start = Math.min(Math.max(0, seconds), duration);
+  streamArchiveWantedSeconds = start;
+  audio.src = player.url;
+  try {
+    // Before the audio has loaded, this is where it starts.
+    audio.currentTime = start;
+  } catch (error) {
+    console.debug("archive start position not set yet", error);
+  }
+  const slider = document.getElementById("stream_archive_position");
+  slider.max = String(duration);
+  renderStreamArchivePosition(start, {fromUser: true});
+}
+
+async function openStreamArchivePlayer(streamId) {
+  pauseStreamArchive({forOther: true});
+  streamArchivePlayerStreamId = streamId;
+  setStreamArchivePlayerResult("");
+  const player = await request(`/api/stream-archive-player?stream=${encodeURIComponent(streamId)}`);
+  if (streamArchivePlayerStreamId !== streamId) return;
+  // Starts an hour before the newest audio, or at the start of a shorter archive.
+  useStreamArchivePlayer(streamId, player, streamArchiveDuration(player) - 3600);
+  setStreamArchivePlaybackState(false);
+  if (streamArchiveDeletedMessage) setStreamArchivePlayerResult(streamArchiveDeletedMessage, "success");
+  streamArchiveDeletedMessage = "";
+  // Jump to time starts out at where it's playing.
+  const fields = streamArchiveFieldValues(streamArchiveTimeAt(streamArchiveWantedSeconds));
+  document.getElementById("stream_archive_jump_date").value = fields.date;
+  document.getElementById("stream_archive_jump_time").value = fields.time;
+}
+
+// A new player for the same stream, at the same time, for when this one has closed or ended.
+async function reopenStreamArchivePlayer() {
+  const streamId = streamArchivePlayerStreamId;
+  const player = await request(`/api/stream-archive-player?stream=${encodeURIComponent(streamId)}`);
+  if (streamArchivePlayerStreamId !== streamId) return null;
+  return player;
+}
+
+async function playStreamArchive() {
+  const audio = document.getElementById("stream_archive_audio");
+  if (!streamArchivePlayer || !audio.src) return;
+  if (streamArchiveNeedsRecovery || audio.error) {
+    streamArchiveNeedsRecovery = false;
+    await recoverStreamArchivePlayer({play: true});
+    return;
+  }
+  pauseCurrentEasAlert();
+  if (monitorPeerConnection || receiverPeerConnection) {
+    await stopStreamMonitor({notifyServer: true});
+    await stopWeatherReceiver({notifyServer: true});
+  }
+  streamArchiveOwnsMediaSession = true;
+  audio.volume = playbackVolumeScalar(streamArchivePlaybackVolume);
+  if (audio.ended) audio.currentTime = streamArchiveWantedSeconds;
+  await audio.play();
+}
+
+function pauseStreamArchive(options = {}) {
+  const audio = document.getElementById("stream_archive_audio");
+  // Another player is starting: the lock screen's controls become its.
+  if (options.forOther) {
+    streamArchiveOwnsMediaSession = false;
+    streamArchiveMediaSessionSet = false;
+  }
+  if (audio && !audio.paused) audio.pause();
+}
+
+function seekStreamArchive(seconds) {
+  if (!streamArchivePlayer) return;
+  const audio = document.getElementById("stream_archive_audio");
+  const target = Math.min(Math.max(0, seconds), streamArchiveDuration());
+  streamArchiveWantedSeconds = target;
+  try {
+    audio.currentTime = target;
+  } catch (error) {
+    console.debug("archive seek failed", error);
+  }
+  renderStreamArchivePosition(target, {fromUser: true});
+  updateStreamArchivePositionState();
+}
+
+function skipStreamArchive(seconds) {
+  seekStreamArchive(streamArchiveCurrentSeconds() + seconds);
+}
+
+function setStreamArchivePlaybackState(playing) {
+  streamArchiveIsPlaying = Boolean(playing);
+  const label = streamArchiveIsPlaying ? "Pause" : "Play";
+  const button = document.getElementById("stream_archive_play_pause");
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  setHidden("stream_archive_play_icon", streamArchiveIsPlaying);
+  setHidden("stream_archive_pause_icon", !streamArchiveIsPlaying);
+  updateStreamArchiveMediaSession();
+}
+
+// The lock screen shows the clock hour being played, not the whole archive, which can be a
+// year long: its elapsed time is the minutes and seconds into the hour, as the clock says.
+function streamArchiveHour(seconds = streamArchiveCurrentSeconds()) {
+  const ms = streamArchiveTimeAt(seconds);
+  const parts = {};
+  const format = new Intl.DateTimeFormat("en-US", {...streamArchiveTimeOptions(), minute: "2-digit", second: "2-digit"});
+  for (const part of format.formatToParts(new Date(ms))) parts[part.type] = part.value;
+  const into = Number(parts.minute) * 60 + Number(parts.second) + (ms % 1000) / 1000;
+  const startMs = ms - into * 1000;
+  const options = streamArchiveTimeOptions();
+  const date = new Intl.DateTimeFormat(undefined, {...options, month: "long", day: "numeric", year: "numeric"}).format(new Date(startMs));
+  const hour = new Intl.DateTimeFormat(undefined, {...options, hour: "numeric", timeZoneName: "short"}).format(new Date(startMs));
+  return {startMs, into: Math.min(Math.max(0, into), 3600), text: `${date}, ${hour}`};
+}
+
+// The hour's in the title: iOS shows a title and artist, but not an album.
+function streamArchiveMediaTitle(hour) {
+  return `Archive of ${streamArchiveCallsign()}, ${hour.text}`;
+}
+
+function updateStreamArchivePositionState() {
+  if (!streamArchiveOwnsMediaSession || !streamArchivePlayer || !("mediaSession" in navigator) || typeof navigator.mediaSession.setPositionState !== "function") return;
+  const hour = streamArchiveHour();
+  // Paused in another hour than the lock screen names: both change when it plays again.
+  const current = navigator.mediaSession.metadata;
+  if (!streamArchiveIsPlaying && current && current.title !== streamArchiveMediaTitle(hour)) return;
+  try {
+    navigator.mediaSession.setPositionState({duration: 3600, playbackRate: 1, position: hour.into});
+  } catch (error) {
+    console.debug("archive media session position update failed", error);
+  }
+}
+
+function logStreamArchiveEvent(event, details = {}) {
+  const audio = document.getElementById("stream_archive_audio");
+  logClientEvent("info", "archive-player", event, {
+    ...details,
+    visibility: document.visibilityState,
+    paused: audio.paused,
+    current_time: Math.round(audio.currentTime * 10) / 10,
+    ready_state: audio.readyState,
+    network_state: audio.networkState,
+    error: audio.error ? audio.error.code : null
+  });
+}
+
+function setStreamArchiveMediaAction(action, handler) {
+  try {
+    if (handler) {
+      const original = handler;
+      handler = details => {
+        logStreamArchiveEvent(`lock screen ${action}`);
+        original(details);
+      };
+    }
+    navigator.mediaSession.setActionHandler(action, handler);
+  } catch (error) {
+    console.debug(`archive media session action ${action} is not supported`, error);
+  }
+}
+
+function updateStreamArchiveMediaSession() {
+  if (!streamArchiveOwnsMediaSession || !streamArchivePlayer) return;
+  if (!("mediaSession" in navigator) || !("MediaMetadata" in window)) return;
+  if (monitorPeerConnection || receiverPeerConnection) return;
+  navigator.mediaSession.playbackState = streamArchiveIsPlaying ? "playing" : "paused";
+  const title = streamArchiveMediaTitle(streamArchiveHour());
+  const current = navigator.mediaSession.metadata;
+  const changed = !current || current.title !== title;
+  // Changed only while playing, as the hour turns over: iOS drops a paused page's Now
+  // Playing if it's set anew then.
+  if (!streamArchiveMediaSessionSet || (changed && streamArchiveIsPlaying)) {
+    navigator.mediaSession.metadata = new MediaMetadata({title, artist: "NWR Stream Manager"});
+  }
+  updateStreamArchivePositionState();
+  if (streamArchiveMediaSessionSet) return;
+  streamArchiveMediaSessionSet = true;
+  setStreamArchiveMediaAction("previoustrack", null);
+  setStreamArchiveMediaAction("nexttrack", null);
+  setStreamArchiveMediaAction("play", () => {
+    playStreamArchive().catch(error => setStreamArchivePlayerResult(`The archived audio couldn't start: ${error.message}`, "error"));
+  });
+  setStreamArchiveMediaAction("pause", () => pauseStreamArchive());
+  setStreamArchiveMediaAction("seekbackward", event => skipStreamArchive(-((event && event.seekOffset) || STREAM_ARCHIVE_SKIP_SECONDS)));
+  setStreamArchiveMediaAction("seekforward", event => skipStreamArchive((event && event.seekOffset) || STREAM_ARCHIVE_SKIP_SECONDS));
+  // Within the hour shown; a time in it with no audio goes to where the audio picks up.
+  setStreamArchiveMediaAction("seekto", event => {
+    if (!event || !Number.isFinite(event.seekTime) || !streamArchivePlayer) return;
+    const target = streamArchiveHour().startMs + Math.min(Math.max(0, event.seekTime), 3600) * 1000;
+    seekStreamArchive(streamArchiveSecondsAt(streamArchivePlayer, target));
+  });
+}
+
+// Delete archived audio: older than a choice of time, or all of it, as EAS alerts are deleted.
+let streamArchiveDeleteChoices = [];
+// Said on the player, or the download page, once it's shown again after deleting.
+let streamArchiveDeletedMessage = "";
+
+function setStreamArchiveDeleteResult(message, kind = "") {
+  const element = document.getElementById("stream-archive-delete-result");
+  element.className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
+  element.textContent = String(message || "");
+}
+
+async function loadStreamArchiveDeleteChoices() {
+  setStreamArchiveDeleteResult("");
+  if (!streamArchives.length) {
+    const data = await request("/api/stream-archives");
+    streamArchives = data.streams || [];
+  }
+  const archive = streamArchives.find(item => item.id === streamArchiveStreamId) || streamArchives[0];
+  const container = document.getElementById("stream_archive_delete_options");
+  if (!archive) {
+    setText("stream_archive_delete_stream_label", "No stream has archived audio yet.");
+    container.replaceChildren();
+    setDisabled(document.getElementById("stream_archive_delete_audio"), true);
+    return;
+  }
+  streamArchiveStreamId = archive.id;
+  setText("stream_archive_delete_stream_label", `Stream: ${archive.label}`);
+  const data = await request(`/api/stream-archive-delete-options?stream=${encodeURIComponent(archive.id)}`);
+  streamArchiveDeleteChoices = data.choices || [];
+  container.replaceChildren(...streamArchiveDeleteChoices.map((choice, index) => {
+    const label = document.createElement("label");
+    label.className = "checkbox-row";
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = "choice";
+    input.value = choice.id;
+    input.checked = index === 0;
+    label.append(input, ` ${choice.label} (${choice.storage})`);
+    return label;
+  }));
+  setDisabled(document.getElementById("stream_archive_delete_audio"), !streamArchiveDeleteChoices.length);
+}
+
+async function deleteStreamArchiveAudio() {
+  if (accountIsReadOnly()) return;
+  const selected = document.querySelector("#stream_archive_delete_options input[name='choice']:checked");
+  const choice = streamArchiveDeleteChoices.find(item => selected && item.id === selected.value);
+  if (!choice) return;
+  if (!window.confirm(`${choice.storage} of archived audio will be permanently deleted.`)) {
+    navigateTo("stream_archives", {streamId: streamArchiveStreamId}, true, true);
+    return;
+  }
+  try {
+    const response = await request("/api/stream-archive-delete", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({stream: streamArchiveStreamId, choice: choice.id})
+    });
+    // The player opens again on what's left.
+    pauseStreamArchive();
+    streamArchivePlayerStreamId = "";
+    streamArchivePlayer = null;
+    streamArchives = [];
+    streamArchiveDeletedMessage = response.message || "";
+    navigateTo("stream_archives", {streamId: streamArchiveStreamId}, true, true);
+  } catch (error) {
+    setStreamArchiveDeleteResult(error.message, "error");
+  }
+}
+
+// At the end of a player: carry on in a newer one if there's newer audio enough, or stop,
+// caught up with the archive.
+async function continueStreamArchive() {
+  const endMs = streamArchiveTimeAt(streamArchiveDuration());
+  try {
+    const player = await reopenStreamArchivePlayer();
+    if (!player) return;
+    const resume = streamArchiveSecondsAt(player, endMs);
+    if (streamArchiveDuration(player) - resume < STREAM_ARCHIVE_CAUGHT_UP_SECONDS) {
+      setStreamArchivePlaybackState(false);
+      setStreamArchivePlayerResult("You've caught up to the newest archived audio.", "success");
+      return;
+    }
+    useStreamArchivePlayer(streamArchivePlayerStreamId, player, resume);
+    await playStreamArchive();
+  } catch (error) {
+    setStreamArchivePlaybackState(false);
+    setStreamArchivePlayerResult(`The archived audio couldn't continue: ${error.message}`, "error");
+  }
+}
+
+// A player the server no longer has, such as after a restart: a new one, at the same time.
+async function recoverStreamArchivePlayer(options = {}) {
+  if (streamArchiveRecovering || !streamArchivePlayer) return;
+  streamArchiveRecovering = true;
+  const wasPlaying = options.play || streamArchiveIsPlaying;
+  const atMs = streamArchiveTimeAt(streamArchiveCurrentSeconds());
+  try {
+    const player = await reopenStreamArchivePlayer();
+    if (!player) return;
+    useStreamArchivePlayer(streamArchivePlayerStreamId, player, streamArchiveSecondsAt(player, atMs));
+    if (wasPlaying) await playStreamArchive();
+  } catch (error) {
+    setStreamArchivePlaybackState(false);
+    setStreamArchivePlayerResult(`The archived audio couldn't be played: ${error.message}`, "error");
+  } finally {
+    window.setTimeout(() => { streamArchiveRecovering = false; }, 5000);
+  }
+}
+
+async function jumpStreamArchive() {
+  if (!streamArchivePlayer) return;
+  const date = document.getElementById("stream_archive_jump_date").value;
+  const time = document.getElementById("stream_archive_jump_time").value;
+  const ask = async () => {
+    const response = await fetch(`/api/stream-archive-player-time?player=${encodeURIComponent(streamArchivePlayer.id)}&date=${encodeURIComponent(date)}&time=${encodeURIComponent(time)}`);
+    return {response, data: await response.json()};
+  };
+  let {response, data} = await ask();
+  if (response.status === 409 && data.reopen) {
+    // Archived since this player opened, or it's closed: a new one has it.
+    const atMs = streamArchiveTimeAt(streamArchiveCurrentSeconds());
+    const player = await reopenStreamArchivePlayer();
+    if (!player) return;
+    const wasPlaying = streamArchiveIsPlaying;
+    useStreamArchivePlayer(streamArchivePlayerStreamId, player, streamArchiveSecondsAt(player, atMs));
+    if (wasPlaying) await playStreamArchive();
+    ({response, data} = await ask());
+  }
+  if (!response.ok) {
+    setStreamArchivePlayerResult(data.error || response.statusText, "error");
+    return;
+  }
+  seekStreamArchive(data.seconds + streamArchivePlayer.delay_seconds);
+  setStreamArchivePlayerResult(`Jumped to ${data.text}.`, "success");
+}
+
 function setEasResult(message, kind = "") {
   const element = document.getElementById("eas-result");
   const className = kind === "success" ? "message success" : kind === "error" ? "message error" : "message";
@@ -3921,6 +4487,90 @@ function setNotchControls(settings) {
   updateNotchWidthLimit(false);
 }
 
+let streamArchivesStatus = {};
+let archiveSignature = "";
+let archiveUpdatePending = false;
+
+function archiveSettingsForStream(stream) {
+  return Object.assign({enabled: false, retention: "1w"}, stream && stream.archive ? stream.archive : {});
+}
+
+function streamArchiveSummaryText(summary) {
+  if (summary && summary.ranges && summary.ranges.length) {
+    return `Archived audio from ${summary.from_text} to ${summary.to_text}, using ${summary.storage}.`;
+  }
+  return "No audio archived yet.";
+}
+
+function setArchiveControls(stream) {
+  if (archiveUpdatePending) return;
+  const settings = archiveSettingsForStream(stream);
+  const summary = (stream && streamArchivesStatus[stream.id]) || {};
+  // Like EAS recording, it can't be turned off when it's all that keeps the stream running.
+  const showEnabledControl = !settings.enabled || enabledStreamOutputCount(stream) > 1;
+  const paused = summary.status === "paused";
+  const text = streamArchiveSummaryText(summary);
+  const nextSignature = JSON.stringify({settings, showEnabledControl, paused, text});
+  if (nextSignature === archiveSignature) return;
+  setChecked("archive_enabled", settings.enabled);
+  // Labelled for what selecting it does now.
+  setText("archive_enabled_text", settings.enabled ? "Disable stream archiving" : "Enable stream archiving");
+  document.getElementById("archive_enabled_label").hidden = !showEnabledControl;
+  setValue("archive_retention", settings.retention);
+  setHidden("archive_storage_blocked_hint", !paused);
+  setText("archive_summary", text);
+  archiveSignature = nextSignature;
+}
+
+async function sendArchiveSettings(confirmDelete = false) {
+  if (applying || !settingsStreamId) return;
+  const stream = currentSettingsStream();
+  const previous = archiveSettingsForStream(stream);
+  const payload = {
+    enabled: document.getElementById("archive_enabled").checked,
+    retention: document.getElementById("archive_retention").value
+  };
+  if (stream && previous.enabled && !payload.enabled && enabledStreamOutputCount(stream) <= 1) {
+    setChecked("archive_enabled", true);
+    setArchiveResult("At least one output must remain enabled for each stream.", "error");
+    return;
+  }
+  archiveUpdatePending = true;
+  try {
+    const response = await fetch("/api/stream-archive", {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({stream_id: settingsStreamId, archive: payload, confirm_delete: confirmDelete})
+    });
+    const data = await response.json();
+    if (response.status === 409 && data.confirm) {
+      // A shorter time to keep audio deletes what's older: ask first.
+      archiveUpdatePending = false;
+      if (window.confirm(`${data.confirm} Delete it?`)) {
+        await sendArchiveSettings(true);
+      } else {
+        setValue("archive_retention", previous.retention);
+        setArchiveResult("Archived audio kept.");
+      }
+      return;
+    }
+    if (!response.ok) throw new Error(data.error || response.statusText);
+    archiveUpdatePending = false;
+    archiveSignature = "";
+    renderStreams(data.streams || []);
+    setArchiveResult(payload.enabled !== previous.enabled
+      ? (payload.enabled ? "Stream archiving is on." : "Stream archiving is off. Audio already archived is kept.")
+      : "Stream archiving settings saved.", "success");
+  } catch (error) {
+    archiveUpdatePending = false;
+    archiveSignature = "";
+    setArchiveResult(error.message, "error");
+    setArchiveControls(currentSettingsStream());
+  } finally {
+    archiveUpdatePending = false;
+  }
+}
+
 function setEasControls(stream) {
   const settings = easSettingsForStream(stream);
   const showEnabledControl = !settings.enabled || canDisableEasRecording(stream);
@@ -4053,7 +4703,8 @@ const STREAM_SETTINGS_SECTION_TITLES = {
   fallback_action: "Fallback action",
   audio: "Audio effects",
   notifications: "Notifications",
-  test_mode: "Test mode"
+  test_mode: "Test mode",
+  archive: "Stream archiving"
 };
 let streamSettingsSection = "";
 let streamSettingsOpenedFrom = null;
@@ -4734,6 +5385,7 @@ function renderStreamSettings() {
   setChecked("stream_monitor_enabled", Boolean(enabled && monitorStreamId === stream.id));
   setAudioEffectsControls(stream);
   setEasControls(stream);
+  setArchiveControls(stream);
   setStreamNotificationControls(stream);
   setStreamFallbackActionControls(stream);
   renderStreamSettingsSignal(stream);
@@ -5521,6 +6173,7 @@ function configuredStreamsRefreshSignature(streams) {
       soundcard: output.soundcard || null
     })),
     eas_recording: stream.eas_recording || {},
+    archive: stream.archive || {},
     fallback_action: stream.fallback_action || {},
     audio_effects: stream.audio_effects || {},
     notifications: stream.notifications || {}
@@ -6373,6 +7026,8 @@ function applyAccountUi(account) {
   setHidden("remove_eas_alert", readOnly);
   updateRtlNotificationControlsVisibility();
   if (roleChanged) {
+    // Whether it can delete archived audio.
+    if (streamArchives.length) renderStreamArchives(false);
     activeStreamsSignature = "";
     icecastOutputTableSignature = "";
     soundcardOutputTableSignature = "";
@@ -6396,7 +7051,7 @@ function applyAccountUi(account) {
 }
 
 function isReadOnlyRestrictedView(view) {
-  return ["rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "settings", "accounts", "create_account", "notifications"].includes(view);
+  return ["rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "stream_archive_delete", "settings", "accounts", "create_account", "notifications"].includes(view);
 }
 
 function accountsTableSignature(accounts) {
@@ -7228,6 +7883,7 @@ async function playCurrentEasAlert() {
     await stopStreamMonitor({notifyServer: true});
     await stopWeatherReceiver({notifyServer: true});
   }
+  pauseStreamArchive({forOther: true});
   applyEasAlertPlaybackVolume();
   await audio.play();
   setEasAlertPlaybackState(true);
@@ -7486,7 +8142,9 @@ function defaultViewTitle(name) {
     eas_alerts: "EAS Alerts",
     eas_alert_export: "Export Alerts",
     eas_alert_delete: "Delete Alerts",
-    eas_alert_detail: "EAS Alert Details"
+    eas_alert_detail: "EAS Alert Details",
+    stream_archives: "Stream Archives",
+    stream_archive_delete: "Delete Archived Audio"
   };
   return titles[name] || "NWR Stream Manager";
 }
@@ -7530,7 +8188,8 @@ function showView(name, options = {}) {
       item.dataset.view === name ||
       (item.dataset.view === "streams" && ["add_stream", "stream_settings", "stream_output"].includes(name)) ||
       (item.dataset.view === "iq_recorder" && ["iq_recorder_start", "iq_recording_download"].includes(name)) ||
-      (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name))
+      (item.dataset.view === "eas_alerts" && ["eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(name)) ||
+      (item.dataset.view === "stream_archives" && name === "stream_archive_delete")
     ) {
       item.setAttribute("aria-current", "page");
     } else {
@@ -7610,6 +8269,16 @@ function routeForView(name, params = {}) {
     if (params.streamId) query.set("stream", params.streamId);
     if (params.outputId) query.set("output", params.outputId);
   }
+  if (name === "stream_archive_delete") {
+    query.set("view", "stream_archive_delete");
+    if (params.streamId) query.set("stream", params.streamId);
+  }
+  if (name === "stream_archives") {
+    query.set("view", "stream_archives");
+    if (params.streamId) query.set("stream", params.streamId);
+    // Where the archive can be played, downloading it is a page of its own.
+    if (params.mode === "download") query.set("download", "1");
+  }
   if (name === "eas_alerts") {
     query.set("view", "eas_alerts");
     if (params.streamId) query.set("stream", params.streamId);
@@ -7645,7 +8314,7 @@ function routeFromLocation() {
     return routeState("settings", {section: SETTINGS_SECTIONS_FROM_OLD_VIEWS[view]});
   }
   if (view === "settings") return routeState("settings", {section: query.get("section") || ""});
-  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "change_password", "streams", "add_stream", "stream_settings", "stream_output", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"].includes(view)) {
+  if (["dashboard", "rtl", "receiver", "iq_recorder", "iq_recorder_start", "iq_recording_download", "logs", "change_password", "streams", "add_stream", "stream_settings", "stream_output", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail", "stream_archives", "stream_archive_delete"].includes(view)) {
     return {
       view,
       streamId: query.get("stream") || "",
@@ -7654,7 +8323,8 @@ function routeFromLocation() {
       recordingId: query.get("recording") || "",
       page: Math.max(1, Number(query.get("page") || 1)),
       // A stream's settings section, named as it is without the page script.
-      section: view === "stream_settings" ? query.get("tab") || "" : ""
+      section: view === "stream_settings" ? query.get("tab") || "" : "",
+      mode: view === "stream_archives" && query.get("download") === "1" ? "download" : ""
     };
   }
   return {view: "dashboard", streamId: "", outputId: "", alertId: "", page: 1};
@@ -7669,6 +8339,7 @@ function routeState(view, params = {}) {
     recordingId: params.recordingId || "",
     page: Math.max(1, Number(params.page || 1)),
     section: params.section || "",
+    mode: params.mode || "",
     // The settings page this one was opened from, so Back can return to it.
     openedFrom: typeof params.openedFrom === "string" ? params.openedFrom : null
   };
@@ -7795,6 +8466,19 @@ function applyRoute(route) {
     setText("output_form_title", `${isSoundcard ? "Edit sound card output" : "Edit output"} for ${streamCallsign(stream)}`);
     showView("stream_output");
     setPageTitle(`${isSoundcard ? "Edit sound card output" : "Edit output"} for ${streamCallsign(stream)}`);
+    return;
+  }
+  if (route.view === "stream_archives") {
+    streamArchiveStreamId = route.streamId || streamArchiveStreamId;
+    streamArchiveDownloadMode = route.mode === "download";
+    showView("stream_archives");
+    loadStreamArchives().catch(error => setStreamArchiveResult(error.message, "error"));
+    return;
+  }
+  if (route.view === "stream_archive_delete") {
+    streamArchiveStreamId = route.streamId || streamArchiveStreamId;
+    showView("stream_archive_delete");
+    loadStreamArchiveDeleteChoices().catch(error => setStreamArchiveDeleteResult(error.message, "error"));
     return;
   }
   if (route.view === "eas_alerts") {
@@ -8160,6 +8844,8 @@ function currentRouteParams() {
   if (view === "eas_alert_export" || view === "eas_alert_delete") return {streamId: easAlertStreamId, page: easAlertPage};
   if (view === "eas_alert_detail") return {streamId: easAlertStreamId, alertId: easAlertDetailId, page: easAlertReturnPage};
   if (view === "iq_recording_download") return {recordingId: selectedIqRecordingId};
+  if (view === "stream_archives") return {streamId: streamArchiveStreamId, mode: streamArchiveDownloadMode ? "download" : ""};
+  if (view === "stream_archive_delete") return {streamId: streamArchiveStreamId};
   if (view === "settings") return {section: settingsSection, openedFrom: settingsOpenedFrom};
   return {};
 }
@@ -8249,6 +8935,7 @@ function renderStorageSummary(storage) {
   const usage = storage && storage.usage ? storage.usage : {};
   setText("summary_iq_storage", usage.iq_recordings || "0 B");
   setText("summary_eas_storage", usage.eas_recordings || "0 B");
+  setText("summary_archive_storage", usage.stream_archives || "0 B");
   const warning = document.getElementById("storage-warning");
   const message = storage && storage.status && storage.status !== "ok" ? storage.message || "Please free up disk space." : "";
   if (warning.textContent !== message) warning.textContent = message;
@@ -9095,6 +9782,11 @@ function applyStatus(data, options = {}) {
     setFallbackControls(data.fallback);
     setNotificationSettings(data.notifications || {});
     setStreamTestModeStatus(data.test_mode || {});
+    if (data.stream_archives) {
+      streamArchivesStatus = data.stream_archives;
+      if (settingsStreamId) setArchiveControls(currentSettingsStream());
+    }
+    document.getElementById("nav_stream_archives").hidden = !data.stream_archives_available;
     syncConfiguredStreamsFromStatus(data);
     updateDashboard(data);
     setText("general_uptime", formatUptime(data.uptime_seconds));
@@ -10377,6 +11069,12 @@ document.getElementById("active-streams-body").addEventListener("click", async e
   if (target.dataset.action === "remove-active-stream") {
     closeStreamActionMenus();
     if (accountIsReadOnly()) return;
+    // Removing a stream deletes its archived audio, which can be months of it: ask first.
+    const archive = streamArchivesStatus[target.dataset.streamId];
+    if (archive && archive.ranges && archive.ranges.length) {
+      const stream = configuredStreams.find(item => item.id === target.dataset.streamId);
+      if (!window.confirm(`Remove stream ${stream ? streamCallsign(stream) : ""}? Its archived audio (${archive.storage}) will be permanently deleted.`)) return;
+    }
     try {
       const data = await request(`/api/streams?id=${encodeURIComponent(target.dataset.streamId)}`, {
         method: "DELETE"
@@ -11746,7 +12444,8 @@ async function resumeListening() {
     alertId: initialRoute.alertId,
     recordingId: initialRoute.recordingId,
     page: initialRoute.page,
-    section: initialRoute.section
+    section: initialRoute.section,
+    mode: initialRoute.mode
   }, true);
   offerResumeListening();
   setInterval(refresh, 1000);
@@ -11768,3 +12467,132 @@ async function resumeListening() {
     }
   }, 5000);
 })();
+
+document.getElementById("archive_enabled").addEventListener("change", () => sendArchiveSettings());
+document.getElementById("archive_retention").addEventListener("change", () => sendArchiveSettings());
+document.getElementById("stream_archive_stream").addEventListener("change", event => {
+  streamArchiveStreamId = event.target.value;
+  replaceCurrentRoute("stream_archives", {streamId: streamArchiveStreamId});
+  renderStreamArchives(true);
+});
+document.getElementById("stream_archive_download_form").addEventListener("submit", () => {
+  setStreamArchiveResult("Download started.", "success");
+});
+for (const id of ["stream_archive_open_delete", "stream_archive_open_delete_link"]) {
+  document.getElementById(id).addEventListener("click", event => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    navigateTo("stream_archive_delete", {streamId: streamArchiveStreamId});
+  });
+}
+document.getElementById("stream_archive_delete_audio").addEventListener("click", () => {
+  deleteStreamArchiveAudio().catch(error => setStreamArchiveDeleteResult(error.message, "error"));
+});
+document.getElementById("cancel_stream_archive_delete").addEventListener("click", () => {
+  navigateTo("stream_archives", {streamId: streamArchiveStreamId}, true, true);
+});
+for (const [id, mode] of [["stream_archive_open_download", "download"], ["stream_archive_back_to_player", ""]]) {
+  document.getElementById(id).addEventListener("click", event => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    navigateTo("stream_archives", {streamId: streamArchiveStreamId, mode});
+  });
+}
+document.getElementById("stream_archive_play_pause").addEventListener("click", () => {
+  if (streamArchiveIsPlaying) {
+    pauseStreamArchive();
+  } else {
+    playStreamArchive().catch(error => setStreamArchivePlayerResult(`The archived audio couldn't start: ${error.message}`, "error"));
+  }
+});
+document.getElementById("stream_archive_back").addEventListener("click", () => skipStreamArchive(-STREAM_ARCHIVE_SKIP_SECONDS));
+document.getElementById("stream_archive_forward").addEventListener("click", () => skipStreamArchive(STREAM_ARCHIVE_SKIP_SECONDS));
+document.getElementById("stream_archive_volume").addEventListener("input", event => {
+  streamArchivePlaybackVolume = Number(event.target.value);
+  document.getElementById("stream_archive_audio").volume = playbackVolumeScalar(streamArchivePlaybackVolume);
+});
+(() => {
+  const slider = document.getElementById("stream_archive_position");
+  // The keys are no use on a phone or tablet with only a touch screen, so they're neither
+  // shown nor read there; a screen reader reads a description even when it's hidden.
+  const touchOnly = window.matchMedia ? window.matchMedia("(hover: none) and (pointer: coarse)") : null;
+  const syncKeyHint = () => {
+    const hidden = Boolean(touchOnly && touchOnly.matches);
+    setHidden("stream_archive_position_hint", hidden);
+    if (hidden) slider.removeAttribute("aria-describedby");
+    else slider.setAttribute("aria-describedby", "stream_archive_position_hint");
+  };
+  syncKeyHint();
+  if (touchOnly && touchOnly.addEventListener) touchOnly.addEventListener("change", syncKeyHint);
+  // Dragging shows the time it's at; letting go goes there.
+  slider.addEventListener("input", () => {
+    streamArchiveSliderActive = true;
+    renderStreamArchivePosition(Number(slider.value), {fromUser: true});
+  });
+  slider.addEventListener("change", () => {
+    streamArchiveSliderActive = false;
+    seekStreamArchive(Number(slider.value));
+  });
+  slider.addEventListener("keydown", event => {
+    const steps = {
+      ArrowLeft: -STREAM_ARCHIVE_SKIP_SECONDS,
+      ArrowDown: -STREAM_ARCHIVE_SKIP_SECONDS,
+      ArrowRight: STREAM_ARCHIVE_SKIP_SECONDS,
+      ArrowUp: STREAM_ARCHIVE_SKIP_SECONDS,
+      PageDown: -STREAM_ARCHIVE_PAGE_SECONDS,
+      PageUp: STREAM_ARCHIVE_PAGE_SECONDS
+    };
+    if (event.key in steps) {
+      event.preventDefault();
+      skipStreamArchive(steps[event.key]);
+    } else if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      seekStreamArchive(event.key === "Home" ? 0 : streamArchiveDuration());
+    }
+  });
+  slider.addEventListener("blur", () => {
+    streamArchiveSliderActive = false;
+  });
+})();
+(() => {
+  const audio = document.getElementById("stream_archive_audio");
+  audio.addEventListener("play", () => {
+    setStreamArchivePlayerResult("");
+    setStreamArchivePlaybackState(true);
+  });
+  audio.addEventListener("pause", () => setStreamArchivePlaybackState(false));
+  audio.addEventListener("loadedmetadata", () => {
+    if (Math.abs(audio.currentTime - streamArchiveWantedSeconds) > 0.5) audio.currentTime = streamArchiveWantedSeconds;
+  });
+  audio.addEventListener("timeupdate", () => {
+    if (audio.readyState >= 1 && !audio.seeking) streamArchiveWantedSeconds = audio.currentTime;
+    renderStreamArchivePosition(streamArchiveCurrentSeconds());
+    if (streamArchiveIsPlaying) updateStreamArchiveMediaSession();
+    else updateStreamArchivePositionState();
+  });
+  audio.addEventListener("ended", () => {
+    continueStreamArchive();
+  });
+  audio.addEventListener("error", () => {
+    if (!audio.error || !streamArchivePlayer) return;
+    logStreamArchiveEvent("error", {code: audio.error.code, message: audio.error.message || ""});
+    // Not while the page is hidden: changing the audio then ends the lock screen's controls.
+    if (document.visibilityState === "hidden") {
+      streamArchiveNeedsRecovery = true;
+      return;
+    }
+    recoverStreamArchivePlayer();
+  });
+  // What the audio does around a pause, for finding out what iOS does with it.
+  for (const name of ["play", "pause", "abort", "emptied", "stalled", "ended"]) {
+    audio.addEventListener(name, () => logStreamArchiveEvent(name));
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (!streamArchivePlayer) return;
+    logStreamArchiveEvent(`page ${document.visibilityState}`);
+  });
+})();
+document.getElementById("stream_archive_jump_form").addEventListener("submit", event => {
+  event.preventDefault();
+  jumpStreamArchive().catch(error => setStreamArchivePlayerResult(error.message, "error"));
+});

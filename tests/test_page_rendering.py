@@ -121,7 +121,7 @@ class PageScriptLoadingTests(unittest.TestCase):
         baseline = {
             "dashboard", "logs", "settings", "change_password", "eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail",
             "iq_recorder", "iq_recorder_start", "iq_recording_download", "rtl", "streams", "stream_settings", "stream_output", "add_stream",
-            "restart",
+            "restart", "stream_archives", "stream_archive_delete",
         }
         for view in baseline:
             self.assertFalse(pages.view_needs_app(page, view), view)
@@ -287,7 +287,21 @@ class BaselinePageServerTests(unittest.TestCase):
         account, secret = self.accounts.create_account("viewer", True)
         self.accounts.change_password(account["id"], secret, "password2", "password2")
 
-        _, page = self.request("GET", "/?view=rtl", user=("viewer", "password2"))
+        # A page it can't use is the dashboard, at the dashboard's address.
+        for path, location in (
+            ("/?view=rtl", "/"),
+            ("/?view=stream_archive_delete&stream=s1", "/"),
+            ("/?view=eas_alert_delete", "/"),
+            ("/?view=no_such_page", "/"),
+        ):
+            response, _ = self.request("GET", path, user=("viewer", "password2"))
+            self.assertEqual((response.status, response.getheader("Location")), (303, location), path)
+        # Pages that are now sections of Settings go there, for those who have Settings.
+        response, _ = self.request("GET", "/?view=notifications", user=("owner", "password1"))
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/?view=settings&section=notifications"))
+        response, _ = self.request("GET", "/?view=stream_archive_delete&stream=s1", user=("owner", "password1"))
+        self.assertEqual(response.status, 200)
+        _, page = self.request("GET", "/", user=("viewer", "password2"))
         self.assertEqual(self.title(page), "Dashboard - NWR Stream Manager")
         self.assertIn('<a id="nav_rtl" href="/?view=rtl" data-view="rtl" hidden>', page)
         self.assertIn('<a id="nav_settings" href="/?view=settings" data-view="settings" hidden>', page)
@@ -358,7 +372,9 @@ class BaselinePageServerTests(unittest.TestCase):
         self.accounts.change_password(account["id"], secret, "password2", "password2")
         helper = ("helper", "password2")
 
-        _, page = self.request("GET", "/?view=settings&section=accounts", cookie=cookie, user=helper)
+        response, _ = self.request("GET", "/?view=settings&section=accounts", cookie=cookie, user=helper)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/?view=settings&section=account"))
+        _, page = self.request("GET", "/?view=settings&section=account", cookie=cookie, user=helper)
         self.assertEqual(self.title(page), "Account - Settings - NWR Stream Manager")
         self.assertRegex(page, r'<div id="settings_panel_account" class="settings-panel">\s*<h3>Account</h3>\s*<form id="change_password_form"')
         self.assertIn('<a id="change_password_cancel_link" class="baseline-only button-link" href="/?view=settings">', page)
@@ -678,8 +694,8 @@ class IqRecorderPageTests(unittest.TestCase):
         self.assertIn('href="/?view=iq_recording_download&amp;recording=rec1"', page)
         self.assertNotIn("confirm=remove", page)
         self.assertRegex(page, r'<a id="open_iq_start_link"[^>]* hidden>')
-        _, page = self.request("GET", "/?view=iq_recorder_start", user=self.viewer)
-        self.assertEqual(self.title(page), "Dashboard - NWR Stream Manager")
+        response, _ = self.request("GET", "/?view=iq_recorder_start", user=self.viewer)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
 
     def test_a_running_recording_shows_its_status_and_a_stop_button(self) -> None:
         self.recorder = {
@@ -885,8 +901,8 @@ class RtlSettingsPageTests(unittest.TestCase):
         view = page[page.index('<div id="view_rtl"'):page.index('<div id="view_receiver"')]
         self.assertEqual(view.count('type="submit"'), 1)
         self.assertRegex(page, r'(?s)<section id="rtl_notifications_section">.*<div id="rtl_save_actions" class="baseline-only">.*</section>(\s*<input type="hidden"[^>]*>)*\s*</form>')
-        _, page = self.request("GET", "/?view=rtl", user=self.viewer)
-        self.assertEqual(self.title(page), "Dashboard - NWR Stream Manager")
+        response, _ = self.request("GET", "/?view=rtl", user=self.viewer)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
 
     def test_only_the_settings_changed_are_saved(self) -> None:
         token, cookie = self.token()
@@ -1038,8 +1054,8 @@ class StreamPageTests(unittest.TestCase):
         _, page = self.request("GET", "/?view=streams", user=self.viewer)
         self.assertNotIn('aria-label="Stop stream', page)
         self.assertRegex(page, r'<a id="open_add_stream_link"[^>]* hidden>')
-        _, page = self.request("GET", "/?view=stream_settings&stream=s1", user=self.viewer)
-        self.assertEqual(self.title(page), "Dashboard - NWR Stream Manager")
+        response, _ = self.request("GET", "/?view=stream_settings&stream=s1", user=self.viewer)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
 
     def test_streams_start_stop_and_are_removed_after_a_confirmation(self) -> None:
         token, cookie = self.token()
@@ -1607,8 +1623,10 @@ class AdvancedPageTests(unittest.TestCase):
         self.assertRegex(page, r'<span id="advanced_port_flag" class="hint" hidden>')
 
     def test_only_the_owner_has_advanced(self) -> None:
-        response, page = self.request("GET", "/?view=settings&section=advanced", user=self.admin)
-        self.assertEqual(self.title(page), "Settings - NWR Stream Manager")
+        response, _ = self.request("GET", "/?view=settings&section=advanced", user=self.admin)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/?view=settings&section=general"))
+        response, page = self.request("GET", "/?view=settings&section=general", user=self.admin)
+        self.assertEqual(self.title(page), "General - Settings - NWR Stream Manager")
         self.assertRegex(page, r'<button id="settings_tab_advanced" [^>]*hidden>')
         token = self.form_token(response)
         fields = {"form": "advanced", "port": "9090", "was_port": "8080", "form_token": token}

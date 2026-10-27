@@ -42,6 +42,7 @@ from .constants import (
     STREAMS_DIRECTORY_MARKER_FILE_NAME,
 )
 from .eas_alerts import eas_recording_settings_from_stream
+from .stream_archive import stream_archive_settings_from_stream
 from .icecast import parse_icecast_address
 from .icecastauth import IcecastSettings
 from .state_files import sanitize_path_component
@@ -360,6 +361,7 @@ def public_stream(stream: dict[str, Any]) -> dict[str, Any]:
         "status": stream.get("status", ""),
         "outputs": [public_stream_output(output) for output in stream_outputs(stream)],
         "eas_recording": {"enabled": bool(eas_recording.get("enabled", False))},
+        "archive": {"enabled": stream_archive_settings_from_stream(stream).enabled},
         "created_at": stream.get("created_at", 0),
         "updated_at": stream.get("updated_at", 0),
     }
@@ -456,6 +458,7 @@ def enabled_output_count(
     *,
     disabled_output_id: str | None = None,
     eas_enabled: bool | None = None,
+    archive_enabled: bool | None = None,
 ) -> int:
     count = 0
     for output in stream_outputs(stream):
@@ -466,6 +469,12 @@ def enabled_output_count(
     if eas_enabled is None:
         eas_enabled = eas_recording_settings_from_stream(stream).enabled
     if eas_enabled:
+        count += 1
+    # Stream archiving keeps a stream running like an output, though it isn't counted
+    # among the outputs the streams list shows.
+    if archive_enabled is None:
+        archive_enabled = stream_archive_settings_from_stream(stream).enabled
+    if archive_enabled:
         count += 1
     return count
 

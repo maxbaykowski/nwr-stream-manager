@@ -86,6 +86,10 @@ NATIVE_DEPENDENCIES = (
             "opus_encode",
             "opus_encoder_destroy",
             "opus_strerror",
+            # Stream archive downloads decode the archive.
+            "opus_decoder_create",
+            "opus_decode",
+            "opus_decoder_destroy",
         ),
     ),
     NativeDependency(

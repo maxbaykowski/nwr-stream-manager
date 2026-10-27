@@ -36,6 +36,7 @@ from .fallback_settings import stream_fallback_action_from_stream, validate_stre
 from .models import normalize_notification_access_url
 from .notifications import stream_notification_settings_from_stream, validate_stream_notification_payload
 from .state_files import validate_remote_buffer_seconds
+from .stream_archive import stream_archive_settings_dict, validate_stream_archive_payload
 from .stream_config import soundcard_channels, validate_audio_payload
 
 
@@ -104,6 +105,33 @@ def stream_list_status(stream: dict[str, Any], status: dict[str, Any]) -> tuple[
         if value in statuses:
             return value, signal
     return "disabled", signal
+
+
+def stream_archive_summary_text(summary: dict[str, Any]) -> str:
+    """What a stream has archived, as its Stream archiving settings show it."""
+    if summary.get("ranges"):
+        return f"Archived audio from {summary['from_text']} to {summary['to_text']}, using {summary['storage']}."
+    return "No audio archived yet."
+
+
+def stream_archive_available_text(archive: dict[str, Any]) -> str:
+    """What the Stream archives page says a stream has."""
+    return f"Archived audio from {archive['from_text']} to {archive['to_text']} ({archive['storage']})."
+
+
+def stream_archive_delete_choices_html(choices: list[dict[str, Any]], chosen: str) -> str:
+    """What archived audio can be deleted, as the page script lists it: the first is chosen."""
+    if chosen not in {choice["id"] for choice in choices}:
+        chosen = choices[0]["id"] if choices else ""
+    return "".join(
+        f'<label class="checkbox-row"><input type="radio" name="choice" value="{html.escape(choice["id"])}"'
+        f'{" checked" if choice["id"] == chosen else ""}> {html.escape(choice["label"])} ({html.escape(choice["storage"])})</label>'
+        for choice in choices
+    )
+
+
+def stream_archive_gaps_html(archive: dict[str, Any]) -> str:
+    return "".join(f"<li>{html.escape(gap)}</li>" for gap in archive["gaps"])
 
 
 def stream_output_count(stream: dict[str, Any]) -> int:
@@ -505,6 +533,8 @@ STREAM_SETTINGS_FIELDS: tuple[tuple[str, str, str, str], ...] = (
     ("eas_post_seconds", "eas_recording", "post_seconds", "text"),
     ("eas_max_seconds", "eas_recording", "max_seconds", "text"),
     ("eas_format", "eas_recording", "format", "text"),
+    ("archive_enabled", "archive", "enabled", "bool"),
+    ("archive_retention", "archive", "retention", "text"),
     ("stream_fallback_action", "fallback_action", "action", "text"),
     ("stream_fallback_delay", "fallback_action", "delay_seconds", "text"),
     ("audio_volume_enabled", "audio", "volume.enabled", "bool"),
@@ -566,6 +596,7 @@ def stream_settings_groups(stream: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {
         "enabled": {"enabled": stream_enabled(stream)},
         "eas_recording": asdict(eas_recording_settings_from_stream(stream)),
+        "archive": stream_archive_settings_dict(stream),
         "fallback_action": asdict(stream_fallback_action_from_stream(stream)),
         "audio": stream_audio_effects(stream),
         "notifications": asdict(stream_notification_settings_from_stream(stream)),
@@ -634,6 +665,8 @@ def stream_settings_changes(form: dict[str, str], stream: dict[str, Any]) -> dic
         changes["audio"] = validate_audio_payload(audio)
     if "eas_recording" in changes:
         changes["eas_recording"] = asdict(validate_eas_recording_payload(changes["eas_recording"]))
+    if "archive" in changes:
+        changes["archive"] = asdict(validate_stream_archive_payload(changes["archive"]))
     if "fallback_action" in changes:
         changes["fallback_action"] = asdict(validate_stream_fallback_action_payload(changes["fallback_action"]))
     if "notifications" in changes:
@@ -914,6 +947,7 @@ def dashboard_parts(status: dict[str, Any], sdr_label: str, read_only: bool, now
     usage = storage.get("usage") or {}
     text["summary_iq_storage"] = str(usage.get("iq_recordings") or "0 B")
     text["summary_eas_storage"] = str(usage.get("eas_recordings") or "0 B")
+    text["summary_archive_storage"] = str(usage.get("stream_archives") or "0 B")
     state = str(storage.get("status") or "unknown")
     warning = str(storage.get("message") or "Please free up disk space.") if storage.get("status") and state != "ok" else ""
     text["storage-warning"] = warning

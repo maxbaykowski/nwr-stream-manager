@@ -381,6 +381,16 @@ class EasAlertTests(unittest.TestCase):
 
             self.assertEqual(response["streams"][0]["outputs"], [])
 
+    def test_a_recordings_folder_with_only_its_index_left_takes_up_nothing(self) -> None:
+        storage = importlib.import_module("nwr_stream_manager.storage")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            (folder / "index.json").write_text("[]\n" * 13, encoding="utf-8")
+            self.assertEqual(storage.directory_size_bytes(folder), 0)
+            self.assertEqual(storage.format_storage_bytes(storage.directory_size_bytes(folder)), "0 B")
+            (folder / "TOR-04-14-2026-2154EDT.mp3").write_bytes(b"\0" * 2000)
+            self.assertEqual(storage.directory_size_bytes(folder), 2000)
+
     def test_storage_monitor_reports_decimal_used_and_total_storage(self) -> None:
         web_control = self.web_control
 

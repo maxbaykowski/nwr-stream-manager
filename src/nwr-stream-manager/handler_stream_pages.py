@@ -41,6 +41,7 @@ from .page_sections import (
     soundcard_device_options_html,
     soundcard_label,
     station_choice_label,
+    stream_archive_summary_text,
     stream_enabled,
     stream_label,
     stream_output_count,
@@ -55,6 +56,8 @@ from .page_sections import (
     stream_signal_display,
     weatherusa_mount,
 )
+from .stream_archive import RETENTION_CHOICES, stream_archive_settings_from_stream
+from .stream_config import enabled_output_count
 
 
 class StreamPageHandlerMixin:
@@ -75,7 +78,7 @@ class StreamPageHandlerMixin:
         label = html.escape(stream_label(stream))
         content = (
             f"<h3>Remove stream {label}?</h3>"
-            "<p>Its outputs and settings will be permanently deleted. EAS alerts it recorded are kept.</p>"
+            "<p>Its outputs, settings and archived audio will be permanently deleted. EAS alerts it recorded are kept.</p>"
             f'<form method="post" action="/streams/remove">{token_input}'
             f'<input type="hidden" name="stream" value="{html.escape(str(stream.get("id", "")))}">'
             '<div class="actions"><button type="submit" class="primary" autofocus>Remove stream</button>'
@@ -145,7 +148,7 @@ class StreamPageHandlerMixin:
         for name, _group, _key, kind in STREAM_SETTINGS_FIELDS:
             if kind == "bool":
                 page = page_rendering.set_attribute(page, name, "checked", "checked" if shown[name] == "1" else None)
-            elif name not in {"eas_format", "stream_fallback_action"}:
+            elif name not in {"eas_format", "stream_fallback_action", "archive_retention"}:
                 page = page_rendering.set_attribute(page, name, "value", shown[name])
         for value in ("wav", "mp3"):
             page = page_rendering.set_attribute(page, f"eas_format_{value}", "checked", "checked" if shown["eas_format"] == value else None)
@@ -155,9 +158,10 @@ class StreamPageHandlerMixin:
             )
         # EAS recording can't be turned off when it's the stream's only output, as the page script shows.
         eas = groups["eas_recording"]
-        page = page_rendering.set_hidden(page, "eas_enabled_label", bool(eas["enabled"]) and stream_output_count(stream) <= 1)
+        page = page_rendering.set_hidden(page, "eas_enabled_label", bool(eas["enabled"]) and enabled_output_count(stream) <= 1)
         storage_critical = (status.get("storage") or {}).get("status") == "critical"
         page = page_rendering.set_hidden(page, "eas_storage_blocked_hint", not (storage_critical and eas["enabled"]))
+        page = self._fill_stream_archive_panel(page, stream, status, shown, form)
         page = page_rendering.set_hidden(page, "stream_notify_eas_alerts_label", not eas["enabled"])
         page = page_rendering.set_hidden(page, "stream_notify_eas_alerts_hint", not eas["enabled"])
         try:
@@ -187,6 +191,38 @@ class StreamPageHandlerMixin:
         tab_title = f"{STREAM_SETTINGS_TABS[chosen]} - " if chosen else ""
         return page, f"{tab_title}Edit stream {callsign}"
 
+    def _fill_stream_archive_panel(
+        self, page: str, stream: dict[str, Any], status: dict[str, Any], shown: dict[str, str], form: dict[str, str]
+    ) -> str:
+        archive = stream_archive_settings_from_stream(stream)
+        summary = (status.get("stream_archives") or {}).get(str(stream.get("id", ""))) or {}
+        page = page_rendering.set_content(
+            page,
+            "archive_retention",
+            "".join(
+                f'<option value="{value}"{" selected" if value == shown["archive_retention"] else ""}>{label}</option>'
+                for value, label, _seconds in RETENTION_CHOICES
+            ),
+        )
+        # Labelled for what selecting it does now.
+        page = page_rendering.set_text(
+            page, "archive_enabled_text", "Disable stream archiving" if archive.enabled else "Enable stream archiving"
+        )
+        # Like EAS recording, it can't be turned off when it's all that keeps the stream running.
+        page = page_rendering.set_hidden(page, "archive_enabled_label", archive.enabled and enabled_output_count(stream) <= 1)
+        page = page_rendering.set_hidden(page, "archive_storage_blocked_hint", summary.get("status") != "paused")
+        page = page_rendering.set_text(page, "archive_summary", stream_archive_summary_text(summary))
+        if form.get("archive_confirm_message"):
+            # A change that deletes archived audio, waiting to be confirmed by saving again.
+            page = page_rendering.set_hidden(page, "archive_confirm", False)
+            page = page_rendering.set_content(
+                page,
+                "archive_confirm",
+                f'<p class="error">{html.escape(form["archive_confirm_message"])} Select <strong>Save changes</strong> again to delete it.</p>'
+                '<input type="hidden" name="confirm_archive_delete" value="1">',
+            )
+        return page
+
     def _handle_stream_form(self, path: str) -> None:
         """Starts, stops, removes and changes streams, for browsers without the page script."""
         form: dict[str, str] = {}
@@ -208,15 +244,30 @@ class StreamPageHandlerMixin:
             if stream is None:
                 raise ValueError("Stream was not found.")
             changes = stream_settings_changes(form, stream)
+            archive = changes.get("archive")
+            if archive is not None and form.get("confirm_archive_delete") != "1":
+                # Asked before anything is saved: a shorter time to keep audio deletes what's older.
+                if archive["retention"] != stream_archive_settings_from_stream(stream).retention:
+                    deletion = self.service.stream_archive_deletion(stream_id, archive["retention"])
+                    if deletion:
+                        form = {**form, "archive_confirm_message": deletion, "tab": form.get("tab") or "archive"}
+                        query = {"view": "stream_settings", "stream": stream_id, "tab": form["tab"]}
+                        self._send_page(self._render_index_page(query, form=form))
+                        return
             # Its own settings first, so turning the stream on uses them.
             for group, method, key in (
                 ("audio", self.service.update_audio_effects, "audio"),
                 ("notifications", self.service.update_stream_notifications, "notifications"),
                 ("fallback_action", self.service.update_stream_fallback_action, "fallback_action"),
                 ("eas_recording", self.service.update_eas_recording, "eas_recording"),
+                ("archive", self.service.update_stream_archive, "archive"),
             ):
                 if group in changes:
-                    method({"stream_id": stream_id, key: changes[group]})
+                    payload = {"stream_id": stream_id, key: changes[group]}
+                    if group == "archive":
+                        # Anything it deletes was confirmed above.
+                        payload["confirm_delete"] = True
+                    method(payload)
             if "enabled" in changes:
                 self.service.update_stream({"stream_id": stream_id, "enabled": changes["enabled"]["enabled"]})
         except Exception as exc:

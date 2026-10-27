@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -60,6 +60,7 @@ from .nfm import float_to_s16, NfmDemodulator
 from .rtl import NWR_CENTER_FREQUENCY_HZ, RtlSampleBatch
 from .signal_meter import ChannelSignalMeter, noise_reference_band_for_transition, SignalPresenceTracker
 from .storage import storage_status_message, StorageMonitor
+from .stream_archive import stream_archive_settings_from_stream, StreamArchiveStore, StreamArchiveWriter
 from .stream_audio import (
     ComplexFrameBuffer,
     FloatFrameBuffer,
@@ -212,8 +213,11 @@ class IcecastStreamWorker:
         soundcard_devices_provider=None,
         soundcard_manager: SharedSoundcardOutputManager | None = None,
         storage_monitor: StorageMonitor | None = None,
+        archive_store_provider=None,
     ) -> None:
         self.stream = stream
+        # The stream's archive folder, kept by the service so it can list, export and prune it.
+        self.archive_store_provider = archive_store_provider
         self.fanout = fanout
         self.fallback_settings_provider = fallback_settings_provider
         self.fallback_audio_provider = fallback_audio_provider
@@ -252,6 +256,10 @@ class IcecastStreamWorker:
         self.eas_recorder: EasRecorderOutput | None = None
         self.eas_status = "disabled"
         self.eas_error: str | None = None
+        self.archive_writer: StreamArchiveWriter | None = None
+        self.archive_status = "disabled"
+        self.archive_error: str | None = None
+        self._archive_storage_checked_at = 0.0
         self.last_audio_at: float | None = None
         self.test_mode_source: SyntheticNwrTestModeSource | None = None
         self.signal_presence = SignalPresenceTracker()
@@ -298,6 +306,7 @@ class IcecastStreamWorker:
                 self.soundcard_manager.remove_output(output_id, owner=self._soundcard_owner)
         self.soundcard_outputs = set()
         self._stop_eas_recorder()
+        self._stop_archive()
         if self.thread.ident is not None:
             self.thread.join(timeout=2.0)
 
@@ -322,6 +331,7 @@ class IcecastStreamWorker:
             writer.start()
         self._sync_soundcard_taps(stream)
         self._sync_eas_recorder(stream)
+        self._sync_archive(stream)
 
     def audio_config(self) -> AudioConfig:
         with self.lock:
@@ -1072,6 +1082,11 @@ class IcecastStreamWorker:
             soundcard_output_ids = list(getattr(self, "soundcard_outputs", set()))
             soundcard_taps = list(getattr(self, "soundcard_taps", {}).values())
             eas_recorder = self.eas_recorder
+            archive_writer = getattr(self, "archive_writer", None)
+        if archive_writer is not None:
+            # Archived exactly as listeners hear it. The writer only queues it here; the
+            # encoding and the disk are on its own thread.
+            self._archive_pcm(archive_writer, pcm)
         for source in monitor_sources:
             source.push_pcm(pcm)
         if float_samples is not None and self.soundcard_manager is not None:
@@ -1125,6 +1140,7 @@ class IcecastStreamWorker:
             or self.has_monitor_sources()
             or self.has_soundcard_taps()
             or self.has_eas_recorder()
+            or self.has_archive()
         )
 
     def _stop_unused_encoder_groups(self) -> None:
@@ -1231,6 +1247,100 @@ class IcecastStreamWorker:
             except Exception as exc:
                 LOG.debug("EAS recorder close failed: %s", exc)
             self.storage_monitor.recording_stopped()
+
+    def has_archive(self) -> bool:
+        with self.lock:
+            return getattr(self, "archive_writer", None) is not None
+
+    def _archive_pcm(self, writer: StreamArchiveWriter, pcm: bytes) -> None:
+        now = time.monotonic()
+        if now - getattr(self, "_archive_storage_checked_at", 0.0) >= 1.0:
+            self._archive_storage_checked_at = now
+            if self.storage_monitor.is_critical(writer.store.directory):
+                self.stop_archive_due_to_storage(storage_status_message("critical"))
+                return
+            if writer.error:
+                LOG.warning("stream archiving stopped for %s: %s", self.stream.get("station", {}).get("callsign"), writer.error)
+                self._stop_archive()
+                with self.lock:
+                    self.archive_status = "needs-attention"
+                    self.archive_error = writer.error
+                return
+        writer.write(pcm)
+
+    def with_archive_stopped(self, action: Callable[[], Any]) -> Any:
+        """Runs action with archiving stopped and its file finished, then carries on
+        archiving in a new one, as when all of a stream's archived audio is deleted."""
+        self._stop_archive()
+        try:
+            return action()
+        finally:
+            self._sync_archive(self.stream)
+
+    def stop_archive_due_to_storage(self, message: str) -> None:
+        with self.lock:
+            has_writer = getattr(self, "archive_writer", None) is not None
+        if not has_writer:
+            return
+        LOG.warning(
+            "pausing stream archiving for %s because storage is critically low",
+            self.stream.get("station", {}).get("callsign"),
+        )
+        self._stop_archive()
+        with self.lock:
+            self.archive_status = "paused"
+            self.archive_error = message
+
+    def archive_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {"status": getattr(self, "archive_status", "disabled"), "error": getattr(self, "archive_error", None)}
+
+    def _sync_archive(self, stream: dict[str, Any]) -> None:
+        settings = stream_archive_settings_from_stream(stream)
+        if not settings.enabled or getattr(self, "archive_store_provider", None) is None:
+            self._stop_archive()
+            with self.lock:
+                self.archive_status = "disabled"
+                self.archive_error = None
+            return
+        with self.lock:
+            if getattr(self, "archive_writer", None) is not None:
+                return
+        store: StreamArchiveStore = self.archive_store_provider(stream)
+        callsign = stream.get("station", {}).get("callsign", "unknown")
+        self.storage_monitor.add_path(store.directory)
+        if self.storage_monitor.is_critical(store.directory):
+            with self.lock:
+                self.archive_status = "paused"
+                self.archive_error = storage_status_message("critical")
+            LOG.warning("stream archiving for %s is paused because storage is critically low", callsign)
+            return
+        try:
+            writer = StreamArchiveWriter(store, input_sample_rate=IQ_SAMPLE_RATE, label=str(callsign))
+        except Exception as exc:
+            LOG.warning("stream archiving couldn't start for %s: %s", callsign, exc)
+            with self.lock:
+                self.archive_status = "needs-attention"
+                self.archive_error = str(exc)
+            return
+        with self.lock:
+            self.archive_writer = writer
+            self.archive_status = "enabled"
+            self.archive_error = None
+        self.storage_monitor.recording_started(store.directory)
+        LOG.info("started stream archiving for %s in %s", callsign, store.directory)
+
+    def _stop_archive(self) -> None:
+        with self.lock:
+            writer = getattr(self, "archive_writer", None)
+            self.archive_writer = None
+            if getattr(self, "archive_status", "disabled") == "enabled":
+                self.archive_status = "disabled"
+        if writer is not None:
+            # Finishes the file being written, so it's complete on disk.
+            writer.close()
+            self.storage_monitor.recording_stopped()
+            LOG.info("stopped stream archiving for %s", self.stream.get("station", {}).get("callsign", "unknown"))
 
     def _set_eas_status(self, status: str, error: str | None = None) -> None:
         with self.lock:

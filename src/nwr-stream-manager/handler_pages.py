@@ -24,7 +24,9 @@ from .baseline_pages import (
     IQ_RECORDER_VIEWS,
     NOTIFICATION_RESULTS,
     OUTPUT_RESULTS,
+    page_route,
     READ_ONLY_RESTRICTED_VIEWS,
+    SETTINGS_SECTIONS_FROM_OLD_VIEWS,
     render_account_secret_page,
     render_change_password_page,
     render_setup_page,
@@ -37,7 +39,13 @@ from .baseline_pages import (
     VIEW_NAV_ITEMS,
     VIEW_TITLES,
 )
-from .page_sections import dashboard_parts, iq_recorder_result
+from .page_sections import (
+    dashboard_parts,
+    iq_recorder_result,
+    stream_archive_available_text,
+    stream_archive_delete_choices_html,
+    stream_archive_gaps_html,
+)
 from .web_address import advanced_saved_text
 
 
@@ -178,7 +186,7 @@ class PageHandlerMixin:
         page = page_rendering.set_hidden(page, "nav_change_password", not read_only)
         page = page_rendering.set_hidden(page, "nav_restart", read_only)
         current = VIEW_NAV_ITEMS.get(view, view)
-        for item in ("dashboard", "rtl", "streams", "eas_alerts", "receiver", "iq_recorder", "logs", "settings", "change_password", "restart"):
+        for item in ("dashboard", "rtl", "streams", "eas_alerts", "stream_archives", "receiver", "iq_recorder", "logs", "settings", "change_password", "restart"):
             page = page_rendering.set_attribute(page, f"nav_{item}", "aria-current", "page" if item == current else None)
         if view == "logs":
             page = self._fill_logs_view(page, read_only)
@@ -210,6 +218,13 @@ class PageHandlerMixin:
                 result = (element_id, message, "success")
         eas_streams = self.service.eas_alert_streams()["streams"]
         page = page_rendering.set_hidden(page, "nav_eas_alerts", not eas_streams)
+        archive_streams = (self.service.stream_archive_streams() or {}).get("streams") or []
+        page = page_rendering.set_hidden(page, "nav_stream_archives", not archive_streams)
+        if view == "stream_archives":
+            page = self._fill_stream_archives_view(page, query, form or {}, archive_streams)
+            page = page_rendering.set_hidden(page, "stream_archive_delete_actions", read_only or not archive_streams)
+        if view == "stream_archive_delete" and not read_only:
+            page = self._fill_stream_archive_delete_view(page, query, form or {}, archive_streams)
         if view in EAS_ALERT_VIEWS:
             page, title = self._fill_eas_alert_view(page, view, query, form or {}, eas_streams, read_only, title)
         if view == "dashboard":
@@ -246,6 +261,24 @@ class PageHandlerMixin:
             # In the title too, so it's the first thing read when the page loads.
             title = f"Error: {message} - {title}" if kind == "error" else f"{message} - {title}"
         return page_rendering.set_title(page, title)
+
+    def _index_page_address(self, query: dict[str, str]) -> str | None:
+        """Where the page asked for really is, for this account, when that's not the address
+        asked for: a page it can't use, or that isn't there, is the dashboard, so the address
+        says so. None when the address is right."""
+        account = getattr(self, "current_account", None)
+        if not isinstance(account, AccountRecord):
+            return None
+        view = query.get("view", "") or "dashboard"
+        if view in SETTINGS_SECTIONS_FROM_OLD_VIEWS and not account.is_read_only:
+            return page_route("settings", section=SETTINGS_SECTIONS_FROM_OLD_VIEWS[view])
+        if view not in INDEX_VIEWS or (account.is_read_only and view in READ_ONLY_RESTRICTED_VIEWS):
+            return "/"
+        section = query.get("section", "")
+        if view == "settings" and section and section not in settings_sections_for(account.is_owner):
+            # Others change their own password where the owner manages accounts.
+            return page_route("settings", section="account" if section in {"accounts", "create_account"} else "general")
+        return None
 
     def _fill_settings_view(self, page: str, account: AccountRecord, query: dict[str, str], form: dict[str, str]) -> tuple[str, str]:
         owner = account.is_owner
@@ -332,6 +365,63 @@ class PageHandlerMixin:
             parts = [device.get("vendor"), device.get("name") or "RTL-SDR", f"serial {serial}"] if device else []
             sdr_label = ", ".join(str(part) for part in parts if part) if device else f"serial {serial}"
         return dashboard_parts(status, sdr_label, read_only, time.time())
+
+    def _fill_stream_archives_view(
+        self, page: str, query: dict[str, str], form: dict[str, str], streams: list[dict[str, Any]]
+    ) -> str:
+        """Stream archives: a stream chosen, what it has, and the download form filled in."""
+        if not streams:
+            page = page_rendering.set_text(page, "stream_archive_available", "No stream has archived audio yet.")
+            return page_rendering.set_hidden(page, "stream_archive_download_form", True)
+        chosen = next((item for item in streams if item["id"] == query.get("stream")), streams[0])
+        page = page_rendering.set_content(
+            page,
+            "stream_archive_stream",
+            "".join(
+                f'<option value="{html.escape(item["id"])}"{" selected" if item is chosen else ""}>{html.escape(item["label"])}</option>'
+                for item in streams
+            ),
+        )
+        page = page_rendering.set_text(page, "stream_archive_available", stream_archive_available_text(chosen))
+        if chosen["gap_count"]:
+            page = page_rendering.set_hidden(page, "stream_archive_gaps_section", False)
+            page = page_rendering.set_content(page, "stream_archive_gaps", stream_archive_gaps_html(chosen))
+            page = page_rendering.set_hidden(page, "stream_archive_gaps", not chosen["gaps"])
+            if chosen["gaps_note"]:
+                page = page_rendering.set_text(page, "stream_archive_gaps_note", chosen["gaps_note"])
+                page = page_rendering.set_hidden(page, "stream_archive_gaps_note", False)
+        page = page_rendering.set_attribute(page, "stream_archive_download_stream", "value", chosen["id"])
+        page = page_rendering.set_attribute(page, "stream_archive_open_delete_link", "href", page_route("stream_archive_delete", stream=chosen["id"]))
+        page = page_rendering.set_text(page, "stream_archive_time_zone", chosen["time_zone"] or "this computer's time zone")
+        for field in ("start_date", "start_time", "end_date", "end_time"):
+            value = form.get(field) if form.get("stream") == chosen["id"] and form.get(field) else chosen[f"default_{field}"]
+            page = page_rendering.set_attribute(page, f"stream_archive_{field}", "value", value)
+        fmt = form.get("format") if form.get("format") in {"opus", "mp3", "wav"} else "opus"
+        return page_rendering.set_content(
+            page,
+            "stream_archive_format",
+            "".join(
+                f'<option value="{value}"{" selected" if value == fmt else ""}>{label}</option>'
+                for value, label in (("opus", "Ogg Opus"), ("mp3", "MP3"), ("wav", "WAV"))
+            ),
+        )
+
+    def _fill_stream_archive_delete_view(
+        self, page: str, query: dict[str, str], form: dict[str, str], streams: list[dict[str, Any]]
+    ) -> str:
+        """Delete archived audio: the choices of what to delete, as the page script lists them."""
+        chosen = next((item for item in streams if item["id"] == query.get("stream")), streams[0] if streams else None)
+        if chosen is None:
+            page = page_rendering.set_text(page, "stream_archive_delete_stream_label", "No stream has archived audio yet.")
+            return page_rendering.set_attribute(page, "stream_archive_delete_audio", "disabled", "disabled")
+        choices = self.service.stream_archive_delete_options(chosen["id"])["choices"]
+        page = page_rendering.set_text(page, "stream_archive_delete_stream_label", f"Stream: {chosen['label']}")
+        page = page_rendering.set_attribute(page, "stream_archive_delete_stream", "value", chosen["id"])
+        page = page_rendering.set_content(page, "stream_archive_delete_options", stream_archive_delete_choices_html(choices, form.get("choice", "")))
+        page = page_rendering.set_attribute(page, "cancel_stream_archive_delete_link", "href", page_route("stream_archives", stream=chosen["id"]))
+        if not choices:
+            page = page_rendering.set_attribute(page, "stream_archive_delete_audio", "disabled", "disabled")
+        return page
 
     def _fill_dashboard_view(self, page: str, read_only: bool) -> str:
         parts = self._dashboard_parts(read_only)

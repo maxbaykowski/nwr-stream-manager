@@ -18,6 +18,7 @@ __INDEX_STYLES__</style>
       <a id="nav_rtl" href="/?view=rtl" data-view="rtl">Configure RTL-SDR</a>
       <a id="nav_streams" href="/?view=streams" data-view="streams">Manage Streams</a>
       <a id="nav_eas_alerts" href="/?view=eas_alerts" data-view="eas_alerts" data-eas-entry="restore" hidden>EAS alerts</a>
+      <a id="nav_stream_archives" href="/?view=stream_archives" data-view="stream_archives" hidden>Stream archives</a>
       <span class="nav-more">
         <button id="nav_more_button" type="button" aria-haspopup="menu" aria-expanded="false" hidden>More</button>
         <span id="nav_more_menu" class="nav-more-menu">
@@ -181,6 +182,7 @@ __INDEX_STYLES__</style>
         <dt>Storage</dt><dd id="summary_storage">unknown</dd>
         <dt>I/Q files</dt><dd id="summary_iq_storage">0 B</dd>
         <dt>EAS recordings</dt><dd id="summary_eas_storage">0 B</dd>
+        <dt>Stream archives</dt><dd id="summary_archive_storage">0 B</dd>
       </dl>
       <div id="storage-warning" class="storage-warning" hidden></div>
     </section>
@@ -1110,6 +1112,7 @@ __INDEX_STYLES__</style>
         <div id="stream_settings_list" class="settings-list needs-app" aria-label="Stream settings">
           <button id="tab_outputs" type="button" data-stream-section="outputs">Outputs</button>
           <button id="tab_eas" type="button" data-stream-section="eas">EAS recording</button>
+          <button id="tab_archive" type="button" data-stream-section="archive">Stream archiving</button>
           <button id="tab_fallback_action" type="button" data-stream-section="fallback_action">Fallback action</button>
           <button id="tab_audio" type="button" data-stream-section="audio">Audio effects</button>
           <button id="tab_notifications" type="button" data-stream-section="notifications" hidden>Notifications</button>
@@ -1118,6 +1121,7 @@ __INDEX_STYLES__</style>
         <div id="stream_settings_links" class="settings-list baseline-only" role="navigation" aria-label="Stream settings">
           <a id="tab_link_outputs" class="button-link" href="">Outputs</a>
           <a id="tab_link_eas" class="button-link" href="">EAS recording</a>
+          <a id="tab_link_archive" class="button-link" href="">Stream archiving</a>
           <a id="tab_link_fallback_action" class="button-link" href="">Fallback action</a>
           <a id="tab_link_audio" class="button-link" href="">Audio effects</a>
           <a id="tab_link_notifications" class="button-link" href="" hidden>Notifications</a>
@@ -1208,6 +1212,30 @@ __INDEX_STYLES__</style>
               </fieldset>
             </div>
             <div id="eas-result" class="message"></div>
+          </div>
+          <div id="panel_archive" class="tabpanel" hidden>
+            <h3>Stream archiving</h3>
+            <div class="grid">
+              <label id="archive_enabled_label" class="checkbox-row">
+                <input id="archive_enabled" name="archive_enabled" value="1" type="checkbox" aria-describedby="archive_enabled_hint">
+                <span id="archive_enabled_text">Enable stream archiving</span>
+              </label>
+              <label>Delete archived audio after
+                <select id="archive_retention" name="archive_retention" aria-describedby="archive_retention_hint">
+                  <option value="24h">24 hours</option>
+                  <option value="1w" selected>1 week</option>
+                  <option value="30d">30 days</option>
+                  <option value="180d">180 days</option>
+                  <option value="1y">1 year</option>
+                </select>
+              </label>
+              <span id="archive_enabled_hint" class="hint">Keep a continuous recording of this stream, as listeners hear it.</span>
+              <span id="archive_retention_hint" class="hint">Older archived audio is deleted.</span>
+              <span id="archive_storage_blocked_hint" class="error" hidden>Paused due to insufficient disk space.</span>
+            </div>
+            <p id="archive_summary" class="hint">No audio archived yet.</p>
+            <div id="archive_confirm" class="baseline-only" hidden></div>
+            <div id="archive-result" class="message"></div>
           </div>
           <div id="panel_fallback_action" class="tabpanel" hidden>
             <h3>Fallback action</h3>
@@ -1607,6 +1635,114 @@ __INDEX_STYLES__</style>
     </section>
   </div>
 
+  <div id="view_stream_archives" class="view" hidden>
+    <section>
+      <h2 id="stream_archives_heading">Stream archives</h2>
+      <p id="stream_archives_intro">Download archived audio from a stream, up to 12 hours at a time.</p>
+      <form id="stream_archive_stream_form" method="get" action="/">
+        <input type="hidden" name="view" value="stream_archives">
+        <label>Stream
+          <select id="stream_archive_stream" name="stream"></select>
+        </label>
+        <div class="actions baseline-only">
+          <button id="show_stream_archive" type="submit" data-baseline-submit>Show archive</button>
+        </div>
+      </form>
+      <p id="stream_archive_available" class="hint"></p>
+      <div id="stream_archive_player" class="needs-app" hidden>
+        <audio id="stream_archive_audio" preload="none" playsinline></audio>
+        <div class="archive-position">
+          <label for="stream_archive_position">Position</label>
+          <input id="stream_archive_position" type="range" min="0" max="0" step="any" value="0" aria-describedby="stream_archive_position_hint">
+          <p id="stream_archive_now" class="archive-now"></p>
+          <p id="stream_archive_position_hint" class="hint">Left and Right Arrow move 10 seconds; Page Up and Page Down move 10 minutes.</p>
+        </div>
+        <div class="receiver-controls" role="group" aria-label="Archive playback controls">
+          <button id="stream_archive_back" class="receiver-control-button" type="button" aria-label="Back 10 seconds" title="Back 10 seconds">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"></path></svg>
+          </button>
+          <button id="stream_archive_play_pause" class="receiver-control-button" type="button" aria-label="Play" title="Play">
+            <svg id="stream_archive_play_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M8 5v14l11-7L8 5z"></path></svg>
+            <svg id="stream_archive_pause_icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false" hidden><path d="M7 5h4v14H7V5zm6 0h4v14h-4V5z"></path></svg>
+          </button>
+          <button id="stream_archive_forward" class="receiver-control-button" type="button" aria-label="Forward 10 seconds" title="Forward 10 seconds">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"></path></svg>
+          </button>
+        </div>
+        <label class="desktop-volume-control">Volume
+          <input id="stream_archive_volume" type="range" min="0" max="100" step="1" value="100">
+        </label>
+        <form id="stream_archive_jump_form">
+          <fieldset>
+            <legend>Jump to time</legend>
+            <label>Date
+              <input id="stream_archive_jump_date" type="date" required aria-describedby="stream_archive_jump_hint">
+            </label>
+            <label>Time
+              <input id="stream_archive_jump_time" type="time" step="1" required aria-describedby="stream_archive_jump_hint">
+            </label>
+            <p id="stream_archive_jump_hint" class="hint">Times like 17:40, 17:40:30 or 5:40 PM, in <span id="stream_archive_jump_zone">this computer's time zone</span>.</p>
+            <div class="actions">
+              <button id="stream_archive_jump" type="submit">Jump</button>
+            </div>
+          </fieldset>
+        </form>
+        <div class="actions archive-download-actions">
+          <a id="stream_archive_open_download" class="button-link" href="/?view=stream_archives">Download archived audio</a>
+          <a id="stream_archive_open_delete" class="button-link" href="/?view=stream_archive_delete" hidden>Delete archived audio</a>
+        </div>
+        <div id="stream-archive-player-result" class="message" aria-live="polite"></div>
+      </div>
+      <div id="stream_archive_download_section">
+      <div id="stream_archive_gaps_section" hidden>
+        <h3>Gaps</h3>
+        <p class="hint">Times nothing was archived, such as while the stream was stopped. They're silent in downloads. The latest five gaps of a minute or more are listed.</p>
+        <ul id="stream_archive_gaps"></ul>
+        <p id="stream_archive_gaps_note" class="hint" hidden></p>
+      </div>
+      <form id="stream_archive_download_form" method="get" action="/stream-archives/download">
+        <input id="stream_archive_download_stream" type="hidden" name="stream" value="">
+        <fieldset>
+          <legend>From</legend>
+          <label>Date
+            <input id="stream_archive_start_date" name="start_date" type="date" required aria-describedby="stream_archive_date_hint">
+          </label>
+          <label>Time
+            <input id="stream_archive_start_time" name="start_time" type="time" step="1" required aria-describedby="stream_archive_time_hint">
+          </label>
+        </fieldset>
+        <fieldset>
+          <legend>To</legend>
+          <label>Date
+            <input id="stream_archive_end_date" name="end_date" type="date" required aria-describedby="stream_archive_date_hint">
+          </label>
+          <label>Time
+            <input id="stream_archive_end_time" name="end_time" type="time" step="1" required aria-describedby="stream_archive_time_hint">
+          </label>
+        </fieldset>
+        <p id="stream_archive_date_hint" class="hint">Dates like 2026-10-23.</p>
+        <p id="stream_archive_time_hint" class="hint">Times like 17:40, 17:40:30 or 5:40 PM, in <span id="stream_archive_time_zone">this computer's time zone</span>.</p>
+        <label>Format
+          <select id="stream_archive_format" name="format" aria-describedby="stream_archive_format_hint">
+            <option value="opus">Ogg Opus</option>
+            <option value="mp3">MP3</option>
+            <option value="wav">WAV</option>
+          </select>
+        </label>
+        <span id="stream_archive_format_hint" class="hint">Ogg Opus is the archive itself, and the smallest. MP3 is 64 Kbps.</span>
+        <div class="actions">
+          <button id="stream_archive_download" type="submit">Download</button>
+          <a id="stream_archive_back_to_player" class="button-link" href="/?view=stream_archives" hidden>Back to player</a>
+        </div>
+      </form>
+      <div id="stream_archive_delete_actions" class="actions archive-download-actions" hidden>
+        <a id="stream_archive_open_delete_link" class="button-link" href="/?view=stream_archive_delete">Delete archived audio</a>
+      </div>
+      <div id="stream-archive-result" class="message"></div>
+      </div>
+    </section>
+  </div>
+
   <div id="view_eas_alert_export" class="view" hidden>
     <section>
       <h2>Export alerts</h2>
@@ -1626,6 +1762,28 @@ __INDEX_STYLES__</style>
         </div>
       </form>
       <div id="eas-export-result" class="message"></div>
+    </section>
+  </div>
+
+  <div id="view_stream_archive_delete" class="view" hidden>
+    <section>
+      <h2>Delete archived audio</h2>
+      <div id="stream_archive_delete_confirm" class="baseline-only" hidden></div>
+      <form id="stream_archive_delete_form" method="post" action="/stream-archives/delete">
+        __FORM_TOKEN_INPUT__
+        <input id="stream_archive_delete_stream" type="hidden" name="stream" value="">
+        <p id="stream_archive_delete_stream_label" class="hint"></p>
+        <fieldset>
+          <legend>Choose audio to delete</legend>
+          <div id="stream_archive_delete_options"></div>
+        </fieldset>
+        <div class="actions">
+          <button id="stream_archive_delete_audio" type="submit" data-baseline-submit>Delete audio</button>
+          <button id="cancel_stream_archive_delete" type="button" class="needs-app-inline">Cancel</button>
+          <a id="cancel_stream_archive_delete_link" class="baseline-only button-link" href="/?view=stream_archives">Cancel</a>
+        </div>
+      </form>
+      <div id="stream-archive-delete-result" class="message"></div>
     </section>
   </div>
 

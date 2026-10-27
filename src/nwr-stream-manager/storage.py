@@ -286,6 +286,8 @@ def format_storage_bytes(value: int | float) -> str:
 
 
 def directory_size_bytes(path: Path) -> int:
+    """What the files in a folder take up, leaving out its index.json: a folder of recordings
+    with none left in it takes up nothing."""
     total = 0
     try:
         stack = [Path(path)]
@@ -297,7 +299,7 @@ def directory_size_bytes(path: Path) -> int:
                         try:
                             if entry.is_dir(follow_symlinks=False):
                                 stack.append(Path(entry.path))
-                            elif entry.is_file(follow_symlinks=False):
+                            elif entry.is_file(follow_symlinks=False) and entry.name != "index.json":
                                 total += int(entry.stat(follow_symlinks=False).st_size)
                         except OSError:
                             continue

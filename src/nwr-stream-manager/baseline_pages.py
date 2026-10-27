@@ -42,6 +42,8 @@ VIEW_TITLES = {
     "eas_alert_export": "Export Alerts",
     "eas_alert_delete": "Delete Alerts",
     "eas_alert_detail": "EAS Alert Details",
+    "stream_archives": "Stream Archives",
+    "stream_archive_delete": "Delete Archived Audio",
     "restart": "Restart NWR Stream Manager?",
 }
 VIEW_NAV_ITEMS = {
@@ -53,9 +55,13 @@ VIEW_NAV_ITEMS = {
     "eas_alert_export": "eas_alerts",
     "eas_alert_delete": "eas_alerts",
     "eas_alert_detail": "eas_alerts",
+    "stream_archive_delete": "stream_archives",
 }
+# Pages that are now sections of Settings, so older links and bookmarks still work.
+SETTINGS_SECTIONS_FROM_OLD_VIEWS = {"notifications": "notifications", "accounts": "accounts", "create_account": "create_account"}
 READ_ONLY_RESTRICTED_VIEWS = {
-    "rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "settings", "restart",
+    "rtl", "add_stream", "stream_settings", "stream_output", "iq_recorder_start", "eas_alert_delete", "stream_archive_delete",
+    "settings", "restart",
 }
 # Settings, as the page script has them.
 SETTINGS_SECTION_TITLES = {
@@ -83,6 +89,9 @@ SETTINGS_PAGE_PARENTS = {
 BASELINE_SETTINGS_SECTIONS = {"general", "accounts", "create_account", "account", "fallback_audio", "notifications", "sdr_sharing", "pair_device", "find_devices", "advanced"}
 ACCOUNT_FORM_PATHS = {"/accounts/create", "/accounts/reset-password", "/accounts/read-only", "/accounts/delete"}
 EAS_ALERT_EXPORT_PATH = "/eas-alerts/export"
+STREAM_ARCHIVE_DOWNLOAD_PATH = "/stream-archives/download"
+STREAM_ARCHIVE_PLAY_PATH = "/stream-archives/play"
+STREAM_ARCHIVE_DELETE_PATH = "/stream-archives/delete"
 EAS_ALERT_FORM_PATHS = {"/eas-alerts/delete", "/eas-alerts/remove"}
 EAS_ALERT_VIEWS = {"eas_alerts", "eas_alert_export", "eas_alert_delete", "eas_alert_detail"}
 EAS_ALERTS_PER_PAGE = 25
@@ -142,6 +151,7 @@ OUTPUT_RESULTS = {
 STREAM_SETTINGS_TABS = {
     "outputs": "Outputs",
     "eas": "EAS recording",
+    "archive": "Stream archiving",
     "fallback_action": "Fallback action",
     "audio": "Audio effects",
     "notifications": "Notifications",

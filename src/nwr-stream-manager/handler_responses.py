@@ -209,47 +209,44 @@ class ResponseHandlerMixin:
         except (BrokenPipeError, ConnectionResetError, OSError):
             LOG.debug("client disconnected before HTML response could be written")
 
+    def _requested_range(self, data_length: int) -> tuple[int, int, bool] | None:
+        """The bytes the request's Range asks for, as (first, last, partial); all of them if it
+        has none; None if it can't be met."""
+        range_header = str(self.headers.get("Range", "")).strip()
+        if not range_header:
+            return 0, data_length - 1, False
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+        if not match or data_length <= 0:
+            return None
+        raw_start, raw_end = match.groups()
+        if raw_start == "" and raw_end == "":
+            return None
+        if raw_start == "":
+            suffix_length = int(raw_end)
+            start = data_length if suffix_length <= 0 else max(0, data_length - suffix_length)
+            end = data_length - 1
+        else:
+            start = int(raw_start)
+            end = int(raw_end) if raw_end else data_length - 1
+        if start >= data_length or start > end:
+            return None
+        return start, min(end, data_length - 1), True
+
+    def _send_range_not_satisfiable(self, data_length: int) -> None:
+        self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+        self.send_header("Content-Range", f"bytes */{data_length}")
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+
     def _send_file(self, path: Path, download_name: str, download: bool, *, delete_after: bool = False) -> None:
         content_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
         disposition = "attachment" if download else "inline"
         data_length = path.stat().st_size
-        start = 0
-        end = data_length - 1
-        partial = False
-        range_header = "" if delete_after else str(self.headers.get("Range", "")).strip()
-        if range_header:
-            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
-            if not match or data_length <= 0:
-                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                self.send_header("Content-Range", f"bytes */{data_length}")
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
-                return
-            raw_start, raw_end = match.groups()
-            if raw_start == "" and raw_end == "":
-                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                self.send_header("Content-Range", f"bytes */{data_length}")
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
-                return
-            if raw_start == "":
-                suffix_length = int(raw_end)
-                if suffix_length <= 0:
-                    start = data_length
-                else:
-                    start = max(0, data_length - suffix_length)
-                end = data_length - 1
-            else:
-                start = int(raw_start)
-                end = int(raw_end) if raw_end else data_length - 1
-            if start >= data_length or start > end:
-                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                self.send_header("Content-Range", f"bytes */{data_length}")
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
-                return
-            end = min(end, data_length - 1)
-            partial = True
+        byte_range = (0, data_length - 1, False) if delete_after else self._requested_range(data_length)
+        if byte_range is None:
+            self._send_range_not_satisfiable(data_length)
+            return
+        start, end, partial = byte_range
         response_length = max(0, end - start + 1)
         try:
             self.send_response(HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK)
@@ -345,4 +342,8 @@ class ResponseHandlerMixin:
 
     def _send_index_page(self, parsed) -> None:
         query = {name: values[0] for name, values in parse_qs(parsed.query).items()}
+        address = self._index_page_address(query)
+        if address is not None:
+            self._send_redirect(address)
+            return
         self._send_page(self._render_index_page(query))

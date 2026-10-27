@@ -120,6 +120,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
         <li><a href="#stream-settings-top">Enabling, monitoring and signal</a></li>
         <li><a href="#outputs-tab">Outputs</a></li>
         <li><a href="#eas-recording">EAS recording</a></li>
+        <li><a href="#stream-archiving">Stream archiving</a></li>
         <li><a href="#fallback-action">Fallback action</a></li>
         <li><a href="#audio-effects">Audio effects</a></li>
         <li><a href="#stream-notifications">Stream notifications</a></li>
@@ -128,6 +129,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     </li>
     <li><a href="#monitoring">Listening to a stream in your browser</a></li>
     <li><a href="#eas-alerts">EAS alerts</a></li>
+    <li><a href="#stream-archives">Stream archives</a></li>
     <li><a href="#weather-radio-receiver">Weather Radio Receiver</a></li>
     <li><a href="#iq-recorder">I/Q Recorder</a></li>
     <li><a href="#logs">Logs</a></li>
@@ -238,7 +240,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <dt>Recently issued EAS alerts</dt>
     <dd>The latest EAS alerts recorded by your streams, if you have <a href="#eas-recording">EAS recording</a> turned on.</dd>
     <dt>Storage</dt>
-    <dd>How much disk space is left, and how much you've gobbled up with saved EAS alert recordings and I/Q recordings. A warning appears if space is running low.</dd>
+    <dd>How much disk space is left, and how much you've gobbled up with saved EAS alert recordings, stream archives and I/Q recordings. A warning appears if space is running low.</dd>
   </dl>
   <p>In an <a href="#older-browsers">older browser</a>, the dashboard shows the same information. If possible, the information updates in realtime every few seconds; but in some browsers you may need to refresh the page to see the latest.</p>
   <p>The bar across the top of every page takes you to the main areas: <strong>Dashboard</strong>, <strong>Configure RTL-SDR</strong>, <strong>Manage Streams</strong>, <strong>EAS alerts</strong> (once alerts have been recorded), and <strong>More</strong>, which holds everything else, including <a href="#settings">Settings</a>. Help is linked at the bottom of every page.</p>
@@ -450,6 +452,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   </dl>
   <p>If the computer runs low on storage, recording is paused automatically so the disk doesn't fill up completely.</p>
 
+  <h3 id="stream-archiving">Stream archiving</h3>
+  <p>Stream archiving keeps a continuous recording of everything the stream plays, exactly as its listeners hear it, so you can go back and download any part of it later from <a href="#stream-archives">Stream archives</a>. Like EAS recording, it keeps the stream running even when it has no other outputs, though it isn't counted among the stream's outputs in the streams table.</p>
+  <dl>
+    <dt>Enable stream archiving</dt>
+    <dd>Turns archiving on for the stream. Once it's on, the same checkbox reads <strong>Disable stream archiving</strong>. Turning it off keeps the audio already archived.</dd>
+    <dt>Delete archived audio after</dt>
+    <dd>How long to keep archived audio: 24 hours, 1 week, 30 days, 180 days or 1 year. Anything older is deleted automatically. If choosing a shorter time would delete audio that's already archived, you're asked to confirm first; in an <a href="#older-browsers">older browser</a>, select <strong>Save changes</strong> a second time to confirm.</dd>
+  </dl>
+  <p>Archived audio is stored compactly (Opus at 32 Kbps), using about 14 MB an hour per stream: roughly 350 MB a day, 2.4 GB a week, 10 GB for 30 days, 62 GB for 180 days or 126 GB for a year. It's good enough that SAME headers in it still decode.</p>
+  <p>Nothing is archived while the stream is stopped, while NWR Stream Manager isn't running, or while the RTL-SDR (or a shared RTL-SDR's network connection) isn't delivering audio; those times show as gaps. If the computer runs low on storage, archiving is paused until there's room again.</p>
+
   <h3 id="fallback-action">Fallback action</h3>
   <p>The Fallback action section chooses what the stream does when it stops getting audio from the radio, or when there's no signal from the station.</p>
   <dl>
@@ -536,6 +549,30 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li>In an <a href="#older-browsers">older browser</a>, alerts play with the browser's own player, and <strong>Previous alert</strong> and <strong>Next alert</strong> move between them. Autoplay works wherever the browser can run scripts. If the browser can't play the recording, select <strong>Download alert</strong> to listen to it. Removing or deleting alerts asks you to confirm on the page first.</li>
   </ul>
   <p>The dashboard also shows the most recently issued alerts.</p>
+</section>
+
+<section aria-labelledby="stream-archives">
+  <h2 id="stream-archives">Stream archives</h2>
+  <p>When <a href="#stream-archiving">stream archiving</a> is on, <strong>Stream archives</strong> appears in the bar at the top once there's archived audio. Choose a stream to play its archive.</p>
+  <h3>Playing an archive</h3>
+  <p>The player starts an hour before the newest archived audio. Below <strong>Position</strong>, it shows the date and time of what's playing. Use the slider to move through the archive; with the keyboard, Left and Right Arrow move 10 seconds and Page Up and Page Down move 10 minutes. <strong>Back 10 seconds</strong> and <strong>Forward 10 seconds</strong> do the same from the buttons, the lock screen and headphone controls.</p>
+  <p>On a phone's lock screen, and wherever else your device shows what's playing, the archive's name includes the hour being played, such as Archive of WXN99, October 24, 2026, 1 AM EDT, and its length is that hour rather than the whole archive. The time elapsed is the minutes and seconds into that hour, as the clock would say, and dragging moves within it.</p>
+  <p>To go straight to a date and time, enter it under <strong>Jump to time</strong> and select <strong>Jump</strong>. If nothing was archived then, the page says so, and when the archive picks up again.</p>
+  <p>Gaps of up to a minute, times when nothing was archived, play as silence. Longer gaps are left out, so the player goes straight from before a gap to after it, and the time shown jumps ahead. When it reaches the newest archived audio, it stops and says you've caught up.</p>
+  <p>The archive keeps playing while you use other pages here. Playing the monitor, the Weather Radio Receiver or an EAS alert pauses it.</p>
+  <h3>Deleting</h3>
+  <p>To free up space, select <strong>Delete archived audio</strong> under the player, or on the download page where that's the page that opens. Choose to delete audio older than 24 hours, 1 week, 30 days, 180 days or 1 year, or all of it; only the choices that would delete something are listed, with how much each would delete. You're asked before anything is deleted. Audio is deleted an hour's file at a time, as when it's kept for a limited time (see <a href="#stream-archiving">stream archiving</a>). Deleting all of it doesn't turn archiving off: it carries on from then. Read-only accounts can't delete archived audio.</p>
+  <h3>Downloading</h3>
+  <p>Select <strong>Download archived audio</strong> under the player. If your browser can't play the archive, the download page is what <strong>Stream archives</strong> opens to, with the stream to choose. Choose the date and time to start and end, up to 12 hours at a time, and a format:</p>
+  <dl>
+    <dt>Ogg Opus</dt>
+    <dd>The archived audio itself, copied without being re-encoded. The smallest and best quality.</dd>
+    <dt>MP3</dt>
+    <dd>64 Kbps, for players that don't support Opus. It's converted as it downloads, so a long one downloads more slowly than the others.</dd>
+    <dt>WAV</dt>
+    <dd>Uncompressed, and much larger: about 115 MB an hour.</dd>
+  </dl>
+  <p>Times are in the time zone of the computer running NWR Stream Manager, which the page names. Times can include seconds. Enter dates like 2026-10-23 and times like 17:40, 17:40:30 or 5:40 PM if your browser doesn't offer its own date and time pickers. The page lists the latest five gaps of a minute or more, times when nothing was archived, and says how many others there are. All gaps, however short, are silent in a download, so the audio stays in step with the clock.</p>
 </section>
 
 <section aria-labelledby="weather-radio-receiver">

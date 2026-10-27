@@ -17,6 +17,7 @@ from .constants import (
     SOUNDCARD_PREVIEW_TIMEOUT_SECONDS,
 )
 from .eas_alerts import eas_recording_settings_from_stream
+from .stream_archive import stream_archive_settings_from_stream
 from .icecastauth import test_mountpoint_authentication
 from .live_audio import LiveAudioSource
 from .models import WebStreamFallbackAction
@@ -311,8 +312,24 @@ class StreamServiceMixin:
             remove_stream_configs(self.streams_directory, removed)
             self._sync_stream_workers_locked()
         self._close_detached_monitor_sources(detached_monitor_sources)
+        # Its worker is being stopped, which finishes the archive's last file; then it goes.
+        threading.Thread(target=self._remove_stream_archive_soon, args=(stream_id,), daemon=True).start()
         LOG.info("removed stream %s", stream_id)
         return self.stream_status()
+
+    def _remove_stream_archive_soon(self, stream_id: str) -> None:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            with self.lock:
+                if stream_id not in self.stream_workers and not any(s.get("id") == stream_id for s in self.streams):
+                    store = self.stream_archive_stores.get(stream_id)
+                    if store is None or store.open_file is None:
+                        break
+            time.sleep(0.2)
+        try:
+            self.remove_stream_archive(stream_id)
+        except Exception as exc:
+            LOG.warning("couldn't delete the archived audio of removed stream %s: %s", stream_id, exc)
 
     def update_stream(self, payload: dict[str, Any]) -> dict[str, Any]:
         stream_id = str(payload.get("stream_id", "")).strip()
@@ -570,6 +587,7 @@ class StreamServiceMixin:
                     any(output.get("enabled", True) for output in stream_outputs(stream))
                     or stream_id in monitored_stream_ids
                     or eas_recording_settings_from_stream(stream).enabled
+                    or stream_archive_settings_from_stream(stream).enabled
                     or stream_id == active_test_stream_id
                 ):
                     desired[stream_worker_key(stream)] = stream
@@ -603,6 +621,7 @@ class StreamServiceMixin:
                 soundcard_manager=self.soundcard_manager,
                 state_directory=self.state_path.parent,
                 storage_monitor=self.storage_monitor,
+                archive_store_provider=self.stream_archive_store,
             )
             self.stream_workers[key] = worker
             worker.start()

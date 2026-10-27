@@ -233,6 +233,7 @@ from .routes_fallback import FallbackRoutesMixin
 from .routes_general import GeneralRoutesMixin
 from .routes_iq_recorder import IqRecorderRoutesMixin
 from .routes_live_audio import LiveAudioRoutesMixin
+from .routes_stream_archive import StreamArchiveRoutesMixin
 from .routes_restart import RestartRoutesMixin
 from .routes_notifications import NotificationRoutesMixin
 from .routes_sdr import SdrRoutesMixin
@@ -253,6 +254,7 @@ from .service_advanced import AdvancedServiceMixin
 from .service_capture import CaptureServiceMixin
 from .service_devices import DeviceServiceMixin
 from .service_eas_alerts import EasAlertServiceMixin
+from .service_stream_archive import StreamArchiveServiceMixin
 from .service_fallback import FallbackServiceMixin
 from .service_general import GeneralServiceMixin
 from .service_iq_recorder import IqRecorderServiceMixin
@@ -283,6 +285,7 @@ from .state_files import (
 )
 from .storage import directory_size_bytes, format_storage_bytes, storage_status_message, StorageMonitor
 from .stream_audio import FloatFrameBuffer, load_web_fallback_audio, next_web_fallback_frame
+from .stream_archive import stream_archive_directory
 from .stream_config import (
     audio_config_from_stream,
     icecast_auth_settings,
@@ -337,6 +340,7 @@ class RtlControlService(
     DeviceServiceMixin,
     IqRecorderServiceMixin,
     EasAlertServiceMixin,
+    StreamArchiveServiceMixin,
     TestModeServiceMixin,
     StreamServiceMixin,
     FallbackServiceMixin,
@@ -419,6 +423,7 @@ class RtlControlService(
         self.drain_thread: threading.Thread | None = None
         self.drain_stop = threading.Event()
         self.stream_workers: dict[str, IcecastStreamWorker] = {}
+        self._init_stream_archives()
         self.preview_streams: dict[str, dict[str, Any]] = {}
         self.preview_cleanup_stop = threading.Event()
         self.preview_cleanup_thread = threading.Thread(
@@ -478,6 +483,7 @@ class RtlControlService(
         self.remote_client: RemoteSdrClient | None = None
         self.storage_monitor.add_path(self.iq_recordings_directory)
         self.storage_monitor.start()
+        self._start_stream_archives()
         self.preview_cleanup_thread.start()
         self.stream_notification_thread.start()
         if self.settings.uses_remote_sdr:
@@ -510,6 +516,7 @@ class RtlControlService(
         self.stream_notification_stop.set()
         self.preview_cleanup_thread.join(timeout=2.0)
         self.stream_notification_thread.join(timeout=2.0)
+        self._stop_stream_archives()
         with self.lock:
             recorder = self.iq_recorder
             self.iq_recorder = None
@@ -587,6 +594,7 @@ class RtlControlService(
                 self.iq_recorder_account_id = None
         for worker in workers:
             worker.stop_eas_recording_due_to_storage(message)
+            worker.stop_archive_due_to_storage(message)
         if recorder is not None:
             LOG.warning("stopping I/Q recorder because storage is critically low")
             recorder.stop()
@@ -696,6 +704,8 @@ class RtlControlService(
                 "active_streams": active_streams,
                 "stream_signals": self._stream_signals_locked(),
                 "active_eas_recorders": self._active_eas_recorders_locked(),
+                "stream_archives": {} if read_only else self.stream_archives_status_locked(),
+                "stream_archives_available": self._stream_archives_available_locked(),
                 "test_mode": {"active": False} if read_only else self._stream_test_mode_status_locked(),
                 "recent_eas_alerts": self._recent_eas_alerts_locked(),
                 "storage": self._storage_status_snapshot_locked(),
@@ -715,9 +725,17 @@ class RtlControlService(
         eas_bytes = 0
         for stream in self.streams:
             eas_bytes += directory_size_bytes(stream_alerts_directory(self.streams_directory.parent, stream))
+        # From what each archive knows it holds, rather than walking thousands of files each time.
+        archive_bytes = sum(
+            self.stream_archive_store(stream).total_bytes()
+            for stream in self.streams
+            if stream_archive_directory(self.state_path.parent, str(stream.get("id", ""))).exists()
+        )
         snapshot["usage"] = {
             "iq_recordings_bytes": iq_bytes,
             "iq_recordings": format_storage_bytes(iq_bytes),
+            "stream_archives_bytes": archive_bytes,
+            "stream_archives": format_storage_bytes(archive_bytes),
             "eas_recordings_bytes": eas_bytes,
             "eas_recordings": format_storage_bytes(eas_bytes),
         }
@@ -727,6 +745,7 @@ class RtlControlService(
 class RtlControlHandler(
     AccountRoutesMixin,
     EasAlertRoutesMixin,
+    StreamArchiveRoutesMixin,
     StreamRoutesMixin,
     LiveAudioRoutesMixin,
     IqRecorderRoutesMixin,

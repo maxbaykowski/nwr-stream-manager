@@ -221,7 +221,7 @@ LAME_FLUSH_BUFFER_BYTES = 8 * 1024
 class Mp3Encoder:
     """Constant-bitrate mono MP3 through the native LAME library (libmp3lame)."""
 
-    def __init__(self, config: IcecastConfig, input_sample_rate: int = IQ_SAMPLE_RATE) -> None:
+    def __init__(self, config: IcecastConfig, input_sample_rate: int = IQ_SAMPLE_RATE, *, bit_reservoir: bool = True) -> None:
         self.config = config
         self.input_sample_rate = int(input_sample_rate)
         self.lame = _load_shared_library("mp3lame", ("libmp3lame.so.0", "libmp3lame.so"))
@@ -242,6 +242,9 @@ class Mp3Encoder:
                 # A streamed MP3 has no file to rewrite, so no blank Xing/VBR info frame.
                 (self.lame.lame_set_bWriteVbrTag, 0),
                 (self.lame.lame_set_mode, LAME_MONO),
+                # Without it, every frame stands alone, so MP3 made from different starting
+                # points joins without a click.
+                (self.lame.lame_set_disable_reservoir, 0 if bit_reservoir else 1),
             ):
                 if setter(self.gfp, value) < 0:
                     raise EncoderError(f"LAME rejected {setter.__name__}({value})")
@@ -265,6 +268,7 @@ class Mp3Encoder:
             "lame_set_quality",
             "lame_set_bWriteVbrTag",
             "lame_set_mode",
+            "lame_set_disable_reservoir",
         ):
             function = getattr(self.lame, name)
             function.restype = ctypes.c_int
