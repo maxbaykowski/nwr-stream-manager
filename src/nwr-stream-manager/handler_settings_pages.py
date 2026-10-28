@@ -18,6 +18,7 @@ from .baseline_pages import (
     page_route,
     REMOTE_SDR_CHOICE_PREFIX,
     render_notice_page,
+    TAILSCALE_SETTINGS_PATH,
 )
 from .constants import REMOTE_SDR_HOST_SETTINGS
 from .custom_fallback_audio import MAX_CUSTOM_FALLBACK_BYTES
@@ -38,6 +39,9 @@ from .page_sections import (
     remote_pair_target,
     remote_sdr_status_text,
     rtl_settings_changes,
+    tailscale_funnel_text,
+    tailscale_https_text,
+    tailscale_status_text,
 )
 from .web_address import advanced_flag_text, advanced_listening_text
 
@@ -571,6 +575,92 @@ class SettingsPageHandlerMixin:
             '<input type="hidden" name="form" value="advanced">'
             + "".join(f'<input type="hidden" name="was_{name}" value="{html.escape(value)}">' for name, value in loaded.items()),
         )
+
+    def _fill_tailscale_page(self, page: str, query: dict[str, str]) -> tuple[str, str]:
+        """Tailscale, as the page script shows it; signing out is asked about first."""
+        status = self.service.tailscale_status()
+        state = status.get("state")
+        page = page_rendering.set_text(page, "tailscale_status", tailscale_status_text(status))
+        if state == "needs-login" and status.get("auth_url"):
+            page = page_rendering.set_hidden(page, "tailscale_sign_in", False)
+            page = page_rendering.set_attribute(page, "tailscale_sign_in_link", "href", status["auth_url"])
+            page = page_rendering.set_text(page, "tailscale_sign_in_address", status["auth_url"])
+        if state == "connected":
+            page = page_rendering.set_hidden(page, "tailscale_details", False)
+            page = page_rendering.set_attribute(page, "tailscale_address", "href", status.get("url", "/"))
+            page = page_rendering.set_text(page, "tailscale_address", status.get("url", ""))
+            page = page_rendering.set_text(page, "tailscale_account", status.get("account") or "Unknown")
+            page = page_rendering.set_text(page, "tailscale_addresses", ", ".join(status.get("addresses") or []))
+        if state == "connected":
+            https = status.get("https") or {}
+            page = page_rendering.set_hidden(page, "tailscale_https_section", False)
+            page = page_rendering.set_attribute(page, "tailscale_https", "checked", "checked" if https.get("enabled") else None)
+            page = page_rendering.set_attribute(page, "tailscale_was_https", "value", "1" if https.get("enabled") else "0")
+            page = page_rendering.set_text(page, "tailscale_https_name", status.get("name", ""))
+            text = tailscale_https_text(https) if https.get("enabled") else ""
+            page = page_rendering.set_text(page, "tailscale_https_status", text)
+            page = page_rendering.set_hidden(page, "tailscale_https_status", not text)
+            if https.get("enabled") and https.get("state") == "needs-enabling":
+                page = page_rendering.set_hidden(page, "tailscale_https_enable", False)
+                if https.get("enable_url"):
+                    page = page_rendering.set_attribute(page, "tailscale_https_enable_link", "href", https["enable_url"])
+            # Funnel, once the secure address works: it's what Funnel serves.
+            funnel_question = ""
+            funnel = status.get("funnel") or {}
+            if https.get("enabled") and https.get("state") == "on":
+                page = page_rendering.set_hidden(page, "tailscale_funnel_section", False)
+                page = page_rendering.set_attribute(page, "tailscale_funnel", "checked", "checked" if funnel.get("enabled") else None)
+                page = page_rendering.set_attribute(page, "tailscale_was_funnel", "value", "1" if funnel.get("enabled") else "0")
+                page = page_rendering.set_text(page, "tailscale_funnel_address", funnel.get("url", ""))
+                text = tailscale_funnel_text(funnel) if funnel.get("enabled") else ""
+                page = page_rendering.set_text(page, "tailscale_funnel_status", text)
+                page = page_rendering.set_hidden(page, "tailscale_funnel_status", not text)
+                if funnel.get("enabled") and funnel.get("state") == "needs-permission":
+                    page = page_rendering.set_hidden(page, "tailscale_funnel_enable", False)
+                    if funnel.get("enable_url"):
+                        page = page_rendering.set_attribute(page, "tailscale_funnel_enable_link", "href", funnel["enable_url"])
+            if query.get("confirm") == "funnel":
+                question = "Make NWR Stream Manager reachable from the internet?"
+                content = (
+                    f"<h4>{question}</h4>"
+                    f"<p>Anyone on the internet can then open its sign-in page, at {html.escape(funnel.get('url', ''))}. "
+                    "Only your accounts' passwords keep them out.</p>"
+                    f'<form method="post" action="{TAILSCALE_SETTINGS_PATH}">{page_rendering.form_token_input(self._form_token())}'
+                    '<input type="hidden" name="action" value="https"><input type="hidden" name="https" value="1">'
+                    '<input type="hidden" name="was_https" value="1"><input type="hidden" name="funnel" value="1">'
+                    '<input type="hidden" name="was_funnel" value="0"><input type="hidden" name="confirmed" value="1">'
+                    '<div class="actions"><button type="submit" class="primary" autofocus>Make it reachable</button>'
+                    f'<a class="button-link" href="{html.escape(page_route("settings", section="tailscale"))}">Cancel</a></div></form>'
+                )
+                page = page_rendering.set_content(page, "tailscale_funnel_confirm", content)
+                page = page_rendering.set_hidden(page, "tailscale_funnel_confirm", False)
+                page = page_rendering.set_hidden(page, "tailscale_https_form", True)
+                page = page_rendering.set_hidden(page, "tailscale_form", True)
+                funnel_question = question
+        # With Tailscale installed on this computer, the message is all there is.
+        page = page_rendering.set_hidden(page, "tailscale_intro", state == "system")
+        connected = state not in {"off", "unavailable", "system"}
+        page = page_rendering.set_hidden(page, "tailscale_connect", connected or state in {"unavailable", "system"})
+        page = page_rendering.set_hidden(page, "tailscale_sign_out", not connected)
+        if state in {"starting", "needs-login"}:
+            page = page_rendering.set_text(page, "tailscale_sign_out", "Cancel")
+        if state == "connected" and funnel_question:
+            return page, funnel_question
+        if query.get("confirm") != "sign_out" or not connected:
+            return page, ""
+        question = "Sign out of Tailscale?"
+        content = (
+            f"<h4>{question}</h4>"
+            "<p>Devices on your tailnet will no longer reach NWR Stream Manager there. To connect again, you'll sign in again.</p>"
+            f'<form method="post" action="{TAILSCALE_SETTINGS_PATH}">{page_rendering.form_token_input(self._form_token())}'
+            '<input type="hidden" name="action" value="sign_out"><input type="hidden" name="confirmed" value="1">'
+            '<div class="actions"><button type="submit" class="primary" autofocus>Sign out</button>'
+            f'<a class="button-link" href="{html.escape(page_route("settings", section="tailscale"))}">Cancel</a></div></form>'
+        )
+        page = page_rendering.set_content(page, "tailscale_confirm", content)
+        page = page_rendering.set_hidden(page, "tailscale_confirm", False)
+        page = page_rendering.set_hidden(page, "tailscale_form", True)
+        return page, question
 
     def _handle_advanced_settings_form(self) -> None:
         """Saves the Advanced settings that were changed, for browsers without the page script."""

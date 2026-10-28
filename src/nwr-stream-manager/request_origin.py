@@ -7,6 +7,7 @@ here. Only changes matter: another website can't read what comes back.
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Mapping
 from urllib.parse import urlsplit
 
@@ -70,6 +71,37 @@ def request_through_proxy(headers: Mapping[str, str]) -> bool:
     from this computer, and one elsewhere on the network from there.
     """
     return any(str(headers.get(name, "")).strip() for name in PROXY_HEADERS)
+
+
+def forwarded_client_address(peer: str, headers: Mapping[str, str]) -> str:
+    """The visitor's own address, which a tunnel or proxy on this computer, such as Tailscale
+    Funnel or Cloudflare Tunnel, passes on; "" if there's none to believe.
+
+    Only a proxy on this computer is believed: anything else on the network could claim any
+    address. Of a chain, the last address is the one the proxy added itself; the others came
+    with the request, and the visitor could have put them there.
+    """
+    try:
+        if not ipaddress.ip_address(peer.strip("[]").split("%", 1)[0]).is_loopback:
+            return ""
+    except ValueError:
+        return ""
+    candidates = [str(headers.get("X-Forwarded-For", "")).split(",")[-1]]
+    last = str(headers.get("Forwarded", "")).split(",")[-1]
+    candidates += [part.split("=", 1)[1] for part in last.split(";") if part.strip().lower().startswith("for=")]
+    candidates += [str(headers.get(name, "")) for name in ("X-Real-IP", "CF-Connecting-IP", "True-Client-IP")]
+    for candidate in candidates:
+        value = candidate.strip().strip('"')
+        # Forwarded gives IPv6 addresses in brackets, with any port after.
+        if value.startswith("["):
+            value = value[1:].split("]", 1)[0]
+        elif value.count(":") == 1:
+            value = value.split(":", 1)[0]
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError:
+            continue
+    return ""
 
 
 def request_from_another_site(method: str, path: str, headers: Mapping[str, str]) -> bool:

@@ -78,6 +78,20 @@ class RequestOriginTests(unittest.TestCase):
                 self.assertTrue(through({"Host": "radio.example.com", header: "203.0.113.9"}))
         self.assertFalse(through({"X-Forwarded-For": "  "}))
 
+    def test_the_visitors_own_address_is_taken_from_a_proxy_on_this_computer(self) -> None:
+        visitor = self.origin.forwarded_client_address
+        # What Tailscale Funnel's proxy adds is the last address; earlier ones came with the request.
+        self.assertEqual(visitor("127.0.0.1", {"X-Forwarded-For": "203.0.113.5"}), "203.0.113.5")
+        self.assertEqual(visitor("127.0.0.1", {"X-Forwarded-For": "1.1.1.1, 203.0.113.5"}), "203.0.113.5")
+        self.assertEqual(visitor("::1", {"X-Forwarded-For": "2001:db8::5"}), "2001:db8::5")
+        self.assertEqual(visitor("127.0.0.1", {"Forwarded": 'for="[2001:db8::5]:4711";proto=https'}), "2001:db8::5")
+        self.assertEqual(visitor("127.0.0.1", {"Forwarded": "for=198.51.100.7:4711"}), "198.51.100.7")
+        self.assertEqual(visitor("127.0.0.1", {"CF-Connecting-IP": "198.51.100.8"}), "198.51.100.8")
+        # Not from this computer, nothing that's an address, or no proxy at all: the connection's own address is used.
+        self.assertEqual(visitor("192.168.1.20", {"X-Forwarded-For": "203.0.113.5"}), "")
+        self.assertEqual(visitor("127.0.0.1", {"X-Forwarded-For": "unknown"}), "")
+        self.assertEqual(visitor("127.0.0.1", {}), "")
+
     def test_https_is_what_the_tunnel_says_the_browser_used(self) -> None:
         over = self.origin.request_over_https
         self.assertFalse(over({"Host": "192.168.1.20:8080"}))

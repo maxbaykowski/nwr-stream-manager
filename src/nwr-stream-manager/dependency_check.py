@@ -148,6 +148,7 @@ NATIVE_DEPENDENCIES = (
         ("libmicrohttpd.so.12", "libmicrohttpd.so"),
         (
             "MHD_start_daemon",
+            "MHD_add_connection",
             "MHD_stop_daemon",
             "MHD_get_connection_values",
             "MHD_get_connection_info",

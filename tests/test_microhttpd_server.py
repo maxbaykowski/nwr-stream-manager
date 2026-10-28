@@ -70,7 +70,9 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 Handler.finished.set()
             return
-        Handler.seen.update(path=self.path, client=self.client_address, agent=self.headers.get("User-Agent"))
+        Handler.seen.update(
+            path=self.path, client=self.client_address, agent=self.headers.get("User-Agent"), proto=self.headers.get("X-Forwarded-Proto")
+        )
         self.send_body(json.dumps({"ok": True}).encode())
 
     def do_POST(self) -> None:
@@ -121,6 +123,63 @@ class MicrohttpdServerTests(unittest.TestCase):
         connection.request("POST", "/echo", body=b"hello there", headers={"Content-Type": "text/plain"})
         response = connection.getresponse()
         self.assertEqual(response.read(), b"hello there")
+
+    def test_a_connection_accepted_elsewhere_is_served_as_from_its_own_address(self) -> None:
+        # As a connection from a tailnet is: handed over, with where it really came from.
+        server = self.start()
+        for address in ("100.101.102.103", "fd7a:115c:a1e0::1"):
+            with self.subTest(address=address):
+                ours, theirs = socket.socketpair()
+                self.addCleanup(ours.close)
+                server.add_connection(theirs.detach(), address)
+                ours.sendall(b"GET /from-the-tailnet HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                ours.settimeout(10)
+                answer = b""
+                while chunk := ours.recv(65536):
+                    answer += chunk
+                self.assertTrue(answer.startswith(b"HTTP/1.1 200"), answer[:80])
+                self.assertEqual(Handler.seen["client"][0], address)
+
+    def test_https_for_connections_handed_over_from_the_tailnet(self) -> None:
+        import ssl
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        try:
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1",
+                 "-subj", "/CN=nwr-stream-manager.example.ts.net", "-keyout", str(folder / "key.pem"), "-out", str(folder / "cert.pem")],
+                check=True, capture_output=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            self.skipTest(f"openssl couldn't make a certificate: {exc}")
+        server = self.start()
+        with self.assertRaisesRegex(self.mhd.MicrohttpdError, "HTTPS isn't ready"):
+            ours, theirs = socket.socketpair()
+            self.addCleanup(ours.close)
+            server.add_connection(theirs.detach(), "100.64.0.1", tls=True)
+        server.start_tls((folder / "cert.pem").read_bytes(), (folder / "key.pem").read_bytes())
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        ours, theirs = socket.socketpair()
+        server.add_connection(theirs.detach(), "100.64.0.1", tls=True)
+        with context.wrap_socket(ours) as secure:
+            # Claimed otherwise, it's still HTTPS.
+            secure.sendall(b"GET /secure HTTP/1.1\r\nHost: x\r\nX-Forwarded-Proto: http\r\nConnection: close\r\n\r\n")
+            answer = b""
+            while chunk := secure.recv(65536):
+                answer += chunk
+        self.assertTrue(answer.startswith(b"HTTP/1.1 200"), answer[:80])
+        self.assertEqual((Handler.seen["path"], Handler.seen["client"][0], Handler.seen["proto"]), ("/secure", "100.64.0.1", "https"))
+        # Plain HTTP is still plain.
+        connection = self.connection()
+        connection.request("GET", "/plain")
+        connection.getresponse().read()
+        self.assertIsNone(Handler.seen["proto"])
 
     def test_long_answers_are_sent_a_piece_at_a_time(self) -> None:
         self.start()

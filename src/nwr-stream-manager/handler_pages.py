@@ -211,6 +211,9 @@ class PageHandlerMixin:
                 }.get(query.get("result", ""))
             if query.get("section") == "general" and not result and query.get("result") == "saved":
                 result = ("general-result", "Changes saved.", "success")
+            if query.get("section") == "tailscale" and not result and query.get("result") in {"connecting", "signed_out", "saved"}:
+                message = {"connecting": "Connecting to Tailscale.", "signed_out": "Signed out of Tailscale.", "saved": "Changes saved."}[query["result"]]
+                result = ("tailscale-result", message, "success")
             if query.get("section") == "advanced" and not result and query.get("result") == "saved":
                 result = ("advanced-result", advanced_saved_text(self.service.advanced_settings()), "success")
             if query.get("section") == "fallback_audio" and not result and query.get("result") in FALLBACK_RESULTS:
@@ -296,6 +299,7 @@ class PageHandlerMixin:
         page = page_rendering.set_hidden(page, "settings_tab_accounts", not owner)
         page = page_rendering.set_hidden(page, "settings_tab_account", owner)
         page = page_rendering.set_hidden(page, "settings_tab_advanced", not owner)
+        page = page_rendering.set_hidden(page, "settings_tab_tailscale", not owner)
         for name in SETTINGS_TABS:
             page = page_rendering.set_attribute(page, f"settings_tab_{name}", "aria-current", "page" if name == shown else None)
             page = page_rendering.set_hidden(page, f"settings_panel_{name}", not (works and name == shown))
@@ -328,6 +332,10 @@ class PageHandlerMixin:
             page = self._fill_general_page(page, form)
         if section == "advanced":
             page = self._fill_advanced_page(page, form)
+        if section == "tailscale":
+            page, confirm_title = self._fill_tailscale_page(page, query)
+            if confirm_title:
+                title = f"{confirm_title} - {title}"
         if section == "notifications":
             page, confirm_title = self._fill_notifications_page(page, query, form)
             if confirm_title:

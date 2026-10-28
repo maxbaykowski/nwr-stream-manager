@@ -21,6 +21,7 @@ import logging
 import os
 import queue
 import socket
+import struct
 import threading
 import time
 from typing import Any
@@ -32,16 +33,22 @@ LOG = logging.getLogger(__name__)
 MHD_NO = 0
 MHD_YES = 1
 
+MHD_USE_TLS = 2
 MHD_USE_THREAD_PER_CONNECTION = 4
 MHD_USE_INTERNAL_POLLING_THREAD = 8
 # poll() rather than select(), which can't watch file descriptors above 1023.
 MHD_USE_POLL = 64
+MHD_USE_NO_LISTEN_SOCKET = 256
+# A way to wake its thread, for connections accepted elsewhere (from a tailnet) and handed to it.
+MHD_USE_ITC = 1024
 MHD_ALLOW_UPGRADE = 32768
 
 MHD_OPTION_END = 0
 MHD_OPTION_CONNECTION_LIMIT = 2
 MHD_OPTION_CONNECTION_TIMEOUT = 3
 MHD_OPTION_NOTIFY_COMPLETED = 4
+MHD_OPTION_HTTPS_MEM_KEY = 8
+MHD_OPTION_HTTPS_MEM_CERT = 9
 MHD_OPTION_LISTEN_SOCKET = 12
 MHD_OPTION_ARRAY = 15
 
@@ -116,6 +123,8 @@ def load_libmicrohttpd() -> ctypes.CDLL:
         lib.MHD_start_daemon.argtypes = [
             ctypes.c_uint, ctypes.c_uint16, ctypes.c_void_p, ctypes.c_void_p, AccessHandler, ctypes.c_void_p,
         ]
+        lib.MHD_add_connection.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        lib.MHD_add_connection.restype = ctypes.c_int
         lib.MHD_stop_daemon.argtypes = [ctypes.c_void_p]
         lib.MHD_stop_daemon.restype = None
         lib.MHD_get_connection_values.argtypes = [ctypes.c_void_p, ctypes.c_int, KeyValueIterator, ctypes.c_void_p]
@@ -252,6 +261,7 @@ class _Request:
         self.query = ""
         self.header_block = b"\r\n"
         self.upgrade_handle: int | None = None
+        self.https = False
         self.thread: threading.Thread | None = None
 
 
@@ -273,6 +283,10 @@ class MicrohttpdServer:
         self.server_address = listener.getsockname()[:2]
         self.listener = listener
         self.daemon: int | None = None
+        # HTTPS, for connections from the tailnet: the one taking new connections, and any
+        # earlier ones, kept until the server stops so connections they still have aren't cut.
+        self.tls_daemon: int | None = None
+        self.retired_tls_daemons: list[int] = []
         # Held while calling libmicrohttpd about a connection from a handler's thread, and
         # while stopping it, so no call is made once it has freed its connections.
         self.daemon_lock = threading.Lock()
@@ -285,11 +299,12 @@ class MicrohttpdServer:
         self._completed = RequestCompleted(self._on_completed)
         self._reader = ContentReader(self._on_read)
         self._upgrade = UpgradeHandler(self._on_upgrade)
+        self._tls_options: list[Any] = []
 
     # -- lifecycle --------------------------------------------------------
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
-        flags = MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION | MHD_USE_POLL | MHD_ALLOW_UPGRADE
+        flags = MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION | MHD_USE_POLL | MHD_USE_ITC | MHD_ALLOW_UPGRADE
         options = (MhdOptionItem * 5)(
             MhdOptionItem(MHD_OPTION_CONNECTION_TIMEOUT, CONNECTION_TIMEOUT_SECONDS, None),
             MhdOptionItem(MHD_OPTION_CONNECTION_LIMIT, CONNECTION_LIMIT, None),
@@ -310,6 +325,64 @@ class MicrohttpdServer:
         LOG.info("serving the web interface with libmicrohttpd")
         self.stopped.wait()
 
+    def start_tls(self, certificate: bytes, key: bytes) -> None:
+        """Serves HTTPS with this certificate, for connections handed over with
+        add_connection(tls=True). A new certificate replaces the last for new connections."""
+        certificate_buffer = ctypes.create_string_buffer(certificate)
+        key_buffer = ctypes.create_string_buffer(key)
+        options = (MhdOptionItem * 5)(
+            MhdOptionItem(MHD_OPTION_CONNECTION_TIMEOUT, CONNECTION_TIMEOUT_SECONDS, None),
+            MhdOptionItem(MHD_OPTION_HTTPS_MEM_KEY, 0, ctypes.cast(key_buffer, ctypes.c_void_p).value),
+            MhdOptionItem(MHD_OPTION_HTTPS_MEM_CERT, 0, ctypes.cast(certificate_buffer, ctypes.c_void_p).value),
+            MhdOptionItem(MHD_OPTION_NOTIFY_COMPLETED, ctypes.cast(self._completed, ctypes.c_void_p).value, None),
+            MhdOptionItem(MHD_OPTION_END, 0, None),
+        )
+        flags = (
+            MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION | MHD_USE_POLL | MHD_USE_ITC
+            | MHD_ALLOW_UPGRADE | MHD_USE_TLS | MHD_USE_NO_LISTEN_SOCKET
+        )
+        # Its requests are told apart from plain HTTP ones by this: libmicrohttpd passes it back.
+        daemon = self.lib.MHD_start_daemon(
+            flags, 0, None, None, self._access, ctypes.c_void_p(1), ctypes.c_int(MHD_OPTION_ARRAY), options, ctypes.c_int(MHD_OPTION_END)
+        )
+        if not daemon:
+            raise MicrohttpdError("libmicrohttpd couldn't start HTTPS")
+        with self.daemon_lock:
+            if self.tls_daemon is not None:
+                self.retired_tls_daemons.append(self.tls_daemon)
+            self.tls_daemon = daemon
+            # libmicrohttpd reads the certificate and key from these as long as it runs.
+            self._tls_options.append((options, certificate_buffer, key_buffer))
+
+    def stop_tls(self) -> None:
+        """No more HTTPS connections; the ones it has go on until they end."""
+        with self.daemon_lock:
+            if self.tls_daemon is not None:
+                self.retired_tls_daemons.append(self.tls_daemon)
+                self.tls_daemon = None
+
+    def add_connection(self, fd: int, address: str, *, tls: bool = False) -> None:
+        """Serves a connection accepted elsewhere, such as from a tailnet, as if it had come
+        from address: handlers, logs and checks see where it really came from. The
+        connection is libmicrohttpd's from then on, closed by it even if it can't take it.
+        With tls, it's served over HTTPS."""
+        host = address.rsplit(":", 1)[0].strip("[]") if address.count(":") == 1 or address.startswith("[") else address
+        try:
+            if ":" in host:
+                sockaddr = struct.pack("<HHI", socket.AF_INET6, 0, 0) + socket.inet_pton(socket.AF_INET6, host) + struct.pack("<I", 0)
+            else:
+                sockaddr = struct.pack("<H", socket.AF_INET) + bytes(2) + socket.inet_aton(host) + bytes(8)
+        except OSError:
+            os.close(fd)
+            raise ValueError(f"unexpected address {address!r}") from None
+        with self.daemon_lock:
+            daemon = self.tls_daemon if tls else self.daemon
+            if self.daemon is None or daemon is None:
+                os.close(fd)
+                raise MicrohttpdError("the web server isn't running" if self.daemon is None else "HTTPS isn't ready")
+            if self.lib.MHD_add_connection(daemon, fd, sockaddr, len(sockaddr)) != MHD_YES:
+                raise MicrohttpdError(f"libmicrohttpd couldn't take a connection from {host}")
+
     def shutdown(self) -> None:
         self.stopped.set()
 
@@ -327,6 +400,10 @@ class MicrohttpdServer:
                 request.thread.join(max(0.0, deadline - time.monotonic()))
         with self.daemon_lock:
             daemon, self.daemon = self.daemon, None
+            tls_daemons = ([self.tls_daemon] if self.tls_daemon is not None else []) + self.retired_tls_daemons
+            self.tls_daemon, self.retired_tls_daemons = None, []
+            for tls_daemon in tls_daemons:
+                self.lib.MHD_stop_daemon(tls_daemon)
             if daemon is not None:
                 self.lib.MHD_stop_daemon(daemon)
         if daemon is None and self.listener.fileno() >= 0:
@@ -334,11 +411,12 @@ class MicrohttpdServer:
 
     # -- requests ---------------------------------------------------------
 
-    def _on_access(self, _cls, connection, url, method, version, upload_data, upload_data_size, req_cls) -> int:
+    def _on_access(self, cls, connection, url, method, version, upload_data, upload_data_size, req_cls) -> int:
         try:
             if not req_cls[0]:
                 request_id = next(self.request_ids)
                 request = _Request(request_id, connection, method.decode("latin-1"), url.decode("latin-1"), version.decode("latin-1"))
+                request.https = bool(cls)
                 with self.requests_lock:
                     self.requests[request_id] = request
                 req_cls[0] = request_id
@@ -362,7 +440,7 @@ class MicrohttpdServer:
             return self._queue_buffer(request, 413, [("Content-Type", "text/plain")], b"The request is too large.")
         request.client_address = self._client_address(request.connection)
         request.query = self._query(request.connection)
-        request.header_block = self._header_block(request.connection)
+        request.header_block = self._header_block(request.connection, https=request.https)
         request.thread = threading.Thread(target=self._run_handler, args=(request,), name="http-request", daemon=True)
         request.thread.start()
         output = request.output
@@ -524,8 +602,12 @@ class MicrohttpdServer:
         self.lib.MHD_get_connection_values(connection, kind, KeyValueIterator(collect), None)
         return values
 
-    def _header_block(self, connection: int) -> bytes:
-        lines = "".join(f"{key}: {value or ''}\r\n" for key, value in self._values(connection, MHD_HEADER_KIND))
+    def _header_block(self, connection: int, *, https: bool = False) -> bytes:
+        values = self._values(connection, MHD_HEADER_KIND)
+        if https:
+            # Said as a proxy taking HTTPS would say it, which is how handlers tell.
+            values = [(key, value) for key, value in values if key.lower() != "x-forwarded-proto"] + [("X-Forwarded-Proto", "https")]
+        lines = "".join(f"{key}: {value or ''}\r\n" for key, value in values)
         return (lines + "\r\n").encode("latin-1")
 
     def _query(self, connection: int) -> str:

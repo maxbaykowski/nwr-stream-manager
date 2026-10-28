@@ -461,6 +461,7 @@ __INDEX_STYLES__</style>
           <button id="settings_tab_sdr_sharing" type="submit" name="section" value="sdr_sharing" data-settings-section="sdr_sharing" data-baseline-submit>SDR sharing</button>
           <button id="settings_tab_notifications" type="submit" name="section" value="notifications" data-settings-section="notifications" data-baseline-submit>Notifications</button>
           <button id="settings_tab_fallback_audio" type="submit" name="section" value="fallback_audio" data-settings-section="fallback_audio" data-baseline-submit>Fallback audio</button>
+          <button id="settings_tab_tailscale" type="submit" name="section" value="tailscale" data-settings-section="tailscale" data-baseline-submit hidden>Tailscale</button>
           <button id="settings_tab_advanced" type="submit" name="section" value="advanced" data-settings-section="advanced" data-baseline-submit hidden>Advanced</button>
         </form>
         <div class="settings-detail">
@@ -713,6 +714,57 @@ __INDEX_STYLES__</style>
               </div>
               <div id="fallback-recording-result" class="message" aria-live="polite"></div>
             </div>
+          </div>
+          <div id="settings_panel_tailscale" class="settings-panel" hidden>
+            <h3>Tailscale</h3>
+            <p id="tailscale_intro" class="hint">Add NWR Stream Manager to your tailnet as a device of its own, so your other devices on Tailscale can reach it, without installing Tailscale on this computer. <a href="/help#tailscale" target="_blank" rel="noopener">Learn more about Tailscale<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
+            <p id="tailscale_status" aria-live="polite">Not connected.</p>
+            <div id="tailscale_sign_in" hidden>
+              <p><a id="tailscale_sign_in_link" href="https://login.tailscale.com/" target="_blank" rel="noopener">Sign in to Tailscale<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
+              <p class="hint">Sign in with your tailnet's account, then approve the device. Tailscale's sign-in page needs a modern browser; if this one can't open it, open this address on another device instead: <span id="tailscale_sign_in_address"></span></p>
+              <p class="hint baseline-only">Refresh this page once you've signed in.</p>
+            </div>
+            <dl id="tailscale_details" class="details-list" hidden>
+              <dt>Address on your tailnet</dt><dd><a id="tailscale_address" href="/"></a></dd>
+              <dt>Tailnet account</dt><dd id="tailscale_account"></dd>
+              <dt>Tailscale IP addresses</dt><dd id="tailscale_addresses"></dd>
+            </dl>
+            <div id="tailscale_https_section" hidden>
+              <form id="tailscale_https_form" method="post" action="/tailscale">
+                __FORM_TOKEN_INPUT__
+                <input type="hidden" name="action" value="https">
+                <input id="tailscale_was_https" type="hidden" name="was_https" value="0">
+                <label class="checkbox-row"><input id="tailscale_https" name="https" type="checkbox" value="1" aria-describedby="tailscale_https_warning"> Use a secure (https) address</label>
+                <p id="tailscale_https_warning" class="hint">A secure address needs a certificate, and certificates are listed in public logs that anyone can search. The log shows NWR Stream Manager's tailnet name, <span id="tailscale_https_name"></span>, and nothing else about your tailnet.</p>
+                <div id="tailscale_funnel_section" hidden>
+                  <input id="tailscale_was_funnel" type="hidden" name="was_funnel" value="0">
+                  <label class="checkbox-row"><input id="tailscale_funnel" name="funnel" type="checkbox" value="1" aria-describedby="tailscale_funnel_warning"> Make NWR Stream Manager reachable from the internet (Tailscale Funnel)</label>
+                  <p id="tailscale_funnel_warning" class="hint">Anyone on the internet can then open NWR Stream Manager's sign-in page, at <span id="tailscale_funnel_address"></span>, not just your tailnet. Bots that watch the public certificate logs find addresses like it quickly, and only your accounts' passwords keep them out, so make sure every account has a strong one.</p>
+                </div>
+                <div class="actions baseline-only">
+                  <button id="save_tailscale_https" type="submit">Save changes</button>
+                </div>
+              </form>
+              <p id="tailscale_https_status" aria-live="polite" hidden></p>
+              <p id="tailscale_funnel_status" aria-live="polite" hidden></p>
+              <div id="tailscale_funnel_enable" hidden>
+                <p><a id="tailscale_funnel_enable_link" href="https://login.tailscale.com/admin/acls" target="_blank" rel="noopener">Allow Tailscale Funnel on your tailnet<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
+              </div>
+              <div id="tailscale_funnel_confirm" class="baseline-only" hidden></div>
+              <div id="tailscale_https_enable" hidden>
+                <p><a id="tailscale_https_enable_link" href="https://login.tailscale.com/admin/dns" target="_blank" rel="noopener">Turn on HTTPS for your tailnet<span class="screen-reader-only"> (opens in a new tab)</span></a></p>
+                <p class="hint">Tailscale's page also has Tailscale Funnel ticked, which lets your tailnet's members put their devices on the public internet. NWR Stream Manager doesn't need it, so untick it unless you want it.</p>
+              </div>
+            </div>
+            <div id="tailscale_confirm" class="baseline-only" hidden></div>
+            <form id="tailscale_form" method="post" action="/tailscale">
+              __FORM_TOKEN_INPUT__
+              <div class="actions">
+                <button id="tailscale_connect" type="submit" name="action" value="connect" data-baseline-submit>Connect to Tailscale</button>
+                <button id="tailscale_sign_out" type="submit" name="action" value="sign_out" data-baseline-submit hidden>Sign out of Tailscale</button>
+              </div>
+            </form>
+            <div id="tailscale-result" class="message" aria-live="polite"></div>
           </div>
           <div id="settings_panel_advanced" class="settings-panel" hidden>
             <h3>Advanced</h3>

@@ -6,6 +6,8 @@ import socket
 import ssl
 from dataclasses import dataclass
 from typing import BinaryIO
+
+from .network_dial import create_connection
 from urllib.parse import urlsplit
 
 from . import __version__
@@ -87,7 +89,8 @@ class IcecastSource:
     response_status_code: int | None = None
 
     def connect(self) -> BinaryIO:
-        raw_sock = socket.create_connection(
+        # Through the tailnet NWR Stream Manager joined, if the server is one of its devices.
+        raw_sock = create_connection(
             (self.config.host, self.config.port), timeout=self.timeout_seconds
         )
         try:

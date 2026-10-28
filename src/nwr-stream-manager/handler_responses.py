@@ -96,7 +96,24 @@ class ResponseHandlerMixin:
         """
         host = browser_host_name(self.headers)
         if host.endswith(".ts.net"):
+            # NWR Stream Manager's own tailnet name, once it has HTTPS there, is HTTPS only.
+            if host == (self.service.tailnet_https_name() or ""):
+                return True
             return tailscale_funnel_serves(host, self.server.server_address[1])
+        return True
+
+    def _redirect_to_tailnet_https(self) -> bool:
+        """Plain HTTP to the tailnet name NWR Stream Manager has itself goes to HTTPS, once it has
+        that: everyone ends up on the secure address, and old links still work."""
+        if self._over_https():
+            return False
+        name = self.service.tailnet_https_name() or ""
+        if not name or browser_host_name(self.headers) != name:
+            return False
+        self.send_response(HTTPStatus.PERMANENT_REDIRECT)
+        self.send_header("Location", f"https://{name}{self.path}")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
         return True
 
     def end_headers(self) -> None:
@@ -115,7 +132,7 @@ class ResponseHandlerMixin:
         super().end_headers()
 
     def log_message(self, format: str, *args) -> None:
-        LOG.debug("HTTP %s - %s", self.address_string(), format % args)
+        LOG.debug("HTTP %s - %s", self._client_address(), format % args)
 
     def _read_json(self) -> dict[str, Any]:
         try:

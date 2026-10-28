@@ -2014,3 +2014,214 @@ class SoundcardHintTests(unittest.TestCase):
         self.assertIn("No sound cards found", options([], [], "", "", False)[0])
         stream = {"outputs": [{"type": "soundcard", "enabled": True, "soundcard": {"stable_id": "usb-1234", "channel_mode": "both"}}]}
         self.assertIn("No sound cards with free channels", options([stream], [{"stable_id": "usb-1234"}], "", "", False)[0])
+
+
+class TailscalePageTests(unittest.TestCase):
+    """Connecting to Tailscale, as a browser without the page script does it."""
+
+    request = BaselinePageServerTests.request
+    form_token = BaselinePageServerTests.form_token
+    title = BaselinePageServerTests.title
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+
+    def setUp(self) -> None:
+        wc = self.web_control
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.accounts = wc.AccountStore(Path(tempdir.name) / "accounts.db")
+        self.accounts.create_admin("owner", "password1", "password1")
+        account, secret = self.accounts.create_account("helper", False)
+        self.accounts.change_password(account["id"], secret, "password2", "password2")
+        self.owner, self.admin = ("owner", "password1"), ("helper", "password2")
+        self.state = {"available": True, "state": "off"}
+        self.calls: list[str] = []
+        self.https_name = ""
+        test = self
+
+        class Service(StandInService):
+            def tailscale_status(self):
+                return dict(test.state)
+
+            def connect_tailscale(self):
+                test.calls.append("connect")
+                test.state = {"available": True, "state": "starting"}
+
+            def sign_out_tailscale(self):
+                test.calls.append("sign_out")
+                test.state = {"available": True, "state": "off"}
+
+            def set_tailscale_https(self, enabled):
+                test.calls.append(f"https {'on' if enabled else 'off'}")
+
+            def set_tailscale_funnel(self, enabled):
+                test.calls.append(f"funnel {'on' if enabled else 'off'}")
+
+            def tailnet_https_name(self):
+                return test.https_name
+
+        self.service = Service(accounts=self.accounts, auth_sessions=wc.AuthSessionStore(), status=lambda read_only=False: {}, lock=threading.Lock())
+        handler = type("TailscalePageTestHandler", (wc.RtlControlHandler,), {"service": self.service})
+        server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+
+    def test_the_owner_connects_signs_in_and_signs_out(self) -> None:
+        response, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        token = self.form_token(response)
+        cookie = f"nwrstmgr_form={token}"
+        self.assertEqual(self.title(page), "Tailscale - Settings - NWR Stream Manager")
+        self.assertRegex(page, r'<button id="settings_tab_tailscale" [^>]*aria-current="page"')
+        self.assertIn('<p id="tailscale_status" aria-live="polite">Not connected.</p>', page)
+        self.assertRegex(page, r'<button id="tailscale_sign_out" [^>]*hidden>')
+
+        response, _ = self.request("POST", "/tailscale", fields={"action": "connect", "form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/?view=settings&section=tailscale&result=connecting"))
+        self.assertEqual(self.calls, ["connect"])
+
+        # Waiting to be signed in: the link, its address to open elsewhere, and Cancel.
+        link = "https://login.tailscale.com/a/abc123"
+        self.state = {"available": True, "state": "needs-login", "auth_url": link}
+        _, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        self.assertIn("Waiting for you to sign in to Tailscale.</p>", page)
+        self.assertIn('<div id="tailscale_sign_in">', page)
+        self.assertRegex(page, rf'<a id="tailscale_sign_in_link" [^>]*href="{link}"')
+        self.assertIn(f'<span id="tailscale_sign_in_address">{link}</span>', page)
+        self.assertRegex(page, r'<button id="tailscale_sign_out" [^>]*>Cancel</button>')
+
+        url = "http://nwr-stream-manager.example.ts.net/"
+        self.state = {"available": True, "state": "connected", "url": url, "account": "someone@example.com", "addresses": ["100.64.0.1"]}
+        _, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        self.assertIn("Connected to your tailnet.</p>", page)
+        self.assertIn(f'<a id="tailscale_address" href="{url}">{url}</a>', page)
+        self.assertIn('<dd id="tailscale_account">someone@example.com</dd>', page)
+        self.assertRegex(page, r'<button id="tailscale_connect" [^>]*hidden>')
+
+        # Signing out is asked about first.
+        response, _ = self.request("POST", "/tailscale", fields={"action": "sign_out", "form_token": token}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=tailscale&confirm=sign_out")
+        self.assertEqual(self.calls, ["connect"])
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "Sign out of Tailscale? - Tailscale - Settings - NWR Stream Manager")
+        self.assertRegex(page, r'<form id="tailscale_form" [^>]*hidden>')
+        fields = {"action": "sign_out", "confirmed": "1", "form_token": token}
+        response, _ = self.request("POST", "/tailscale", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=tailscale&result=signed_out")
+        self.assertEqual(self.calls, ["connect", "sign_out"])
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "Signed out of Tailscale. - Tailscale - Settings - NWR Stream Manager")
+
+    def test_without_its_library_it_says_so(self) -> None:
+        self.state = {"available": False, "state": "unavailable"}
+        _, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        self.assertIn("Tailscale can't be used here yet: its library (libtailscale) isn't installed. To install it, run nwr-stream-manager --build-libtailscale", html.unescape(page))
+        self.assertRegex(page, r'<button id="tailscale_connect" [^>]*hidden>')
+        self.assertRegex(page, r'<button id="tailscale_sign_out" [^>]*hidden>')
+
+    def test_with_tailscale_installed_on_the_computer_only_a_message_is_shown(self) -> None:
+        self.state = {"available": False, "state": "system", "signed_out_for_system": False}
+        _, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        self.assertIn("A systemwide installation of Tailscale was detected on this computer", page)
+        for element in ("tailscale_intro", "tailscale_connect", "tailscale_sign_out"):
+            self.assertRegex(page, rf'id="{element}" [^>]*hidden', element)
+
+    def test_a_secure_address_is_a_switch_saved_only_when_changed(self) -> None:
+        connected = {"available": True, "state": "connected", "name": "nwr-stream-manager.example.ts.net", "url": "http://nwr-stream-manager.example.ts.net/"}
+        self.state = {**connected, "https": {"enabled": False, "state": "off"}}
+        response, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        token = self.form_token(response)
+        cookie = f"nwrstmgr_form={token}"
+        self.assertIn('<div id="tailscale_https_section">', page)
+        self.assertNotRegex(page, r'<input id="tailscale_https" [^>]*checked')
+        self.assertIn("The log shows NWR Stream Manager's tailnet name, <span id=\"tailscale_https_name\">nwr-stream-manager.example.ts.net</span>", html.unescape(page))
+        self.assertRegex(page, r'<p id="tailscale_https_status" [^>]*hidden>')
+
+        fields = {"action": "https", "https": "1", "was_https": "0", "form_token": token}
+        response, _ = self.request("POST", "/tailscale", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=tailscale&result=saved")
+        self.assertEqual(self.calls, ["https on"])
+        # Saved again unchanged: nothing to do.
+        fields = {"action": "https", "https": "1", "was_https": "1", "form_token": token}
+        self.request("POST", "/tailscale", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(self.calls, ["https on"])
+
+        # The tailnet has HTTPS off: Tailscale's own link to turn it on.
+        link = "https://login.tailscale.com/f/serve?node=abc"
+        self.state = {**connected, "https": {"enabled": True, "state": "needs-enabling", "enable_url": link}}
+        _, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        self.assertRegex(page, r'<input id="tailscale_https" [^>]*checked')
+        self.assertIn("HTTPS is turned off for your tailnet.", page)
+        self.assertIn('<div id="tailscale_https_enable">', page)
+        self.assertIn("untick it unless you want it", page)
+        self.assertRegex(page, rf'<a id="tailscale_https_enable_link" [^>]*href="{re.escape(link)}"')
+
+    def test_funnel_is_offered_once_the_secure_address_works_and_asked_about_first(self) -> None:
+        connected = {"available": True, "state": "connected", "name": "nwr-stream-manager.example.ts.net"}
+        public = "https://nwr-stream-manager.example.ts.net:8443/"
+        self.state = {**connected, "https": {"enabled": True, "state": "starting"}, "funnel": {"enabled": False, "state": "off", "url": public}}
+        _, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        self.assertIn('<div id="tailscale_funnel_section" hidden>', page)
+        self.state = {**connected, "https": {"enabled": True, "state": "on"}, "funnel": {"enabled": False, "state": "off", "url": public}}
+        response, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        token = self.form_token(response)
+        cookie = f"nwrstmgr_form={token}"
+        self.assertIn('<div id="tailscale_funnel_section">', page)
+        self.assertIn(f'<span id="tailscale_funnel_address">{public}</span>', page)
+
+        fields = {"action": "https", "https": "1", "was_https": "1", "funnel": "1", "was_funnel": "0", "form_token": token}
+        response, _ = self.request("POST", "/tailscale", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=tailscale&confirm=funnel")
+        self.assertEqual(self.calls, [])
+        _, page = self.request("GET", response.getheader("Location"), user=self.owner)
+        self.assertEqual(self.title(page), "Make NWR Stream Manager reachable from the internet? - Tailscale - Settings - NWR Stream Manager")
+        self.assertIn(public, page)
+        for form in ("tailscale_https_form", "tailscale_form"):
+            self.assertRegex(page, rf'<form id="{form}" [^>]*hidden>', form)
+        response, _ = self.request("POST", "/tailscale", fields={**fields, "confirmed": "1"}, cookie=cookie, user=self.owner)
+        self.assertEqual(response.getheader("Location"), "/?view=settings&section=tailscale&result=saved")
+        self.assertEqual(self.calls, ["funnel on"])
+
+        self.state = {**connected, "https": {"enabled": True, "state": "on"}, "funnel": {"enabled": True, "state": "on", "url": public}}
+        _, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
+        self.assertIn(f"NWR Stream Manager is reachable from the internet at {public}", page)
+        # Turned off: no asking.
+        fields = {"action": "https", "https": "1", "was_https": "1", "was_funnel": "1", "form_token": token}
+        self.request("POST", "/tailscale", fields=fields, cookie=cookie, user=self.owner)
+        self.assertEqual(self.calls, ["funnel on", "funnel off"])
+
+    def test_plain_http_to_its_tailnet_name_goes_to_https_once_it_has_that(self) -> None:
+        def get(host, proto=""):
+            connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            self.addCleanup(connection.close)
+            headers = {"Host": host, "Authorization": "Basic " + base64.b64encode(b"owner:password1").decode()}
+            if proto:
+                headers["X-Forwarded-Proto"] = proto
+            connection.request("GET", "/?view=streams", headers=headers)
+            response = connection.getresponse()
+            response.read()
+            return response
+
+        name = "nwr-stream-manager.example.ts.net"
+        self.assertEqual(get(name).status, 200)  # no secure address yet
+        self.https_name = name
+        response = get(name)
+        self.assertEqual((response.status, response.getheader("Location")), (308, f"https://{name}/?view=streams"))
+        # Other names, and HTTPS itself, are left alone; HTTPS on that name gets HSTS.
+        self.assertEqual(get("192.168.1.79:8080").status, 200)
+        response = get(name, proto="https")
+        self.assertEqual(response.status, 200)
+        self.assertIsNotNone(response.getheader("Strict-Transport-Security"))
+
+    def test_only_the_owner_has_it(self) -> None:
+        _, page = self.request("GET", "/?view=settings", user=self.admin)
+        self.assertRegex(page, r'<button id="settings_tab_tailscale" [^>]*hidden>')
+        response, _ = self.request("GET", "/?view=settings&section=tailscale", user=self.admin)
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/?view=settings&section=general"))
+        for method, path, fields in (("GET", "/api/tailscale", None), ("POST", "/tailscale", {"action": "connect"})):
+            response, _ = self.request(method, path, fields=fields, user=self.admin)
+            self.assertEqual(response.status, 403, path)
+        self.assertEqual(self.calls, [])

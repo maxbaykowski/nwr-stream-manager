@@ -119,6 +119,51 @@ def stream_archive_available_text(archive: dict[str, Any]) -> str:
     return f"Archived audio from {archive['from_text']} to {archive['to_text']} ({archive['storage']})."
 
 
+def tailscale_https_text(https: dict[str, Any]) -> str:
+    """What Settings says about the secure address; the page script says the same."""
+    state = https.get("state")
+    if state == "needs-enabling":
+        return "HTTPS is turned off for your tailnet. Turn it on with the link below; the secure address is set up as soon as it is."
+    if state == "on":
+        return "The secure address is ready."
+    if state == "error":
+        return f"The secure address couldn't be set up: {https.get('error') or 'unknown error'}. NWR Stream Manager keeps trying."
+    if state == "starting":
+        return "Setting up the secure address. Getting its certificate can take a minute."
+    return ""
+
+
+def tailscale_funnel_text(funnel: dict[str, Any]) -> str:
+    """What Settings says about Tailscale Funnel; the page script says the same."""
+    state = funnel.get("state")
+    if state == "on":
+        return f"NWR Stream Manager is reachable from the internet at {funnel.get('url', '')}"
+    if state == "needs-permission":
+        return "Your tailnet doesn't allow this device to use Funnel yet. Allow it with the link below; Funnel opens as soon as it's allowed."
+    if state == "error":
+        return f"Funnel couldn't be opened: {funnel.get('error') or 'unknown error'}. NWR Stream Manager keeps trying."
+    return ""
+
+
+def tailscale_status_text(status: dict[str, Any]) -> str:
+    """What Settings says about Tailscale; the page script says the same."""
+    state = status.get("state")
+    if state == "system":
+        signed_out = "NWR Stream Manager signed itself out of Tailscale when it found it, so the two aren't on your tailnet at once. Its own device stays in the Tailscale admin console, marked as expired, until you remove it there." if status.get("signed_out_for_system") else ""
+        return " ".join(part for part in ("A systemwide installation of Tailscale was detected on this computer, so NWR Stream Manager uses it instead of connecting to Tailscale by itself.", signed_out) if part)
+    if state == "unavailable":
+        return "Tailscale can't be used here yet: its library (libtailscale) isn't installed. To install it, run nwr-stream-manager --build-libtailscale on this computer, with sudo if NWR Stream Manager runs as a systemd service. It's used as soon as it's built, without restarting."
+    if state == "off":
+        return "Not connected."
+    if state == "needs-login":
+        return "Waiting for you to sign in to Tailscale."
+    if state == "connected":
+        return "Connected to your tailnet."
+    if state == "error":
+        return f"Tailscale couldn't connect: {status.get('error') or 'unknown error'}."
+    return "Connecting to Tailscale."
+
+
 def stream_archive_delete_choices_html(choices: list[dict[str, Any]], chosen: str) -> str:
     """What archived audio can be deleted, as the page script lists it: the first is chosen."""
     if chosen not in {choice["id"] for choice in choices}:

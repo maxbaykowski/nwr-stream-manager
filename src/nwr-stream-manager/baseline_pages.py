@@ -75,10 +75,11 @@ SETTINGS_SECTION_TITLES = {
     "notifications": "Notifications",
     "fallback_audio": "Fallback audio",
     "record_announcement": "Record an announcement",
+    "tailscale": "Tailscale",
     "advanced": "Advanced",
 }
 SETTINGS_BACK_NAMES = {"accounts": "accounts", "sdr_sharing": "SDR sharing", "fallback_audio": "fallback audio"}
-SETTINGS_TABS = ("general", "accounts", "account", "sdr_sharing", "notifications", "fallback_audio", "advanced")
+SETTINGS_TABS = ("general", "accounts", "account", "sdr_sharing", "notifications", "fallback_audio", "tailscale", "advanced")
 SETTINGS_PAGE_PARENTS = {
     "create_account": "accounts",
     "pair_device": "sdr_sharing",
@@ -86,7 +87,10 @@ SETTINGS_PAGE_PARENTS = {
     "record_announcement": "fallback_audio",
 }
 # The settings that work without the page script.
-BASELINE_SETTINGS_SECTIONS = {"general", "accounts", "create_account", "account", "fallback_audio", "notifications", "sdr_sharing", "pair_device", "find_devices", "advanced"}
+BASELINE_SETTINGS_SECTIONS = {
+    "general", "accounts", "create_account", "account", "fallback_audio", "notifications", "sdr_sharing", "pair_device", "find_devices",
+    "tailscale", "advanced",
+}
 ACCOUNT_FORM_PATHS = {"/accounts/create", "/accounts/reset-password", "/accounts/read-only", "/accounts/delete"}
 EAS_ALERT_EXPORT_PATH = "/eas-alerts/export"
 STREAM_ARCHIVE_DOWNLOAD_PATH = "/stream-archives/download"
@@ -119,6 +123,7 @@ NOTIFICATIONS_SET_UP_HTML = (
     "and turn on Notify when the RTL-SDR requires attention.</p>"
 )
 ADVANCED_SETTINGS_PATH = "/advanced-settings"
+TAILSCALE_SETTINGS_PATH = "/tailscale"
 GENERAL_SETTINGS_PATH = "/general-settings"
 RESTART_PATH = "/restart"
 FALLBACK_SETTINGS_PATH = "/fallback-audio/settings"
@@ -169,8 +174,8 @@ IQ_RECORDER_RESULTS = {
 
 def settings_sections_for(owner: bool) -> list[str]:
     sections = ["account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"]
-    # Only the owner chooses where NWR Stream Manager can be reached.
-    return ["general", "accounts", "create_account", *sections, "advanced"] if owner else ["general", *sections]
+    # Only the owner chooses where NWR Stream Manager can be reached, Tailscale included.
+    return ["general", "accounts", "create_account", *sections, "tailscale", "advanced"] if owner else ["general", *sections]
 
 
 def settings_tab_section(section: str, owner: bool) -> str:

@@ -146,27 +146,9 @@ class RemoteSdrNetworkTests(unittest.TestCase):
             ["100.64.0.9", "192.168.1.5", "127.0.0.1"],
         )
 
-    def test_tailscale_peers_are_online_non_mobile_ipv4(self) -> None:
-        import json
-        import subprocess
-        from unittest.mock import patch
-
-        status = {
-            "Self": {"TailscaleIPs": ["100.113.206.20"]},
-            "Peer": {
-                "a": {"Online": True, "OS": "linux", "TailscaleIPs": ["100.105.221.80", "fd7a::1"]},
-                "b": {"Online": False, "OS": "linux", "TailscaleIPs": ["100.114.42.106"]},
-                "c": {"Online": True, "OS": "iOS", "TailscaleIPs": ["100.95.146.71"]},
-                "d": {"Online": True, "OS": "", "TailscaleIPs": ["fd7a::2", "100.67.156.54"]},
-            },
-        }
-        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(status), stderr="")
-        with patch.object(self.remote.subprocess, "run", return_value=completed):
-            self.assertEqual(self.remote.tailscale_peer_addresses(), ["100.105.221.80", "100.67.156.54"])
-        with patch.object(self.remote.subprocess, "run", side_effect=FileNotFoundError("tailscale")):
-            self.assertEqual(self.remote.tailscale_peer_addresses(), [])
-
-    def test_discovery_targets_cover_every_lan_and_tailscale_peers(self) -> None:
+    def test_discovery_looks_on_every_lan_only(self) -> None:
+        # Pairing needs both on the local network; once paired, they reach each other over
+        # Tailscale by the addresses they swapped.
         from unittest.mock import patch
 
         interfaces = [
@@ -174,14 +156,25 @@ class RemoteSdrNetworkTests(unittest.TestCase):
             self.remote.LocalInterface("enp3s0", "10.0.0.5", "10.0.0.255", False),
             self.remote.LocalInterface("tailscale0", "100.113.206.20", "", True),
         ]
-        with patch.object(self.remote, "local_interfaces", return_value=interfaces), patch.object(
-            self.remote, "tailscale_peer_addresses", return_value=["100.105.221.80"]
-        ):
+        with patch.object(self.remote, "local_interfaces", return_value=interfaces):
             targets = self.remote.discovery_targets()
             addresses = self.remote.local_addresses()
 
-        self.assertEqual(targets, ["255.255.255.255", "192.168.1.255", "10.0.0.255", "100.105.221.80", "127.0.0.1"])
+        self.assertEqual(targets, ["255.255.255.255", "192.168.1.255", "10.0.0.255", "127.0.0.1"])
         self.assertEqual(addresses, {"tailscale": "100.113.206.20", "lan": ["192.168.1.79", "10.0.0.5"]})
+
+    def test_the_tailnet_nwr_stream_manager_joined_itself_counts_as_tailscale(self) -> None:
+        from unittest.mock import patch
+
+        dial = importlib.import_module("nwr_stream_manager.network_dial")
+        self.addCleanup(dial.set_tailnet_dialer, None)
+        interfaces = [self.remote.LocalInterface("wlp2s0", "192.168.1.79", "192.168.1.255", False)]
+        with patch.object(self.remote, "local_interfaces", return_value=interfaces):
+            self.assertFalse(self.remote.tailscale_is_up())
+            self.assertEqual(self.remote.local_addresses()["tailscale"], "")
+            dial.set_tailnet_dialer(lambda host, port, timeout: None, lambda: "100.115.70.83")
+            self.assertTrue(self.remote.tailscale_is_up())
+            self.assertEqual(self.remote.local_addresses(), {"tailscale": "100.115.70.83", "lan": ["192.168.1.79"]})
 
 
 class SilentHostTests(unittest.TestCase):
@@ -878,6 +871,98 @@ class RemoteSdrProtocolTests(unittest.TestCase):
             client.reset_sdr()
         self.assertEqual(client.update_settings({"gain": 49.6})["settings"]["gain"], 49.6)
 
+    def test_a_paired_host_is_used_over_the_tailnet_nwr_stream_manager_joined_itself(self) -> None:
+        # Neither computer is on the tailnet itself; each NWR Stream Manager is. A socket pair
+        # stands in for libtailscale, connecting the client's dial to the host's tailnet listener.
+        import socket
+
+        node = importlib.import_module("nwr_stream_manager.tailscale_node")
+        dial = importlib.import_module("nwr_stream_manager.network_dial")
+        self.addCleanup(dial.set_tailnet_dialer, None)
+        record = self.pair()
+        self.hosts.add(
+            record["id"], record["name"], token=record["token"], peer_token=record["peer_token"],
+            address="100.70.0.5", port=self.remote.REMOTE_SDR_TCP_PORT, addresses=["100.70.0.5"],
+        )
+        dialed = []
+
+        def through_the_tailnet(host, port, timeout):
+            if host != "100.70.0.5":
+                return None
+            dialed.append((host, port))
+            ours, theirs = socket.socketpair()
+            self.server.accept_connection(node.TailnetConnection(fileno=theirs.detach(), peer=("100.70.0.9", 0)), ("100.70.0.9", 0))
+            return node.TailnetConnection(fileno=ours.detach(), peer=(host, port))
+
+        dial.set_tailnet_dialer(through_the_tailnet, lambda: "100.70.0.9")
+        client = self.client()
+        wait_for(lambda: client.status()["reachable"])
+        self.assertEqual(dialed[0], ("100.70.0.5", self.remote.REMOTE_SDR_TCP_PORT))
+        self.assertEqual(client.update_settings({"gain": 49.6})["settings"]["gain"], 49.6)
+
+    def test_each_side_learns_where_the_other_is_now(self) -> None:
+        from unittest.mock import patch
+
+        record = self.pair()
+        # Saved at pairing, then the host's Tailscale address changed.
+        self.hosts.add(
+            record["id"], record["name"], token=record["token"], peer_token=record["peer_token"],
+            address="127.0.0.1", port=self.server.port, addresses=["100.70.0.5", "127.0.0.1"],
+        )
+        host_now = {"tailscale": "100.70.0.9", "lan": ["127.0.0.1"]}
+        with patch.object(self.remote, "local_addresses", return_value=host_now), \
+                patch.object(self.remote, "tailscale_is_up", return_value=False):
+            client = self.client()
+            wait_for(lambda: client.status()["reachable"])
+            saved = self.hosts.get(self.host_identity.fingerprint)
+            self.assertEqual(saved["addresses"], ["100.70.0.9", "127.0.0.1"])
+            # The host was told the client's too.
+            device = self.server.devices.get(self.client_identity.fingerprint)
+            self.assertIn("100.70.0.9", device["addresses"])
+        # While connected: the host's status says where it is now.
+        moved = {"tailscale": "100.70.0.11", "lan": ["127.0.0.1"]}
+        with patch.object(self.remote, "local_addresses", return_value=moved):
+            self.server.notify_status_changed()
+            wait_for(lambda: self.hosts.get(self.host_identity.fingerprint)["addresses"][0] == "100.70.0.11")
+        self.assertEqual(self.hosts.get(self.host_identity.fingerprint)["addresses"], ["100.70.0.11", "127.0.0.1"])
+
+    def test_a_host_whose_address_changed_is_found_on_the_tailnet_by_its_certificate(self) -> None:
+        # The host went from Tailscale on its computer to its own: the saved address is gone, and
+        # the local network doesn't have it either. One of the tailnet's devices is it.
+        import socket
+        from unittest.mock import patch
+
+        node = importlib.import_module("nwr_stream_manager.tailscale_node")
+        dial = importlib.import_module("nwr_stream_manager.network_dial")
+        self.addCleanup(dial.set_tailnet_dialer, None)
+        record = self.pair()
+        self.hosts.add(
+            record["id"], record["name"], token=record["token"], peer_token=record["peer_token"],
+            address="100.70.0.5", port=self.remote.REMOTE_SDR_TCP_PORT, addresses=["100.70.0.5"],
+        )
+        tried = []
+
+        def tailnet(host, port, timeout):
+            tried.append(host)
+            if host == "100.70.0.8":
+                ours, theirs = socket.socketpair()
+                self.server.accept_connection(node.TailnetConnection(fileno=theirs.detach(), peer=("100.70.0.1", 0)), ("100.70.0.1", 0))
+                return node.TailnetConnection(fileno=ours.detach(), peer=(host, port))
+            raise ConnectionRefusedError(f"nothing at {host}")
+
+        dial.set_tailnet_dialer(tailnet, lambda: "100.70.0.1", lambda: ["100.70.0.7", "100.70.0.8"])
+        with patch.object(self.remote.subprocess, "run", side_effect=FileNotFoundError("tailscale")):
+            client = self.remote.RemoteSdrClient(
+                self.host_identity.fingerprint, self.hosts, client_id=self.client_identity.fingerprint,
+                discovery_port=self.server.discovery.port, discovery_targets=[],
+            )
+            client.start()
+            self.addCleanup(client.stop)
+            wait_for(lambda: client.status()["reachable"], 10)
+        self.assertIn("100.70.0.7", tried)
+        self.assertEqual(self.hosts.get(self.host_identity.fingerprint)["last_reached_address"], "100.70.0.8")
+        self.assertEqual(client.update_settings({"gain": 49.6})["settings"]["gain"], 49.6)
+
     def test_unpaired_client_is_rejected(self) -> None:
         self.hosts.add(
             self.host_identity.fingerprint, "weather-pi", token="forged" * 8, peer_token="x" * 43,
@@ -900,6 +985,8 @@ class RemoteSdrProtocolTests(unittest.TestCase):
             client.connect(self.remote.REMOTE_SDR_ROLE_CONTROL)
 
     def test_host_found_again_after_its_address_changes(self) -> None:
+        from unittest.mock import patch
+
         record = self.pair()
         self.hosts.update(record["id"], address="127.0.0.2", port=1)  # stale address
         client = self.remote.RemoteSdrClient(
@@ -909,7 +996,9 @@ class RemoteSdrProtocolTests(unittest.TestCase):
             discovery_port=self.server.discovery.port,
             discovery_targets=["127.0.0.1"],
         )
-        connection = client.connect(self.remote.REMOTE_SDR_ROLE_CONTROL)
+        # Where the host says it is, whatever this computer's own addresses are.
+        with patch.object(self.remote, "local_addresses", return_value={"tailscale": "", "lan": ["127.0.0.1"]}):
+            connection = client.connect(self.remote.REMOTE_SDR_ROLE_CONTROL)
         connection.close()
 
         self.assertEqual(self.hosts.get(record["id"])["address"], "127.0.0.1")

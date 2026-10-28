@@ -228,6 +228,7 @@ from .remote_sdr import (
 )
 from .routes_accounts import AccountRoutesMixin
 from .routes_advanced import AdvancedRoutesMixin
+from .routes_tailscale import TailscaleRoutesMixin
 from .routes_eas_alerts import EasAlertRoutesMixin
 from .routes_fallback import FallbackRoutesMixin
 from .routes_general import GeneralRoutesMixin
@@ -251,6 +252,8 @@ from .rtl import (
 )
 from .same_live import generate_same_message, SameEventQueue
 from .service_advanced import AdvancedServiceMixin
+from .service_tailscale import TailscaleServiceMixin
+from .tailscale_build import build_libtailscale
 from .service_capture import CaptureServiceMixin
 from .service_devices import DeviceServiceMixin
 from .service_eas_alerts import EasAlertServiceMixin
@@ -348,6 +351,7 @@ class RtlControlService(
     CaptureServiceMixin,
     SdrSharingServiceMixin,
     AdvancedServiceMixin,
+    TailscaleServiceMixin,
     RestartServiceMixin,
     GeneralServiceMixin,
 ):
@@ -424,6 +428,7 @@ class RtlControlService(
         self.drain_stop = threading.Event()
         self.stream_workers: dict[str, IcecastStreamWorker] = {}
         self._init_stream_archives()
+        self._init_tailscale()
         self.preview_streams: dict[str, dict[str, Any]] = {}
         self.preview_cleanup_stop = threading.Event()
         self.preview_cleanup_thread = threading.Thread(
@@ -517,6 +522,7 @@ class RtlControlService(
         self.preview_cleanup_thread.join(timeout=2.0)
         self.stream_notification_thread.join(timeout=2.0)
         self._stop_stream_archives()
+        self._stop_tailscale()
         with self.lock:
             recorder = self.iq_recorder
             self.iq_recorder = None
@@ -753,6 +759,7 @@ class RtlControlHandler(
     NotificationRoutesMixin,
     FallbackRoutesMixin,
     AdvancedRoutesMixin,
+    TailscaleRoutesMixin,
     RestartRoutesMixin,
     GeneralRoutesMixin,
     AuthHandlerMixin,
@@ -797,6 +804,8 @@ class RtlControlHandler(
         body = self.rfile
         try:
             parsed = urlparse(self.path)
+            if self._redirect_to_tailnet_https():
+                return
             if not self._auth_ok_or_setup_response(parsed.path, method):
                 return
             name = self.ROUTES.get((method, parsed.path))
@@ -933,6 +942,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="path for the rotating server log file; defaults to the state directory",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--build-libtailscale",
+        action="store_true",
+        help="build libtailscale, which connecting to Tailscale from Settings needs, then exit",
+    )
     return parser
 
 
@@ -1130,6 +1144,7 @@ def run_server(
     LOG.info("server log file is %s", log_path)
     if development_iq_sources:
         LOG.info("development I/Q file source controls are enabled")
+    service.start_tailscale(server)
     try:
         # Check for shutdown often, so a restart isn't held up waiting on this loop.
         server.serve_forever(poll_interval=0.1)
@@ -1142,6 +1157,8 @@ def run_server(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.build_libtailscale:
+        return build_libtailscale()
     try:
         restart = run_server(
             args.host,

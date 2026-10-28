@@ -7014,6 +7014,7 @@ function applyAccountUi(account) {
   setHidden("settings_tab_accounts", !owner);
   setHidden("settings_tab_account", owner || readOnly);
   setHidden("settings_tab_advanced", !owner);
+  setHidden("settings_tab_tailscale", !owner);
   setHidden("nav_restart", readOnly);
   placeChangePasswordForm();
   setHidden("nav_rtl", readOnly);
@@ -7200,6 +7201,184 @@ async function saveGeneralSettings() {
 
 // Advanced is saved only when Save changes is selected, not as it's changed:
 // a wrong port or address could leave nobody able to reach NWR Stream Manager.
+// Tailscale: NWR Stream Manager joined to a tailnet as a device of its own. Checked every
+// couple of seconds while it's shown, so signing in on Tailscale's page shows here by itself.
+let tailscaleTimer = null;
+const TAILSCALE_STATUS_INTERVAL_MS = 2000;
+
+function tailscaleStatusText(status) {
+  const state = status.state;
+  if (state === "system") {
+    const message = "A systemwide installation of Tailscale was detected on this computer, so NWR Stream Manager uses it instead of connecting to Tailscale by itself.";
+    return status.signed_out_for_system ? `${message} NWR Stream Manager signed itself out of Tailscale when it found it, so the two aren't on your tailnet at once. Its own device stays in the Tailscale admin console, marked as expired, until you remove it there.` : message;
+  }
+  if (state === "unavailable") return "Tailscale can't be used here yet: its library (libtailscale) isn't installed. To install it, run nwr-stream-manager --build-libtailscale on this computer, with sudo if NWR Stream Manager runs as a systemd service. It's used as soon as it's built, without restarting.";
+  if (state === "off") return "Not connected.";
+  if (state === "needs-login") return "Waiting for you to sign in to Tailscale.";
+  if (state === "connected") return "Connected to your tailnet.";
+  if (state === "error") return `Tailscale couldn't connect: ${status.error || "unknown error"}.`;
+  return "Connecting to Tailscale.";
+}
+
+function tailscaleHttpsText(https) {
+  const state = https.state;
+  if (state === "needs-enabling") return "HTTPS is turned off for your tailnet. Turn it on with the link below; the secure address is set up as soon as it is.";
+  if (state === "on") return "The secure address is ready.";
+  if (state === "error") return `The secure address couldn't be set up: ${https.error || "unknown error"}. NWR Stream Manager keeps trying.`;
+  if (state === "starting") return "Setting up the secure address. Getting its certificate can take a minute.";
+  return "";
+}
+
+function renderTailscaleHttps(status) {
+  const https = status.https || {};
+  const shown = status.state === "connected";
+  setHidden("tailscale_https_section", !shown);
+  if (!shown) return;
+  // Left alone while a change to it is on its way.
+  if (!tailscaleHttpsSaving) setChecked("tailscale_https", Boolean(https.enabled));
+  setText("tailscale_https_name", status.name || "");
+  const text = https.enabled ? tailscaleHttpsText(https) : "";
+  setText("tailscale_https_status", text);
+  setHidden("tailscale_https_status", !text);
+  const enabling = Boolean(https.enabled) && https.state === "needs-enabling";
+  setHidden("tailscale_https_enable", !enabling);
+  const link = document.getElementById("tailscale_https_enable_link");
+  const url = https.enable_url || "https://login.tailscale.com/admin/dns";
+  if (enabling && link.getAttribute("href") !== url) link.setAttribute("href", url);
+  renderTailscaleFunnel(status);
+}
+
+function tailscaleFunnelText(funnel) {
+  const state = funnel.state;
+  if (state === "on") return `NWR Stream Manager is reachable from the internet at ${funnel.url || ""}`;
+  if (state === "needs-permission") return "Your tailnet doesn't allow this device to use Funnel yet. Allow it with the link below; Funnel opens as soon as it's allowed.";
+  if (state === "error") return `Funnel couldn't be opened: ${funnel.error || "unknown error"}. NWR Stream Manager keeps trying.`;
+  return "";
+}
+
+// Funnel, once the secure address works: it's what Funnel serves.
+function renderTailscaleFunnel(status) {
+  const https = status.https || {};
+  const funnel = status.funnel || {};
+  const shown = status.state === "connected" && Boolean(https.enabled) && https.state === "on";
+  setHidden("tailscale_funnel_section", !shown);
+  const text = shown && funnel.enabled ? tailscaleFunnelText(funnel) : "";
+  setText("tailscale_funnel_status", text);
+  setHidden("tailscale_funnel_status", !text);
+  const allowing = shown && Boolean(funnel.enabled) && funnel.state === "needs-permission";
+  setHidden("tailscale_funnel_enable", !allowing);
+  if (!shown) return;
+  if (!tailscaleHttpsSaving) setChecked("tailscale_funnel", Boolean(funnel.enabled));
+  setText("tailscale_funnel_address", funnel.url || "");
+  const link = document.getElementById("tailscale_funnel_enable_link");
+  const url = funnel.enable_url || "https://login.tailscale.com/admin/acls";
+  if (allowing && link.getAttribute("href") !== url) link.setAttribute("href", url);
+}
+
+async function saveTailscaleFunnel() {
+  const checkbox = document.getElementById("tailscale_funnel");
+  if (checkbox.checked && !window.confirm(`Make NWR Stream Manager reachable from the internet? Anyone on the internet can then open its sign-in page, at ${document.getElementById("tailscale_funnel_address").textContent}. Only your accounts' passwords keep them out.`)) {
+    checkbox.checked = false;
+    return;
+  }
+  tailscaleHttpsSaving = true;
+  setMessage("tailscale-result", "");
+  try {
+    renderTailscale(await request("/api/tailscale", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: "funnel", enabled: checkbox.checked})
+    }));
+  } catch (error) {
+    setMessage("tailscale-result", error.message, "error");
+  } finally {
+    tailscaleHttpsSaving = false;
+  }
+}
+
+let tailscaleHttpsSaving = false;
+
+async function saveTailscaleHttps() {
+  tailscaleHttpsSaving = true;
+  setMessage("tailscale-result", "");
+  try {
+    renderTailscale(await request("/api/tailscale", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: "https", enabled: document.getElementById("tailscale_https").checked})
+    }));
+  } catch (error) {
+    setMessage("tailscale-result", error.message, "error");
+  } finally {
+    tailscaleHttpsSaving = false;
+  }
+}
+
+function renderTailscale(status) {
+  const state = status.state;
+  renderTailscaleHttps(status);
+  setText("tailscale_status", tailscaleStatusText(status));
+  const signingIn = state === "needs-login" && Boolean(status.auth_url);
+  setHidden("tailscale_sign_in", !signingIn);
+  if (signingIn) {
+    const link = document.getElementById("tailscale_sign_in_link");
+    if (link.getAttribute("href") !== status.auth_url) link.setAttribute("href", status.auth_url);
+    setText("tailscale_sign_in_address", status.auth_url);
+  }
+  setHidden("tailscale_details", state !== "connected");
+  if (state === "connected") {
+    const address = document.getElementById("tailscale_address");
+    if (address.getAttribute("href") !== status.url) address.setAttribute("href", status.url);
+    setText("tailscale_address", status.url || "");
+    setText("tailscale_account", status.account || "Unknown");
+    setText("tailscale_addresses", (status.addresses || []).join(", "));
+  }
+  // With Tailscale installed on this computer, the message is all there is.
+  setHidden("tailscale_intro", state === "system");
+  const connected = !["off", "unavailable", "system"].includes(state);
+  setHidden("tailscale_connect", connected || ["unavailable", "system"].includes(state));
+  setHidden("tailscale_sign_out", !connected);
+  setText("tailscale_sign_out", ["starting", "needs-login"].includes(state) ? "Cancel" : "Sign out of Tailscale");
+}
+
+async function loadTailscaleStatus() {
+  try {
+    renderTailscale(await request("/api/tailscale"));
+  } catch (error) {
+    setMessage("tailscale-result", error.message, "error");
+  }
+}
+
+function showTailscaleSettings(showing) {
+  if (showing && !tailscaleTimer) {
+    setMessage("tailscale-result", "");
+    loadTailscaleStatus();
+    tailscaleTimer = setInterval(loadTailscaleStatus, TAILSCALE_STATUS_INTERVAL_MS);
+  } else if (!showing && tailscaleTimer) {
+    clearInterval(tailscaleTimer);
+    tailscaleTimer = null;
+  }
+}
+
+async function tailscaleAction(action) {
+  const connected = document.getElementById("tailscale_sign_out").textContent !== "Cancel";
+  if (action === "sign_out" && connected
+    && !window.confirm("Sign out of Tailscale? Devices on your tailnet will no longer reach NWR Stream Manager there. To connect again, you'll sign in again.")) {
+    return;
+  }
+  setMessage("tailscale-result", "");
+  try {
+    renderTailscale(await request("/api/tailscale", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action})
+    }));
+    if (action === "sign_out") setMessage("tailscale-result", connected ? "Signed out of Tailscale." : "Connecting was cancelled.", "success");
+  } catch (error) {
+    setMessage("tailscale-result", error.message, "error");
+  }
+}
+
 let advancedSettingsLoaded = null;
 let advancedSettingsShowing = false;
 
@@ -8180,6 +8359,7 @@ function showView(name, options = {}) {
   if (name !== "settings") syncRemotePairingPage("");
   if (name !== "settings") stopAnnouncementPlaybackOffPage(name, null);
   if (name !== "settings") advancedSettingsShowing = false;
+  if (name !== "settings") showTailscaleSettings(false);
   if (name !== "settings") generalSettingsShowing = false;
   if (options.focus !== false) focusViewHeading(name);
   const moreButton = document.getElementById("nav_more_button");
@@ -8541,6 +8721,7 @@ const SETTINGS_SECTION_TITLES = {
   notifications: "Notifications",
   fallback_audio: "Fallback audio",
   record_announcement: "Record an announcement",
+  tailscale: "Tailscale",
   advanced: "Advanced"
 };
 // How "Back to ..." names the page a sub-page belongs to.
@@ -8563,7 +8744,7 @@ function availableSettingsTabs() {
 function settingsSectionsForAccount() {
   if (accountIsReadOnly()) return [];
   // Only the owner chooses where NWR Stream Manager can be reached.
-  if (accountIsOwner()) return ["general", "accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement", "advanced"];
+  if (accountIsOwner()) return ["general", "accounts", "create_account", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement", "tailscale", "advanced"];
   return ["general", "account", "sdr_sharing", "pair_device", "find_devices", "notifications", "fallback_audio", "record_announcement"];
 }
 
@@ -8672,6 +8853,7 @@ function renderSettingsSection() {
   // Loaded on arriving, not each time Settings is redrawn, which would undo what's been typed.
   if (section === "advanced" && !advancedSettingsShowing) loadAdvancedSettings();
   advancedSettingsShowing = section === "advanced";
+  showTailscaleSettings(section === "tailscale");
   if (section === "general" && !generalSettingsShowing) loadGeneralSettings();
   generalSettingsShowing = section === "general";
   syncRemotePairingPage(section);
@@ -10537,6 +10719,11 @@ for (const id of Object.values(GENERAL_SETTING_INPUTS)) {
 }
 document.getElementById("save_general_settings").addEventListener("click", saveGeneralSettings);
 document.getElementById("save_advanced_settings").addEventListener("click", saveAdvancedSettings);
+document.getElementById("tailscale_connect").addEventListener("click", () => tailscaleAction("connect"));
+document.getElementById("tailscale_sign_out").addEventListener("click", () => tailscaleAction("sign_out"));
+document.getElementById("tailscale_https").addEventListener("change", saveTailscaleHttps);
+document.getElementById("tailscale_funnel").addEventListener("change", saveTailscaleFunnel);
+document.getElementById("tailscale_https_form").addEventListener("submit", event => event.preventDefault());
 // Enter in the port saves too, as it would without this script.
 document.getElementById("advanced_port").addEventListener("keydown", event => {
   if (event.key !== "Enter") return;

@@ -15,6 +15,11 @@ import tty
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+try:
+    from .network_dial import create_connection
+except ImportError:  # run on its own, as a script
+    create_connection = socket.create_connection
+
 
 DEFAULT_SERVER = "http://127.0.0.1"
 DEFAULT_PORT = "8000"
@@ -321,6 +326,8 @@ def test_mountpoint_authentication(settings: IcecastSettings) -> IcecastAuthResu
     response = None
     try:
         connection = connection_class(host, port, **kwargs)
+        # Through the tailnet NWR Stream Manager joined, if the server is one of its devices.
+        connection._create_connection = create_connection
         connection.request("SOURCE", target, body=b"", headers=headers)
         response = connection.getresponse()
         status = response.status

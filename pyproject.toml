@@ -53,4 +53,8 @@ nwr_stream_manager = "src/nwr-stream-manager"
 "nwr_stream_manager.assets" = "src/nwr-stream-manager/assets"
 
 [tool.setuptools.package-data]
-nwr_stream_manager = ["assets/*.json", "assets/*.wav", "assets/*.mp3", "assets/*.html", "assets/*.css", "assets/*.js"]
+# libtailscale's build, for nwr-stream-manager --build-libtailscale.
+nwr_stream_manager = [
+  "assets/*.json", "assets/*.wav", "assets/*.mp3", "assets/*.html", "assets/*.css", "assets/*.js",
+  "libtailscale/build.sh", "libtailscale/user-log.patch",
+]

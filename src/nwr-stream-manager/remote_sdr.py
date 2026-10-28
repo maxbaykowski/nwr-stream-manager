@@ -68,6 +68,8 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
+from .network_dial import create_connection, own_tailnet_address, own_tailnet_peers
+
 
 LOG = logging.getLogger(__name__)
 
@@ -125,8 +127,10 @@ REMOTE_IQ_BUFFER_EPSILON_SECONDS = 1e-6  # buffered time is a running float sum
 REMOTE_IQ_WIDEBAND_QUEUE_SECONDS = 15.0
 TAILSCALE_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 TAILSCALE_STATUS_TIMEOUT_SECONDS = 3.0
-# Tailscale peers that cannot be running NWR Stream Manager.
+# Tailscale devices that can't be running NWR Stream Manager.
 TAILSCALE_SKIPPED_OS = {"ios", "android", "ipados", "tvos"}
+# Looking for a paired device among the tailnet's devices: this many at once.
+TAILNET_SEARCH_WORKERS = 16
 VIRTUAL_INTERFACE_PREFIXES = ("br-", "cali", "cni", "docker", "flannel", "kube", "lxc", "podman", "veth", "virbr", "vmnet", "vboxnet")
 
 # A paired device's discovery request says when it was made. Older or newer than this,
@@ -362,6 +366,26 @@ class PairedDeviceStore(_JsonRecordStore):
                 changes["last_reached_address"] = address
             if port is not None:
                 changes["port"] = int(port)
+            if all(record.get(key) == value for key, value in changes.items()):
+                return
+            record.update(changes)
+            self._save_locked(records)
+
+    def set_addresses(self, peer_id: str, advertised: Any) -> None:
+        """The addresses the peer says it has now, in place of older ones: its Tailscale
+        address changes when it moves between Tailscale on its computer and its own."""
+        addresses = advertised_addresses(advertised)
+        if not addresses:
+            return
+        with self.lock:
+            records = self._load_locked()
+            record = records.get(str(peer_id))
+            if record is None:
+                return
+            # The address last reached it is kept too: it worked, whatever the peer thinks it has.
+            last_reached = str(record.get("last_reached_address") or "")
+            ordered = ordered_addresses(addresses + [last_reached])
+            changes: dict[str, Any] = {"addresses": ordered, "address": ordered[0]}
             if all(record.get(key) == value for key, value in changes.items()):
                 return
             record.update(changes)
@@ -658,9 +682,12 @@ def open_host_connection(
     expected_fingerprint: str | None,
     timeout: float = HANDSHAKE_TIMEOUT_SECONDS,
 ) -> FrameConnection:
-    raw = socket.create_connection((address, int(port)), timeout=timeout)
+    # Through the tailnet NWR Stream Manager joined, if the host is one of its devices. That
+    # connection isn't a TCP socket here, so it has no TCP options to set.
+    raw = create_connection((address, int(port)), timeout=timeout)
     try:
-        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if raw.family in (socket.AF_INET, socket.AF_INET6):
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock = _client_context().wrap_socket(raw, server_hostname=None)
     except Exception:
         raw.close()
@@ -671,6 +698,40 @@ def open_host_connection(
         sock.close()
         raise RemoteSdrAuthError("the remote SDR at this address is a different NWR Stream Manager instance")
     return FrameConnection(sock, fingerprint)
+
+
+def find_host_on_tailnet(host_id: str, port: int, *, exclude: list[str] | None = None) -> str:
+    """Where a paired host is among the tailnet's devices, for when its address changed: the one
+    whose certificate is the one saved when pairing. Nothing is sent before that's checked, and
+    a device that isn't sharing refuses the connection. "" if none of them is it."""
+    candidates = [address for address in tailnet_peer_addresses() if address not in set(exclude or [])]
+    if not candidates:
+        return ""
+    found: list[str] = []
+    lock = threading.Lock()
+
+    def check(address: str) -> None:
+        try:
+            connection = open_host_connection(address, port, expected_fingerprint=host_id, timeout=CONNECT_TIMEOUT_SECONDS)
+        except (RemoteSdrAuthError, OSError, ssl.SSLError):
+            return
+        connection.close()
+        with lock:
+            found.append(address)
+
+    workers = [threading.Thread(target=check, args=(address,), daemon=True) for address in candidates[:256]]
+    for start in range(0, len(workers), TAILNET_SEARCH_WORKERS):
+        batch = workers[start : start + TAILNET_SEARCH_WORKERS]
+        for worker in batch:
+            worker.start()
+        for worker in batch:
+            worker.join(CONNECT_TIMEOUT_SECONDS + 1)
+        if found:
+            break
+    if found:
+        LOG.info("found the paired remote SDR at %s on the tailnet: its address had changed", found[0])
+        return found[0]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -753,57 +814,58 @@ def local_interfaces() -> list[LocalInterface]:
 def local_addresses() -> dict[str, Any]:
     interfaces = local_interfaces()
     return {
-        "tailscale": next((item.address for item in interfaces if item.tailscale), ""),
+        "tailscale": next((item.address for item in interfaces if item.tailscale), "") or own_tailnet_address(),
         "lan": [item.address for item in interfaces if not item.tailscale],
     }
 
 
-def tailscale_is_up() -> bool:
+def system_tailscale_is_up() -> bool:
+    """Whether Tailscale is installed on this computer and connected: its interface is up.
+    NWR Stream Manager's own connection to a tailnet has no interface, so it doesn't count."""
     return any(item.tailscale for item in local_interfaces())
 
 
-def tailscale_peer_addresses() -> list[str]:
-    """IPv4 addresses of online tailnet peers that could run NWR Stream Manager.
+def advertised_addresses(advertised: Any) -> list[str]:
+    """The addresses in a peer's {"tailscale": ..., "lan": [...]}, Tailscale first."""
+    if not isinstance(advertised, dict):
+        return []
+    found = [str(advertised.get("tailscale") or "")] + [str(item) for item in advertised.get("lan") or []]
+    return [address for address in found if address]
 
-    Tailscale carries no broadcast traffic, so discovery asks each peer
-    directly. Uses the tailscale CLI, which ordinary users may run for status.
-    """
+
+def tailnet_peer_addresses() -> list[str]:
+    """The Tailscale addresses of the other devices online on the tailnet, from Tailscale on this
+    computer and from the tailnet NWR Stream Manager joined itself, for finding a paired device
+    whose address changed. Phones and tablets can't be running NWR Stream Manager."""
+    addresses = list(own_tailnet_peers())
     try:
         result = subprocess.run(
-            ["tailscale", "status", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=TAILSCALE_STATUS_TIMEOUT_SECONDS,
-            check=False,
+            ["tailscale", "status", "--json"], capture_output=True, text=True, timeout=TAILSCALE_STATUS_TIMEOUT_SECONDS, check=False
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return []
-    if result.returncode != 0:
-        return []
-    try:
-        status = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
+        status = json.loads(result.stdout) if result.returncode == 0 else {}
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        status = {}
     peers = status.get("Peer") if isinstance(status, dict) else None
-    addresses: list[str] = []
     for peer in (peers or {}).values():
-        if not isinstance(peer, dict) or not peer.get("Online"):
+        if not isinstance(peer, dict) or not peer.get("Online") or str(peer.get("OS", "")).lower() in TAILSCALE_SKIPPED_OS:
             continue
-        if str(peer.get("OS", "")).lower() in TAILSCALE_SKIPPED_OS:
-            continue
-        for address in peer.get("TailscaleIPs") or []:
-            if is_tailscale_address(str(address)):
-                addresses.append(str(address))
-                break
-    return addresses
+        addresses.extend(str(address) for address in peer.get("TailscaleIPs") or [] if is_tailscale_address(str(address)))
+    return list(dict.fromkeys(addresses))
+
+
+def tailscale_is_up() -> bool:
+    """Whether tailnet addresses can be reached: through Tailscale on this computer, or the
+    tailnet NWR Stream Manager joined itself."""
+    return system_tailscale_is_up() or bool(own_tailnet_address())
 
 
 def discovery_targets() -> list[str]:
+    """Where to look for other NWR Stream Managers: the local network only. Pairing needs both on
+    it; once paired, they reach each other over Tailscale too, by the addresses they swapped."""
     targets = ["255.255.255.255"]
     for interface in local_interfaces():
         if interface.broadcast and not interface.tailscale:
             targets.append(interface.broadcast)
-    targets.extend(tailscale_peer_addresses())
     targets.append("127.0.0.1")
     return list(dict.fromkeys(targets))
 
@@ -1289,23 +1351,28 @@ class RemoteSdrServer:
                 continue
             except OSError:
                 return
-            with self.lock:
-                full = self._unauthenticated >= MAX_UNAUTHENTICATED_CONNECTIONS
-                if not full:
-                    self._unauthenticated += 1
-            if full:
-                LOG.debug("remote SDR connection from %s refused: too many connections waiting to sign in", address[0])
-                try:
-                    raw.close()
-                except OSError:
-                    pass
-                continue
-            threading.Thread(
-                target=self._handle_connection,
-                args=(raw, address),
-                name=f"remote-sdr-{address[0]}",
-                daemon=True,
-            ).start()
+            self.accept_connection(raw, address)
+
+    def accept_connection(self, raw: socket.socket, address: tuple[str, int]) -> None:
+        """Takes a connection from another device: from this host's listener, or from the
+        tailnet NWR Stream Manager joined itself."""
+        with self.lock:
+            full = self._unauthenticated >= MAX_UNAUTHENTICATED_CONNECTIONS
+            if not full:
+                self._unauthenticated += 1
+        if full:
+            LOG.debug("remote SDR connection from %s refused: too many connections waiting to sign in", address[0])
+            try:
+                raw.close()
+            except OSError:
+                pass
+            return
+        threading.Thread(
+            target=self._handle_connection,
+            args=(raw, address),
+            name=f"remote-sdr-{address[0]}",
+            daemon=True,
+        ).start()
 
     def _handle_connection(self, raw: socket.socket, address: tuple[str, int]) -> None:
         connection: FrameConnection | None = None
@@ -1344,6 +1411,7 @@ class RemoteSdrServer:
                     {"client_id": client_id, "client_name": record.get("name", ""), "role": role}
                 )
             self.devices.update(client_id, last_seen_at=time.time())
+            self.devices.set_addresses(client_id, hello.get("addresses"))
             self.devices.note_address(client_id, address[0])
             if role == REMOTE_SDR_ROLE_CONTROL:
                 self._handle_control(connection)
@@ -1488,7 +1556,7 @@ class RemoteSdrServer:
 
     def _handle_control(self, connection: FrameConnection) -> None:
         connection.send_json(
-            {"type": "welcome", "host": {"id": self.identity.fingerprint, "name": self.identity.name}}
+            {"type": "welcome", "host": {"id": self.identity.fingerprint, "name": self.identity.name}, "addresses": local_addresses()}
         )
         done = threading.Event()
         wakeup = threading.Event()
@@ -1529,14 +1597,15 @@ class RemoteSdrServer:
                 # Cleared before the status is taken, so a change made while
                 # it is being sent still wakes the next one.
                 wakeup.clear()
-                connection.send_json({"type": "status", "status": self.backend.status()})
+                # Where it is too: a paired device keeps up if its Tailscale address changes.
+                connection.send_json({"type": "status", "status": self.backend.status(), "addresses": local_addresses()})
                 wakeup.wait(CONTROL_STATUS_INTERVAL_SECONDS)
         finally:
             with self.lock:
                 self._status_wakeups.discard(wakeup)
 
     def _stream_iq(self, connection: FrameConnection, source: Any, *, retunable: bool) -> None:
-        connection.send_json({"type": "welcome", "host": {"id": self.identity.fingerprint, "name": self.identity.name}})
+        connection.send_json({"type": "welcome", "host": {"id": self.identity.fingerprint, "name": self.identity.name}, "addresses": local_addresses()})
         done = threading.Event()
 
         def reader() -> None:
@@ -1674,6 +1743,8 @@ class RemoteSdrClient:
         self.thread: threading.Thread | None = None
         self.connection: FrameConnection | None = None
         self.host_status: dict[str, Any] = {}
+        # The addresses the host last said it has, saved when they change.
+        self.host_addresses: list[str] = []
         # The newest status number seen from the host on this connection.
         self.host_status_seq: int | None = None
         self.reachable = False
@@ -1758,6 +1829,7 @@ class RemoteSdrClient:
                             "role": role,
                             "client_id": self.client_id,
                             "token": record.get("token", ""),
+                            "addresses": local_addresses(),
                             **params,
                         }
                     )
@@ -1770,6 +1842,7 @@ class RemoteSdrClient:
                     if welcome.get("code") == "unauthorized":
                         raise RemoteSdrAuthError("The remote SDR no longer recognises this device. Pair it again.")
                     raise RemoteSdrError(str(welcome.get("error", "The remote SDR refused the connection.")))
+                self.hosts.set_addresses(self.host_id, welcome.get("addresses"))
                 self.hosts.note_address(self.host_id, address, attempt_port, reached=True)
                 return connection
             if index == 0:
@@ -1784,6 +1857,9 @@ class RemoteSdrClient:
                     if host["id"] == self.host_id
                     for address in usable(host["addresses"])
                 ]
+                if not attempts and tailscale:
+                    found = find_host_on_tailnet(self.host_id, port, exclude=remembered)
+                    attempts = [(found, port)] if found else []
         raise RemoteSdrError(f"The remote SDR is not reachable: {last_error or 'not found on the network'}")
 
     def update_settings(self, changes: dict[str, Any], timeout: float = CONTROL_REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
@@ -1849,7 +1925,8 @@ class RemoteSdrClient:
             delay = RECONNECT_MIN_SECONDS
             try:
                 peer_address = connection.sock.getpeername()[0]
-            except OSError:
+            except (OSError, IndexError):
+                # Through the tailnet, it has no address of its own to give.
                 peer_address = ""
             with self.lock:
                 self.connection = connection
@@ -1866,6 +1943,10 @@ class RemoteSdrClient:
                     kind = message.get("type")
                     if kind == "status":
                         status = message.get("status") if isinstance(message.get("status"), dict) else {}
+                        addresses = advertised_addresses(message.get("addresses"))
+                        if addresses and addresses != self.host_addresses:
+                            self.host_addresses = addresses
+                            self.hosts.set_addresses(self.host_id, message.get("addresses"))
                         with self.lock:
                             accepted = self._accept_host_status_locked(status)
                             self.reachable = True

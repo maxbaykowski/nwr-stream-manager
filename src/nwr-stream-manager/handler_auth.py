@@ -29,9 +29,16 @@ from .baseline_pages import (
     SIGN_IN_REQUIRED_HTML,
     STREAM_ARCHIVE_DOWNLOAD_PATH,
     STREAM_ARCHIVE_PLAY_PATH,
+    TAILSCALE_SETTINGS_PATH,
 )
 from .constants import AUTH_REALM, AUTH_SESSION_COOKIE_NAME
-from .request_origin import ANOTHER_SITE_MESSAGE, SETUP_THROUGH_PROXY_MESSAGE, request_from_another_site, request_through_proxy
+from .request_origin import (
+    ANOTHER_SITE_MESSAGE,
+    forwarded_client_address,
+    request_from_another_site,
+    request_through_proxy,
+    SETUP_THROUGH_PROXY_MESSAGE,
+)
 from .sign_in_limits import SignInWait
 
 
@@ -42,8 +49,14 @@ class AuthHandlerMixin:
     """Mixed into RtlControlHandler."""
 
     def _client_address(self) -> str:
+        """Who sent the request, for the log: the visitor's own address when a tunnel or proxy
+        on this computer passes it on, rather than the proxy's."""
         host = self.client_address[0] if self.client_address else self.address_string()
         port = self.client_address[1] if self.client_address and len(self.client_address) > 1 else ""
+        headers = getattr(self, "headers", None)
+        visitor = forwarded_client_address(str(host), headers) if headers is not None else ""
+        if visitor:
+            return visitor
         return f"{host}:{port}" if port else host
 
     def _auth_ok_or_setup_response(self, path: str, method: str) -> bool:
@@ -175,7 +188,10 @@ class AuthHandlerMixin:
                 return True
             self._send_json({"error": "password change is required"}, status=HTTPStatus.FORBIDDEN)
             return False
-        owner_paths = {"/api/account-reset-password", "/api/account-read-only", "/api/advanced-settings", ADVANCED_SETTINGS_PATH}
+        owner_paths = {
+            "/api/account-reset-password", "/api/account-read-only", "/api/advanced-settings", ADVANCED_SETTINGS_PATH,
+            "/api/tailscale", TAILSCALE_SETTINGS_PATH,
+        }
         if path.startswith("/api/accounts") or path in owner_paths or path in ACCOUNT_FORM_PATHS:
             if not account.is_owner:
                 self._send_json({"error": "owner account is required"}, status=HTTPStatus.FORBIDDEN)

@@ -30,11 +30,15 @@ need:
   Debian and Raspberry Pi OS, `libmicrohttpd12t64` on newer Debian releases,
   `libmicrohttpd` on Fedora)
 
-Then install the Python package directly from GitHub:
+Then install NWR Stream Manager directly from GitHub with pipx (`pipx` on
+Debian, Raspberry Pi OS and Fedora), which keeps it and its Python packages
+apart from the rest of the system:
 
 ```bash
-python3 -m pip install 'nwr-stream-manager @ git+https://github.com/maxbaykowski/nwr-stream-manager.git@testing'
+pipx install 'git+https://github.com/maxbaykowski/nwr-stream-manager.git@testing'
 ```
+
+To upgrade later, run `pipx upgrade nwr-stream-manager`.
 
 Run the web interface:
 
@@ -59,6 +63,35 @@ These options override the Advanced settings for as long as they're given:
   you've locked yourself out with the Advanced settings, start with this (and
   `--port` if needed) to get back in.
 - `--host ADDRESS` listens on one particular address.
+
+### Tailscale from Settings (optional)
+
+NWR Stream Manager can join your tailnet by itself, from Settings, without
+Tailscale installed on the computer. That needs Tailscale's library,
+libtailscale, which distributions don't package, so NWR Stream Manager builds
+it. Building it needs `git`, a C compiler and Go 1.21 or later (`git`, `gcc`
+and `golang-go` on Debian and Raspberry Pi OS, `git`, `gcc` and `golang` on
+Fedora). libtailscale asks for a newer Go than most distributions have, so Go
+downloads that version by itself for the build. On Debian 12 and Raspberry Pi
+OS based on it, whose Go is older than 1.21, install `golang-go` from
+bookworm-backports. After installing NWR Stream Manager, run:
+
+```bash
+nwr-stream-manager --build-libtailscale
+```
+
+That builds it for your user, in `~/.local/lib/nwr-stream-manager`. If NWR
+Stream Manager runs as a systemd service, build it for every user, including
+the service's, in `/usr/local/lib/nwr-stream-manager`, instead:
+
+```bash
+sudo "$(command -v nwr-stream-manager)" --build-libtailscale
+```
+
+It takes a few minutes and only needs doing once: installing or upgrading NWR
+Stream Manager again doesn't remove it, and a running NWR Stream Manager uses
+it as soon as it's built. Without it, NWR Stream Manager works as before, and
+its Tailscale settings say the library isn't installed.
 
 ## Browser monitoring notes
 
