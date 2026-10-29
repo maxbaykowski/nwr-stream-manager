@@ -71,7 +71,10 @@ class Handler(BaseHTTPRequestHandler):
                 Handler.finished.set()
             return
         Handler.seen.update(
-            path=self.path, client=self.client_address, agent=self.headers.get("User-Agent"), proto=self.headers.get("X-Forwarded-Proto")
+            path=self.path, client=self.client_address, agent=self.headers.get("User-Agent"), proto=self.headers.get("X-Forwarded-Proto"),
+            own_https=self.headers.get("X-NWR-Stream-Manager-HTTPS"),
+            serve=self.headers.get("X-NWR-Stream-Manager-Tailscale-Serve"),
+            tailnet=self.headers.get("X-NWR-Stream-Manager-Tailnet"),
         )
         self.send_body(json.dumps({"ok": True}).encode())
 
@@ -140,6 +143,86 @@ class MicrohttpdServerTests(unittest.TestCase):
                 self.assertTrue(answer.startswith(b"HTTP/1.1 200"), answer[:80])
                 self.assertEqual(Handler.seen["client"][0], address)
 
+    def test_connections_from_its_own_tailnet_connection_are_marked_and_nothing_else_can_claim_it(self) -> None:
+        server = self.start()
+
+        def handed_over(**kind) -> None:
+            ours, theirs = socket.socketpair()
+            self.addCleanup(ours.close)
+            server.add_connection(theirs.detach(), "100.101.102.103", **kind)
+            ours.sendall(b"GET /tailnet HTTP/1.1\r\nHost: x\r\nX-NWR-Stream-Manager-Tailnet: guessed\r\nConnection: close\r\n\r\n")
+            ours.settimeout(10)
+            while ours.recv(65536):
+                pass
+
+        handed_over(tailnet=True)
+        self.assertEqual(Handler.seen["tailnet"], self.mhd.OWN_TAILNET_TOKEN)
+        handed_over()
+        self.assertIsNone(Handler.seen["tailnet"])
+        connection = self.connection()
+        connection.request("GET", "/plain", headers={"X-NWR-Stream-Manager-Tailnet": self.mhd.OWN_TAILNET_TOKEN})
+        connection.getresponse().read()
+        self.assertIsNone(Handler.seen["tailnet"])
+
+    def test_connections_from_tailscale_serve_are_marked_and_nothing_else_can_claim_it(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        serve_socket_module = importlib.import_module("nwr_stream_manager.tailscale_serve_socket")
+        folder = Path(tempfile.mkdtemp(prefix="nwr"))
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        server = self.start()
+        allowed = []
+        serve_socket = serve_socket_module.TailscaleServeSocket(
+            folder / "serve.sock",
+            lambda fd: server.add_connection(fd, "127.0.0.1", serve=True),
+            is_allowed=lambda pid, uid: allowed.append((pid, uid)) or True,
+        )
+        self.assertTrue(serve_socket.start())
+        self.addCleanup(serve_socket.close)
+        self.assertEqual(oct((folder / "serve.sock").stat().st_mode & 0o777), "0o600")
+
+        def through_socket(path: str) -> bytes:
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(str(folder / "serve.sock"))
+                client.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\nX-NWR-Stream-Manager-Tailscale-Serve: guessed\r\nConnection: close\r\n\r\n".encode())
+                answer = b""
+                while chunk := client.recv(65536):
+                    answer += chunk
+            return answer
+
+        self.assertTrue(through_socket("/serve").startswith(b"HTTP/1.1 200"))
+        self.assertEqual(Handler.seen["serve"], self.mhd.TAILSCALE_SERVE_TOKEN)
+        self.assertEqual(allowed[0], (os.getpid(), os.getuid()))
+        # Not by the port, whatever it says.
+        connection = self.connection()
+        connection.request("GET", "/plain", headers={"X-NWR-Stream-Manager-Tailscale-Serve": self.mhd.TAILSCALE_SERVE_TOKEN})
+        connection.getresponse().read()
+        self.assertIsNone(Handler.seen["serve"])
+
+    def test_only_tailscaled_can_use_the_tailscale_serve_socket(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        serve_socket_module = importlib.import_module("nwr_stream_manager.tailscale_serve_socket")
+        folder = Path(tempfile.mkdtemp(prefix="nwr"))
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        handed = []
+        serve_socket = serve_socket_module.TailscaleServeSocket(folder / "serve.sock", handed.append)
+        self.assertTrue(serve_socket.start())
+        self.addCleanup(serve_socket.close)
+        # This test isn't tailscaled, so it's turned away.
+        with socket.socket(socket.AF_UNIX) as client:
+            client.connect(str(folder / "serve.sock"))
+            client.settimeout(5)
+            self.assertEqual(client.recv(10), b"")
+        self.assertEqual(handed, [])
+        self.assertFalse(serve_socket_module.is_tailscaled(os.getpid(), 0))
+        self.assertFalse(serve_socket_module.is_tailscaled(os.getpid(), os.getuid()))
+        # A path a socket can't have is said so, rather than failing.
+        long = serve_socket_module.TailscaleServeSocket(folder / ("x" * 120), handed.append)
+        self.assertFalse(long.start())
+
     def test_https_for_connections_handed_over_from_the_tailnet(self) -> None:
         import ssl
         import subprocess
@@ -175,11 +258,14 @@ class MicrohttpdServerTests(unittest.TestCase):
                 answer += chunk
         self.assertTrue(answer.startswith(b"HTTP/1.1 200"), answer[:80])
         self.assertEqual((Handler.seen["path"], Handler.seen["client"][0], Handler.seen["proto"]), ("/secure", "100.64.0.1", "https"))
+        # And that it was this server, not a proxy, which a request can't claim.
+        self.assertEqual(Handler.seen["own_https"], self.mhd.OWN_HTTPS_TOKEN)
         # Plain HTTP is still plain.
         connection = self.connection()
-        connection.request("GET", "/plain")
+        connection.request("GET", "/plain", headers={"X-NWR-Stream-Manager-HTTPS": self.mhd.OWN_HTTPS_TOKEN})
         connection.getresponse().read()
         self.assertIsNone(Handler.seen["proto"])
+        self.assertIsNone(Handler.seen["own_https"])
 
     def test_long_answers_are_sent_a_piece_at_a_time(self) -> None:
         self.start()
@@ -229,6 +315,25 @@ class MicrohttpdServerTests(unittest.TestCase):
         server.server_close()
         self.assertLess(time.monotonic() - started, 5)
         self.assertTrue(Handler.finished.wait(5))
+
+    def test_a_response_finished_as_the_server_stops_doesnt_hang_it(self) -> None:
+        # The handler finished just as its connection was aborted, so it never said it was done.
+        # libmicrohttpd can't stop until the connection's thread stops waiting for it.
+        output = self.mhd._ResponseOutput()
+        output.write(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlate")
+        output.aborted.set()
+        output.finish()
+        self.assertTrue(output.finished.is_set())
+        draining = threading.Thread(target=lambda: Handler.seen.update(drained=self.mhd.MicrohttpdServer._drain(output)), daemon=True)
+        draining.start()
+        draining.join(5)
+        self.assertFalse(draining.is_alive(), "waited for the rest of the response forever")
+        self.assertIsNone(Handler.seen["drained"])
+        # Without stopping, the whole body comes out.
+        output = self.mhd._ResponseOutput()
+        output.write(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nfine")
+        output.finish()
+        self.assertEqual(self.mhd.MicrohttpdServer._drain(output), b"fine")
 
     def test_a_connection_that_goes_quiet_is_closed(self) -> None:
         with mock.patch.object(self.mhd, "CONNECTION_TIMEOUT_SECONDS", 1):

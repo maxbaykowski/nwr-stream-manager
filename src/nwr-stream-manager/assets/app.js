@@ -382,6 +382,9 @@ function handleLiveSameEvent(event) {
 async function request(path, options = {}) {
   const response = await fetch(path, options);
   const data = await response.json();
+  // From outside the local network, once this session no longer counts as verified: loading the
+  // page again asks for the code, then comes back here.
+  if (response.status === 403 && data.two_step) window.location.reload();
   if (!response.ok) throw new Error(data.error || response.statusText);
   return data;
 }
@@ -7209,8 +7212,10 @@ const TAILSCALE_STATUS_INTERVAL_MS = 2000;
 function tailscaleStatusText(status) {
   const state = status.state;
   if (state === "system") {
-    const message = "A systemwide installation of Tailscale was detected on this computer, so NWR Stream Manager uses it instead of connecting to Tailscale by itself.";
-    return status.signed_out_for_system ? `${message} NWR Stream Manager signed itself out of Tailscale when it found it, so the two aren't on your tailnet at once. Its own device stays in the Tailscale admin console, marked as expired, until you remove it there.` : message;
+    const parts = ["A systemwide installation of Tailscale was detected on this computer, so NWR Stream Manager uses it instead of connecting to Tailscale by itself."];
+    if (status.signed_out_for_system) parts.push("NWR Stream Manager signed itself out of Tailscale when it found it, so the two aren't on your tailnet at once. Its own device stays in the Tailscale admin console, marked as expired, until you remove it there.");
+    if (status.serve_command) parts.push(`For a secure (https) address on your tailnet, run this on the computer: ${status.serve_command}`);
+    return parts.join(" ");
   }
   if (state === "unavailable") return "Tailscale can't be used here yet: its library (libtailscale) isn't installed. To install it, run nwr-stream-manager --build-libtailscale on this computer, with sudo if NWR Stream Manager runs as a systemd service. It's used as soon as it's built, without restarting.";
   if (state === "off") return "Not connected.";
@@ -7277,7 +7282,7 @@ function renderTailscaleFunnel(status) {
 
 async function saveTailscaleFunnel() {
   const checkbox = document.getElementById("tailscale_funnel");
-  if (checkbox.checked && !window.confirm(`Make NWR Stream Manager reachable from the internet? Anyone on the internet can then open its sign-in page, at ${document.getElementById("tailscale_funnel_address").textContent}. Only your accounts' passwords keep them out.`)) {
+  if (checkbox.checked && !window.confirm(`Make NWR Stream Manager reachable from the internet? Anyone on the internet can then open its sign-in page, at ${document.getElementById("tailscale_funnel_address").textContent}. Only accounts with two-step verification set up can be used there.`)) {
     checkbox.checked = false;
     return;
   }
@@ -7466,8 +7471,12 @@ async function loadAccounts() {
   return data;
 }
 
-function showAccountSecret(secret) {
+function showAccountSecret(secret, setupCode) {
   setValue("account_secret", secret || "");
+  // A new account's setup code, for two-step verification from outside the local network.
+  setValue("account_setup_code", setupCode || "");
+  setHidden("account_setup_code_box", !setupCode);
+  setHidden("copy_account_setup_code", !setupCode);
   const dialog = document.getElementById("account_secret_dialog");
   if (dialog) dialog.hidden = !secret;
 }
@@ -7476,23 +7485,24 @@ function dismissAccountSecret() {
   const dialog = document.getElementById("account_secret_dialog");
   if (dialog) dialog.hidden = true;
   setValue("account_secret", "");
+  setValue("account_setup_code", "");
 }
 
-async function copyAccountSecret() {
-  const input = document.getElementById("account_secret");
+async function copyAccountSecret(inputId, buttonId, what) {
+  const input = document.getElementById(inputId);
   const secret = input ? input.value : "";
   if (!secret) return;
-  const button = document.getElementById("copy_account_secret");
+  const button = document.getElementById(buttonId);
   try {
     if (navigator.clipboard && window.isSecureContext) {
       await navigator.clipboard.writeText(secret);
     } else if (!copyTextWithSelectionFallback(input)) {
       throw new Error("clipboard API is unavailable");
     }
-    setAccountResult("Temporary password copied to clipboard.", "success");
+    setAccountResult(`${what} copied to clipboard.`, "success");
     if (button) button.focus();
   } catch (error) {
-    setAccountResult("Copy failed. Select the temporary password and copy it manually.", "error");
+    setAccountResult(`Copy failed. Select the ${what.toLowerCase()} and copy it manually.`, "error");
   }
 }
 
@@ -7526,7 +7536,7 @@ async function createAccountFromForm() {
   });
   setValue("new_account_username", "");
   setChecked("new_account_read_only", false);
-  showAccountSecret(data.secret || "");
+  showAccountSecret(data.secret || "", data.setup_code || "");
   await loadAccounts();
   leaveSettingsSubpage();
   setAccountResult("Account created.", "success");
@@ -10777,7 +10787,8 @@ document.getElementById("nav_more_menu").addEventListener("keydown", event => {
 });
 
 document.getElementById("dismiss_account_secret").addEventListener("click", dismissAccountSecret);
-document.getElementById("copy_account_secret").addEventListener("click", copyAccountSecret);
+document.getElementById("copy_account_secret").addEventListener("click", () => copyAccountSecret("account_secret", "copy_account_secret", "Temporary password"));
+document.getElementById("copy_account_setup_code").addEventListener("click", () => copyAccountSecret("account_setup_code", "copy_account_setup_code", "Setup code"));
 document.getElementById("open_create_account").addEventListener("click", () => {
   setAccountResult("");
   setCreateAccountResult("");

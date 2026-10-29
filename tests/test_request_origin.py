@@ -7,6 +7,8 @@ import sys
 import tempfile
 import threading
 import unittest
+
+import pytest
 from unittest import mock
 from pathlib import Path
 
@@ -69,6 +71,15 @@ class RequestOriginTests(unittest.TestCase):
         websocket = {"Upgrade": "websocket", "Host": "192.168.1.20:8080"}
         self.assertTrue(self.origin.request_from_another_site("GET", "/api/live-audio", {**websocket, "Origin": "https://evil.example"}))
         self.assertFalse(self.origin.request_from_another_site("GET", "/api/live-audio", {**websocket, "Origin": "http://192.168.1.20:8080"}))
+
+    def test_https_this_server_took_itself_isnt_a_proxy(self) -> None:
+        through = self.origin.request_through_proxy
+        mine = {"X-Forwarded-Proto": "https", "X-NWR-Stream-Manager-HTTPS": self.origin.OWN_HTTPS_TOKEN}
+        self.assertFalse(through(mine))
+        # Anything else a proxy adds still counts, and the secret can't be guessed.
+        self.assertTrue(through({**mine, "X-Forwarded-For": "203.0.113.9"}))
+        self.assertTrue(through({"X-Forwarded-Proto": "https", "X-NWR-Stream-Manager-HTTPS": "1"}))
+        self.assertTrue(through({"X-Forwarded-Proto": "https"}))
 
     def test_tunnels_and_proxies_say_they_passed_a_request_on(self) -> None:
         through = self.origin.request_through_proxy
@@ -209,7 +220,7 @@ class HttpsCookieTests(unittest.TestCase):
     def test_over_https_every_cookie_is_secure(self) -> None:
         response = self.get("/", X_Forwarded_Proto="https", X_Forwarded_For="203.0.113.9")
         cookies = self.cookies(response)
-        self.assertEqual({cookie.split("=", 1)[0] for cookie in cookies}, {"nwrstmgr_session", "nwrstmgr_form"})
+        self.assertEqual({cookie.split("=", 1)[0] for cookie in cookies}, {f"nwrstmgr_session_{self.accounts.cookie_id}", f"nwrstmgr_form_{self.accounts.cookie_id}"})
         for cookie in cookies:
             self.assertTrue(cookie.endswith("; Secure"), cookie)
         self.assertEqual(response.getheader("Strict-Transport-Security"), "max-age=31536000")
@@ -327,7 +338,7 @@ class SetupThroughProxyTests(unittest.TestCase):
         with self.assertLogs("nwr_stream_manager", level="WARNING") as logs:
             response, body = self.account(X_Forwarded_For="203.0.113.9")
         self.assertEqual(response.status, 403)
-        self.assertIn("can't be set up for the first time through a tunnel or proxy", json.loads(body)["error"])
+        self.assertIn("can only be set up for the first time from a device on its local network", json.loads(body)["error"])
         self.assertIn("refused first-time setup", logs.output[0])
         with self.assertLogs("nwr_stream_manager", level="WARNING"):
             response, page = self.send(
@@ -338,7 +349,17 @@ class SetupThroughProxyTests(unittest.TestCase):
         self.assertIn("Finish setup from your own network", page)
         self.assertFalse(self.accounts.has_account())
 
-    def test_from_the_network_setup_works_and_then_the_tunnel_can_sign_in(self) -> None:
+    @pytest.mark.real_local_network
+    def test_not_even_from_this_computer_itself(self) -> None:
+        # A tunnel on this computer, such as ssh -R, connects from 127.0.0.1 with nothing added.
+        response, page = self.send("GET", "/")
+        self.assertEqual(response.status, 403)
+        self.assertIn('<div id="setup_blocked">', page)
+        response, body = self.account()
+        self.assertEqual(response.status, 403)
+        self.assertFalse(self.accounts.has_account())
+
+    def test_from_the_network_setup_works_and_then_the_tunnel_needs_two_step_verification(self) -> None:
         response, page = self.send("GET", "/")
         self.assertEqual(response.status, 200)
         self.assertIn('<div id="setup_blocked" hidden>', page)
@@ -346,8 +367,8 @@ class SetupThroughProxyTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertTrue(self.accounts.has_account())
         auth = "Basic " + base64.b64encode(b"owner:password1").decode()
-        response, _body = self.send("GET", "/api/account/me", Authorization=auth, X_Forwarded_For="203.0.113.9")
-        self.assertEqual(response.status, 200)
+        response, body = self.send("GET", "/api/account/me", Authorization=auth, X_Forwarded_For="203.0.113.9")
+        self.assertEqual((response.status, json.loads(body)["two_step"]), (403, "not_set_up"))
 
 
 if __name__ == "__main__":

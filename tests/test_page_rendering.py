@@ -9,6 +9,7 @@ import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlencode
 
 from test_auth import load_web_control_module
@@ -58,7 +59,7 @@ class PageEditingTests(unittest.TestCase):
         self.assertTrue(self.pages.form_token_valid(token, token))
         self.assertFalse(self.pages.form_token_valid(token, token + "x"))
         self.assertFalse(self.pages.form_token_valid("", ""))
-        self.assertIn("HttpOnly", self.pages.form_token_cookie_header(token))
+        self.assertIn("HttpOnly", self.pages.form_token_cookie_header("nwrstmgr_form_0a1b2c3d", token))
 
     def test_elements_can_be_moved_and_added_to_even_with_nested_elements(self) -> None:
         page = '<div id="outer"><div id="inner">x</div></div><form id="form"><div>f</div></form><div id="home"><h3>Home</h3></div>'
@@ -204,9 +205,10 @@ class BaselinePageServerTests(unittest.TestCase):
 
     def form_token(self, response) -> str:
         cookie = response.getheader("Set-Cookie") or ""
-        match = re.search(r"nwrstmgr_form=([^;]+)", cookie)
+        match = re.search(r"(nwrstmgr_form_\w+)=([^;]+)", cookie)
         self.assertIsNotNone(match, cookie)
-        return match.group(1)
+        self.form_cookie_name = match.group(1)
+        return match.group(2)
 
     def title(self, page: str) -> str:
         return re.search(r"<title>(.*?)</title>", page).group(1)
@@ -217,30 +219,30 @@ class BaselinePageServerTests(unittest.TestCase):
         self.assertRegex(page, r'<div id="setup_welcome">')
         self.assertRegex(page, r'<form id="setup_form" method="post" action="/setup" hidden>')
 
-        response, page = self.request("GET", "/?step=account", cookie=f"nwrstmgr_form={token}")
+        response, page = self.request("GET", "/?step=account", cookie=f"{self.form_cookie_name}={token}")
         self.assertIsNone(response.getheader("Set-Cookie"))
         self.assertIn('<form id="setup_form" method="post" action="/setup">', page)
         self.assertIn(f'<input type="hidden" name="form_token" value="{token}">', page)
 
         fields = {"username": "owner", "password": "password1", "confirm_password": "password2", "form_token": token}
-        response, page = self.request("POST", "/setup", fields=fields, cookie=f"nwrstmgr_form={token}")
+        response, page = self.request("POST", "/setup", fields=fields, cookie=f"{self.form_cookie_name}={token}")
         self.assertEqual(response.status, 400)
         self.assertEqual(self.title(page), "Error: Passwords do not match. - NWR Stream Manager Setup")
         self.assertIn('role="alert"', page)
         self.assertIn('value="owner"', page)
         self.assertFalse(self.accounts.has_account())
 
-        response, page = self.request("POST", "/setup", fields={**fields, "confirm_password": "password1"}, cookie=f"nwrstmgr_form={token}")
+        response, page = self.request("POST", "/setup", fields={**fields, "confirm_password": "password1"}, cookie=f"{self.form_cookie_name}={token}")
         self.assertEqual(response.status, 200)
         self.assertIn('<form id="setup_done" method="get" action="/">', page)
         self.assertTrue(self.accounts.has_account())
 
-        response, _ = self.request("POST", "/setup", fields=fields, cookie=f"nwrstmgr_form={token}")
+        response, _ = self.request("POST", "/setup", fields=fields, cookie=f"{self.form_cookie_name}={token}")
         self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
 
     def test_setup_forms_from_other_websites_are_refused(self) -> None:
         fields = {"username": "intruder", "password": "password1", "confirm_password": "password1"}
-        for cookie, token in (("", ""), ("nwrstmgr_form=real", "guessed")):
+        for cookie, token in (("", ""), (f"nwrstmgr_form_{self.accounts.cookie_id}=real", "guessed")):
             response, page = self.request("POST", "/setup", fields={**fields, "form_token": token}, cookie=cookie)
             self.assertEqual(response.status, 400)
             self.assertIn("This page had expired", page)
@@ -312,7 +314,7 @@ class BaselinePageServerTests(unittest.TestCase):
         owner = ("owner", "password1")
         response, page = self.request("GET", "/?view=settings&section=accounts", user=owner)
         token = self.form_token(response)
-        return owner, token, f"nwrstmgr_form={token}"
+        return owner, token, f"{self.form_cookie_name}={token}"
 
     def test_the_owner_manages_accounts_with_plain_forms(self) -> None:
         owner, token, cookie = self.owner_with_token()
@@ -335,6 +337,9 @@ class BaselinePageServerTests(unittest.TestCase):
         self.assertNotIn('id="view_settings"', page)
         secret = re.search(r'<input id="notice_copy_value" readonly value="([^"]+)">', page).group(1)
         self.assertIsNotNone(self.accounts.verify_basic_account("helper", secret))
+        # With a setup code, for two-step verification from outside the local network.
+        self.assertIn("If this user must access NWR Stream Manager via the public internet, also share this setup code with them.", page)
+        self.assertRegex(page, r'<label>Setup code <input id="notice_setup_code" readonly value="[a-z0-9]{5}-[a-z0-9]{5}"></label>')
         self.assertIn('<input type="hidden" name="section" value="accounts">', page)
         helper = next(account for account in self.accounts.list_accounts() if account["username"] == "helper")
         _, page = self.request("GET", "/?view=settings&section=accounts", cookie=cookie, user=owner)
@@ -395,7 +400,7 @@ class BaselinePageServerTests(unittest.TestCase):
         response, page = self.request("GET", "/", user=user)
         token = self.form_token(response)
         self.assertIn('<form id="password_form" method="post" action="/change-password">', page)
-        cookie = f"nwrstmgr_form={token}"
+        cookie = f"{self.form_cookie_name}={token}"
         fields = {"current_password": "wrong", "new_password": "password2", "confirm_password": "password2", "form_token": token}
 
         response, page = self.request("POST", "/change-password", fields=fields, cookie=cookie, user=user)
@@ -481,7 +486,7 @@ class EasAlertPageTests(unittest.TestCase):
     def token(self):
         response, _ = self.request("GET", "/?view=eas_alerts", user=self.owner)
         token = self.form_token(response)
-        return token, f"nwrstmgr_form={token}"
+        return token, f"{self.form_cookie_name}={token}"
 
     def test_the_alert_list_is_filled_in_with_plain_links(self) -> None:
         _, page = self.request("GET", "/?view=eas_alerts", user=self.owner)
@@ -676,7 +681,7 @@ class IqRecorderPageTests(unittest.TestCase):
     def token(self):
         response, _ = self.request("GET", "/?view=iq_recorder", user=self.owner)
         token = self.form_token(response)
-        return token, f"nwrstmgr_form={token}"
+        return token, f"{self.form_cookie_name}={token}"
 
     def test_recordings_are_listed_with_plain_links(self) -> None:
         _, page = self.request("GET", "/?view=iq_recorder", user=self.owner)
@@ -872,7 +877,7 @@ class RtlSettingsPageTests(unittest.TestCase):
     def token(self):
         response, _ = self.request("GET", "/?view=rtl", user=self.owner)
         token = self.form_token(response)
-        return token, f"nwrstmgr_form={token}"
+        return token, f"{self.form_cookie_name}={token}"
 
     def page_fields(self, token):
         """Everything the page sends with Save changes, as it was filled in."""
@@ -1033,7 +1038,7 @@ class StreamPageTests(unittest.TestCase):
     def token(self):
         response, _ = self.request("GET", "/?view=streams", user=self.owner)
         token = self.form_token(response)
-        return token, f"nwrstmgr_form={token}"
+        return token, f"{self.form_cookie_name}={token}"
 
     def page_fields(self, token, stream="s1", tab=""):
         _, page = self.request("GET", f"/?view=stream_settings&stream={stream}&tab={tab}", user=self.owner)
@@ -1219,7 +1224,7 @@ class OutputPageTests(unittest.TestCase):
     def token(self):
         response, _ = self.request("GET", "/?view=streams", user=self.owner)
         token = self.form_token(response)
-        return token, f"nwrstmgr_form={token}"
+        return token, f"{self.form_cookie_name}={token}"
 
     def page_fields(self, page, form_id):
         start = page.index(f'<form id="{form_id}"')
@@ -1463,7 +1468,7 @@ class FallbackAudioPageTests(unittest.TestCase):
     def token(self):
         response, _ = self.request("GET", "/?view=settings&section=fallback_audio", user=self.owner)
         token = self.form_token(response)
-        return token, f"nwrstmgr_form={token}"
+        return token, f"{self.form_cookie_name}={token}"
 
     def upload(self, token, cookie, data, user=None, length=None):
         boundary = "nwrtestboundary"
@@ -1583,7 +1588,7 @@ class AdvancedPageTests(unittest.TestCase):
     def test_only_changes_are_saved_for_the_next_start(self) -> None:
         response, page = self.request("GET", "/?view=settings&section=advanced", user=self.owner)
         token = self.form_token(response)
-        cookie = f"nwrstmgr_form={token}"
+        cookie = f"{self.form_cookie_name}={token}"
         self.assertEqual(self.title(page), "Advanced - Settings - NWR Stream Manager")
         self.assertIn("Right now, NWR Stream Manager accepts connections from other devices on port 8080.</p>", page)
         self.assertRegex(page, r'<input id="advanced_port" [^>]*value="8080">')
@@ -1630,7 +1635,7 @@ class AdvancedPageTests(unittest.TestCase):
         self.assertRegex(page, r'<button id="settings_tab_advanced" [^>]*hidden>')
         token = self.form_token(response)
         fields = {"form": "advanced", "port": "9090", "was_port": "8080", "form_token": token}
-        response, _ = self.request("POST", "/advanced-settings", fields=fields, cookie=f"nwrstmgr_form={token}", user=self.admin)
+        response, _ = self.request("POST", "/advanced-settings", fields=fields, cookie=f"{self.form_cookie_name}={token}", user=self.admin)
         self.assertEqual(response.status, 403)
         response, _ = self.request("GET", "/api/advanced-settings", user=self.admin)
         self.assertEqual(response.status, 403)
@@ -1684,7 +1689,7 @@ class NotificationPageTests(unittest.TestCase):
     def token(self):
         response, _ = self.request("GET", "/?view=settings&section=notifications", user=self.owner)
         token = self.form_token(response)
-        return token, f"nwrstmgr_form={token}"
+        return token, f"{self.form_cookie_name}={token}"
 
     def setup_step(self, token, cookie, fields, action="Next"):
         response, page = self.request("POST", "/notifications/setup", fields={"form": "notification_setup", **fields, "setup_action": action, "form_token": token}, cookie=cookie, user=self.owner)
@@ -1840,7 +1845,7 @@ class SdrSharingPageTests(unittest.TestCase):
     def token(self):
         response, _ = self.request("GET", "/?view=settings&section=sdr_sharing", user=self.owner)
         token = self.form_token(response)
-        return token, f"nwrstmgr_form={token}"
+        return token, f"{self.form_cookie_name}={token}"
 
     def test_sharing_is_turned_on_and_a_code_held_open(self) -> None:
         token, cookie = self.token()
@@ -2073,7 +2078,7 @@ class TailscalePageTests(unittest.TestCase):
     def test_the_owner_connects_signs_in_and_signs_out(self) -> None:
         response, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
         token = self.form_token(response)
-        cookie = f"nwrstmgr_form={token}"
+        cookie = f"{self.form_cookie_name}={token}"
         self.assertEqual(self.title(page), "Tailscale - Settings - NWR Stream Manager")
         self.assertRegex(page, r'<button id="settings_tab_tailscale" [^>]*aria-current="page"')
         self.assertIn('<p id="tailscale_status" aria-live="polite">Not connected.</p>', page)
@@ -2134,7 +2139,7 @@ class TailscalePageTests(unittest.TestCase):
         self.state = {**connected, "https": {"enabled": False, "state": "off"}}
         response, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
         token = self.form_token(response)
-        cookie = f"nwrstmgr_form={token}"
+        cookie = f"{self.form_cookie_name}={token}"
         self.assertIn('<div id="tailscale_https_section">', page)
         self.assertNotRegex(page, r'<input id="tailscale_https" [^>]*checked')
         self.assertIn("The log shows NWR Stream Manager's tailnet name, <span id=\"tailscale_https_name\">nwr-stream-manager.example.ts.net</span>", html.unescape(page))
@@ -2168,7 +2173,7 @@ class TailscalePageTests(unittest.TestCase):
         self.state = {**connected, "https": {"enabled": True, "state": "on"}, "funnel": {"enabled": False, "state": "off", "url": public}}
         response, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
         token = self.form_token(response)
-        cookie = f"nwrstmgr_form={token}"
+        cookie = f"{self.form_cookie_name}={token}"
         self.assertIn('<div id="tailscale_funnel_section">', page)
         self.assertIn(f'<span id="tailscale_funnel_address">{public}</span>', page)
 
@@ -2206,6 +2211,11 @@ class TailscalePageTests(unittest.TestCase):
             return response
 
         name = "nwr-stream-manager.example.ts.net"
+        # HTTPS is said here as a proxy says it, which isn't the local network; the tailnet's own
+        # HTTPS is, which is what this stands in for.
+        patcher = mock.patch.object(self.web_control.RtlControlHandler, "_request_proven_local", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.assertEqual(get(name).status, 200)  # no secure address yet
         self.https_name = name
         response = get(name)

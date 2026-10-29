@@ -126,13 +126,13 @@ class RestartPageTests(unittest.TestCase):
         self.assertLess(page.index('id="nav_change_password"'), page.index('id="nav_restart"'))
         self.assertLess(page.index('id="nav_restart"'), page.index("</span>", page.index('id="nav_more_menu"')))
         response, page = self.request("GET", "/?view=restart", owner)
-        token = re.search(r"nwrstmgr_form=([^;]+)", response.getheader("Set-Cookie")).group(1)
+        cookie_name, token = re.search(r"(nwrstmgr_form_\w+)=([^;]+)", response.getheader("Set-Cookie")).groups()
         self.assertEqual(self.title(page), "Restart NWR Stream Manager? - NWR Stream Manager")
         self.assertIn('<input id="restart_instance" type="hidden" name="instance" value="run1">', page)
         self.assertIn('<button id="restart_confirm" type="submit" class="primary" autofocus="autofocus">Restart</button>', page)
         self.assertIn('<a id="nav_restart" href="/?view=restart" aria-current="page">', page)
 
-        cookie = f"nwrstmgr_form={token}"
+        cookie = f"{cookie_name}={token}"
         response, page = self.request("POST", "/restart", owner, {"instance": "run0", "form_token": token}, cookie)
         self.assertEqual(response.status, 400)
         self.assertEqual(self.title(page), "Error: NWR Stream Manager has already restarted since this page was opened. - Restart NWR Stream Manager? - NWR Stream Manager")

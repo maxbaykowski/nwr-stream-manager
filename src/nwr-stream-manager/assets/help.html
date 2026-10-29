@@ -147,6 +147,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li><a href="#restart">Restarting NWR Stream Manager</a></li>
     <li><a href="#tailscale">Setting up Tailscale</a></li>
     <li><a href="#secure-address">Using a secure (https) address with Tailscale Serve</a></li>
+    <li><a href="#public-internet">Accessing NWR Stream Manager via the public internet</a>
+      <ol>
+        <li><a href="#two-step">Two-step verification</a></li>
+        <li><a href="#two-step-local">What counts as the local network</a></li>
+        <li><a href="#two-step-set-up">Setting up two-step verification</a></li>
+        <li><a href="#two-step-setup-code">Using a setup code</a></li>
+        <li><a href="#two-step-using">Actually using two-step verification</a></li>
+        <li><a href="#two-step-lost">What if I lose my phone?</a></li>
+        <li><a href="#sign-in-alerts">Sign-in alerts</a></li>
+      </ol>
+    </li>
     <li><a href="#storage">Storage</a></li>
     <li><a href="#older-browsers">Older browsers</a></li>
   </ol>
@@ -225,7 +236,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <div class="warning">
     <p><strong>Create your account right away.</strong> Until an account exists, anyone on your network who opens NWR Stream Manager sees the setup page. This means someone else in your house could create the owner account themselves, which wouldn't be good, would it? Open up your browser and complete the setup as soon as NWR Stream Manager is running for the first time.</p>
   </div>
-  <p>Setup only works from the computer NWR Stream Manager runs on, or from a device on the same network. If you open it through a tunnel or proxy, such as Cloudflare Tunnel or Tailscale Funnel, before the owner account exists, you'll see a page asking you to finish setup from your own network instead. This keeps a stranger who finds your tunnel's address from creating the owner account. Once setup is done, the tunnel works as usual.</p>
+  <p>Setup only works from a device on the same network as the computer NWR Stream Manager runs on, using that computer's network address, such as <code>http://192.168.1.20:8080</code>, or from a web browser on that computer itself (see <a href="#two-step-local">What counts as the local network</a>). Anywhere else, such as through a tunnel or proxy like Cloudflare Tunnel or Tailscale Funnel, you'll see a page asking you to finish setup from your own network instead. This keeps a stranger who finds your tunnel's address from creating the owner account. Once setup is done, you can sign in from elsewhere with <a href="#two-step">two-step verification</a>.</p>
   <h3 id="signing-in">Signing in</h3>
   <p>After setup, your browser asks for your username and password whenever you open NWR Stream Manager. This is your browser's own sign-in box, not part of the page. Your browser remembers that you're signed in for a while, so you won't be nagged to sign in every time.</p>
 </section>
@@ -454,15 +465,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>If the computer runs low on storage, recording is paused automatically so the disk doesn't fill up completely.</p>
 
   <h3 id="stream-archiving">Stream archiving</h3>
-  <p>Stream archiving keeps a continuous recording of everything the stream plays, exactly as its listeners hear it, so you can go back and download any part of it later from <a href="#stream-archives">Stream archives</a>. Like EAS recording, it keeps the stream running even when it has no other outputs, though it isn't counted among the stream's outputs in the streams table.</p>
+  <p>Stream archiving keeps a continuous recording of the stream, exactly as listeners hear it, so you can go back and download any part of it later from <a href="#stream-archives">Stream archives</a>. Similar to EAS recording, it can be used on its own, without the stream having any additional outputs, meaning it's possible to have a stream that only archives audio without streaming anywhere.</p>
   <dl>
     <dt>Enable stream archiving</dt>
-    <dd>Turns archiving on for the stream. Once it's on, the same checkbox reads <strong>Disable stream archiving</strong>. Turning it off keeps the audio already archived.</dd>
+    <dd>Turns archiving on for the stream. Once it's on, the same checkbox reads <strong>Disable stream archiving</strong>, which disables it. Disabling it keeps all archived audio.</dd>
     <dt>Delete archived audio after</dt>
     <dd>How long to keep archived audio: 24 hours, 1 week, 30 days, 180 days or 1 year. Anything older is deleted automatically. If choosing a shorter time would delete audio that's already archived, you're asked to confirm first; in an <a href="#older-browsers">older browser</a>, select <strong>Save changes</strong> a second time to confirm.</dd>
   </dl>
-  <p>Archived audio is stored compactly (Opus at 32 Kbps), using about 14 MB an hour per stream: roughly 350 MB a day, 2.4 GB a week, 10 GB for 30 days, 62 GB for 180 days or 126 GB for a year. It's good enough that SAME headers in it still decode.</p>
-  <p>Nothing is archived while the stream is stopped, while NWR Stream Manager isn't running, or while the RTL-SDR (or a shared RTL-SDR's network connection) isn't delivering audio; those times show as gaps. If the computer runs low on storage, archiving is paused until there's room again.</p>
+  <p>Archived audio will be slightly lower quality to preserve storage space. Audio is stored internally using Opus at 32 Kbps, using about 14 MB an hour per stream: roughly 350 MB a day, 2.4 GB a week, 10 GB for 30 days, 62 GB for 180 days or 126 GB for a full year.</p>
+  <p>Nothing is archived while the stream is stopped, while NWR Stream Manager isn't running, or while the RTL-SDR (or a shared RTL-SDR's network connection) isn't delivering audio; those times show as gaps. The only exception is if a stream has fallback audio enabled, in which case audio will still be archived when the SDR drops. If the computer runs low on storage, archiving is paused until there's room again.</p>
 
   <h3 id="fallback-action">Fallback action</h3>
   <p>The Fallback action section chooses what the stream does when it stops getting audio from the radio, or when there's no signal from the station.</p>
@@ -733,7 +744,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
 <section aria-labelledby="restart">
   <h2 id="restart">Restarting NWR Stream Manager</h2>
-  <p>To restart NWR Stream Manager, open <strong>More</strong>, then <strong>Restart NWR Stream Manager</strong>, and confirm. The owner and administrators can do this; read-only accounts can't. NWR Stream Manager shuts down the same way it does when it exits, then starts again by itself. Streams stop for a few seconds and then start again, and an I/Q recording in progress stops. Every open page shows that it's restarting and reloads by itself once it's back; in an <a href="#older-browsers">older browser</a>, wait a few seconds, then select <strong>Done</strong> or refresh the page.</p>
+  <p>To restart NWR Stream Manager, open <strong>More</strong>, then <strong>Restart NWR Stream Manager</strong>, and confirm. The owner and administrators can do this; read-only accounts can't. NWR Stream Manager shuts down the same way it does when it exits, then starts again by itself. Streams stop for a few seconds and then start again, and an I/Q recording in progress stops. Everyone stays signed in. Every open page shows that it's restarting and reloads by itself once it's back; in an <a href="#older-browsers">older browser</a>, wait a few seconds, then select <strong>Done</strong> or refresh the page.</p>
   <p>Restarting starts the version of NWR Stream Manager that's installed now, so it's also how to start using an update after installing it, without restarting the computer or the service. It also applies <a href="#advanced">Advanced</a> settings you've saved.</p>
 </section>
 
@@ -771,7 +782,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>Once the secure address works, the Tailscale settings also offer <strong>Make NWR Stream Manager reachable from the internet (Tailscale Funnel)</strong>, for opening it from devices that aren't on your tailnet, such as someone else's phone. Only the owner account has it, and you're asked to confirm before it's turned on. The public address is the secure address with <code>:8443</code> after it, such as <code>https://nwr-stream-manager.example-tailnet.ts.net:8443/</code>; your own devices on Tailscale keep using the address without it.</p>
   <p>Funnel needs your tailnet to allow it. If it doesn't, the Tailscale settings show an <strong>Allow Tailscale Funnel on your tailnet</strong> link to Tailscale's page for allowing it, and Funnel opens as soon as it's allowed.</p>
   <div class="warning">
-    <p><strong>Anyone on the internet can then open the sign-in page.</strong> Bots that watch the public certificate logs find new addresses like it within minutes and try passwords. NWR Stream Manager makes each wrong password wait longer, and the owner account can't be set up through Funnel, but only your accounts' passwords keep strangers out, so make sure every account has a long, unique one. Turn Funnel off when you don't need it.</p>
+    <p><strong>Anyone on the internet can then open the sign-in page.</strong> Bots that watch the public certificate logs find new addresses like it within minutes and try passwords. Through Funnel, every account needs <a href="#two-step">two-step verification</a> as well as its password, and an account without it can't be used there at all. NWR Stream Manager also makes each wrong password wait longer, and the owner account can't be set up through Funnel. Still, give every account a long, unique password, and turn Funnel off when you don't need it.</p>
   </div>
   <p>Turning off the secure address, or signing out of Tailscale, turns Funnel off too.</p>
   <p>NWR Stream Manager stays connected to your tailnet when it restarts. To take it off, select <strong>Sign out of Tailscale</strong>; to connect again, you'll sign in again. Signing out can't remove it from your tailnet's list of devices, so it stays in the <a href="https://login.tailscale.com/admin/machines">Tailscale admin console</a>, marked as expired, until you remove it there. Remove it before connecting again, or the new connection gets a numbered name, such as nwr-stream-manager-1. It can be reached on your tailnet even with <strong>Only allow connections from this computer</strong> turned on in <a href="#advanced">Advanced</a>, so you can keep it off your local network and still reach it through Tailscale.</p>
@@ -822,9 +833,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <h3 id="secure-address-serve">Give NWR Stream Manager a secure address</h3>
   <p>Now that we've gotten the boring stuff out of the way, we can finally enable Tailscale Serve for NWR Stream Manager! Follow the steps below to turn it on:</p>
   <ol>
-    <li>On the computer running NWR Stream Manager, open a command line and run the following. If you changed NWR Stream Manager's port in <a href="#advanced">Advanced</a> settings, or started it with <code>--port</code>, use that number instead of 8080.
-      <div class="command"><code>sudo tailscale serve --bg 8080</code><button type="button" class="copy-button" hidden>Copy</button></div>
+    <li>On the computer running NWR Stream Manager, open a command line and run the command for how NWR Stream Manager runs there. Settings, under Tailscale, also shows the exact command for your computer.
+      <p>If it runs as a systemd service:</p>
+      <div class="command"><code>sudo tailscale serve --bg unix:/var/lib/nwr-stream-manager/tailscale-serve.sock</code><button type="button" class="copy-button" hidden>Copy</button></div>
+      <p>If you start it yourself:</p>
+      <div class="command"><code>sudo tailscale serve --bg unix:$HOME/.local/state/nwr-stream-manager/tailscale-serve.sock</code><button type="button" class="copy-button" hidden>Copy</button></div>
       The first time you do this, Tailscale may show a web link asking you to allow Serve on your account. Open the link, approve it, then run the command again.
+      <p>This passes requests to NWR Stream Manager through a socket that only Tailscale can use, rather than its port, so NWR Stream Manager knows for certain that a request came from someone on your tailnet: they don't need <a href="#two-step">two-step verification</a>. If you set up Serve with <code>sudo tailscale serve --bg 8080</code> before, run <code>sudo tailscale serve reset</code>, then the command above. Serve still works with the port, but anything else on the computer could come in by the port the same way, so everyone through it is asked for a two-step verification code. Don't use <code>--tcp</code> or <code>--tls-terminated-tcp</code> with the socket: those pass on whatever a visitor sends, so anyone, even through Funnel, could claim to be on your tailnet. While Serve is set up that way, NWR Stream Manager refuses connections through it, and says so in its log.</p>
     </li>
     <li>Tailscale shows the secure address NWR Stream Manager is now available at. You can see it again at any time with:
       <div class="command"><code>tailscale serve status</code><button type="button" class="copy-button" hidden>Copy</button></div>
@@ -837,6 +852,65 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <div class="command"><code>sudo tailscale serve reset</code><button type="button" class="copy-button" hidden>Copy</button></div>
   <h3 id="secure-address-other">Other ways to get a secure address</h3>
   <p>You can also put NWR Stream Manager behind a reverse proxy with a certificate, such as Caddy or nginx, or reach it through a Cloudflare Tunnel. If you have no idea what any of that means, just follow the steps above. A reverse proxy or Cloudflare Tunnel is more involved and is outside the scope of this help. However, if you plan to use a Cloudflare Tunnel or reverse proxy, set up some sort of access policy, otherwise your instance will be accessible to the public internet. Do not rely on NWR Stream Manager's authentication alone to protect you from malicious actors. If you're using something like Cloudflare, please, do yourself a favor and <a href="https://developers.cloudflare.com/cloudflare-one/access-controls/policies/">configure Cloudflare Access for the tunnel</a>.</p>
+</section>
+
+<section aria-labelledby="public-internet">
+  <h2 id="public-internet">Accessing NWR Stream Manager via the public internet</h2>
+  <p>Most people probably access NWR Stream Manager via their local network or via their Tailnet. However, if you reach it from anywhere else, such as through a reverse proxy, a port forward, Cloudflare Tunnel or Tailscale Funnel, every account that reaches it this way must have two-step verification enabled. Most people fail to have any sort of protection infront of the doorway, so I've built some protection into NWR Stream Manager. You may think it's annoying, but I promise you'd be way more upset if a bad actor gained access to your streams than you woudl be turning on two-step verification.</p>
+  <h3 id="two-step">Two-step verification</h3>
+  <p>On your local network, your username and password are all you need to sign into your account. From anywhere else, such as a reverse proxy, a port forward, Cloudflare Tunnel or Tailscale Funnel, you need a 6-digit code from an authenticator app on your phone. Your local network is mostly secure. The public internet, however, isn't, and there are bad actors out there that may want to try and hack their way into your NWR Stream Manager instance if you're not careful. That's the reason why you must have two-step verification for each account that needs access outside your local network; simply entering a username and password in that instance doesn't cut it.</p>
+  <p>If you don't have two-step on for an account, that account can only be logged into if you're accessing NWR Stream Manager on your local network. If you try to log into that account through your reverse proxy or tunnel, you won't be allowed in.</p>
+  <h3 id="two-step-local">What counts as the local network</h3>
+  <p>NWR Stream Manager only skips the code when it's certain it isn't being accessed over the public internet. As such, these routes bypass the code:</p>
+  <ul>
+    <li>A device on the same home or office network as the computer running NWR Stream Manager, connecting to it directly.</li>
+    <li>A web browser on the computer running NWR Stream Manager, at any of its addresses, <code>localhost</code> included. Due to Linux limitations, a browser on that computer only gets a free pass when it's running under the same user as NWR Stream Manager, whichever of the computer's addresses it uses. If you're running NWR Stream Manager via a systemd service, this most likely isn't the case. As a workaround, use another device on your local network.</li>
+    <li>A device on your tailnet, while NWR Stream Manager is on Tailscale itself (see <a href="#tailscale-connect">Connecting NWR Stream Manager from Settings</a>), or while Tailscale is installed on the computer it runs on and you use the computer's Tailscale address, or its secure address from Tailscale Serve (see <a href="#secure-address-serve">Give NWR Stream Manager a secure address</a>).</li>
+  </ul>
+  <p>Everything else is sus and requires a code, including:</p>
+  <ul>
+    <li>Any other program on the computer running NWR Stream Manager, such as a tunnel (<code>ssh -R</code>, <code>cloudflared</code>) or a reverse proxy, whichever of the computer's addresses it connects from, <code>localhost</code> included.</li>
+    <li>Anything through a tunnel or reverse proxy, even one on your own network. Tailscale Serve is the exception when it's set up as in <a href="#secure-address-serve">Give NWR Stream Manager a secure address</a>: then signed-in users on your tailnet don't need a code.</li>
+    <li>A port forwarded from the internet on your router, including when your router makes those connections look like they came from the router itself.</li>
+    <li>Anyone on a VPN the computer is connected to.</li>
+    <li>Every network but your tailnet, when the computer is directly on the internet, with a public IPv4 address of its own. On such a server, use Tailscale installed on it to reach NWR Stream Manager from your own devices, first-time setup included.</li>
+    <li>An address that looks like a tailnet's (100.64.0.0 to 100.127.255.255) but didn't come through Tailscale. Some internet providers give out the same addresses to their customers, so NWR Stream Manager checks that the connection really came from a device on your tailnet.</li>
+  </ul>
+  <h3 id="two-step-set-up">Setting up two-step verification</h3>
+  <p>You must be accessing NWR Stream Manager via your local network or tailnet to set up two-step; you can't set it up any other way. If setting it up over the public internet were allowed, anyone who learned your password could set it up for themselves. If you for some reason can't access the local network, see <a href="#two-step-setup-code">Using a setup code</a>. The owner should set it up at the end of first-time setup, while on the local network: no one can give the owner a setup code.</p>
+  <ol>
+    <li>Install an authenticator app on your phone if you don't have one, such as Google Authenticator, Microsoft Authenticator or 1Password.</li>
+    <li>In NWR Stream Manager, open <strong>More</strong>, then <strong>Two-step verification</strong>, and select <strong>Set up two-step verification</strong>. Every account has it, read-only accounts included.</li>
+    <li>Add NWR Stream Manager to the app. Scan the QR code, open the setup link on your phone, or type in the key shown. If the app asks, it's a time-based key. (The QR code needs libqrencode, <code>qrencode-libs</code> on Fedora or <code>libqrencode4</code> on Debian and Raspberry Pi OS; without it, use the link or the key.)</li>
+    <li>NWR Stream Manager shows up in your authenticator app as NWR Stream Manager: &lt;username&gt; on &lt;instance name&gt;. If you type in the key, give it that name. Each computer you run NWR Stream Manager on has its own accounts, so set up two-step verification on each one, and the name tells you which code is for which.</li>
+    <li>Enter the 6-digit code the app shows, and select <strong>Turn on two-step verification</strong>.</li>
+    <li>You're then shown 10 recovery codes. Keep them somewhere safe, such as a password manager. They're only shown once; you won't be able to see them again.</li>
+  </ol>
+  <h3 id="two-step-setup-code">Using a setup code</h3>
+  <p>If you have users on your NWR Stream Manager instance that can't sign into NWR Stream Manager any other way except for the public internet, you can create a setup code for that user if you own the instance. A setup code works once and must be used within 24 hours of creation.</p>
+  <ul>
+    <li>When you create an account, a setup code is shown along with its temporary password. If the person must access NWR Stream Manager via the public internet, you'll need to share the setup code with them in addition to the password.</li>
+    <li>For an existing account, you can open <strong>More</strong>, then <strong>Two-step verification</strong>, and select <strong>Create setup code</strong> beside it under Other accounts. This works from anywhere. A new setup code replaces the one before.</li>
+  </ul>
+  <p>From outside the local network, after entering your password, enter the setup code where NWR Stream Manager asks for it. You'll then set up your authenticator app, as in the steps above, before you can do anything else. Once it's on, you're shown your recovery codes, and then go on to NWR Stream Manager, or to changing your temporary password if applicable.</p>
+  <h3 id="two-step-using">Actually using two-step verification</h3>
+  <p>From outside the local network, after your password, you'll be prompted for the code your authenticator app shows. If you don't want to do this every time you log in, tick <strong>Remember this device for 30 days</strong>. To make every remembered device ask again, select <strong>Forget remembered devices</strong> on the Two-step verification page. Note that resetting or changing your password forgets all of your devices as well.</p>
+  <p>Wrong codes are limited the same way as wrong passwords: after 5 attempts, you have to wait longer and longer, up to an hour for codes and 15 minutes for passwords. Oh, and if you didn't think that was bad enough, signing in doesn't start the count again, so someone guessing slowly can't get their free tries back whenever you sign in, and neither does restarting NWR Stream Manager. A day without a wrong try does.</p>
+  <h3 id="two-step-lost">What if I lose my phone?</h3>
+  <p>I get it, it happens to the best of us; you drop your phone down the toilet, or maybe it falls out of your pocket while standing in a grocery store parking lot and a car runs it over. Either way, you no longer have access to that device. That's why recovery codes exist. You may enter one of your recovery codes in place of a code from your authenticator app. Each recovery code only works once. Then, from the local network, turn two-step verification off and set it up again on your new phone, or select <strong>Get new recovery codes</strong> if you're running low.</p>
+  <p>If someone has lost their phone and has no recovery codes left, you can create a setup code for them if you're the owner. After their password, they enter it in place of a code, and set up their new phone; the lost phone's codes stop working. From the local network, you can also turn two-step verification off for them instead, on your own Two-step verification page.</p>
+  <p><strong>Note</strong>: If you are the owner and you lose your phone, however, your only way out is your recovery codes or local network access. Lose both of those, and you're out of luck.</p>
+  <h3 id="sign-in-alerts">Sign-in alerts</h3>
+  <p>NWR Stream Manager keeps track of every incorrect attempt to access someone's account, as well as every incorrect two-step verification code for each account. If there are more than 3 incorrect attempts, a page saying so appears upon the next successful sign-in to the account in question. Select <strong>Continue</strong> to go on.</p>
+  <p>For each address the attempts came from, the page says:</p>
+  <ul>
+    <li>How many wrong passwords and codes came from it, and when.</li>
+    <li>The IP address itself.</li>
+    <li>Roughly where the IP address is. If the IP is external, a location is given. Note that this location can be inaccurate, especially for phones on mobile data or attackers using VPN services. To find it, NWR Stream Manager sends the IP address, and nothing else, to <a href="https://ipinfo.io">ipinfo.io</a>. Addresses on your local network or tailnet are never sent.</li>
+    <li>What kind of device it was, such as an Apple iPhone with Safari, a Windows computer with Chrome, or a program rather than a web browser. NWR Stream Manager logs whatever the device says it is, which attackers can change.</li>
+  </ul>
+  <p><strong>Note</strong>: A wrong two-step verification code means whoever tried to access your account successfully guessed your password. If this happens, change your password immediately.</p>
+  <p>The owner is also notified about more than 3 incorrect passwords for any other account, even if it isn't their own, as well as usernames that are invalid, such as admin, which bots often try. Everything is also written to the <a href="#logs">log</a>, and the details are kept for 90 days.</p>
 </section>
 
 <section aria-labelledby="storage">

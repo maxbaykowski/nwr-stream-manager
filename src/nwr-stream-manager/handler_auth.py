@@ -7,7 +7,6 @@ import binascii
 import json
 import logging
 from http import HTTPStatus
-from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -29,14 +28,15 @@ from .baseline_pages import (
     SIGN_IN_REQUIRED_HTML,
     STREAM_ARCHIVE_DOWNLOAD_PATH,
     STREAM_ARCHIVE_PLAY_PATH,
+    SIGN_IN_ALERT_PATH,
     TAILSCALE_SETTINGS_PATH,
+    TWO_STEP_PATH,
 )
 from .constants import AUTH_REALM, AUTH_SESSION_COOKIE_NAME
 from .request_origin import (
     ANOTHER_SITE_MESSAGE,
     forwarded_client_address,
     request_from_another_site,
-    request_through_proxy,
     SETUP_THROUGH_PROXY_MESSAGE,
 )
 from .sign_in_limits import SignInWait
@@ -47,6 +47,12 @@ LOG = logging.getLogger(__name__)
 
 class AuthHandlerMixin:
     """Mixed into RtlControlHandler."""
+
+    def _visitor_host(self) -> str:
+        """The visitor's own address, without its port: see _client_address."""
+        host = self.client_address[0] if getattr(self, "client_address", None) else ""
+        headers = getattr(self, "headers", None)
+        return (forwarded_client_address(str(host), headers) if headers is not None else "") or str(host)
 
     def _client_address(self) -> str:
         """Who sent the request, for the log: the visitor's own address when a tunnel or proxy
@@ -62,6 +68,8 @@ class AuthHandlerMixin:
     def _auth_ok_or_setup_response(self, path: str, method: str) -> bool:
         # One connection can carry several requests.
         self._new_form_token = ""
+        self._auth_session_token = ""
+        self._new_auth_session = False
         self._sign_in_wait: SignInWait | None = None
         if request_from_another_site(method, path, self.headers):
             self._send_another_site_refused(path)
@@ -89,8 +97,9 @@ class AuthHandlerMixin:
             self._send_json({"setup_required": not has_account, "instance": self.service.instance_id})
             return False
         if not has_account:
-            if request_through_proxy(self.headers):
-                # Anyone who found a tunnel's address could create the owner account.
+            if not self._request_proven_local():
+                # Anyone who found a tunnel's address could create the owner account; a tunnel on this
+                # computer, such as ssh -R, connects from it, so not even that is taken.
                 if method != "GET":
                     LOG.warning("refused first-time setup from %s: it came through a tunnel or proxy", self._client_address())
                 if path.startswith("/api/"):
@@ -125,9 +134,7 @@ class AuthHandlerMixin:
         account = self._basic_auth_valid()
         if isinstance(account, AccountRecord):
             self.current_account = account
-            self._pending_auth_session_cookie = self.service.auth_sessions.cookie_header(
-                self.service.auth_sessions.create(account.id)
-            )
+            self._start_auth_session(account)
             if not self._account_authorized_or_response(path, method, account):
                 return False
             return True
@@ -149,18 +156,14 @@ class AuthHandlerMixin:
             self._send_page(render_notice_page("Nothing was changed", f"<p>{ANOTHER_SITE_MESSAGE}</p>", {}), HTTPStatus.FORBIDDEN)
 
     def _session_auth_valid(self) -> AccountRecord | None:
-        cookie_header = self.headers.get("Cookie", "")
-        if not cookie_header:
+        token = self._cookie_value(AUTH_SESSION_COOKIE_NAME)
+        if not token:
             return None
-        try:
-            cookies = SimpleCookie(cookie_header)
-        except Exception:
+        account = self.service.auth_sessions.validate(token, self.service.accounts)
+        if not isinstance(account, AccountRecord):
             return None
-        morsel = cookies.get(AUTH_SESSION_COOKIE_NAME)
-        if morsel is None:
-            return None
-        account = self.service.auth_sessions.validate(morsel.value, self.service.accounts)
-        return account if isinstance(account, AccountRecord) else None
+        self._auth_session_token = token
+        return account
 
     def _basic_auth_valid(self) -> AccountRecord | None:
         header = self.headers.get("Authorization", "")
@@ -174,17 +177,35 @@ class AuthHandlerMixin:
         if not separator:
             return None
         try:
-            return self.service.accounts.verify_basic_account(username, password)
+            return self.service.accounts.verify_basic_account(username, password, attempt=self._sign_in_attempt_details())
         except SignInWait as wait:
             self._sign_in_wait = wait
             return None
 
+    def _start_auth_session(self, account: AccountRecord) -> None:
+        self._auth_session_token = self.service.auth_sessions.create(account.id)
+        self._new_auth_session = True
+        self._pending_auth_session_cookie = self.service.auth_sessions.cookie_header(self._cookie_name(AUTH_SESSION_COOKIE_NAME), self._auth_session_token)
+
     def _account_authorized_or_response(self, path: str, method: str, account: AccountRecord) -> bool:
+        # From outside the local network, a password isn't enough.
+        if not self._two_step_ok_or_response(path, method, account):
+            return False
+        if getattr(self, "_new_auth_session", False) and not getattr(self, "_two_step_code_pending", False) and not getattr(self, "_two_step_setup_only", False):
+            # Signed in, two-step verification included: a few wrong passwords or codes before it
+            # were most likely typing mistakes. Not before then, or someone with the password could
+            # start session after session, and their wrong codes would never add up.
+            self.service.accounts.forget_few_sign_in_attempts(account.id)
+        # Told about wrong passwords and codes since it last signed in, before anything else.
+        if not self._sign_in_alert_or_continue(path, method, account):
+            return False
         if account.must_change_password:
             if method == "GET" and path == "/":
                 self._send_page(render_change_password_page(self._form_token()))
                 return False
-            if path in {"/api/account/me", "/api/account/password", "/api/client-log", CHANGE_PASSWORD_FORM_PATH}:
+            # Two-step verification comes first from outside the local network, as with a temporary password
+            # after a password reset, or for a new account set up with a setup code.
+            if path in {"/api/account/me", "/api/account/password", "/api/client-log", CHANGE_PASSWORD_FORM_PATH, SIGN_IN_ALERT_PATH, TWO_STEP_PATH}:
                 return True
             self._send_json({"error": "password change is required"}, status=HTTPStatus.FORBIDDEN)
             return False
@@ -218,9 +239,11 @@ class AuthHandlerMixin:
             self._send_auth_required()
             return False
         self.current_account = account
-        self._pending_auth_session_cookie = self.service.auth_sessions.cookie_header(
-            self.service.auth_sessions.create(account.id)
-        )
+        # The browser's session goes on if it's this account's, along with whether it passed
+        # two-step verification; otherwise the link would ask for a code every time.
+        existing = self._session_auth_valid()
+        if not (isinstance(existing, AccountRecord) and existing.id == account.id):
+            self._start_auth_session(account)
         if not self._account_authorized_or_response(path, method, account):
             return False
         return True
@@ -257,6 +280,7 @@ class AuthHandlerMixin:
                 IQ_RECORDING_DOWNLOAD_PATH,
                 "/api/logs",
                 "/api/account/me",
+                TWO_STEP_PATH,
             }
         if method == "POST":
             return path in {
@@ -269,22 +293,16 @@ class AuthHandlerMixin:
                 "/api/receiver/resume",
                 "/api/receiver/stop",
                 "/api/account/password",
+                TWO_STEP_PATH,
+                SIGN_IN_ALERT_PATH,
             }
         return False
 
     def _invalidate_request_auth_session_cookie(self) -> None:
-        cookie_header = self.headers.get("Cookie", "")
-        if cookie_header:
-            try:
-                cookies = SimpleCookie(cookie_header)
-                morsel = cookies.get(AUTH_SESSION_COOKIE_NAME)
-                if morsel is not None:
-                    self.service.auth_sessions.invalidate_token(morsel.value)
-            except Exception:
-                pass
-        self._pending_auth_session_cookie = (
-            f"{AUTH_SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
-        )
+        token = self._cookie_value(AUTH_SESSION_COOKIE_NAME)
+        if token:
+            self.service.auth_sessions.invalidate_token(token)
+        self._pending_auth_session_cookie = f"{self._cookie_name(AUTH_SESSION_COOKIE_NAME)}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
 
     def _send_auth_required(self) -> None:
         wait = getattr(self, "_sign_in_wait", None)
@@ -303,7 +321,7 @@ class AuthHandlerMixin:
         self.send_header("WWW-Authenticate", f'Basic realm="{AUTH_REALM}", charset="UTF-8"')
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Set-Cookie", f"{AUTH_SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+        self.send_header("Set-Cookie", f"{self._cookie_name(AUTH_SESSION_COOKIE_NAME)}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         try:
@@ -355,6 +373,7 @@ class AuthHandlerMixin:
         if cookie:
             self.send_header("Set-Cookie", cookie)
             self._pending_auth_session_cookie = ""
+        self._send_pending_device_cookie()
 
     def _change_own_password(self, account: AccountRecord, current: str, new: str, confirm: str) -> dict[str, Any]:
         updated = self.service.accounts.change_password(account.id, current, new, confirm)
@@ -366,14 +385,17 @@ class AuthHandlerMixin:
             abort_downloads=True,
             stop_iq_recording=True,
         )
-        self._pending_auth_session_cookie = f"{AUTH_SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
+        self._pending_auth_session_cookie = f"{self._cookie_name(AUTH_SESSION_COOKIE_NAME)}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
         LOG.info("changed password for account %s", updated.get("username", ""))
         return updated
 
-    def _create_account(self, username: str, read_only: bool) -> tuple[dict[str, Any], str]:
+    def _create_account(self, username: str, read_only: bool) -> tuple[dict[str, Any], str, str]:
+        """The new account, its temporary password, and a setup code, for setting up two-step
+        verification if it's first used from outside the local network."""
         account, secret = self.service.accounts.create_account(username, read_only)
+        setup_code = self.service.accounts.create_setup_code(int(account["id"]))
         LOG.info("created account %s", account.get("username", ""))
-        return account, secret
+        return account, secret, setup_code
 
     def _current_account_id(self) -> int | None:
         account = getattr(self, "current_account", None)

@@ -29,6 +29,9 @@ need:
 - `libmicrohttpd` runtime library for the web interface (`libmicrohttpd12` on
   Debian and Raspberry Pi OS, `libmicrohttpd12t64` on newer Debian releases,
   `libmicrohttpd` on Fedora)
+- optionally, `libqrencode` for the QR code shown when setting up two-step
+  verification (`libqrencode4` on Debian and Raspberry Pi OS, `qrencode-libs` on
+  Fedora); without it, the key is typed into the authenticator app instead
 
 Then install NWR Stream Manager directly from GitHub with pipx (`pipx` on
 Debian, Raspberry Pi OS and Fedora), which keeps it and its Python packages
@@ -50,9 +53,15 @@ The web interface is served with GNU libmicrohttpd. It closes a connection that
 sends nothing for 60 seconds and accepts up to 256 connections at once, live
 audio included.
 
-The web interface will print the local and LAN URLs it is listening on. It
-listens on port 8080 on every network address unless you change that in
-Settings, under Advanced; changes there take effect the next time it starts.
+From anywhere other than its own local network, such as through a tunnel, a
+reverse proxy or a forwarded port, signing in also needs a code from an
+authenticator app. Each account sets that up from the local network, under
+More, then Two-step verification.
+
+The web interface will print the addresses it is listening on, on this computer
+and on your local network. It listens on port 8080 on every network address
+unless you change that in Settings, under Advanced; changes there take effect
+the next time it starts.
 
 These options override the Advanced settings for as long as they're given:
 
@@ -228,13 +237,43 @@ for USB device access and `audio` for sound card playback:
 sudo usermod -aG plugdev,audio nwr-stream-manager
 ```
 
+Install NWR Stream Manager for the whole computer, so the service can run it.
+A pipx install for your own user lives in your home folder, which the service
+can't see. With pipx 1.5 or later (Fedora, Debian 13 and later):
+
+```bash
+sudo pipx install --global 'git+https://github.com/maxbaykowski/nwr-stream-manager.git@testing'
+```
+
+With an older pipx, such as Debian 12's and Raspberry Pi OS based on it, which
+has no `--global`, give pipx the same places itself:
+
+```bash
+sudo PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install 'git+https://github.com/maxbaykowski/nwr-stream-manager.git@testing'
+```
+
+Either way, the command is `/usr/local/bin/nwr-stream-manager`, which the
+example service runs. To upgrade it later, run `sudo pipx upgrade --global
+nwr-stream-manager`, or with an older pipx, `sudo PIPX_HOME=/opt/pipx
+PIPX_BIN_DIR=/usr/local/bin pipx upgrade nwr-stream-manager`, then `sudo
+systemctl restart nwr-stream-manager`. To connect to Tailscale from Settings,
+build libtailscale for the service too:
+
+```bash
+sudo /usr/local/bin/nwr-stream-manager --build-libtailscale
+```
+
 Install and start the example service:
 
 ```bash
-sudo cp packaging/systemd/nwr-stream-manager.service /etc/systemd/system/
+sudo curl -o /etc/systemd/system/nwr-stream-manager.service https://raw.githubusercontent.com/maxbaykowski/nwr-stream-manager/testing/packaging/systemd/nwr-stream-manager.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now nwr-stream-manager
 ```
+
+From a copy of the source code, `sudo cp
+packaging/systemd/nwr-stream-manager.service /etc/systemd/system/` does the same
+as the `curl` line.
 
 The example unit uses:
 

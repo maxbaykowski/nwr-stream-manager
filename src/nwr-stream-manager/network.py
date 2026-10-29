@@ -37,6 +37,11 @@ TAILSCALE_SERVE_CACHE_SECONDS = 30.0
 LOCAL_PROXY_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _tailscale_serve_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
 _tailscale_serve_cache_lock = threading.Lock()
+# How Serve passes connections to NWR Stream Manager's socket, looked up again this often, as it
+# decides whose word is taken for where a request came from.
+TAILSCALE_SERVE_SOCKET_USE_SECONDS = 2.0
+_tailscale_serve_socket_use: tuple[float, str] | None = None
+_tailscale_serve_socket_use_lock = threading.Lock()
 DNS_TYPE_PTR = 12
 DNS_CLASS_IN = 1
 
@@ -185,6 +190,20 @@ def tailscale_magicdns_name(address: str) -> str:
     return ""
 
 
+# NWR Stream Manager's socket for Tailscale Serve, which Serve can pass requests on to instead of its port.
+_tailscale_serve_socket = ""
+
+
+def set_tailscale_serve_socket(path: Any) -> None:
+    global _tailscale_serve_socket
+    global _tailscale_serve_socket_use
+    _tailscale_serve_socket = str(path or "")
+    with _tailscale_serve_cache_lock:
+        _tailscale_serve_cache.clear()
+    with _tailscale_serve_socket_use_lock:
+        _tailscale_serve_socket_use = None
+
+
 def tailscale_serve_address(serve_status: dict[str, Any], port: int) -> dict[str, Any] | None:
     """Find the https address Tailscale Serve proxies to this NWR Stream Manager, if any.
 
@@ -205,18 +224,7 @@ def tailscale_serve_addresses(serve_status: dict[str, Any], port: int) -> list[d
         handlers = config.get("Handlers") if isinstance(config, dict) else None
         root = handlers.get("/") if isinstance(handlers, dict) else None
         proxy = str(root.get("Proxy", "")).strip() if isinstance(root, dict) else ""
-        if not proxy:
-            continue
-        target = urlparse(proxy if "://" in proxy else f"http://{proxy}")
-        try:
-            target_port = target.port
-        except ValueError:
-            continue
-        if proxy.isdigit():
-            target_host, target_port = "127.0.0.1", int(proxy)
-        else:
-            target_host = target.hostname or ""
-        if target.scheme != "http" or target_host not in LOCAL_PROXY_HOSTS or target_port != port:
+        if not proxy or not _serve_proxy_leads_here(proxy, port):
             continue
         host, _separator, serve_port = str(host_port).rpartition(":")
         if not host or not serve_port.isdigit():
@@ -224,6 +232,75 @@ def tailscale_serve_addresses(serve_status: dict[str, Any], port: int) -> list[d
         url = f"https://{host}" if serve_port == "443" else f"https://{host}:{serve_port}"
         found.append({"url": url, "host": host, "public": bool(funnel.get(host_port))})
     return found
+
+
+def _serve_proxy_leads_here(proxy: str, port: int) -> bool:
+    """Whether a Serve proxy target is this NWR Stream Manager: its port, or its socket for Serve."""
+    if proxy.startswith("unix:"):
+        return bool(_tailscale_serve_socket) and proxy.removeprefix("unix:") == _tailscale_serve_socket
+    target = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+    try:
+        target_port = target.port
+    except ValueError:
+        return False
+    if proxy.isdigit():
+        target_host, target_port = "127.0.0.1", int(proxy)
+    else:
+        target_host = target.hostname or ""
+    return target.scheme == "http" and target_host in LOCAL_PROXY_HOSTS and target_port == port
+
+
+def tailscale_serve_socket_use(serve_status: Any, socket_path: str) -> str:
+    """How Tailscale Serve passes connections on to the socket at socket_path, going by serve_status
+    (`tailscale serve status --json`): "web" when only as web requests, whose Tailscale-User-Login
+    and Tailscale-Funnel-Request headers tailscaled sets itself; "tcp" when any of it is raw TCP
+    (--tcp or --tls-terminated-tcp), whose headers are whatever the visitor sent, even through
+    Funnel; or "" when nothing leads there."""
+    target = f"unix:{socket_path}"
+    found: set[str] = set()
+
+    def walk(value: Any) -> None:
+        # Everywhere, as settings can be nested, such as for services or Serve run in the foreground.
+        if isinstance(value, dict):
+            if str(value.get("TCPForward", "")).strip() == target:
+                found.add("tcp")
+            if str(value.get("Proxy", "")).strip() == target:
+                found.add("web")
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    if socket_path:
+        walk(serve_status)
+    return "tcp" if "tcp" in found else "web" if "web" in found else ""
+
+
+def tailscale_serve_socket_use_now() -> str | None:
+    """tailscale_serve_socket_use for NWR Stream Manager's socket, as Serve is set up now; None if
+    that can't be found out, as when tailscale won't say."""
+    global _tailscale_serve_socket_use
+    now = time.monotonic()
+    with _tailscale_serve_socket_use_lock:
+        if _tailscale_serve_socket_use is not None and now - _tailscale_serve_socket_use[0] < TAILSCALE_SERVE_SOCKET_USE_SECONDS:
+            use = _tailscale_serve_socket_use[1]
+            return use if use != "unknown" else None
+        use = "unknown"
+        try:
+            result = subprocess.run(
+                ["tailscale", "serve", "status", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=TAILSCALE_SERVE_STATUS_TIMEOUT_SECONDS,
+                check=False,
+            )
+            if result.returncode == 0:
+                use = tailscale_serve_socket_use(json.loads(result.stdout or "{}"), _tailscale_serve_socket)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        _tailscale_serve_socket_use = (now, use)
+        return use if use != "unknown" else None
 
 
 def tailscale_serve_url_for_port(port: int) -> dict[str, Any] | None:

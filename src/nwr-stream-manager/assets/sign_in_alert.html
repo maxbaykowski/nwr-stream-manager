@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Someone tried to sign in</title>
+<style>
+__BASE_PAGE_STYLES__
+[hidden] { display: none !important; }
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; background: #f6f7f9; color: #14181f; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 24px; }
+.panel { background: #fff; border: 1px solid #d8dde6; border-radius: 8px; padding: 24px; margin-bottom: 18px; }
+label { display: grid; gap: 6px; margin: 14px 0; font-weight: 700; }
+label.checkbox-row { display: flex; gap: 8px; align-items: center; font-weight: 400; }
+input { font: inherit; padding: 10px; border: 1px solid #aab2c0; border-radius: 6px; }
+input[type="checkbox"] { padding: 0; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; align-items: center; }
+form.inline { display: inline; margin: 0; }
+button, .button-link { font: inherit; padding: 10px 14px; border: 1px solid #9aa4b2; border-radius: 6px; background: #fff; color: #14181f; cursor: pointer; text-decoration: none; display: inline-block; }
+.primary { background: #174a98; color: #fff; border-color: #174a98; }
+.message { min-height: 1.5em; margin-top: 14px; font-weight: 700; }
+.error { color: #a61b1b; }
+.success { color: #17663a; }
+.hint { color: #4b5563; }
+.key { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 1.15em; letter-spacing: 0.05em; word-break: break-all; }
+.codes { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 1.15em; line-height: 1.8; }
+.qr { display: block; width: 228px; height: 228px; margin: 12px 0; image-rendering: pixelated; }
+ul.attempts { padding-left: 1.2em; }
+ul.attempts li { margin: 10px 0; }
+.warning { font-weight: 700; color: #a61b1b; }
+a { color: #174a98; }
+footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
+.screen-reader-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+@media (prefers-color-scheme: dark) {
+  .error, .warning { color: #ff8a8a; }
+  .success { color: #86efac; }
+  body { background: #111827; color: #f9fafb; }
+  .panel, button, .button-link, input { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
+  .primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .hint { color: #cbd5e1; }
+  a { color: #93c5fd; }
+}
+</style>
+</head>
+<body>
+<main>
+  <h1 id="sign_in_alert_title">Someone tried to sign in</h1>
+  <section id="sign_in_alert_own" class="panel" aria-labelledby="sign_in_alert_own_title" hidden>
+    <h2 id="sign_in_alert_own_title">Your account</h2>
+    <p id="sign_in_alert_own_summary"></p>
+    <ul id="sign_in_alert_own_list" class="attempts"></ul>
+    <p id="sign_in_alert_code_warning" class="warning" hidden></p>
+    <p id="sign_in_alert_advice"></p>
+  </section>
+  <section id="sign_in_alert_others" class="panel" aria-labelledby="sign_in_alert_others_title" hidden>
+    <h2 id="sign_in_alert_others_title">Other accounts</h2>
+    <p>As the owner, you're also told about wrong passwords for other accounts, and for usernames that aren't accounts, which bots often try.</p>
+    <ul id="sign_in_alert_others_list" class="attempts"></ul>
+  </section>
+  <form method="post" action="/sign-in-alert">
+    __FORM_TOKEN_INPUT__
+    <input id="sign_in_alert_up_to" type="hidden" name="up_to" value="0">
+    <input id="sign_in_alert_next" type="hidden" name="next" value="/">
+    <div class="actions">
+      <button class="primary" type="submit" autofocus>Continue</button>
+    </div>
+  </form>
+</main>
+<footer>
+  <a href="/help#sign-in-alerts" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>
+</footer>
+</body>
+</html>

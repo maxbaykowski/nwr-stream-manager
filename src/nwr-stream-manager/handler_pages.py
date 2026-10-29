@@ -65,7 +65,7 @@ class PageHandlerMixin:
                 raise ValueError(FORM_EXPIRED_MESSAGE)
             if path == "/accounts/create":
                 try:
-                    account, secret = self._create_account(form.get("username", ""), form.get("read_only") == "1")
+                    account, secret, setup_code = self._create_account(form.get("username", ""), form.get("read_only") == "1")
                 except ValueError as exc:
                     # Shown on the form, which keeps what was entered.
                     query = {"view": "settings", "section": "create_account"}
@@ -73,7 +73,7 @@ class PageHandlerMixin:
                     self._send_page(self._render_index_page(query, result=result, form=form), HTTPStatus.BAD_REQUEST)
                     return
                 summary = f"Account {account.get('username', '')} created."
-                self._send_page(render_account_secret_page(summary, secret))
+                self._send_page(render_account_secret_page(summary, secret, setup_code))
                 return
             account_id = int(form.get("account_id", "0") or 0)
             if path == "/accounts/reset-password":

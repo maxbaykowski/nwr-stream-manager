@@ -84,8 +84,8 @@ def new_form_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def form_token_cookie_header(token: str) -> str:
-    return f"{FORM_TOKEN_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax"
+def form_token_cookie_header(name: str, token: str) -> str:
+    return f"{name}={token}; Path=/; HttpOnly; SameSite=Lax"
 
 
 def form_token_valid(cookie_token: str, submitted_token: str) -> bool:

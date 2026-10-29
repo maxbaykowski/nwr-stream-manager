@@ -27,6 +27,7 @@ __INDEX_STYLES__</style>
           <a id="nav_logs" href="/?view=logs" data-view="logs">Logs</a>
           <a id="nav_settings" href="/?view=settings" data-view="settings" hidden>Settings</a>
           <a id="nav_change_password" href="/?view=change_password" data-view="change_password" hidden>Change account password</a>
+          <a id="nav_two_step" href="/two-step">Two-step verification</a>
           <a id="nav_restart" href="/?view=restart" hidden>Restart NWR Stream Manager</a>
         </span>
       </span>
@@ -78,8 +79,15 @@ __INDEX_STYLES__</style>
   <label>Temporary password
     <input id="account_secret" readonly>
   </label>
+  <div id="account_setup_code_box" hidden>
+    <p>If this user must access NWR Stream Manager via the public internet, also share this setup code with them. It works once, within 24 hours, and lets them set up two-step verification.</p>
+    <label>Setup code
+      <input id="account_setup_code" readonly>
+    </label>
+  </div>
   <div class="actions">
-    <button id="copy_account_secret" type="button">Copy to clipboard</button>
+    <button id="copy_account_secret" type="button">Copy temporary password</button>
+    <button id="copy_account_setup_code" type="button" hidden>Copy setup code</button>
     <button id="dismiss_account_secret" type="button">Dismiss</button>
   </div>
 </div>
@@ -739,7 +747,7 @@ __INDEX_STYLES__</style>
                 <div id="tailscale_funnel_section" hidden>
                   <input id="tailscale_was_funnel" type="hidden" name="was_funnel" value="0">
                   <label class="checkbox-row"><input id="tailscale_funnel" name="funnel" type="checkbox" value="1" aria-describedby="tailscale_funnel_warning"> Make NWR Stream Manager reachable from the internet (Tailscale Funnel)</label>
-                  <p id="tailscale_funnel_warning" class="hint">Anyone on the internet can then open NWR Stream Manager's sign-in page, at <span id="tailscale_funnel_address"></span>, not just your tailnet. Bots that watch the public certificate logs find addresses like it quickly, and only your accounts' passwords keep them out, so make sure every account has a strong one.</p>
+                  <p id="tailscale_funnel_warning" class="hint">Anyone on the internet can then open NWR Stream Manager's sign-in page, at <span id="tailscale_funnel_address"></span>, not just your tailnet. Bots that watch the public certificate logs find addresses like it quickly. Only accounts with two-step verification set up, in More, then Two-step verification, can be used there, with a code from an authenticator app as well as their password.</p>
                 </div>
                 <div class="actions baseline-only">
                   <button id="save_tailscale_https" type="submit">Save changes</button>

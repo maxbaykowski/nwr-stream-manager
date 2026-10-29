@@ -55,6 +55,16 @@ def change_password_page() -> str:
     return assemble("change_password.html")
 
 
+def two_step_page() -> str:
+    """Two-step verification: asking for the code, and setting it up."""
+    return assemble("two_step.html")
+
+
+def sign_in_alert_page() -> str:
+    """Wrong passwords and codes since the account last signed in, shown before what it asked for."""
+    return assemble("sign_in_alert.html")
+
+
 def notice_page() -> str:
     """A message on a page of its own, where the page script would show a notice."""
     return assemble("notice.html")

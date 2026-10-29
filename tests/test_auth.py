@@ -1245,6 +1245,39 @@ class AuthTests(unittest.TestCase):
         with patch.object(self.network, "tailscale_serve_addresses_for_port", return_value=addresses[:1]):
             self.assertFalse(self.network.tailscale_funnel_serves("max-pi5.example.ts.net", 8080))
 
+    def test_serve_through_nwr_stream_managers_own_socket_leads_here(self) -> None:
+        status = {
+            "Web": {
+                "max-pi5.example.ts.net:443": {"Handlers": {"/": {"Proxy": "unix:/var/lib/nwr-stream-manager/tailscale-serve.sock"}}},
+                "max-pi5.example.ts.net:10000": {"Handlers": {"/": {"Proxy": "unix:/run/something-else.sock"}}},
+            },
+        }
+        self.assertEqual(self.network.tailscale_serve_addresses(status, 8080), [])  # until it's listening
+        self.network.set_tailscale_serve_socket("/var/lib/nwr-stream-manager/tailscale-serve.sock")
+        self.addCleanup(self.network.set_tailscale_serve_socket, "")
+        self.assertEqual(
+            self.network.tailscale_serve_addresses(status, 8080),
+            [{"url": "https://max-pi5.example.ts.net", "host": "max-pi5.example.ts.net", "public": False}],
+        )
+
+    def test_how_serve_passes_connections_to_the_socket_is_told_apart(self) -> None:
+        sock = "/var/lib/nwr-stream-manager/tailscale-serve.sock"
+        use = self.network.tailscale_serve_socket_use
+        web = {"Web": {"max-pi5.example.ts.net:443": {"Handlers": {"/": {"Proxy": f"unix:{sock}"}}}}, "TCP": {"443": {"HTTPS": True}}}
+        self.assertEqual(use(web, sock), "web")
+        # Raw TCP, plain or with Serve's TLS taken off first, as tailscale serve or funnel --tcp and
+        # --tls-terminated-tcp set it up: the visitor's own headers reach the socket.
+        raw = {"TCP": {"10001": {"TCPForward": f"unix:{sock}"}}}
+        tls = {"TCP": {"8443": {"TCPForward": f"unix:{sock}", "TerminateTLS": "max-pi5.example.ts.net"}}, "AllowFunnel": {"max-pi5.example.ts.net:8443": True}}
+        self.assertEqual(use(raw, sock), "tcp")
+        self.assertEqual(use(tls, sock), "tcp")
+        self.assertEqual(use({**web, **raw}, sock), "tcp")  # any of it
+        # However deep it's set up, such as Serve run in the foreground.
+        self.assertEqual(use({"Foreground": {"session1": raw}}, sock), "tcp")
+        self.assertEqual(use({"TCP": {"10001": {"TCPForward": "unix:/run/something-else.sock"}}}, sock), "")
+        self.assertEqual(use({}, sock), "")
+        self.assertEqual(use(raw, ""), "")
+
     def test_notification_access_urls_include_tailscale_magicdns_when_detected(self) -> None:
         with (
             patch.object(self.network, "tailscale_serve_url_for_port", return_value=None),
@@ -1471,11 +1504,14 @@ class AuthTests(unittest.TestCase):
             has_account=lambda: True,
             account_by_id=lambda account_id: account if account_id == 1 else None,
             touch_account_access=lambda _account_id: None,
-            verify_basic_account=lambda _username, _password: self.fail("password hash should not be checked"),
+            verify_basic_account=lambda _username, _password, attempt=None: self.fail("password hash should not be checked"),
+            sign_in_attempts_for=lambda _account: {"own": [], "others": []},
+            cookie_id="0a1b2c3d",
         )
         handler = object.__new__(self.web_control.RtlControlHandler)
         handler.service = types.SimpleNamespace(accounts=accounts, auth_sessions=sessions)
-        handler.headers = {"Cookie": f"{self.web_control.AUTH_SESSION_COOKIE_NAME}={token}"}
+        handler.headers = {"Cookie": f"{self.web_control.AUTH_SESSION_COOKIE_NAME}_0a1b2c3d={token}"}
+        handler.client_address = ("127.0.0.1", 50000)
 
         self.assertTrue(handler._auth_ok_or_setup_response("/", "GET"))
 
@@ -1487,10 +1523,11 @@ class AuthTests(unittest.TestCase):
             handler.service = types.SimpleNamespace(accounts=store, auth_sessions=self.web_control.AuthSessionStore())
             token = base64.b64encode(b"admin:StrongPass!1").decode("ascii")
             handler.headers = {"Authorization": f"Basic {token}"}
+            handler.client_address = ("127.0.0.1", 50000)
 
             self.assertTrue(handler._auth_ok_or_setup_response("/", "GET"))
             cookie = getattr(handler, "_pending_auth_session_cookie", "")
-            self.assertIn(f"{self.web_control.AUTH_SESSION_COOKIE_NAME}=", cookie)
+            self.assertIn(f"{self.web_control.AUTH_SESSION_COOKIE_NAME}_{store.cookie_id}=", cookie)
             self.assertIn("HttpOnly", cookie)
             self.assertIn("SameSite=Lax", cookie)
 
@@ -1802,6 +1839,7 @@ class AuthTests(unittest.TestCase):
             account = web_control.AccountRecord(1, "someone", role, False, 0.0, None)
             for method, path in paths:
                 handler = object.__new__(web_control.RtlControlHandler)
+                handler.headers, handler.client_address = {}, ("127.0.0.1", 50000)
                 refused = []
                 handler._send_json = lambda payload, status=web_control.HTTPStatus.OK: refused.append(status)
                 self.assertEqual(

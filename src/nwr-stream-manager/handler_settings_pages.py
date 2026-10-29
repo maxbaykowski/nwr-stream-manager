@@ -624,7 +624,7 @@ class SettingsPageHandlerMixin:
                 content = (
                     f"<h4>{question}</h4>"
                     f"<p>Anyone on the internet can then open its sign-in page, at {html.escape(funnel.get('url', ''))}. "
-                    "Only your accounts' passwords keep them out.</p>"
+                    "Only accounts with two-step verification set up can be used there.</p>"
                     f'<form method="post" action="{TAILSCALE_SETTINGS_PATH}">{page_rendering.form_token_input(self._form_token())}'
                     '<input type="hidden" name="action" value="https"><input type="hidden" name="https" value="1">'
                     '<input type="hidden" name="was_https" value="1"><input type="hidden" name="funnel" value="1">'

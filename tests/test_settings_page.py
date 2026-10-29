@@ -169,6 +169,7 @@ class SettingsPermissionTests(unittest.TestCase):
     def handler_for(self, role: str):
         web_control = self.web_control
         handler = object.__new__(web_control.RtlControlHandler)
+        handler.headers, handler.client_address = {}, ("127.0.0.1", 50000)
         sent = []
         handler._send_json = lambda payload, status=None: sent.append((payload, status))
         account = web_control.AccountRecord(

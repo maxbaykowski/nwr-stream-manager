@@ -70,8 +70,8 @@ class AccountRoutesMixin:
     def _post_account(self, parsed: ParseResult) -> None:
         def create() -> dict:
             payload = self._read_json()
-            account, secret = self._create_account(str(payload.get("username", "")), bool(payload.get("read_only", False)))
-            return {"success": True, "account": account, "secret": secret}
+            account, secret, setup_code = self._create_account(str(payload.get("username", "")), bool(payload.get("read_only", False)))
+            return {"success": True, "account": account, "secret": secret, "setup_code": setup_code}
 
         self._send_json_result(create)
 

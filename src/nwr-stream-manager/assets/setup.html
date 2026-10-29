@@ -67,11 +67,12 @@ footer a { color: #174a98; }
     </form>
     <div id="setup_blocked" hidden>
       <h2>Finish setup from your own network</h2>
-      <p>For your security, NWR Stream Manager can't be set up for the first time through a tunnel or proxy, such as Cloudflare Tunnel or Tailscale Funnel. Otherwise, a stranger who found its address could create the owner account before you do.</p>
-      <p>To set it up, open NWR Stream Manager on the computer it's running on, or on a device on the same network. Once the owner account exists, you can sign in through your tunnel as usual.</p>
+      <p>For your security, NWR Stream Manager can only be set up for the first time from a device on its local network. Through a tunnel or proxy, such as Cloudflare Tunnel or Tailscale Funnel, a stranger who found its address could otherwise create the owner account before you do.</p>
+      <p>To set it up, open NWR Stream Manager from a device on the same network as the computer it's running on, using that computer's network address, such as http://192.168.1.20:8080, or in a web browser on that computer itself. Once the owner account exists, you can sign in from elsewhere with <a href="/help#two-step">two-step verification</a>.</p>
     </div>
     <form id="setup_done" method="get" action="/" hidden>
       <p>You're all set up! Click the finish button to log in.</p>
+      <p>If you'll use NWR Stream Manager from outside its local network, such as through a tunnel, you'll need two-step verification. As the owner, you can only set it up from the local network, so it's best done now: <a id="setup_two_step" href="/two-step">set up two-step verification</a>. You can also do it later, from <strong>More</strong>, then <strong>Two-step verification</strong>.</p>
       <div class="actions">
         <button id="setup_finish" class="primary" type="submit">Finish</button>
       </div>

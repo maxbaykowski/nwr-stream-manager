@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -57,11 +59,42 @@ class SignInLimitTests(unittest.TestCase):
         self.clock.now += 5
         self.assertTrue(self.limits.check("owner", "guess", "hash1"))
 
-    def test_signing_in_starts_again(self) -> None:
-        self.wrong(5)
-        self.clock.now += 5
-        self.limits.signed_in("owner")
-        self.assertEqual(self.wrong(4), [0, 0, 0, 0])
+    def test_codes_wait_up_to_an_hour(self) -> None:
+        limits = self.limits_module.SignInLimits(clock=self.clock, longest_wait=self.limits_module.LONGEST_CODE_WAIT_SECONDS)
+        waits = []
+        for i in range(16):
+            self.clock.now += 4000
+            waits.append(limits.wrong_password("owner", f"{i:06d}"))
+        self.assertEqual(waits[-4:], [1280, 2560, 3600, 3600])
+
+    def test_a_clock_put_back_doesnt_make_it_wait_longer(self) -> None:
+        self.wrong(14)
+        self.clock.now -= 10 * 24 * 60 * 60
+        with self.assertRaises(self.limits_module.SignInWait) as raised:
+            self.limits.check("owner", "guess", "hash1")
+        self.assertEqual(raised.exception.seconds, 900)
+
+    def test_its_kept_when_nwr_stream_manager_restarts(self) -> None:
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        path = Path(tempdir.name) / "accounts.db"
+
+        def connect():
+            return sqlite3.connect(path)
+
+        limits = self.limits_module.SignInLimits(clock=self.clock, connect=connect, kind="code")
+        for i in range(6):
+            limits.wrong_password("owner", f"{i:06d}")
+        again = self.limits_module.SignInLimits(clock=self.clock, connect=connect, kind="code")
+        with self.assertRaises(self.limits_module.SignInWait) as raised:
+            again.check("owner", "123456")
+        self.assertEqual(raised.exception.seconds, 10)
+        # Each kind is counted on its own.
+        self.assertTrue(self.limits_module.SignInLimits(clock=self.clock, connect=connect, kind="password").check("owner", "x"))
+        # Forgotten after a day, there too.
+        self.clock.now += 24 * 60 * 60 + 11
+        self.assertTrue(again.check("owner", "123456"))
+        self.assertEqual(self.limits_module.SignInLimits(clock=self.clock, connect=connect, kind="code").tries, {})
 
     def test_each_username_is_limited_on_its_own(self) -> None:
         self.wrong(5, "owner")
@@ -115,10 +148,45 @@ class AccountSignInLimitTests(unittest.TestCase):
             self.store.verify_basic_account("owner", "password1")
         self.clock.now += 5
         self.assertIsNotNone(self.store.verify_basic_account("owner", "password1"))
-        # Signed in, so the free tries are back.
-        for i in range(4):
-            self.assertIsNone(self.store.verify_basic_account("owner", f"again{i}"))
-        self.assertIsNotNone(self.store.verify_basic_account("owner", "password1"))
+        # Signing in doesn't give a guesser their free tries back.
+        with self.assertLogs("nwr_stream_manager", level="WARNING"):
+            self.assertIsNone(self.store.verify_basic_account("owner", "again"))
+        with self.assertRaises(self.limits_module.SignInWait):
+            self.store.verify_basic_account("owner", "password1")
+
+    def at_once(self, count: int, attempt) -> tuple[int, int]:
+        """Makes count tries at the same moment: how many were checked, and how many were made to wait."""
+        start = threading.Barrier(count)
+        checked, waited = [], []
+
+        def one(number: int) -> None:
+            start.wait()
+            try:
+                attempt(number)
+                checked.append(number)
+            except self.limits_module.SignInWait:
+                waited.append(number)
+
+        threads = [threading.Thread(target=one, args=(number,)) for number in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return len(checked), len(waited)
+
+    def test_wrong_passwords_sent_at_once_are_counted_one_after_another(self) -> None:
+        with self.assertLogs("nwr_stream_manager", level="WARNING"):
+            self.assertEqual(self.at_once(30, lambda number: self.store.verify_basic_account("owner", f"wrong{number}")), (5, 25))
+
+    def test_wrong_codes_sent_at_once_are_counted_one_after_another(self) -> None:
+        two_step = sys.modules["nwr_stream_manager.two_step"]
+        owner = self.store.verify_basic_account("owner", "password1")
+        secret = self.store.start_two_step_setup(owner.id)
+        self.store.enable_two_step(owner.id, secret, two_step.code_at(secret, two_step.current_step() - 1))
+        right = {two_step.code_at(secret, two_step.current_step() + offset) for offset in (-1, 0, 1)}
+        wrong = [code for code in (f"{number:06d}" for number in range(100)) if code not in right]
+        with self.assertLogs("nwr_stream_manager", level="WARNING"):
+            self.assertEqual(self.at_once(60, lambda number: self.store.verify_two_step(owner, wrong[number])), (5, 55))
 
     def test_usernames_that_dont_exist_are_limited_the_same(self) -> None:
         with self.assertLogs("nwr_stream_manager", level="WARNING"):

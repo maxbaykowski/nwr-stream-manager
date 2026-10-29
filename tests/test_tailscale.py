@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import tempfile
 import threading
 import unittest
@@ -35,6 +36,38 @@ class TailscaleTests(unittest.TestCase):
                 self._init_tailscale()
 
         return Service()
+
+    def test_serve_headers_are_only_believed_while_serve_passes_on_web_requests(self) -> None:
+        service = self.service()
+        handed = []
+        server = mock.Mock(add_connection=lambda fd, address, serve=False: (handed.append(serve), os.close(fd)))
+        with mock.patch.object(self.service_module, "TailscaleServeSocket") as socket_class:
+            socket_class.return_value.start.return_value = True
+            service._start_tailscale_serve_socket(server)
+        self.addCleanup(self.service_module.set_tailscale_serve_socket, "")
+        hand_over = socket_class.call_args.args[1]
+
+        def connect(use):
+            reader, writer = os.pipe()
+            os.close(reader)
+            with mock.patch.object(self.service_module, "tailscale_serve_socket_use_now", return_value=use):
+                hand_over(writer)
+            # Closed, by the server or else by refusing it.
+            with self.assertRaises(OSError):
+                os.fstat(writer)
+
+        connect("web")
+        self.assertEqual(handed, [True])
+        # Raw TCP: anyone could say they're on the tailnet, so nothing through it is taken.
+        with self.assertLogs("nwr_stream_manager", level="WARNING") as logs:
+            connect("tcp")
+        self.assertEqual(handed, [True])
+        self.assertIn("pass raw TCP", logs.output[0])
+        # Not known: served, but as anyone else through a tunnel is, asked for a code.
+        with self.assertLogs("nwr_stream_manager", level="WARNING"):
+            connect(None)
+        connect("")
+        self.assertEqual(handed, [True, False, False])
 
     def test_without_the_library_it_can_not_be_connected(self) -> None:
         service = self.service()

@@ -293,9 +293,14 @@ class ResponseHandlerMixin:
             if delete_after:
                 path.unlink(missing_ok=True)
 
+    def _cookie_name(self, name: str) -> str:
+        """name as this NWR Stream Manager's own; see AccountStore.cookie_id."""
+        return f"{name}_{self.service.accounts.cookie_id}"
+
     def _cookie_value(self, name: str) -> str:
+        """The value of this NWR Stream Manager's own cookie called name."""
         try:
-            morsel = SimpleCookie(self.headers.get("Cookie", "")).get(name)
+            morsel = SimpleCookie(self.headers.get("Cookie", "")).get(self._cookie_name(name))
         except Exception:
             return ""
         return morsel.value if morsel is not None else ""
@@ -311,7 +316,7 @@ class ResponseHandlerMixin:
     def _send_new_form_token_cookie(self) -> None:
         token = getattr(self, "_new_form_token", "")
         if token:
-            self.send_header("Set-Cookie", page_rendering.form_token_cookie_header(token))
+            self.send_header("Set-Cookie", page_rendering.form_token_cookie_header(self._cookie_name(page_rendering.FORM_TOKEN_COOKIE_NAME), token))
             self._new_form_token = ""
 
     def _read_form(self) -> dict[str, str]:

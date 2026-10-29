@@ -258,8 +258,8 @@ class GeneralPageTests(unittest.TestCase):
     def test_only_a_changed_name_is_saved_and_titles_change_at_once(self) -> None:
         admin = ("helper", "password2")
         response, page = self.request("GET", "/?view=settings&section=general", admin)
-        token = re.search(r"nwrstmgr_form=([^;]+)", response.getheader("Set-Cookie")).group(1)
-        cookie = f"nwrstmgr_form={token}"
+        cookie_name, token = re.search(r"(nwrstmgr_form_\w+)=([^;]+)", response.getheader("Set-Cookie")).groups()
+        cookie = f"{cookie_name}={token}"
         self.assertEqual(self.title(page), "General - Settings - NWR Stream Manager on weatherpi")
         self.assertIn('<input type="hidden" name="was_instance_name" value="NWR Stream Manager on weatherpi"><input type="hidden" name="was_location" value="">', page)
         fields = {

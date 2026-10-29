@@ -7,7 +7,9 @@ here. Only changes matter: another website can't read what comes back.
 
 from __future__ import annotations
 
+import hmac
 import ipaddress
+import secrets
 from typing import Mapping
 from urllib.parse import urlsplit
 
@@ -18,6 +20,28 @@ ANOTHER_SITE_MESSAGE = "This request came from another website, so nothing was c
 # browser ask this server first, and it never agrees, so only pages from here can send one.
 FORM_CONTENT_TYPES = {"application/x-www-form-urlencoded", "multipart/form-data", "text/plain"}
 DEFAULT_PORTS = {"http": 80, "https": 443}
+# What the web server adds to requests it took over HTTPS itself (see microhttpd_server): a secret
+# made new at each start, so no request can claim it, whatever passes it on.
+OWN_HTTPS_HEADER = "X-NWR-Stream-Manager-HTTPS"
+OWN_HTTPS_TOKEN = secrets.token_hex(16)
+# Likewise for requests that came through Tailscale Serve, by a socket only tailscaled can reach
+# it by (see tailscale_serve_socket), whose own headers can then be believed.
+TAILSCALE_SERVE_HEADER = "X-NWR-Stream-Manager-Tailscale-Serve"
+TAILSCALE_SERVE_TOKEN = secrets.token_hex(16)
+
+
+# And for connections from NWR Stream Manager's own connection to a tailnet (see tailscale_node), which
+# only devices on the tailnet can reach.
+OWN_TAILNET_HEADER = "X-NWR-Stream-Manager-Tailnet"
+OWN_TAILNET_TOKEN = secrets.token_hex(16)
+
+
+def from_tailscale_serve(headers: Mapping[str, str]) -> bool:
+    return hmac.compare_digest(str(headers.get(TAILSCALE_SERVE_HEADER, "")).strip(), TAILSCALE_SERVE_TOKEN)
+
+
+def from_own_tailnet(headers: Mapping[str, str]) -> bool:
+    return hmac.compare_digest(str(headers.get(OWN_TAILNET_HEADER, "")).strip(), OWN_TAILNET_TOKEN)
 # What tunnels and proxies add to the requests they pass on, such as Cloudflare Tunnel's
 # CF-Connecting-IP and Tailscale's Tailscale-User-Login. A browser can't take these away.
 PROXY_HEADERS = (
@@ -33,8 +57,8 @@ PROXY_HEADERS = (
     "Via",
 )
 SETUP_THROUGH_PROXY_MESSAGE = (
-    "NWR Stream Manager can't be set up for the first time through a tunnel or proxy. "
-    "Open it from a device on the same network as it to set it up."
+    "NWR Stream Manager can only be set up for the first time from a device on its local network, "
+    "using the computer's network address, or in a web browser on the computer itself. Open it that way to set it up."
 )
 
 
@@ -68,9 +92,13 @@ def request_through_proxy(headers: Mapping[str, str]) -> bool:
     """Whether a request came through a tunnel or proxy rather than straight from the browser.
 
     The address a request comes from can't tell: a tunnel on this computer connects
-    from this computer, and one elsewhere on the network from there.
+    from this computer, and one elsewhere on the network from there. HTTPS this server
+    took itself says X-Forwarded-Proto as a proxy would, and says it was this server.
     """
-    return any(str(headers.get(name, "")).strip() for name in PROXY_HEADERS)
+    own_https = hmac.compare_digest(str(headers.get(OWN_HTTPS_HEADER, "")).strip(), OWN_HTTPS_TOKEN)
+    return any(
+        str(headers.get(name, "")).strip() for name in PROXY_HEADERS if not (own_https and name == "X-Forwarded-Proto")
+    )
 
 
 def forwarded_client_address(peer: str, headers: Mapping[str, str]) -> str:

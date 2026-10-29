@@ -27,8 +27,15 @@ import time
 from typing import Any
 from urllib.parse import quote, quote_plus
 
+from .request_origin import OWN_HTTPS_HEADER, OWN_HTTPS_TOKEN, OWN_TAILNET_HEADER, OWN_TAILNET_TOKEN, TAILSCALE_SERVE_HEADER, TAILSCALE_SERVE_TOKEN
+
 
 LOG = logging.getLogger(__name__)
+
+# What each daemon's requests are told apart by, as libmicrohttpd passes it back.
+FROM_OWN_HTTPS = 1
+FROM_TAILSCALE_SERVE = 2
+FROM_OWN_TAILNET = 3
 
 MHD_NO = 0
 MHD_YES = 1
@@ -262,6 +269,8 @@ class _Request:
         self.header_block = b"\r\n"
         self.upgrade_handle: int | None = None
         self.https = False
+        self.serve = False
+        self.tailnet = False
         self.thread: threading.Thread | None = None
 
 
@@ -287,6 +296,8 @@ class MicrohttpdServer:
         # earlier ones, kept until the server stops so connections they still have aren't cut.
         self.tls_daemon: int | None = None
         self.retired_tls_daemons: list[int] = []
+        self.serve_daemon: int | None = None
+        self.tailnet_daemon: int | None = None
         # Held while calling libmicrohttpd about a connection from a handler's thread, and
         # while stopping it, so no call is made once it has freed its connections.
         self.daemon_lock = threading.Lock()
@@ -321,13 +332,34 @@ class MicrohttpdServer:
             raise MicrohttpdError("libmicrohttpd couldn't start")
         # libmicrohttpd closes the listening socket when it stops.
         self.listener.detach()
-        self.daemon = daemon
+        # Connections from Tailscale Serve, handed over by add_connection(serve=True): their requests
+        # are told apart by this daemon, which libmicrohttpd passes back.
+        serve_options = (MhdOptionItem * 3)(
+            MhdOptionItem(MHD_OPTION_CONNECTION_TIMEOUT, CONNECTION_TIMEOUT_SECONDS, None),
+            MhdOptionItem(MHD_OPTION_NOTIFY_COMPLETED, ctypes.cast(self._completed, ctypes.c_void_p).value, None),
+            MhdOptionItem(MHD_OPTION_END, 0, None),
+        )
+        self._serve_options = serve_options
+        serve_daemon = self.lib.MHD_start_daemon(
+            flags | MHD_USE_NO_LISTEN_SOCKET, 0, None, None, self._access, ctypes.c_void_p(FROM_TAILSCALE_SERVE),
+            ctypes.c_int(MHD_OPTION_ARRAY), serve_options, ctypes.c_int(MHD_OPTION_END),
+        )
+        # And from NWR Stream Manager's own connection to a tailnet, by add_connection(tailnet=True).
+        tailnet_daemon = self.lib.MHD_start_daemon(
+            flags | MHD_USE_NO_LISTEN_SOCKET, 0, None, None, self._access, ctypes.c_void_p(FROM_OWN_TAILNET),
+            ctypes.c_int(MHD_OPTION_ARRAY), serve_options, ctypes.c_int(MHD_OPTION_END),
+        )
+        with self.daemon_lock:
+            self.daemon = daemon
+            self.serve_daemon = serve_daemon or None
+            self.tailnet_daemon = tailnet_daemon or None
         LOG.info("serving the web interface with libmicrohttpd")
         self.stopped.wait()
 
     def start_tls(self, certificate: bytes, key: bytes) -> None:
         """Serves HTTPS with this certificate, for connections handed over with
-        add_connection(tls=True). A new certificate replaces the last for new connections."""
+        add_connection(tls=True), which only come from NWR Stream Manager's own connection to a
+        tailnet. A new certificate replaces the last for new connections."""
         certificate_buffer = ctypes.create_string_buffer(certificate)
         key_buffer = ctypes.create_string_buffer(key)
         options = (MhdOptionItem * 5)(
@@ -343,7 +375,7 @@ class MicrohttpdServer:
         )
         # Its requests are told apart from plain HTTP ones by this: libmicrohttpd passes it back.
         daemon = self.lib.MHD_start_daemon(
-            flags, 0, None, None, self._access, ctypes.c_void_p(1), ctypes.c_int(MHD_OPTION_ARRAY), options, ctypes.c_int(MHD_OPTION_END)
+            flags, 0, None, None, self._access, ctypes.c_void_p(FROM_OWN_HTTPS), ctypes.c_int(MHD_OPTION_ARRAY), options, ctypes.c_int(MHD_OPTION_END)
         )
         if not daemon:
             raise MicrohttpdError("libmicrohttpd couldn't start HTTPS")
@@ -361,11 +393,12 @@ class MicrohttpdServer:
                 self.retired_tls_daemons.append(self.tls_daemon)
                 self.tls_daemon = None
 
-    def add_connection(self, fd: int, address: str, *, tls: bool = False) -> None:
+    def add_connection(self, fd: int, address: str, *, tls: bool = False, serve: bool = False, tailnet: bool = False) -> None:
         """Serves a connection accepted elsewhere, such as from a tailnet, as if it had come
         from address: handlers, logs and checks see where it really came from. The
         connection is libmicrohttpd's from then on, closed by it even if it can't take it.
-        With tls, it's served over HTTPS."""
+        With serve, it's from Tailscale Serve, as checked by whoever accepted it; with tailnet,
+        from NWR Stream Manager's own connection to a tailnet; with tls, that too, over HTTPS."""
         host = address.rsplit(":", 1)[0].strip("[]") if address.count(":") == 1 or address.startswith("[") else address
         try:
             if ":" in host:
@@ -376,10 +409,13 @@ class MicrohttpdServer:
             os.close(fd)
             raise ValueError(f"unexpected address {address!r}") from None
         with self.daemon_lock:
-            daemon = self.tls_daemon if tls else self.daemon
+            daemon = self.tls_daemon if tls else self.serve_daemon if serve else self.tailnet_daemon if tailnet else self.daemon
             if self.daemon is None or daemon is None:
                 os.close(fd)
-                raise MicrohttpdError("the web server isn't running" if self.daemon is None else "HTTPS isn't ready")
+                raise MicrohttpdError(
+                    "the web server isn't running" if self.daemon is None else "HTTPS isn't ready" if tls
+                    else "the web server can't take connections from Tailscale Serve" if serve else "the web server can't take connections from the tailnet"
+                )
             if self.lib.MHD_add_connection(daemon, fd, sockaddr, len(sockaddr)) != MHD_YES:
                 raise MicrohttpdError(f"libmicrohttpd couldn't take a connection from {host}")
 
@@ -401,7 +437,8 @@ class MicrohttpdServer:
         with self.daemon_lock:
             daemon, self.daemon = self.daemon, None
             tls_daemons = ([self.tls_daemon] if self.tls_daemon is not None else []) + self.retired_tls_daemons
-            self.tls_daemon, self.retired_tls_daemons = None, []
+            tls_daemons += [extra for extra in (self.serve_daemon, self.tailnet_daemon) if extra is not None]
+            self.tls_daemon, self.retired_tls_daemons, self.serve_daemon, self.tailnet_daemon = None, [], None, None
             for tls_daemon in tls_daemons:
                 self.lib.MHD_stop_daemon(tls_daemon)
             if daemon is not None:
@@ -416,7 +453,10 @@ class MicrohttpdServer:
             if not req_cls[0]:
                 request_id = next(self.request_ids)
                 request = _Request(request_id, connection, method.decode("latin-1"), url.decode("latin-1"), version.decode("latin-1"))
-                request.https = bool(cls)
+                request.https = cls == FROM_OWN_HTTPS
+                request.serve = cls == FROM_TAILSCALE_SERVE
+                # HTTPS is only served to the tailnet (see start_tls).
+                request.tailnet = cls in (FROM_OWN_TAILNET, FROM_OWN_HTTPS)
                 with self.requests_lock:
                     self.requests[request_id] = request
                 req_cls[0] = request_id
@@ -440,7 +480,7 @@ class MicrohttpdServer:
             return self._queue_buffer(request, 413, [("Content-Type", "text/plain")], b"The request is too large.")
         request.client_address = self._client_address(request.connection)
         request.query = self._query(request.connection)
-        request.header_block = self._header_block(request.connection, https=request.https)
+        request.header_block = self._header_block(request.connection, https=request.https, serve=request.serve, tailnet=request.tailnet)
         request.thread = threading.Thread(target=self._run_handler, args=(request,), name="http-request", daemon=True)
         request.thread.start()
         output = request.output
@@ -453,7 +493,10 @@ class MicrohttpdServer:
             return self._queue(request, response, output.status, output.headers)
         if output.finished.is_set():
             # Done already, as most are: the whole body is waiting.
-            return self._queue_buffer(request, output.status, output.headers, self._drain(output))
+            body = self._drain(output)
+            if body is None:
+                return MHD_NO  # stopping
+            return self._queue_buffer(request, output.status, output.headers, body)
         length = output.header("Content-Length")
         size = int(length) if length.isdigit() else MHD_SIZE_UNKNOWN
         response = self.lib.MHD_create_response_from_callback(
@@ -479,10 +522,17 @@ class MicrohttpdServer:
             self.lib.MHD_destroy_response(response)
 
     @staticmethod
-    def _drain(output: _ResponseOutput) -> bytes:
+    def _drain(output: _ResponseOutput) -> bytes | None:
+        """The whole body, or None if the connection was aborted first: a handler that finishes then
+        doesn't say it's done (see finish), and libmicrohttpd can't stop until this returns."""
         chunks = []
         while True:
-            chunk = output.body.get()
+            try:
+                chunk = output.body.get(timeout=0.5)
+            except queue.Empty:
+                if output.aborted.is_set():
+                    return None
+                continue
             if chunk is None:
                 return b"".join(chunks)
             chunks.append(chunk)
@@ -602,11 +652,20 @@ class MicrohttpdServer:
         self.lib.MHD_get_connection_values(connection, kind, KeyValueIterator(collect), None)
         return values
 
-    def _header_block(self, connection: int, *, https: bool = False) -> bytes:
-        values = self._values(connection, MHD_HEADER_KIND)
+    def _header_block(self, connection: int, *, https: bool = False, serve: bool = False, tailnet: bool = False) -> bytes:
+        # Only this server says it served HTTPS itself, or that a request came from Tailscale Serve or
+        # its own tailnet connection: a request can't.
+        ours = {OWN_HTTPS_HEADER.lower(), TAILSCALE_SERVE_HEADER.lower(), OWN_TAILNET_HEADER.lower()}
+        values = [(key, value) for key, value in self._values(connection, MHD_HEADER_KIND) if key.lower() not in ours]
+        if serve:
+            values.append((TAILSCALE_SERVE_HEADER, TAILSCALE_SERVE_TOKEN))
+        if tailnet:
+            values.append((OWN_TAILNET_HEADER, OWN_TAILNET_TOKEN))
         if https:
-            # Said as a proxy taking HTTPS would say it, which is how handlers tell.
-            values = [(key, value) for key, value in values if key.lower() != "x-forwarded-proto"] + [("X-Forwarded-Proto", "https")]
+            # Said as a proxy taking HTTPS would say it, which is how handlers tell; and that it was
+            # this server, so it isn't taken for a proxy.
+            values = [(key, value) for key, value in values if key.lower() != "x-forwarded-proto"]
+            values += [("X-Forwarded-Proto", "https"), (OWN_HTTPS_HEADER, OWN_HTTPS_TOKEN)]
         lines = "".join(f"{key}: {value or ''}\r\n" for key, value in values)
         return (lines + "\r\n").encode("latin-1")
 

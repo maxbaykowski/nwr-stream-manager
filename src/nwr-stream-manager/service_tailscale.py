@@ -15,6 +15,8 @@ from .microhttpd_server import MicrohttpdError
 from .network_dial import set_tailnet_dialer
 from .state_files import atomic_write_json
 from .remote_sdr import REMOTE_SDR_TCP_PORT, system_tailscale_is_up
+from .network import set_tailscale_serve_socket, tailscale_serve_socket_use_now
+from .tailscale_serve_socket import SOCKET_FILE_NAME as SERVE_SOCKET_FILE_NAME, serve_command, TailscaleServeSocket
 from .tailscale_node import (
     FUNNEL_PORT,
     libtailscale_error,
@@ -57,6 +59,9 @@ class TailscaleServiceMixin:
         self.tailscale_https: dict[str, str] = {"state": "off", "enable_url": "", "error": ""}
         self.tailscale_https_wake = threading.Event()
         self.tailscale_funnel: dict[str, str] = {"state": "off", "enable_url": "", "error": ""}
+        # For Tailscale installed on this computer: Serve passes requests on by this, where tailnet users can be told from Funnel.
+        self.tailscale_serve_socket_path: Path = self.state_path.parent / SERVE_SOCKET_FILE_NAME
+        self.tailscale_serve_socket: TailscaleServeSocket | None = None
 
     def _tailscale_settings(self) -> dict[str, Any]:
         try:
@@ -85,12 +90,45 @@ class TailscaleServiceMixin:
         """Connects to the tailnet at startup if it was connected before, serving web_server
         there too, unless Tailscale is installed on this computer."""
         self.web_server = web_server
+        self._start_tailscale_serve_socket(web_server)
         if self._tailscale_enabled() and not self._leave_tailnet_to_system_tailscale():
             try:
                 self._start_tailscale_node()
             except Exception as exc:
                 LOG.warning("couldn't connect to Tailscale: %s", exc)
         threading.Thread(target=self._watch_for_system_tailscale, name="tailscale-system-check", daemon=True).start()
+
+    def _start_tailscale_serve_socket(self, web_server: Any) -> None:
+        if not hasattr(web_server, "add_connection"):
+            return
+
+        said: dict[str, str] = {"use": "web"}
+
+        def hand_over(fd: int) -> None:
+            # Where it's really from is in the headers tailscaled adds; 127.0.0.1 stands in until then.
+            # Those are only believed while Serve passes on web requests, which tailscaled sets them in.
+            use = tailscale_serve_socket_use_now()
+            if use == "tcp":
+                os.close(fd)
+                if said["use"] != "tcp":
+                    LOG.warning(
+                        "refused connections from Tailscale Serve: it's set up to pass raw TCP to NWR Stream Manager "
+                        "(tailscale serve or funnel with --tcp or --tls-terminated-tcp), which lets anyone, even through "
+                        "Funnel, claim to be on your tailnet. Remove that, and use: %s", serve_command(self.tailscale_serve_socket_path),
+                    )
+            elif use != "web" and said["use"] != "unknown":
+                LOG.warning("couldn't find out how Tailscale Serve is set up, so everyone through it is asked for a two-step verification code for now")
+            said["use"] = use if use in {"web", "tcp"} else "unknown"
+            if use != "tcp":
+                web_server.add_connection(fd, "127.0.0.1", serve=use == "web")
+
+        serve_socket = TailscaleServeSocket(self.tailscale_serve_socket_path, hand_over)
+        if not serve_socket.start():
+            return
+        self.tailscale_serve_socket = serve_socket
+        set_tailscale_serve_socket(self.tailscale_serve_socket_path)
+        if system_tailscale_is_up():
+            LOG.info("for a secure (https) address on your tailnet with Tailscale Serve, run: %s", serve_command(self.tailscale_serve_socket_path))
 
     def _watch_for_system_tailscale(self) -> None:
         while not self.tailscale_watch_stop.wait(SYSTEM_TAILSCALE_CHECK_SECONDS):
@@ -121,6 +159,8 @@ class TailscaleServiceMixin:
 
     def _stop_tailscale(self) -> None:
         self.tailscale_watch_stop.set()
+        if self.tailscale_serve_socket is not None:
+            self.tailscale_serve_socket.close()
         with self.lock:
             node, self.tailscale_node = self.tailscale_node, None
         set_tailnet_dialer(None)
@@ -159,7 +199,7 @@ class TailscaleServiceMixin:
         if server is None:
             os.close(fd)
             return
-        server.add_connection(fd, address)
+        server.add_connection(fd, address, tailnet=True)
 
     def _tailnet_https_connection(self, fd: int, address: str) -> None:
         server = self.web_server
@@ -308,6 +348,7 @@ class TailscaleServiceMixin:
                 "available": False,
                 "state": "system",
                 "signed_out_for_system": bool(self._tailscale_settings().get("signed_out_for_system")),
+                "serve_command": serve_command(self.tailscale_serve_socket_path) if self.tailscale_serve_socket is not None else "",
             }
         if load_libtailscale() is None:
             return {"available": False, "state": "unavailable", "reason": libtailscale_error()}

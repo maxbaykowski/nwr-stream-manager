@@ -229,6 +229,9 @@ from .remote_sdr import (
 from .routes_accounts import AccountRoutesMixin
 from .routes_advanced import AdvancedRoutesMixin
 from .routes_tailscale import TailscaleRoutesMixin
+from .handler_two_step import TwoStepHandlerMixin
+from .handler_sign_in_alerts import SignInAlertHandlerMixin
+from .sign_in_alerts import AddressLocations
 from .routes_eas_alerts import EasAlertRoutesMixin
 from .routes_fallback import FallbackRoutesMixin
 from .routes_general import GeneralRoutesMixin
@@ -384,7 +387,10 @@ class RtlControlService(
         self.test_mode_time = TestModeTimeBudget(state_path.with_name(TEST_MODE_TIME_FILE_NAME))
         self.soundcard_names_path = state_path.with_name(SOUNDCARD_DEVICE_NAMES_FILE_NAME)
         self.accounts = AccountStore(state_path.parent / ACCOUNTS_DATABASE_FILE_NAME)
-        self.auth_sessions = AuthSessionStore()
+        # Where each wrong password or code came from, looked up in the background for the account to be told.
+        self.address_locations = AddressLocations()
+        self.accounts.on_sign_in_attempt = self._locate_sign_in_attempt
+        self.auth_sessions = AuthSessionStore(connect=self.accounts._connect)
         self.log_handler = log_handler
         self.storage_monitor = StorageMonitor(
             [state_path.parent],
@@ -615,6 +621,13 @@ class RtlControlService(
             self._cleanup_expired_soundcard_previews()
             self._cleanup_expired_stream_test_mode()
 
+    def _locate_sign_in_attempt(self, row_id: int, address: str) -> None:
+        def found(location: str) -> None:
+            self.accounts.set_sign_in_attempt_location(row_id, location)
+            LOG.info("a wrong password or code came from %s, %s", address, location)
+
+        self.address_locations.look_up(address, found)
+
     def uptime_seconds(self) -> float:
         """How long this run of NWR Stream Manager has been running."""
         return time.monotonic() - self.started_at
@@ -760,6 +773,8 @@ class RtlControlHandler(
     FallbackRoutesMixin,
     AdvancedRoutesMixin,
     TailscaleRoutesMixin,
+    TwoStepHandlerMixin,
+    SignInAlertHandlerMixin,
     RestartRoutesMixin,
     GeneralRoutesMixin,
     AuthHandlerMixin,
@@ -916,7 +931,7 @@ def build_parser() -> argparse.ArgumentParser:
     address.add_argument(
         "--host",
         default=None,
-        help="address to bind, overriding the Advanced settings; use 0.0.0.0 for LAN access",
+        help="address to bind, overriding the Advanced settings; use 0.0.0.0 for access from your local network",
     )
     address.add_argument(
         "--localhost-only",

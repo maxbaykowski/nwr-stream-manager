@@ -124,6 +124,8 @@ NOTIFICATIONS_SET_UP_HTML = (
 )
 ADVANCED_SETTINGS_PATH = "/advanced-settings"
 TAILSCALE_SETTINGS_PATH = "/tailscale"
+TWO_STEP_PATH = "/two-step"
+SIGN_IN_ALERT_PATH = "/sign-in-alert"
 GENERAL_SETTINGS_PATH = "/general-settings"
 RESTART_PATH = "/restart"
 FALLBACK_SETTINGS_PATH = "/fallback-audio/settings"
@@ -237,6 +239,8 @@ MUST_CHANGE_PASSWORD_HTML = pages.change_password_page()
 
 
 NOTICE_PAGE_HTML = pages.notice_page()
+TWO_STEP_HTML = pages.two_step_page()
+SIGN_IN_ALERT_HTML = pages.sign_in_alert_page()
 INDEX_HTML = pages.index_page(APP_VERSION)
 INDEX_VIEWS = page_rendering.page_views(INDEX_HTML)
 
@@ -280,6 +284,7 @@ def render_notice_page(
     *,
     copy_label: str = "",
     copy_value: str = "",
+    after_copy_html: str = "",
     title: str = "",
 ) -> str:
     """A message on a page of its own, for browsers without the page script.
@@ -304,17 +309,32 @@ def render_notice_page(
         page = page_rendering.set_hidden(page, "notice_copy", False)
         page = page_rendering.set_text(page, "notice_copy_label", copy_label)
         page = page_rendering.set_attribute(page, "notice_copy_value", "value", copy_value)
+    if after_copy_html:
+        page = page_rendering.set_content(page, "notice_after_copy", after_copy_html)
     return page_rendering.set_title(page, f"{title or heading} - NWR Stream Manager")
 
 
-def render_account_secret_page(summary: str, secret: str) -> str:
-    """A temporary password, which the page script shows in a notice."""
+SETUP_CODE_TEXT = (
+    "If this user must access NWR Stream Manager via the public internet, also share this setup code with them. "
+    "It works once, within 24 hours, and lets them set up two-step verification."
+)
+
+
+def render_account_secret_page(summary: str, secret: str, setup_code: str = "") -> str:
+    """A temporary password, and for a new account a setup code, which the page script shows in a notice."""
+    after_copy_html = ""
+    if setup_code:
+        after_copy_html = (
+            f"<p>{html.escape(SETUP_CODE_TEXT)}</p>"
+            f'<label>Setup code <input id="notice_setup_code" readonly value="{html.escape(setup_code)}"></label>'
+        )
     return render_notice_page(
         "Temporary password",
         f"<p>{html.escape(summary)}</p><p>Copy the temporary password and give it to the user. You won't be able to see it again.</p>",
         {"view": "settings", "section": "accounts"},
         copy_label="Temporary password",
         copy_value=secret,
+        after_copy_html=after_copy_html,
         title=f"{summary} - Temporary password",
     )
 

@@ -150,7 +150,8 @@ def tailscale_status_text(status: dict[str, Any]) -> str:
     state = status.get("state")
     if state == "system":
         signed_out = "NWR Stream Manager signed itself out of Tailscale when it found it, so the two aren't on your tailnet at once. Its own device stays in the Tailscale admin console, marked as expired, until you remove it there." if status.get("signed_out_for_system") else ""
-        return " ".join(part for part in ("A systemwide installation of Tailscale was detected on this computer, so NWR Stream Manager uses it instead of connecting to Tailscale by itself.", signed_out) if part)
+        serve = f"For a secure (https) address on your tailnet, run this on the computer: {status['serve_command']}" if status.get("serve_command") else ""
+        return " ".join(part for part in ("A systemwide installation of Tailscale was detected on this computer, so NWR Stream Manager uses it instead of connecting to Tailscale by itself.", signed_out, serve) if part)
     if state == "unavailable":
         return "Tailscale can't be used here yet: its library (libtailscale) isn't installed. To install it, run nwr-stream-manager --build-libtailscale on this computer, with sudo if NWR Stream Manager runs as a systemd service. It's used as soon as it's built, without restarting."
     if state == "off":
