@@ -124,6 +124,22 @@ class AuthTests(unittest.TestCase):
 
         self.assertEqual(reconciled.access_url_mode, "auto")
 
+    def test_an_unavailable_notification_address_is_only_set_aside_until_its_back(self) -> None:
+        # Such as NWR Stream Manager's own tailnet connection, still connecting after a restart.
+        with tempfile.TemporaryDirectory() as folder:
+            service = object.__new__(self.web_control.RtlControlService)
+            service.lock = self.web_control.threading.RLock()
+            service.notification_state_path = Path(folder) / "notifications.json"
+            service.notification_settings = self.web_control.WebNotificationSettings(access_url_mode="tailscale:tailscale:100.70.1.2")
+            options = [{"id": "interface:wlp9s0:192.168.1.79", "url": "http://192.168.1.79:8080"}]
+            service._notification_access_url_options = lambda: options
+            self.assertEqual(service.notification_effective_access_url(), "http://192.168.1.79:8080")
+            self.assertEqual(service.notification_access_url_options()["selected"], "auto")
+            self.assertFalse(service.notification_state_path.exists())
+            options.insert(0, {"id": "tailscale:tailscale:100.70.1.2", "url": "http://100.70.1.2"})
+            self.assertEqual(service.notification_effective_access_url(), "http://100.70.1.2")
+            self.assertEqual(service.notification_access_url_options()["selected"], "tailscale:tailscale:100.70.1.2")
+
     def test_notification_access_url_selection_preserves_available_or_custom(self) -> None:
         selected = self.web_control.WebNotificationSettings(
             access_url_mode="tailscale:tailscale0:100.113.206.20",
@@ -1297,6 +1313,40 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(options[0]["url"], "http://max-thinkpad.example.ts.net:8080")
         self.assertIn("Tailscale MagicDNS", options[0]["label"])
         self.assertTrue(any(option["url"] == "http://100.113.206.20:8080" for option in options))
+
+    def test_its_own_tailnet_connection_is_offered_as_tailscale_on_the_computer_is(self) -> None:
+        # Only one of the two is used at a time, so they're named alike.
+        own = {"name": "nwr-stream-manager.example.ts.net", "ipv4": "100.70.1.2", "secure": False}
+        with (
+            patch.object(self.network, "tailscale_serve_url_for_port", return_value=None),
+            patch.object(self.web_control.socket, "if_nameindex", return_value=[(2, "wlp9s0")]),
+            patch.object(self.network, "interface_is_up", return_value=True),
+            patch.object(self.network, "interface_is_physical_or_tailscale", return_value=True),
+            patch.object(self.network, "interface_ipv4_address", return_value="192.168.1.79"),
+        ):
+            options = self.web_control.notification_access_url_options("0.0.0.0", 8080, own)
+            secure = self.web_control.notification_access_url_options("0.0.0.0", 8080, dict(own, secure=True))
+            bound = self.web_control.notification_access_url_options("127.0.0.1", 8080, own)
+
+        self.assertEqual(
+            [(option["label"], option["url"]) for option in options],
+            [
+                ("Tailscale MagicDNS (nwr-stream-manager.example.ts.net)", "http://nwr-stream-manager.example.ts.net"),
+                ("Tailscale (100.70.1.2)", "http://100.70.1.2"),
+                ("wlp9s0 (192.168.1.79)", "http://192.168.1.79:8080"),
+            ],
+        )
+        # Its secure address comes first, so Automatic uses it; the plain name only sends browsers there.
+        self.assertEqual(
+            [(option["label"], option["url"]) for option in secure],
+            [
+                ("Tailscale Serve (https://nwr-stream-manager.example.ts.net)", "https://nwr-stream-manager.example.ts.net"),
+                ("Tailscale (100.70.1.2)", "http://100.70.1.2"),
+                ("wlp9s0 (192.168.1.79)", "http://192.168.1.79:8080"),
+            ],
+        )
+        # The tailnet reaches it even when it only listens on this computer.
+        self.assertEqual([option["url"] for option in bound], ["http://nwr-stream-manager.example.ts.net", "http://100.70.1.2", "http://127.0.0.1:8080"])
 
     def test_notification_access_urls_prefer_default_route_after_tailscale(self) -> None:
         with (

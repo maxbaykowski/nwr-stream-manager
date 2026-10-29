@@ -158,6 +158,24 @@ class TailscaleTests(unittest.TestCase):
         # Its keys are gone with it.
         self.assertFalse(service.tailscale_state_directory.exists())
 
+    def test_its_own_tailnet_address_is_given_for_notifications_once_connected(self) -> None:
+        service = self.service()
+        self.assertIsNone(service.own_tailnet())
+
+        class Node:
+            state = "starting"
+
+            def snapshot(self):
+                return {"state": self.state, "auth_url": "", "name": "nwr-stream-manager.example.ts.net",
+                        "addresses": ["fd7a:115c:a1e0::5", "100.70.1.2"], "account": "", "error": ""}
+
+        service.tailscale_node = node = Node()
+        self.assertIsNone(service.own_tailnet())
+        node.state = "connected"
+        self.assertEqual(service.own_tailnet(), {"name": "nwr-stream-manager.example.ts.net", "ipv4": "100.70.1.2", "secure": False})
+        service._set_tailscale_https("on")
+        self.assertTrue(service.own_tailnet()["secure"])
+
     def test_with_tailscale_installed_on_the_computer_it_signs_itself_out_and_says_so(self) -> None:
         service = self.service()
         signed_out = []

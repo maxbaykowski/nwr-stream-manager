@@ -361,20 +361,45 @@ def default_route_ipv4_address() -> str:
         return ""
 
 
-def notification_access_url_options(host: str, port: int) -> list[dict[str, str]]:
+def own_tailnet_options(tailnet: dict[str, Any] | None) -> tuple[dict[str, str] | None, list[dict[str, str]]]:
+    """The addresses NWR Stream Manager's own connection to a tailnet has, named as Tailscale on the
+    computer's would be, as only one of the two is used at a time: its secure address, if it has one,
+    and the rest. tailnet is its name, IPv4 address, and whether it serves HTTPS itself."""
+    if not tailnet:
+        return None, []
+    name, address = str(tailnet.get("name") or ""), str(tailnet.get("ipv4") or "")
+    secure_option = None
+    options: list[dict[str, str]] = []
+    if name and tailnet.get("secure"):
+        url = f"https://{name}"
+        secure_option = {"id": f"tailscale-serve:{name}", "label": f"Tailscale Serve ({url})", "url": url, "interface": "tailscale-serve"}
+    elif name:
+        # Once it's secure, the plain address only sends browsers on to it.
+        options.append({"id": f"tailscale-magicdns:tailscale:{name}", "label": f"Tailscale MagicDNS ({name})", "url": f"http://{name}", "interface": "tailscale"})
+    if address:
+        options.append({"id": f"tailscale:tailscale:{address}", "label": f"Tailscale ({address})", "url": f"http://{address}", "interface": "tailscale"})
+    return secure_option, options
+
+
+def notification_access_url_options(host: str, port: int, tailnet: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """Where notifications could open NWR Stream Manager. tailnet is its own connection to a tailnet,
+    if it has one (see own_tailnet_options)."""
     options: list[dict[str, str]] = []
     seen_urls: set[str] = set()
     default_route_address = default_route_ipv4_address()
     # A secure Tailscale Serve address comes first, so Automatic uses it when there is one.
     serve = tailscale_serve_url_for_port(port)
     serve_option = tailscale_serve_option(port)
+    own_secure_option, own_options = own_tailnet_options(tailnet)
+    serve_option = serve_option or own_secure_option
     # While Funnel makes the name public, browsers that open it are told to use HTTPS for that
     # name from then on (HSTS), so the plain-HTTP MagicDNS address on it wouldn't load for them.
     funnel_public = bool(serve and serve.get("public"))
     if host not in {"0.0.0.0", "::", ""}:
         url = f"http://{host}:{port}"
         bound = {"id": "auto", "label": f"Server bind address ({url})", "url": url, "interface": ""}
-        return [serve_option, bound] if serve_option is not None else [bound]
+        # Its own tailnet connection reaches it whatever it listens on.
+        return ([serve_option] if serve_option is not None else []) + own_options + [bound]
     try:
         for _index, name in socket.if_nameindex():
             if not interface_is_up(name) or not interface_is_physical_or_tailscale(name):
@@ -409,6 +434,7 @@ def notification_access_url_options(host: str, port: int) -> list[dict[str, str]
             options.append({"id": option_id, "label": label, "url": url, "interface": name})
     except OSError:
         pass
+    options += own_options
     if not options:
         if default_route_address:
             options.append(

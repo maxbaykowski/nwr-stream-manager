@@ -303,6 +303,19 @@ class TailscaleServiceMixin:
             self.web_server.stop_tls()
         self._set_tailscale_https("off")
 
+    def own_tailnet(self) -> dict[str, Any] | None:
+        """Its own connection to a tailnet, while it's connected: its name, IPv4 address, and whether
+        it serves HTTPS there itself. For where notifications open it."""
+        with self.lock:
+            node, https = getattr(self, "tailscale_node", None), dict(getattr(self, "tailscale_https", {}))
+        if node is None:
+            return None
+        snapshot = node.snapshot()
+        if snapshot["state"] != "connected":
+            return None
+        ipv4 = next((address for address in snapshot["addresses"] if ":" not in str(address)), "")
+        return {"name": snapshot["name"], "ipv4": ipv4, "secure": https.get("state") == "on"}
+
     def tailnet_https_name(self) -> str:
         """The tailnet name NWR Stream Manager serves HTTPS at itself, or "" if it doesn't:
         plain HTTP to that name goes there."""

@@ -75,7 +75,8 @@ class NotificationServiceMixin:
         return self.status()
 
     def _notification_access_url_options(self) -> list[dict[str, str]]:
-        return notification_access_url_options(self.web_host, self.web_port)
+        own_tailnet = getattr(self, "own_tailnet", None)
+        return notification_access_url_options(self.web_host, self.web_port, own_tailnet() if own_tailnet is not None else None)
 
     def _reconcile_notification_access_url_selection_locked(
         self,
@@ -84,14 +85,12 @@ class NotificationServiceMixin:
         if options is None:
             options = self._notification_access_url_options()
         settings = reconcile_notification_access_url_selection(self.notification_settings, options)
-        if settings is not self.notification_settings:
-            LOG.info(
-                "notification access URL selection %s is unavailable; falling back to automatic",
-                self.notification_settings.access_url_mode,
-            )
-            self.notification_settings = settings
-            save_notification_settings(self.notification_state_path, settings)
-        return self.notification_settings
+        unavailable = self.notification_settings.access_url_mode if settings is not self.notification_settings else ""
+        if unavailable and unavailable != getattr(self, "_notification_access_url_unavailable", ""):
+            # Only for now, and not saved: such as a tailnet that's still connecting after a restart.
+            LOG.info("notification access URL selection %s is unavailable; using automatic until it's back", unavailable)
+        self._notification_access_url_unavailable = unavailable
+        return settings
 
     def test_notification_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
