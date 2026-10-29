@@ -86,7 +86,8 @@ def setup_uri(secret: str, username: str, instance_name: str) -> str:
     """The otpauth: link an authenticator app takes the key from, by QR code or opened on a phone."""
     label = quote(f"{ISSUER}:{authenticator_name(username, instance_name)}", safe="")
     return f"otpauth://totp/{label}?" + urlencode(
-        {"secret": secret, "issuer": ISSUER, "algorithm": "SHA1", "digits": DIGITS, "period": STEP_SECONDS}
+        {"secret": secret, "issuer": ISSUER, "algorithm": "SHA1", "digits": DIGITS, "period": STEP_SECONDS},
+        quote_via=quote,  # spaces as %20; some apps show a + as it is
     )
 
 

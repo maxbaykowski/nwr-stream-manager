@@ -51,7 +51,7 @@ class CodeTests(unittest.TestCase):
 
     def test_the_setup_link_names_the_account_and_which_computer_its_on(self) -> None:
         uri = self.two_step.setup_uri("ABCDEFGH", "owner", "Attic SDR")
-        self.assertTrue(uri.startswith("otpauth://totp/NWR%20Stream%20Manager%3Aowner%20on%20Attic%20SDR?secret=ABCDEFGH&issuer=NWR+Stream+Manager&"))
+        self.assertTrue(uri.startswith("otpauth://totp/NWR%20Stream%20Manager%3Aowner%20on%20Attic%20SDR?secret=ABCDEFGH&issuer=NWR%20Stream%20Manager&"))
         # NWR Stream Manager isn't said twice, and the computer is named even if the instance isn't.
         name = self.two_step.authenticator_name
         self.assertEqual(name("owner", "NWR Stream Manager on weatherpi"), "owner on weatherpi")
