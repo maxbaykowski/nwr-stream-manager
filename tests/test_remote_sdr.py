@@ -1632,6 +1632,17 @@ class RemoteSdrServiceTests(unittest.TestCase):
         self.assertTrue(outcome["result"]["success"])
         wait_for(lambda: (self.shown_reset(client) or ("",))[0] == "finished", timeout=1.0)
 
+    def test_a_reset_with_no_sdr_chosen_resets_the_one_in_use(self) -> None:
+        # Such as when the page couldn't list it, because it had stopped answering.
+        host = self.service("host", development=True)
+        self.synthetic_source(host)
+        host.update({"serial": "00000001"})
+        release, resets = self.fake_usb_reset()
+        release.set()
+        result = host.reset_rtl_device("")
+        self.assertEqual(resets, ["00000001"])
+        self.assertTrue(result["reappeared"])
+
     def test_how_a_reset_ended_stops_showing_after_a_while(self) -> None:
         host, client = self.paired_host_and_client()
         release, _ = self.fake_usb_reset()

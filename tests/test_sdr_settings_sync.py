@@ -354,13 +354,16 @@ class SdrSettingsSyncTests(unittest.TestCase):
             "RTL-SDR serial 00000001 was reset using usbreset and reappeared.",
         ])
 
-    def test_a_local_reset_needs_an_sdr_chosen(self) -> None:
+    def test_a_local_reset_with_none_chosen_resets_the_one_in_use(self) -> None:
+        # Such as when the list couldn't be loaded because the SDR stopped answering: the server
+        # resets the one in use, or says to choose one if there isn't one.
         result = self.run_scenario("""
             elements.serial.value = "";
+            request = (path, options) => { sent.push({path, body: JSON.parse(options.body)}); return Promise.reject(new Error("Select an RTL-SDR to reset.")); };
             await resetSdr(false);
             results.after = resetShown();
         """)
-        self.assertEqual(result["sent"], [])
+        self.assertEqual(result["sent"], [{"path": "/api/rtl-reset", "body": {"serial": ""}}])
         self.assertEqual(result["results"]["after"]["message"], "Select an RTL-SDR to reset.")
 
     def test_a_number_being_typed_is_left_alone_while_others_still_update(self) -> None:

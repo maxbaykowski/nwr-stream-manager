@@ -25,6 +25,41 @@ class RtlCaptureTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.rtl = load_rtl_module()
 
+    def test_an_sdr_that_cant_be_read_doesnt_hide_the_others(self) -> None:
+        # Such as one that's stopped answering. The other is still listed, and with none
+        # readable, why is said.
+        rtl = self.rtl
+        readable = {0: False, 1: True}
+
+        class StandInLibrtlsdr:
+            @staticmethod
+            def rtlsdr_get_device_count():
+                return len(readable)
+
+            @staticmethod
+            def rtlsdr_get_device_usb_strings(index, manufacturer, product, serial):
+                if not readable[index]:
+                    return -7  # LIBUSB_ERROR_TIMEOUT
+                for buffer, text in ((manufacturer, "Nooelec"), (product, "NESDR SMArt v5"), (serial, "47497952")):
+                    for position, character in enumerate(text.encode()):
+                        buffer[position] = character
+                return 0
+
+            @staticmethod
+            def rtlsdr_get_device_name(index):
+                return b"Generic RTL2832U OEM"
+
+        original = rtl.rtlsdr_lib
+        rtl.rtlsdr_lib = StandInLibrtlsdr()
+        try:
+            devices = rtl.list_rtl_devices()
+            self.assertEqual([(device.index, device.serial) for device in devices], [(1, "47497952")])
+            readable[1] = False
+            with self.assertRaises(rtl.LibUsbError):
+                rtl.list_rtl_devices()
+        finally:
+            rtl.rtlsdr_lib = original
+
     def test_async_buffer_size_stays_low_latency_at_low_sample_rates(self) -> None:
         config = self.rtl.RtlConfig(serial="dummy", sample_rate=240_040)
         buffer_size = self.rtl.RtlCaptureSource._rtl_async_buffer_size(config)

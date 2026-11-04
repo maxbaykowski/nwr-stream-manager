@@ -404,6 +404,7 @@ class RtlControlService(
                 "alsa_playback": discover_playback_devices,
             },
             poll_interval_seconds=0.5,
+            labels={"rtl": "librtlsdr", "rtl_usb": "USB", "alsa_playback": "Sound card"},
         )
         self.lock = threading.RLock()
         self.settings = load_settings(state_path)

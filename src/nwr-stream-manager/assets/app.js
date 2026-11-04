@@ -11366,11 +11366,8 @@ document.getElementById("rescan_devices").addEventListener("click", async () => 
 
 // Resets the SDR this machine uses: its own, or a remote SDR's, which the host resets.
 async function resetSdr(remote) {
+  // With none chosen, such as when the list couldn't be loaded, the server resets the one in use.
   const serial = document.getElementById("serial").value;
-  if (!remote && !serial) {
-    setMessage("sdr-reset-status", "Select an RTL-SDR to reset.", "error");
-    return;
-  }
   sdrResetRequestPending = true;
   setSdrResetButtonsDisabled(true);
   setMessage("sdr-reset-status", "Resetting RTL-SDR...");

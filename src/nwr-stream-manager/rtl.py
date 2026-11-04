@@ -913,6 +913,7 @@ def list_rtl_devices() -> list[RtlDeviceInfo]:
     if rtlsdr_lib is None:
         raise RtlDependencyError(str(RTLSDR_IMPORT_ERROR))
     devices: list[RtlDeviceInfo] = []
+    unreadable: list[LibUsbError] = []
     device_count = int(rtlsdr_lib.rtlsdr_get_device_count())
     for index in range(device_count):
         manufacturer = (c_ubyte * 256)()
@@ -925,7 +926,9 @@ def list_rtl_devices() -> list[RtlDeviceInfo]:
                     f"Access denied while reading USB strings for RTL-SDR {index}. "
                     "Check udev permissions or run with sufficient access."
                 )
-            raise LibUsbError(result, f"while reading USB strings for RTL-SDR {index}")
+            # Such as one that's stopped answering: the others are still listed.
+            unreadable.append(LibUsbError(result, f"while reading USB strings for RTL-SDR {index}"))
+            continue
         manufacturer_text = "".join(chr(value) for value in manufacturer if value > 0)
         product_text = "".join(chr(value) for value in product if value > 0)
         serial_text = "".join(chr(value) for value in serial if value > 0)
@@ -939,6 +942,8 @@ def list_rtl_devices() -> list[RtlDeviceInfo]:
                 serial=serial_text or None,
             )
         )
+    if unreadable and not devices:
+        raise unreadable[0]
     return devices
 
 

@@ -176,7 +176,7 @@ class DeviceServiceMixin:
         return devices
 
     def _refresh_soundcards(self) -> list[Any]:
-        devices = list(self.device_probe.snapshot(force=True).devices("alsa_playback"))
+        devices = list(self.device_probe.devices("alsa_playback", force=True))
         self._remember_soundcard_devices_locked(devices)
         return devices
 
@@ -309,6 +309,10 @@ class DeviceServiceMixin:
         if uses_remote_sdr:
             return self._reset_remote_sdr()
         serial = str(serial or "").strip()
+        if not serial:
+            # The one in use, when the page couldn't list it, such as while it's stopped answering.
+            with self.lock:
+                serial = str(self.settings.serial or "").strip()
         if not serial:
             raise ValueError("Select an RTL-SDR to reset.")
         if not self.reset_lock.acquire(blocking=False):

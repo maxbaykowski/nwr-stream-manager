@@ -273,7 +273,7 @@ __INDEX_STYLES__</style>
         <div class="actions">
           <button id="save_rtl_settings" type="submit" data-baseline-submit>Save changes</button>
         </div>
-        <div id="rtl-save-result" class="message"></div>
+        <div id="rtl-save-result" class="message" aria-live="polite"></div>
       </div>
     </section>
     <section id="rtl_notifications_section" hidden>
@@ -299,7 +299,7 @@ __INDEX_STYLES__</style>
       <div id="iq_test_source_directory" class="hint"></div>
       <div id="iq_test_source_seek_controls" class="hint" tabindex="0" role="group" aria-label="I/Q file seek controls">Up and Down Arrow seek 10 seconds; Page Up and Page Down seek 1 minute.</div>
       <div id="iq_test_source_position" class="hint"></div>
-      <div id="iq-test-source-result" class="message"></div>
+      <div id="iq-test-source-result" class="message" aria-live="polite"></div>
       <div class="actions iq-test-source-actions">
         <button id="rescan_iq_test_sources" type="button">Rescan I/Q files</button>
         <button id="start_iq_test_source" type="button">Use I/Q file source</button>
@@ -334,14 +334,14 @@ __INDEX_STYLES__</style>
       <label class="desktop-volume-control">Volume
         <input id="receiver_volume" type="range" min="0" max="100" step="1" value="100">
       </label>
-      <div id="receiver-result" class="message"></div>
+      <div id="receiver-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 
   <div id="view_iq_recorder" class="view" hidden>
     <section>
       <h2>I/Q Recorder</h2>
-      <div id="iq-recorder-result" class="message"></div>
+      <div id="iq-recorder-result" class="message" aria-live="polite"></div>
       <div id="iq_remove_confirm" class="baseline-only" hidden></div>
       <div id="iq_recorder_active" hidden>
         <p id="iq_refresh_hint" class="hint baseline-only">Refresh the page for the latest status.</p>
@@ -386,7 +386,7 @@ __INDEX_STYLES__</style>
   <div id="view_iq_recorder_start" class="view" hidden>
     <section>
       <h2>New I/Q Recording</h2>
-      <div id="iq-start-result" class="message"></div>
+      <div id="iq-start-result" class="message" aria-live="polite"></div>
       <form id="iq_recorder_idle" method="post" action="/iq-recorder/start">
         __FORM_TOKEN_INPUT__
         <fieldset id="iq_mode_choices">
@@ -445,7 +445,7 @@ __INDEX_STYLES__</style>
           <a id="cancel_iq_download_link" class="baseline-only button-link" href="/?view=iq_recorder">Cancel</a>
         </div>
       </form>
-      <div id="iq-download-result" class="message"></div>
+      <div id="iq-download-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 
@@ -512,7 +512,7 @@ __INDEX_STYLES__</style>
           <div id="settings_panel_accounts" class="settings-panel" hidden>
             <div id="settings_accounts_page">
               <h3>Accounts</h3>
-              <div id="account-result" class="message"></div>
+              <div id="account-result" class="message" aria-live="polite"></div>
               <div id="account_confirm" class="baseline-only" hidden></div>
               <div class="actions">
                 <button id="open_create_account" type="button" class="needs-app-inline">Create account</button>
@@ -535,7 +535,7 @@ __INDEX_STYLES__</style>
             <form id="settings_create_account_page" method="post" action="/accounts/create" hidden>
               __FORM_TOKEN_INPUT__
               <h3>Create account</h3>
-              <div id="create-account-result" class="message"></div>
+              <div id="create-account-result" class="message" aria-live="polite"></div>
               <label>Username
                 <input id="new_account_username" name="username" autocomplete="off" pattern="[A-Za-z0-9_\-]{1,64}">
               </label>
@@ -933,7 +933,7 @@ __INDEX_STYLES__</style>
   <div id="view_restart" class="view" hidden>
     <section>
       <h2>Restart NWR Stream Manager?</h2>
-      <div id="restart-result" class="message"></div>
+      <div id="restart-result" class="message" aria-live="polite"></div>
       <p>Your streams will go offline for a few seconds and any I/Q recordings in progress will be ended.</p>
       <form id="restart_form" method="post" action="/restart">
         __FORM_TOKEN_INPUT__
@@ -951,7 +951,7 @@ __INDEX_STYLES__</style>
       <h2>Change Account Password</h2>
       <form id="change_password_form" method="post" action="/change-password">
         __FORM_TOKEN_INPUT__
-        <div id="change-password-result" class="message"></div>
+        <div id="change-password-result" class="message" aria-live="polite"></div>
         <label>Current password
           <input id="account_current_password" name="current_password" type="password" autocomplete="current-password">
         </label>
@@ -995,7 +995,7 @@ __INDEX_STYLES__</style>
           </tr>
         </tbody>
       </table>
-      <div id="streams-result" class="message"></div>
+      <div id="streams-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 
@@ -1148,7 +1148,7 @@ __INDEX_STYLES__</style>
       </div>
       <div id="wizard_baseline_actions" class="actions baseline-only"></div>
       </form>
-      <div id="stream-result" class="message"></div>
+      <div id="stream-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 
@@ -1173,7 +1173,7 @@ __INDEX_STYLES__</style>
             </label>
             <span id="stream_monitor_hint" class="hint">Listen in your browser.</span>
           </div>
-          <div id="stream-settings-result" class="message"></div>
+          <div id="stream-settings-result" class="message" aria-live="polite"></div>
           <dl id="stream_settings_signal" class="details-list">
             <dt>Signal</dt><dd id="stream_settings_signal_value" class="hint">No signal data</dd>
             <dt id="stream_settings_signal_levels_label" hidden>Levels</dt><dd id="stream_settings_signal_levels" hidden></dd>
@@ -1251,7 +1251,7 @@ __INDEX_STYLES__</style>
               </tbody>
             </table>
             </div>
-            <div id="output-list-result" class="message"></div>
+            <div id="output-list-result" class="message" aria-live="polite"></div>
           </div>
           <div id="panel_eas" class="tabpanel" hidden>
             <h3>EAS recording</h3>
@@ -1281,7 +1281,7 @@ __INDEX_STYLES__</style>
                 <label class="checkbox-row"><input id="eas_format_mp3" name="eas_format" type="radio" value="mp3"> MP3</label>
               </fieldset>
             </div>
-            <div id="eas-result" class="message"></div>
+            <div id="eas-result" class="message" aria-live="polite"></div>
           </div>
           <div id="panel_archive" class="tabpanel" hidden>
             <h3>Stream archiving</h3>
@@ -1305,7 +1305,7 @@ __INDEX_STYLES__</style>
             </div>
             <p id="archive_summary" class="hint">No audio archived yet.</p>
             <div id="archive_confirm" class="baseline-only" hidden></div>
-            <div id="archive-result" class="message"></div>
+            <div id="archive-result" class="message" aria-live="polite"></div>
           </div>
           <div id="panel_fallback_action" class="tabpanel" hidden>
             <h3>Fallback action</h3>
@@ -1420,7 +1420,7 @@ __INDEX_STYLES__</style>
               </label>
               <span id="stream_notify_eas_alerts_hint" class="hint" hidden>When a new alert is recorded.</span>
             </div>
-            <div id="stream-notifications-result" class="message"></div>
+            <div id="stream-notifications-result" class="message" aria-live="polite"></div>
           </div>
           <div id="panel_test_mode" class="tabpanel" hidden>
             <h3>Test mode</h3>
@@ -1447,7 +1447,7 @@ __INDEX_STYLES__</style>
             <div class="actions">
               <button id="test_mode_same" type="button">Send SAME test</button>
             </div>
-            <div id="test-mode-result" class="message"></div>
+            <div id="test-mode-result" class="message" aria-live="polite"></div>
             <div id="test_tones_section" hidden>
               <h4>Tone generators</h4>
               <p class="hint">Adds tones to simulate buzzes and whines.</p>
@@ -1532,7 +1532,7 @@ __INDEX_STYLES__</style>
             <div class="actions">
               <button id="save_stream_settings" type="submit" data-baseline-submit>Save changes</button>
             </div>
-            <div id="stream-settings-save-result" class="message"></div>
+            <div id="stream-settings-save-result" class="message" aria-live="polite"></div>
           </div>
         </div>
       </div>
@@ -1670,7 +1670,7 @@ __INDEX_STYLES__</style>
           </form>
           <div id="output_actions" class="baseline-only" hidden></div>
         </div>
-        <div id="output-result" class="message"></div>
+        <div id="output-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 
@@ -1701,7 +1701,7 @@ __INDEX_STYLES__</style>
         <button id="eas_alert_next" type="button" class="needs-app-inline">Next</button>
         <a id="eas_alert_page_next_link" class="baseline-only button-link" href="/?view=eas_alerts" hidden>Next page</a>
       </div>
-      <div id="eas-alert-result" class="message"></div>
+      <div id="eas-alert-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 
@@ -1808,7 +1808,7 @@ __INDEX_STYLES__</style>
       <div id="stream_archive_delete_actions" class="actions archive-download-actions" hidden>
         <a id="stream_archive_open_delete_link" class="button-link" href="/?view=stream_archive_delete">Delete archived audio</a>
       </div>
-      <div id="stream-archive-result" class="message"></div>
+      <div id="stream-archive-result" class="message" aria-live="polite"></div>
       </div>
     </section>
   </div>
@@ -1831,7 +1831,7 @@ __INDEX_STYLES__</style>
           <a id="cancel_eas_export_link" class="baseline-only button-link" href="/?view=eas_alerts">Cancel</a>
         </div>
       </form>
-      <div id="eas-export-result" class="message"></div>
+      <div id="eas-export-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 
@@ -1853,7 +1853,7 @@ __INDEX_STYLES__</style>
           <a id="cancel_stream_archive_delete_link" class="baseline-only button-link" href="/?view=stream_archives">Cancel</a>
         </div>
       </form>
-      <div id="stream-archive-delete-result" class="message"></div>
+      <div id="stream-archive-delete-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 
@@ -1877,7 +1877,7 @@ __INDEX_STYLES__</style>
           <a id="cancel_eas_delete_link" class="baseline-only button-link" href="/?view=eas_alerts">Cancel</a>
         </div>
       </form>
-      <div id="eas-delete-result" class="message"></div>
+      <div id="eas-delete-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 
@@ -1927,7 +1927,7 @@ __INDEX_STYLES__</style>
         <a id="remove_eas_alert_link" class="baseline-only button-link" href="/?view=eas_alerts">Remove alert</a>
         <a id="back_to_eas_alerts" href="/?view=eas_alerts">Alert list</a>
       </div>
-      <div id="eas-alert-detail-result" class="message"></div>
+      <div id="eas-alert-detail-result" class="message" aria-live="polite"></div>
     </section>
   </div>
 

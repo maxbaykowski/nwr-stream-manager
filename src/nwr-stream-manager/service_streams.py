@@ -18,7 +18,7 @@ from .constants import (
 )
 from .eas_alerts import eas_recording_settings_from_stream
 from .stream_archive import stream_archive_settings_from_stream
-from .icecastauth import test_mountpoint_authentication
+from .icecastauth import IcecastAuthResult, test_mountpoint_authentication
 from .live_audio import LiveAudioSource
 from .models import WebStreamFallbackAction
 from .rtl import NWR_CENTER_FREQUENCY_HZ
@@ -30,6 +30,7 @@ from .stream_config import (
     icecast_auth_signature,
     mutable_stream_outputs,
     public_stream,
+    saved_icecast_address,
     remove_stream_configs,
     save_streams,
     soundcard_channels,
@@ -368,6 +369,28 @@ class StreamServiceMixin:
         output_id = str(payload.get("output_id", "")).strip()
         enabled = bool(payload.get("enabled", True))
         output_type = str(payload.get("type", "")).strip().lower()
+        tested = None
+        if output_type == "icecast" or not output_type:
+            with self.lock:
+                _stream, output = self._stream_output_locked(stream_id, output_id)
+                output_type = output_type or str(output.get("type", "icecast")).strip().lower()
+                if output_type == "icecast":
+                    icecast = validate_icecast_payload(payload.get("icecast"))
+                    self._reject_duplicate_icecast_locked(icecast, ignore_output_id=output_id)
+                    # Only a changed sign-in is tested, such as a new password or mountpoint: not
+                    # enabling or disabling, or other settings such as the bitrate.
+                    if icecast_auth_changed(output, icecast):
+                        tested = icecast_auth_signature(icecast)
+                        same_mountpoint = _same_mountpoint(output.get("icecast", {}), icecast)
+            if tested is not None:
+                # Not while holding the lock: a slow server would hold up everything else.
+                result = self._test_saved_icecast_auth(icecast, same_mountpoint)
+                if not result.success:
+                    return {
+                        "success": False,
+                        "message": result.message,
+                        "streams": list(self.streams),
+                    }
         with self.lock:
             stream, output = self._stream_output_locked(stream_id, output_id)
             output_type = output_type or str(output.get("type", "icecast")).strip().lower()
@@ -376,17 +399,16 @@ class StreamServiceMixin:
             if output_type == "icecast":
                 icecast = validate_icecast_payload(payload.get("icecast"))
                 self._reject_duplicate_icecast_locked(icecast, ignore_output_id=output_id)
-                must_test_auth = icecast_auth_changed(output, icecast)
-                if must_test_auth:
-                    result = test_mountpoint_authentication(icecast_auth_settings(icecast))
-                    if not result.success:
+                if icecast_auth_changed(output, icecast):
+                    if tested != icecast_auth_signature(icecast):
+                        # Changed again by someone else while it was being tested.
                         return {
                             "success": False,
-                            "message": result.message,
+                            "message": "This output's settings changed while they were being saved; try again.",
                             "streams": list(self.streams),
                         }
                     output["auth_validated_at"] = time.time()
-                    output["auth_signature"] = icecast_auth_signature(icecast)
+                    output["auth_signature"] = tested
                 output["icecast"] = icecast
             elif output_type == "soundcard":
                 soundcard = validate_soundcard_output_payload(payload.get("soundcard"))
@@ -409,6 +431,19 @@ class StreamServiceMixin:
             "streams": list(self.streams),
         }
 
+    def _test_saved_icecast_auth(self, icecast: dict[str, Any], same_mountpoint: bool) -> IcecastAuthResult:
+        result = test_mountpoint_authentication(icecast_auth_settings(icecast))
+        if not result.success and result.status_code == 403 and same_mountpoint:
+            # Icecast only says a mountpoint is in use once it's accepted the username and password,
+            # and an output saved on the mountpoint it's already on is most likely the one using it.
+            LOG.info("Icecast accepted the new sign-in for %s:%s%s, which is in use", icecast["host"], icecast["port"], icecast["mount"])
+            return IcecastAuthResult(True, "Icecast authentication successful.", 403)
+        if result.success:
+            LOG.info("Icecast authentication succeeded for %s:%s%s", icecast["host"], icecast["port"], icecast["mount"])
+        else:
+            LOG.warning("Icecast authentication failed for %s:%s%s: %s", icecast["host"], icecast["port"], icecast["mount"], result.message)
+        return result
+
     def add_stream_output(self, payload: dict[str, Any]) -> dict[str, Any]:
         stream_id = str(payload.get("stream_id", "")).strip()
         output_type = str(payload.get("type", "icecast")).strip().lower()
@@ -422,7 +457,11 @@ class StreamServiceMixin:
             else:
                 raise ValueError("stream output type is not supported")
         if output_type == "icecast":
-            result = self.test_icecast_auth(icecast)
+            auth_cache_key = icecast_auth_cache_key(icecast)
+            with self.lock:
+                auth_is_cached = self._icecast_auth_cached_locked(auth_cache_key)
+            # The page tests it a step before adding it, as adding a stream does.
+            result = {"success": True} if auth_is_cached else self.test_icecast_auth(icecast)
             if not result["success"]:
                 return {
                     "success": False,
@@ -670,3 +709,9 @@ class StreamServiceMixin:
             for stream_id, worker in self.stream_workers.items()
             if hasattr(worker, "signal_snapshot")
         }
+
+
+def _same_mountpoint(saved: dict[str, Any], icecast: dict[str, Any]) -> bool:
+    """Whether icecast is on the same server and mountpoint as saved settings, however they were written."""
+    before, after = saved_icecast_address(saved), saved_icecast_address(icecast)
+    return before is not None and after is not None and (before.host.lower(), before.port, before.mount) == (after.host.lower(), after.port, after.mount)

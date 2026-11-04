@@ -525,7 +525,13 @@ def icecast_auth_cache_key(icecast: dict[str, Any]) -> str:
 
 
 def icecast_auth_changed(output: dict[str, Any], icecast: dict[str, Any]) -> bool:
-    return output.get("auth_signature") != icecast_auth_signature(icecast)
+    """Whether icecast signs in differently from what was last tested. What was tested is read as it
+    would be saved now, so outputs saved by older versions, before addresses were cleaned on save or
+    TLS was kept, aren't taken as changed, and tested again against their own live mountpoint."""
+    saved = output.get("auth_signature")
+    if not isinstance(saved, dict):
+        return True
+    return icecast_auth_signature(saved) != icecast_auth_signature(icecast)
 
 
 def icecast_config_from_output(output: dict[str, Any]) -> IcecastConfig:

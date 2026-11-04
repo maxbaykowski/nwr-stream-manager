@@ -10,6 +10,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -349,6 +350,84 @@ class EasAlertTests(unittest.TestCase):
             self.assertTrue(response["success"])
             self.assertFalse(stream["outputs"][0]["enabled"])
 
+    def test_outputs_saved_by_older_versions_can_be_disabled_while_live(self) -> None:
+        web_control = self.web_control
+        service_streams = sys.modules["nwr_stream_manager.service_streams"]
+        # As saved before addresses were cleaned on save or TLS was kept.
+        old = [
+            ("http://audio1.broadcastify.com", 80, "/abc123", "custom", "mp3", 16),
+            ("wxradio.org", 8000, "/MI-WestOlive-WXN99", "nwrorg", "mp3", 32),
+        ]
+        outputs = []
+        for number, (host, port, mount, service_name, stream_format, bitrate) in enumerate(old):
+            password = "WxRadio2014" if service_name == "nwrorg" else "hackme"
+            outputs.append({
+                "id": f"icecast-{number}",
+                "enabled": True,
+                "type": "icecast",
+                "auth_signature": {"host": host, "port": port, "mount": mount, "username": "source", "password": password},
+                "icecast": {
+                    "service": service_name, "host": host, "port": port, "mount": mount, "username": "source", "password": password,
+                    "format": stream_format, "bitrate": bitrate, "sample_rate": 22050,
+                },
+            })
+        stream = {"id": "stream-1", "station": {"callsign": "WXN99"}, "outputs": outputs, "eas_recording": {"enabled": False}}
+        tested = []
+
+        def occupied(settings):
+            # The stream itself is on the mountpoint.
+            tested.append(settings)
+            return sys.modules["nwr_stream_manager.icecastauth"].IcecastAuthResult(False, "The Icecast mountpoint is already occupied.", 403)
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(service_streams, "test_mountpoint_authentication", occupied):
+            service = object.__new__(web_control.RtlControlService)
+            service.lock = web_control.threading.RLock()
+            service.streams_directory = Path(temp_dir) / "streams"
+            service.streams = [stream]
+            service._sync_stream_workers_locked = lambda: None
+            for output in outputs:
+                response = service.update_stream_output({
+                    "stream_id": "stream-1", "output_id": output["id"], "enabled": output["id"] != "icecast-0",
+                    "type": "icecast", "icecast": dict(output["icecast"]),
+                })
+                self.assertTrue(response["success"], response["message"])
+            self.assertEqual(tested, [])
+            self.assertFalse(outputs[0]["enabled"])
+            # A new password is tested. Icecast only says the mountpoint's in use once it's accepted the
+            # password, and it's in use by this output, so it's saved.
+            response = service.update_stream_output({
+                "stream_id": "stream-1", "output_id": "icecast-0", "enabled": False,
+                "type": "icecast", "icecast": {**outputs[0]["icecast"], "password": "different"},
+            })
+            self.assertTrue(response["success"], response["message"])
+            self.assertEqual(len(tested), 1)
+            self.assertEqual(outputs[0]["icecast"]["password"], "different")
+            # Saved again as it is, it isn't tested again.
+            service.update_stream_output({
+                "stream_id": "stream-1", "output_id": "icecast-1", "enabled": True, "type": "icecast", "icecast": dict(outputs[1]["icecast"]),
+            })
+            self.assertEqual(len(tested), 1)
+            # A mountpoint someone else is using isn't.
+            response = service.update_stream_output({
+                "stream_id": "stream-1", "output_id": "icecast-0", "enabled": False,
+                "type": "icecast", "icecast": {**outputs[0]["icecast"], "mount": "/someone-else"},
+            })
+            self.assertFalse(response["success"])
+            self.assertEqual(response["message"], "The Icecast mountpoint is already occupied.")
+            self.assertEqual(outputs[0]["icecast"]["mount"], "/abc123")
+
+        def refused(settings):
+            return sys.modules["nwr_stream_manager.icecastauth"].IcecastAuthResult(False, "Invalid Icecast username or password.", 401)
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(service_streams, "test_mountpoint_authentication", refused):
+            service.streams_directory = Path(temp_dir) / "streams"
+            response = service.update_stream_output({
+                "stream_id": "stream-1", "output_id": "icecast-0", "enabled": False,
+                "type": "icecast", "icecast": {**outputs[0]["icecast"], "password": "wrong"},
+            })
+            self.assertFalse(response["success"])
+            self.assertEqual(outputs[0]["icecast"]["password"], "different")
+
     def test_soundcard_output_can_be_removed_when_eas_output_remains(self) -> None:
         web_control = self.web_control
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -657,6 +736,7 @@ class EasAlertTests(unittest.TestCase):
             service.streams_directory = streams_dir
             service.streams = [stream]
             service.test_icecast_auth = lambda icecast: {"success": True, "message": "Authentication successful."}
+            service.icecast_auth_cache = {}
             service._sync_stream_workers_locked = lambda: None
 
             response = service.add_stream_output(

@@ -169,5 +169,6 @@ class FallbackServiceMixin:
         return self.stream_status()
 
     def fallback_settings_snapshot(self) -> WebFallbackSettings:
-        with self.lock:
-            return self.fallback_settings
+        # Without the lock: streams ask for every frame of fallback audio, which would stop while
+        # anything else held it. The settings are only ever replaced whole, never changed.
+        return self.fallback_settings
