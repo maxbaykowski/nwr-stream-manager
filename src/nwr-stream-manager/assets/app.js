@@ -10243,6 +10243,8 @@ function trapSameTestWarningFocus(event) {
 function guardSameTestWarningFocus(event) {
   const dialog = document.getElementById("same_test_warning_dialog");
   if (!dialog || dialog.hidden || dialog.contains(event.target)) return;
+  // Dialogs that open over it keep their focus.
+  if (event.target.closest && event.target.closest("#sign_in_alert_dialog, #server_unavailable_dialog")) return;
   event.preventDefault();
   focusSameTestWarningInitialControl();
 }
@@ -12353,8 +12355,111 @@ async function refresh() {
     throw error;
   }
   serverFailureCount = 0;
+  if (data.sign_in_alert) showSignInAlert();
   applyStatus(data, {syncControls: false, requestNumber});
 }
+
+// Someone got the password or code wrong too many times since the page was loaded. It's said over
+// whatever is on the page, rather than by loading it again, so nothing entered is lost.
+let signInAlertOpen = false;
+let signInAlertReturnFocus = null;
+
+function signInAlertModalTargets() {
+  return [
+    document.querySelector("header"),
+    document.querySelector("main"),
+    ...document.querySelectorAll(".global-status-banner, .notice-dialog, .same-alert-flash, #same_alert_live, #listening_status_live, #same_test_warning_dialog")
+  ].filter(Boolean);
+}
+
+function setSignInAlertModalOpen(open) {
+  for (const element of signInAlertModalTargets()) {
+    if ("inert" in element) element.inert = open;
+    if (open) element.setAttribute("aria-hidden", "true");
+    else element.removeAttribute("aria-hidden");
+  }
+  // Closed over the test warning, the page stays shut off behind that.
+  if (!open && !document.getElementById("same_test_warning_dialog").hidden) setSameTestWarningModalOpen(true);
+}
+
+async function showSignInAlert() {
+  if (signInAlertOpen) return;
+  signInAlertOpen = true;
+  let data;
+  try {
+    data = await request("/api/sign-in-alert", {cache: "no-store"});
+  } catch (error) {
+    signInAlertOpen = false;
+    return;
+  }
+  if (!data.waiting || serverUnavailable) {
+    signInAlertOpen = false;
+    return;
+  }
+  const dialog = document.getElementById("sign_in_alert_dialog");
+  document.getElementById("sign_in_alert_dialog_content").innerHTML = data.html;
+  dialog.dataset.upTo = String(data.up_to);
+  setHidden("sign_in_alert_dialog_message", true);
+  signInAlertReturnFocus = document.activeElement;
+  setSignInAlertModalOpen(true);
+  dialog.hidden = false;
+  document.getElementById("sign_in_alert_dialog_title").focus();
+}
+
+async function dismissSignInAlert() {
+  const dialog = document.getElementById("sign_in_alert_dialog");
+  const button = document.getElementById("sign_in_alert_dialog_continue");
+  button.disabled = true;
+  try {
+    await request("/api/sign-in-alert", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({up_to: Number(dialog.dataset.upTo || 0)})
+    });
+  } catch (error) {
+    setText("sign_in_alert_dialog_message", `Couldn't continue: ${error.message}`);
+    setHidden("sign_in_alert_dialog_message", false);
+    button.disabled = false;
+    return;
+  }
+  dialog.hidden = true;
+  button.disabled = false;
+  setSignInAlertModalOpen(false);
+  signInAlertOpen = false;
+  // Back to where they were, with everything as they left it.
+  if (signInAlertReturnFocus && signInAlertReturnFocus.isConnected && signInAlertReturnFocus !== document.body) {
+    signInAlertReturnFocus.focus();
+  }
+  signInAlertReturnFocus = null;
+}
+
+function trapSignInAlertFocus(event) {
+  if (event.key !== "Tab") return;
+  const dialog = document.getElementById("sign_in_alert_dialog");
+  const focusable = Array.from(dialog.querySelectorAll("a[href], button:not([disabled])"))
+    .filter(element => element.getClientRects().length > 0);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement) || document.activeElement.id === "sign_in_alert_dialog_title")) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+document.getElementById("sign_in_alert_dialog_continue").addEventListener("click", dismissSignInAlert);
+document.getElementById("sign_in_alert_dialog_content").addEventListener("click", async event => {
+  // Following one of its links, such as to change the password, counts as having been told.
+  const link = event.target.closest("a[href]");
+  if (!link) return;
+  event.preventDefault();
+  await dismissSignInAlert();
+  if (!signInAlertOpen) window.location.href = link.href;
+});
+document.getElementById("sign_in_alert_dialog").addEventListener("keydown", trapSignInAlertFocus);
 
 // The server says when SDR settings change, here or on a remote SDR's host or
 // another machine using it, so they show at once instead of at the next status check.
@@ -12461,7 +12566,7 @@ function serverUnavailableModalTargets() {
   return [
     document.querySelector("header"),
     document.querySelector("main"),
-    ...document.querySelectorAll(".global-status-banner, .notice-dialog, .same-alert-flash, #same_alert_live, #listening_status_live")
+    ...document.querySelectorAll(".global-status-banner, .notice-dialog, .same-alert-flash, #same_alert_live, #listening_status_live, #same_test_warning_dialog, #sign_in_alert_dialog")
   ].filter(Boolean);
 }
 

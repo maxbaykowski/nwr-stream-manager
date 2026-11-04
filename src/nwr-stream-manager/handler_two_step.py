@@ -318,7 +318,7 @@ class TwoStepHandlerMixin:
         if token:
             self.service.auth_sessions.pass_two_step(token)
         # Signed in now: a few wrong codes or passwords before it were most likely typing mistakes.
-        self.service.accounts.forget_few_sign_in_attempts(account.id)
+        self.service.accounts.forget_few_sign_in_attempts(account.id, self._visitor_host())
         if form.get("remember") == "1":
             device = self.service.accounts.remember_device(account.id)
             self._pending_device_cookie = (
@@ -347,7 +347,7 @@ class TwoStepHandlerMixin:
         if token:
             self.service.auth_sessions.pass_two_step(token)
         self._sign_out_other_sessions(account.id)
-        accounts.forget_few_sign_in_attempts(account.id)
+        accounts.forget_few_sign_in_attempts(account.id, self._visitor_host())
         LOG.info("%s set up two-step verification from %s with a setup code", account.username, self._client_address())
         self._send_page(self._render_two_step_page(account, "codes", codes=codes))
 

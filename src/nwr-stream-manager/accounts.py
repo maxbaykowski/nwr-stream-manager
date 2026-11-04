@@ -41,6 +41,9 @@ LOG = logging.getLogger(__name__)
 TWO_STEP_SETUP_SECONDS = 30 * 60
 # More wrong passwords or codes than this, and the account is told at its next sign-in (see handler_sign_in_alerts).
 SIGN_IN_ALERT_AFTER = 3
+# Once an account's been told, it isn't told again for this long, even if more come, so someone trying
+# from many addresses at once can't keep an alert in front of it. Any more are told together after.
+SIGN_IN_ALERT_QUIET_SECONDS = 3600
 # Wrong tries kept, oldest forgotten first, so a guesser can't fill the disk.
 SIGN_IN_ATTEMPTS_KEPT = 10_000
 SIGN_IN_ATTEMPTS_KEPT_SECONDS = 90 * 24 * 3600
@@ -407,7 +410,7 @@ class AccountStore:
             if record.id == int(requester_id):
                 raise ValueError("you cannot delete the account you are using")
             connection.execute("DELETE FROM accounts WHERE id = ?", (record.id,))
-            for table in ("two_step", "two_step_recovery", "two_step_setup_codes", "remembered_devices", "sign_in_attempts"):
+            for table in ("two_step", "two_step_recovery", "two_step_setup_codes", "remembered_devices", "sign_in_attempts", "sign_in_alerts_told"):
                 connection.execute(f"DELETE FROM {table} WHERE account_id = ?", (record.id,))
             connection.commit()
             return record.to_public_dict()
@@ -473,7 +476,9 @@ class AccountStore:
             if attempt is not None:
                 self.record_sign_in_attempt(str(username)[:64], int(row["id"]) if row is not None else None, "password", attempt)
             if wait:
-                LOG.warning("too many wrong passwords for %r; its next try has to wait %d seconds", str(username)[:64], wait)
+                # A username that isn't an account isn't written down: it could be a password typed in the wrong box.
+                who = repr(str(username)[:64]) if row is not None else "a username that isn't an account"
+                LOG.warning("too many wrong passwords for %s; its next try has to wait %d seconds", who, wait)
             return None
         with self.lock, self._connect() as connection:
             row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(row["id"]),)).fetchone()
@@ -546,6 +551,8 @@ class AccountStore:
                 )
                 """
             )
+            # When each account was last told about them.
+            connection.execute("CREATE TABLE IF NOT EXISTS sign_in_alerts_told (account_id INTEGER PRIMARY KEY, at REAL NOT NULL)")
             connection.commit()
 
     def start_two_step_setup(self, account_id: int) -> str:
@@ -716,6 +723,9 @@ class AccountStore:
     # -- wrong passwords and codes, for telling the account ----------------------
 
     def record_sign_in_attempt(self, username: str, account_id: int | None, kind: str, attempt: dict[str, str]) -> None:
+        if account_id is None:
+            # Not kept or logged: it could be a password typed in the wrong box, which every account can read in the log.
+            username = ""
         address = str(attempt.get("address", ""))[:64]
         user_agent = str(attempt.get("user_agent", ""))[:512]
         device = sign_in_alerts.describe_device(user_agent)
@@ -731,14 +741,24 @@ class AccountStore:
                 "DELETE FROM sign_in_attempts WHERE id <= (SELECT id FROM sign_in_attempts ORDER BY id DESC LIMIT 1 OFFSET ?)",
                 (SIGN_IN_ATTEMPTS_KEPT,),
             )
-            unseen = connection.execute(
-                "SELECT COUNT(*) FROM sign_in_attempts WHERE username = ? AND seen = 0", (username,)
-            ).fetchone()[0]
+            if account_id is not None:
+                unseen = connection.execute(
+                    "SELECT COUNT(*) FROM sign_in_attempts WHERE username = ? AND seen = 0", (username,)
+                ).fetchone()[0]
+            else:
+                # Usernames that aren't accounts add up together: someone guessing them tries each only once or twice.
+                unseen = connection.execute(
+                    "SELECT COUNT(*) FROM sign_in_attempts WHERE account_id IS NULL AND owner_seen = 0"
+                ).fetchone()[0]
             connection.commit()
         what = "wrong two-step verification code" if kind == "code" else "wrong password"
-        LOG.warning("%s for %r%s from %s, %s (%s)", what, username, "" if account_id is not None else " (not an account)", address, device, user_agent or "no user agent")
+        who = repr(username) if account_id is not None else "a username that isn't an account"
+        LOG.warning("%s for %s from %s, %s (%s)", what, who, address, device, user_agent or "no user agent")
         if unseen == SIGN_IN_ALERT_AFTER + 1:
-            LOG.warning("%r has had more than %d wrong passwords or codes; it'll be told when it next signs in", username, SIGN_IN_ALERT_AFTER)
+            if account_id is not None:
+                LOG.warning("%r has had more than %d wrong passwords or codes; it'll be told when it next signs in", username, SIGN_IN_ALERT_AFTER)
+            else:
+                LOG.warning("usernames that aren't accounts have had more than %d wrong passwords; the owner will be told when they next sign in", SIGN_IN_ALERT_AFTER)
         if place is None and self.on_sign_in_attempt is not None:
             self.on_sign_in_attempt(int(row_id), address)
 
@@ -749,8 +769,11 @@ class AccountStore:
 
     def sign_in_attempts_for(self, account: AccountRecord) -> dict[str, list[dict[str, Any]]]:
         """What the account hasn't been told: its own wrong tries, if there are more than a few,
-        and for the owner, other usernames' that are."""
+        and for the owner, other usernames' that are. Nothing while it's still quiet after the last time."""
         with self.lock, self._connect() as connection:
+            told = connection.execute("SELECT at FROM sign_in_alerts_told WHERE account_id = ?", (account.id,)).fetchone()
+            if told is not None and 0 <= time.time() - float(told["at"]) < SIGN_IN_ALERT_QUIET_SECONDS:
+                return {"own": [], "others": []}
             own = [dict(row) for row in connection.execute(
                 "SELECT * FROM sign_in_attempts WHERE account_id = ? AND seen = 0 ORDER BY id", (account.id,)
             ).fetchall()]
@@ -759,39 +782,78 @@ class AccountStore:
                 others = [dict(row) for row in connection.execute(
                     "SELECT * FROM sign_in_attempts WHERE (account_id IS NULL OR account_id != ?) AND owner_seen = 0 ORDER BY id", (account.id,)
                 ).fetchall()]
-        counts: dict[str, int] = {}
+        # Each other account's tries add up on their own, and usernames that aren't accounts all together.
+        counts: dict[str | None, int] = {}
         for row in others:
-            counts[row["username"]] = counts.get(row["username"], 0) + 1
+            key = _others_key(row)
+            counts[key] = counts.get(key, 0) + 1
         return {
             "own": own if len(own) > SIGN_IN_ALERT_AFTER else [],
-            "others": [row for row in others if counts[row["username"]] > SIGN_IN_ALERT_AFTER],
+            "others": [row for row in others if counts[_others_key(row)] > SIGN_IN_ALERT_AFTER],
         }
+
+    def sign_in_alert_waiting(self, account: AccountRecord) -> bool:
+        """Whether account has wrong tries to be told about, which the page asks every second, so
+        they're only counted, as sign_in_attempts_for would."""
+        with self.lock, self._connect() as connection:
+            told = connection.execute("SELECT at FROM sign_in_alerts_told WHERE account_id = ?", (account.id,)).fetchone()
+            if told is not None and 0 <= time.time() - float(told["at"]) < SIGN_IN_ALERT_QUIET_SECONDS:
+                return False
+            own = connection.execute("SELECT COUNT(*) FROM sign_in_attempts WHERE account_id = ? AND seen = 0", (account.id,)).fetchone()[0]
+            if own > SIGN_IN_ALERT_AFTER:
+                return True
+            if not account.is_owner:
+                return False
+            others = connection.execute(
+                """
+                SELECT 1 FROM sign_in_attempts WHERE (account_id IS NULL OR account_id != ?) AND owner_seen = 0
+                GROUP BY CASE WHEN account_id IS NULL THEN NULL ELSE username END HAVING COUNT(*) > ? LIMIT 1
+                """,
+                (account.id, SIGN_IN_ALERT_AFTER),
+            ).fetchone()
+            return others is not None
 
     def sign_in_attempts_seen(self, account: AccountRecord, up_to_id: int) -> None:
         """account has been told about every wrong try up to up_to_id."""
         with self.lock, self._connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO sign_in_alerts_told (account_id, at) VALUES (?, ?)", (account.id, time.time()))
             connection.execute("UPDATE sign_in_attempts SET seen = 1 WHERE account_id = ? AND id <= ?", (account.id, int(up_to_id)))
             if account.is_owner:
-                # Only the usernames the owner was shown: ones with only a few go on adding up.
+                # Only the accounts the owner was shown: ones with only a few go on adding up, as do
+                # usernames that aren't accounts while there are only a few of them.
                 connection.execute(
                     """
                     UPDATE sign_in_attempts SET owner_seen = 1
-                    WHERE (account_id IS NULL OR account_id != ?) AND owner_seen = 0 AND id <= ? AND username IN (
+                    WHERE account_id IS NOT NULL AND account_id != ? AND owner_seen = 0 AND id <= ? AND username IN (
                         SELECT username FROM sign_in_attempts
-                        WHERE (account_id IS NULL OR account_id != ?) AND owner_seen = 0 AND id <= ?
+                        WHERE account_id IS NOT NULL AND account_id != ? AND owner_seen = 0 AND id <= ?
                         GROUP BY username HAVING COUNT(*) > ?
                     )
                     """,
                     (account.id, int(up_to_id), account.id, int(up_to_id), SIGN_IN_ALERT_AFTER),
                 )
+                connection.execute(
+                    """
+                    UPDATE sign_in_attempts SET owner_seen = 1
+                    WHERE account_id IS NULL AND owner_seen = 0 AND id <= ? AND (
+                        SELECT COUNT(*) FROM sign_in_attempts WHERE account_id IS NULL AND owner_seen = 0 AND id <= ?
+                    ) > ?
+                    """,
+                    (int(up_to_id), int(up_to_id), SIGN_IN_ALERT_AFTER),
+                )
             connection.commit()
 
-    def forget_few_sign_in_attempts(self, account_id: int) -> None:
-        """At sign-in, a few wrong tries aren't worth telling: likely typing mistakes."""
+    def forget_few_sign_in_attempts(self, account_id: int, address: str) -> None:
+        """At sign-in, a few wrong tries from the same address aren't worth telling: likely typing
+        mistakes. Ones from anywhere else go on adding up, so signing in on another device doesn't
+        hide them."""
         with self.lock, self._connect() as connection:
             unseen = connection.execute("SELECT COUNT(*) FROM sign_in_attempts WHERE account_id = ? AND seen = 0", (int(account_id),)).fetchone()[0]
             if 0 < unseen <= SIGN_IN_ALERT_AFTER:
-                connection.execute("UPDATE sign_in_attempts SET seen = 1 WHERE account_id = ? AND seen = 0", (int(account_id),))
+                connection.execute(
+                    "UPDATE sign_in_attempts SET seen = 1 WHERE account_id = ? AND seen = 0 AND address = ?",
+                    (int(account_id), str(address)[:64]),
+                )
                 connection.commit()
 
     def touch_account_access(self, account_id: int, *, minimum_interval_seconds: float = 300.0) -> None:
@@ -807,6 +869,11 @@ class AccountStore:
             if last_accessed_at is None or now - float(last_accessed_at) >= minimum_interval_seconds:
                 connection.execute("UPDATE accounts SET last_accessed_at = ? WHERE id = ?", (now, int(account_id)))
                 connection.commit()
+
+
+def _others_key(row: dict[str, Any]) -> str | None:
+    """What the owner's told about another account's wrong tries by: its username, or None for usernames that aren't accounts."""
+    return row["username"] if row["account_id"] is not None else None
 
 
 def _token_hash(token: str) -> str:

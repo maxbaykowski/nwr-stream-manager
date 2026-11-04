@@ -854,7 +854,12 @@ class RtlControlHandler(
     @route("GET", DASHBOARD_PARTS_PATH)
     def _get_dashboard_parts(self, parsed: ParseResult) -> None:
         # For pages without the page script that can still update the dashboard as it changes.
-        self._send_json(self._dashboard_parts(self._current_account_is_read_only()))
+        parts = self._dashboard_parts(self._current_account_is_read_only())
+        account = getattr(self, "current_account", None)
+        if isinstance(account, AccountRecord):
+            # Wrong passwords or codes since the page was loaded: loading it again tells the account.
+            parts["sign_in_alert"] = self.service.accounts.sign_in_alert_waiting(account)
+        self._send_json(parts)
 
     @route("GET", "/api/status")
     def _get_status(self, parsed: ParseResult) -> None:
@@ -865,6 +870,8 @@ class RtlControlHandler(
         response = self.service.status(read_only=read_only)
         if isinstance(account, AccountRecord):
             response["account"] = account.to_public_dict()
+            # Wrong passwords or codes since the page was loaded: loading it again tells the account.
+            response["sign_in_alert"] = self.service.accounts.sign_in_alert_waiting(account)
             if account.is_read_only:
                 response["iq_recorder"] = self.service.redacted_iq_recorder_status()
         self._send_json(response)

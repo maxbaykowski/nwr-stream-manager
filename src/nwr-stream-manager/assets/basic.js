@@ -264,7 +264,15 @@
       request.onreadystatechange = function () {
         if (request.readyState !== 4) return;
         try {
-          if (request.status === 200) apply(JSON.parse(request.responseText));
+          if (request.status === 200) {
+            var parts = JSON.parse(request.responseText);
+            // Someone got the password or code wrong too many times: loading the page again says so.
+            if (parts.sign_in_alert) {
+              window.location.reload();
+              return;
+            }
+            apply(parts);
+          }
         } catch (error) {}
         setTimeout(update, 5000);
       };

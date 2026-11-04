@@ -28,6 +28,7 @@ from .baseline_pages import (
     SIGN_IN_REQUIRED_HTML,
     STREAM_ARCHIVE_DOWNLOAD_PATH,
     STREAM_ARCHIVE_PLAY_PATH,
+    SIGN_IN_ALERT_API_PATH,
     SIGN_IN_ALERT_PATH,
     TAILSCALE_SETTINGS_PATH,
     TWO_STEP_PATH,
@@ -192,10 +193,10 @@ class AuthHandlerMixin:
         if not self._two_step_ok_or_response(path, method, account):
             return False
         if getattr(self, "_new_auth_session", False) and not getattr(self, "_two_step_code_pending", False) and not getattr(self, "_two_step_setup_only", False):
-            # Signed in, two-step verification included: a few wrong passwords or codes before it
-            # were most likely typing mistakes. Not before then, or someone with the password could
+            # Signed in, two-step verification included: a few wrong passwords or codes before it,
+            # from the same address, were most likely typing mistakes. Not before then, or someone with the password could
             # start session after session, and their wrong codes would never add up.
-            self.service.accounts.forget_few_sign_in_attempts(account.id)
+            self.service.accounts.forget_few_sign_in_attempts(account.id, self._visitor_host())
         # Told about wrong passwords and codes since it last signed in, before anything else.
         if not self._sign_in_alert_or_continue(path, method, account):
             return False
@@ -281,6 +282,7 @@ class AuthHandlerMixin:
                 "/api/logs",
                 "/api/account/me",
                 TWO_STEP_PATH,
+                SIGN_IN_ALERT_API_PATH,
             }
         if method == "POST":
             return path in {
@@ -295,6 +297,7 @@ class AuthHandlerMixin:
                 "/api/account/password",
                 TWO_STEP_PATH,
                 SIGN_IN_ALERT_PATH,
+                SIGN_IN_ALERT_API_PATH,
             }
         return False
 

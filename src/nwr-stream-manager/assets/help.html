@@ -910,8 +910,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>If someone has lost their phone and has no recovery codes left, you can create a setup code for them if you're the owner. After their password, they enter it in place of a code, and set up their new phone; the lost phone's codes stop working. From the local network, you can also turn two-step verification off for them instead, on your own Two-step verification page.</p>
   <p><strong>Note</strong>: If you are the owner and you lose your phone, however, your only way out is your recovery codes or local network access. Lose both of those, and you're out of luck.</p>
   <h3 id="sign-in-alerts">Sign-in alerts</h3>
-  <p>NWR Stream Manager keeps track of every incorrect attempt to access someone's account, as well as every incorrect two-step verification code for each account. If there are more than 3 incorrect attempts, a page saying so appears upon the next successful sign-in to the account in question. Select <strong>Continue</strong> to go on.</p>
-  <p>For each address the attempts came from, the page says:</p>
+  <p>NWR Stream Manager keeps track of every incorrect attempt to access someone's account, as well as every incorrect two-step verification code for each account. If there are more than 3 incorrect attempts, a page saying so appears upon the next successful sign-in to the account in question. Anywhere the account is already signed in, it appears within a few seconds over whatever page is open, without losing anything you've entered, or in browsers without JavaScript, the next time a page is loaded. Select <strong>Continue</strong> to go on. So that someone trying from many addresses at once can't keep the page in front of you, it doesn't appear again for an hour after you continue; any attempts during that hour are shown together after it.</p>
+  <p>For each address the attempts came from, up to the latest 10, the page says:</p>
   <ul>
     <li>How many wrong passwords and codes came from it, and when.</li>
     <li>The IP address itself.</li>
@@ -919,7 +919,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     <li>What kind of device it was, such as an Apple iPhone with Safari, a Windows computer with Chrome, or a program rather than a web browser. NWR Stream Manager logs whatever the device says it is, which attackers can change.</li>
   </ul>
   <p><strong>Note</strong>: A wrong two-step verification code means whoever tried to access your account successfully guessed your password. If this happens, change your password immediately.</p>
-  <p>The owner is also notified about more than 3 incorrect passwords for any other account, even if it isn't their own, as well as usernames that are invalid, such as admin, which bots often try. Everything is also written to the <a href="#logs">log</a>, and the details are kept for 90 days.</p>
+  <p>The owner is also notified about more than 3 incorrect passwords for any other account, even if it isn't their own, as well as usernames that are invalid, such as admin, which bots often try. Invalid usernames are counted together, since someone guessing them usually tries each one only once. Everything is also written to the <a href="#logs">log</a>, and the details are kept for 90 days.</p>
 </section>
 
 <section aria-labelledby="storage">
