@@ -46,6 +46,9 @@ nav a[aria-current="page"], nav button[aria-current="page"] { border-color: #255
 .js-app .nav-more-menu { position: absolute; right: 0; z-index: 15; display: grid; gap: 4px; min-width: 230px; margin-top: 6px; padding: 6px; border: 1px solid #b9c0cc; border-radius: 6px; background: #fff; box-shadow: 0 8px 18px rgb(20 24 31 / 18%); }
 .js-app .nav-more-menu[hidden] { display: none; }
 .js-app .nav-more-menu a { border: 0; border-radius: 4px; }
+.nav-sign-out { display: inline; margin: 0; }
+.js-app .nav-sign-out { display: block; }
+.js-app .nav-more-menu .nav-sign-out button { width: 100%; border: 0; border-radius: 4px; text-align: left; }
 .view[hidden] { display: none; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; min-width: 0; }
 .row { display: flex; align-items: center; gap: 10px; min-width: 0; }

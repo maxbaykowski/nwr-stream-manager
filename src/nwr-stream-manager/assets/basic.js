@@ -208,6 +208,11 @@
       request.open("GET", "/api/remote-sdr?time=" + new Date().getTime(), true);
       request.onreadystatechange = function () {
         if (request.readyState !== 4) return;
+        // Signed out: loading the page again goes to the sign-in page.
+        if (request.status === 401) {
+          window.location.reload();
+          return;
+        }
         var pairing = null;
         try {
           if (request.status === 200) pairing = JSON.parse(request.responseText).sharing.pairing;
@@ -263,6 +268,11 @@
       request.open("GET", "/dashboard/parts?time=" + new Date().getTime(), true);
       request.onreadystatechange = function () {
         if (request.readyState !== 4) return;
+        // Signed out: loading the page again goes to the sign-in page.
+        if (request.status === 401) {
+          window.location.reload();
+          return;
+        }
         try {
           if (request.status === 200) {
             var parts = JSON.parse(request.responseText);
@@ -350,6 +360,11 @@
       request.open("GET", "/api/iq-recorder/status?time=" + new Date().getTime(), true);
       request.onreadystatechange = function () {
         if (request.readyState !== 4) return;
+        // Signed out: loading the page again goes to the sign-in page.
+        if (request.status === 401) {
+          window.location.reload();
+          return;
+        }
         var status = null;
         try {
           if (request.status === 200) status = JSON.parse(request.responseText);

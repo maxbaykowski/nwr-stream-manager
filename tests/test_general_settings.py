@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode
 
+from signing_in import session_cookie
 from test_auth import load_web_control_module
 from test_page_rendering import StandInService
 
@@ -229,7 +230,8 @@ class GeneralPageTests(unittest.TestCase):
         self.addCleanup(connection.close)
         headers = {}
         if user:
-            headers["Authorization"] = "Basic " + base64.b64encode(":".join(user).encode()).decode()
+            # Signed in as user, as long as the password's right.
+            cookie = "; ".join(part for part in (cookie, session_cookie(self.service, *user)) if part)
         body = None
         if fields is not None:
             body = urlencode(fields)
@@ -288,7 +290,7 @@ class GeneralPageTests(unittest.TestCase):
 
         response, page = self.request("POST", "/general-settings", admin, {**fields, "instance_name": "x" * 65}, cookie)
         self.assertEqual(response.status, 400)
-        self.assertEqual(self.title(page), "Error: The instance name can be up to 64 characters long. - General - Settings - Kitchen &lt;Pi&gt;")
+        self.assertEqual(self.title(page), "General - Settings - Kitchen &lt;Pi&gt;")
         self.assertRegex(page, r'<input id="general_instance_name" [^>]*value="x{65}">')
 
     def test_read_only_accounts_cannot_change_it_and_signed_out_pages_dont_show_it(self) -> None:

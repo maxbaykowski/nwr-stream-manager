@@ -29,6 +29,10 @@ __INDEX_STYLES__</style>
           <a id="nav_change_password" href="/?view=change_password" data-view="change_password" hidden>Change account password</a>
           <a id="nav_two_step" href="/two-step">Two-step verification</a>
           <a id="nav_restart" href="/?view=restart" hidden>Restart NWR Stream Manager</a>
+          <form id="nav_sign_out_form" class="nav-sign-out" method="post" action="/sign-out">
+            __FORM_TOKEN_INPUT__
+            <button id="nav_sign_out" type="submit">Sign out</button>
+          </form>
         </span>
       </span>
     </nav>

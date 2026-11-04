@@ -15,6 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
+from signing_in import session_cookie
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_PATH = REPO_ROOT / "src" / "nwr-stream-manager"
@@ -1681,7 +1683,7 @@ class RemoteSdrServiceTests(unittest.TestCase):
             f"Host: 127.0.0.1:{server.server_address[1]}\r\n"
             "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
             f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}\r\n"
-            f"Authorization: Basic {base64.b64encode(b'tester:password123').decode()}\r\n\r\n"
+            f"Cookie: {session_cookie(service, 'tester')}\r\n\r\n"
         ).encode())
         reader = sock.makefile("rb")
         self.assertIn(b" 101 ", reader.readline())
@@ -1727,7 +1729,7 @@ class RemoteSdrServiceTests(unittest.TestCase):
             f"Host: 127.0.0.1:{server.server_address[1]}\r\n"
             "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
             f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}\r\n"
-            f"Authorization: Basic {base64.b64encode(b'tester:password123').decode()}\r\n\r\n"
+            f"Cookie: {session_cookie(server.RequestHandlerClass.service, 'tester')}\r\n\r\n"
         ).encode())
         reader = sock.makefile("rb")
         self.assertIn(b" 101 ", reader.readline())
@@ -1817,8 +1819,7 @@ class RemoteSdrServiceTests(unittest.TestCase):
         server = wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)
-        import base64
-        auth = "Basic " + base64.b64encode(b"tester:password123").decode()
+        auth = session_cookie(service, "tester")
 
         def call(method: str, path: str, payload=None):
             data = None if payload is None else json.dumps(payload).encode()
@@ -1826,7 +1827,7 @@ class RemoteSdrServiceTests(unittest.TestCase):
                 f"http://127.0.0.1:{server.server_address[1]}{path}",
                 data=data,
                 method=method,
-                headers={"Authorization": auth, "Content-Type": "application/json"},
+                headers={"Cookie": auth, "Content-Type": "application/json"},
             )
             try:
                 with urllib.request.urlopen(request, timeout=10) as response:

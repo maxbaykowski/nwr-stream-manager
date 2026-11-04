@@ -19,6 +19,7 @@ from urllib.parse import urlencode
 
 import pytest
 
+from signing_in import needs_sign_in
 from test_auth import load_web_control_module
 from test_page_rendering import StandInService
 
@@ -211,7 +212,7 @@ class AccountTwoStepTests(unittest.TestCase):
         self.addCleanup(tempdir.cleanup)
         self.accounts = self.wc.AccountStore(Path(tempdir.name) / "accounts.db")
         self.accounts.create_admin("owner", "password1", "password1")
-        self.owner = self.accounts.verify_basic_account("owner", "password1")
+        self.owner = self.accounts.verify_password("owner", "password1")
 
     def enable(self) -> tuple[str, list[str]]:
         secret = self.accounts.start_two_step_setup(self.owner.id)
@@ -309,16 +310,36 @@ class AccountTwoStepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as other:
             self.assertNotEqual(self.wc.AccountStore(Path(other) / "accounts.db").cookie_id, cookie_id)
 
-    def test_remembered_devices_are_forgotten_when_the_password_changes(self) -> None:
-        self.enable()
-        token = self.accounts.remember_device(self.owner.id)
-        self.assertTrue(self.accounts.device_remembered(self.owner.id, token))
-        self.assertFalse(self.accounts.device_remembered(self.owner.id + 1, token))
-        self.accounts.change_password(self.owner.id, "password1", "password2", "password2")
-        self.assertFalse(self.accounts.device_remembered(self.owner.id, token))
-        token = self.accounts.remember_device(self.owner.id)
-        self.accounts.disable_two_step(self.owner.id)
-        self.assertFalse(self.accounts.device_remembered(self.owner.id, token))
+    def test_a_remembered_session_lasts_30_days_until_its_signed_out(self) -> None:
+        sessions = self.wc.AuthSessionStore(connect=self.accounts._connect)
+        token = sessions.create(self.owner.id, remember=True)
+        # Asked for, but not until it's signed in, two-step verification included.
+        self.assertTrue(sessions.remember_wanted(token))
+        # Until then, only until the browser is quit.
+        self.assertNotIn("Max-Age", sessions.cookie_header("session", token))
+        sessions.remember(token)
+        self.assertFalse(sessions.remember_wanted(token))
+        self.assertRegex(sessions.cookie_header("session", token), r"Max-Age=259\d{4};")
+        expires = next(iter(sessions.sessions.values())).expires_at
+        self.assertAlmostEqual(expires - time.time(), 30 * 24 * 3600, delta=5)
+        # Using it doesn't make it last longer than 30 days from signing in.
+        sessions.validate(token)
+        self.assertEqual(next(iter(sessions.sessions.values())).expires_at, expires)
+        # Still remembered after a restart.
+        restarted = self.wc.AuthSessionStore(connect=self.accounts._connect)
+        self.assertRegex(restarted.cookie_header("session", token), r"Max-Age=259\d{4};")
+        # Forgetting remembered devices signs out the others, and this one is only signed in as usual.
+        other = restarted.create(self.owner.id)
+        restarted.remember(other)
+        restarted.forget_remembered(self.owner.id, keep=token)
+        self.assertTrue(restarted.validate(token))
+        self.assertFalse(restarted.validate(other))
+        self.assertNotIn("Max-Age", restarted.cookie_header("session", token))
+        # A password change, which signs out every session, signs out a remembered one too.
+        again = restarted.create(self.owner.id)
+        restarted.remember(again)
+        restarted.invalidate_account(self.owner.id)
+        self.assertFalse(restarted.validate(again))
 
 
 class TwoStepPageTests(unittest.TestCase):
@@ -334,7 +355,7 @@ class TwoStepPageTests(unittest.TestCase):
         self.addCleanup(tempdir.cleanup)
         self.accounts = self.wc.AccountStore(Path(tempdir.name) / "accounts.db")
         self.accounts.create_admin("owner", "password1", "password1")
-        self.owner = self.accounts.verify_basic_account("owner", "password1")
+        self.owner = self.accounts.verify_password("owner", "password1")
         service = StandInService(accounts=self.accounts, auth_sessions=self.wc.AuthSessionStore(), instance_id="run1")
         handler = type("TwoStepTestHandler", (self.wc.RtlControlHandler,), {"service": service})
         server = self.wc.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -345,11 +366,30 @@ class TwoStepPageTests(unittest.TestCase):
         self.cookies: dict[str, str] = {}
 
     def send(self, method, path, form=None, auth=True, user=("owner", "password1")):
+        response, page = self.exchange(method, path, form)
+        if auth and needs_sign_in(response):
+            # Signed in on the sign-in page, as a browser would be sent to, then again.
+            self.exchange("GET", "/sign-in")
+            form_token = self.cookies.get(f"nwrstmgr_form_{self.service_cookie_id()}", "")
+            sign_in = {"form_token": form_token, "username": user[0], "password": user[1]}
+            if getattr(self, "remember", False):
+                sign_in["remember"] = "1"
+            self.sign_in_response = self.exchange("POST", "/sign-in", sign_in)[0]
+            response, page = self.exchange(method, path, form)
+        return response, page
+
+    def service_cookie_id(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/sign-in")
+        response = connection.getresponse()
+        response.read()
+        return re.search(r"nwrstmgr_form_(\w+)=", response.getheader("Set-Cookie")).group(1)
+
+    def exchange(self, method, path, form=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         self.addCleanup(connection.close)
         headers = {"Cookie": "; ".join(f"{name}={value}" for name, value in self.cookies.items())}
-        if auth:
-            headers["Authorization"] = "Basic " + base64.b64encode(f"{user[0]}:{user[1]}".encode()).decode()
         body = None
         if form is not None:
             body = urlencode(form)
@@ -374,6 +414,8 @@ class TwoStepPageTests(unittest.TestCase):
         self.assertEqual(response.status, 403)
         self.assertTrue(self.shown(page, "two_step_unavailable"))
         self.assertIn("Accessing NWR Stream Manager over the public internet requires two-step verification to be enabled on your account.", page)
+        # Another account can sign in instead.
+        self.assertIn('<form id="two_step_sign_out" class="sign-out" method="post" action="/sign-out">', page)
         # No one can give the owner a setup code.
         self.assertRegex(page, r'<span id="two_step_unavailable_setup_code" hidden')
         response, body = self.send("GET", "/api/status")
@@ -386,6 +428,7 @@ class TwoStepPageTests(unittest.TestCase):
 
     @pytest.mark.real_local_network
     def test_from_outside_the_code_is_asked_for_then_remembered(self) -> None:
+        self.remember = True  # ticked on the sign-in page
         secret = self.accounts.start_two_step_setup(self.owner.id)
         self.accounts.enable_two_step(self.owner.id, secret, self.two_step.code_at(secret, self.two_step.current_step() - 1))
         response, page = self.send("GET", "/?view=logs")
@@ -400,11 +443,11 @@ class TwoStepPageTests(unittest.TestCase):
         self.assertEqual(response.status, 403)
         self.assertTrue(self.accounts.two_step_enabled(self.owner.id))
         code = self.two_step.code_at(secret, self.two_step.current_step())
-        form = {"form_token": self.token(page), "action": "verify", "code": code, "next": "/?view=logs", "remember": "1"}
+        form = {"form_token": self.token(page), "action": "verify", "code": code, "next": "/?view=logs"}
         response, _page = self.send("POST", "/two-step", form)
         self.assertEqual((response.status, response.getheader("Location")), (303, "/?view=logs"))
-        device_cookie = f"nwrstmgr_device_{self.accounts.cookie_id}"
-        self.assertIn(device_cookie, self.cookies)
+        # Remember this device was ticked on the sign-in page: now the code's right, it's remembered.
+        self.assertRegex(response.getheader("Set-Cookie"), rf"nwrstmgr_session_{self.accounts.cookie_id}=[^;]+; Max-Age=259\d{{4}};")
         response, _page = self.send("GET", "/")
         self.assertEqual(response.status, 200)
         # Changes need the local network, even then.
@@ -412,15 +455,11 @@ class TwoStepPageTests(unittest.TestCase):
         response, page = self.send("POST", "/two-step", {"form_token": self.token(page), "action": "disable", "confirmed": "1"})
         self.assertEqual(response.status, 403)
         self.assertIn("local network", html.unescape(page))
-        # A new session on the remembered device isn't asked again.
-        self.cookies = {device_cookie: self.cookies[device_cookie]}
-        response, _page = self.send("GET", "/")
-        self.assertEqual(response.status, 200)
-        self.assertNotIn("two_step_verify", _page)
-        # Without it, it is.
+        # Another browser signs in, code and all: being remembered is the session itself.
         self.cookies = {}
         response, page = self.send("GET", "/")
         self.assertTrue(self.shown(page, "two_step_verify"))
+        self.assertNotIn('name="remember"', page)
 
     @pytest.mark.real_local_network
     def test_a_notification_link_from_outside_goes_through_after_the_code(self) -> None:
@@ -449,7 +488,7 @@ class TwoStepPageTests(unittest.TestCase):
         self.assertIn('<h2 id="two_step_verify_title">Enter your setup code</h2>', page)
         self.assertIn("You are accessing NWR Stream Manager via the public internet. Enter your setup code. If you didn't get a setup code, ask the owner for it.", html.unescape(page))
         self.assertIn('<span id="two_step_code_label">Setup code</span>', page)
-        self.assertRegex(page, r'<label id="two_step_remember_row" class="checkbox-row" hidden')
+        self.assertNotIn('name="remember"', page)
         response, page = self.send("POST", "/two-step", {"form_token": self.token(page), "action": "verify", "code": "aaaaa-bbbbb"}, user=someone)
         self.assertEqual(response.status, 400)
         self.assertIn("That setup code isn't right.", html.unescape(page))
@@ -538,6 +577,29 @@ class TwoStepPageTests(unittest.TestCase):
         for port in (first_port, other_port):
             self.port = port
             self.assertEqual(self.send("GET", "/", auth=False)[0].status, 200)
+
+    def test_on_the_local_network_a_remembered_sign_in_needs_only_the_password(self) -> None:
+        # Even with two-step verification on.
+        secret = self.accounts.start_two_step_setup(self.owner.id)
+        self.accounts.enable_two_step(self.owner.id, secret, self.two_step.code_at(secret, self.two_step.current_step() - 1))
+        self.remember = True
+        response, page = self.send("GET", "/")
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("two_step_verify", page)
+        self.assertRegex(self.sign_in_response.getheader("Set-Cookie"), r"Max-Age=259\d{4};")
+
+    def test_without_it_a_remembered_sign_in_needs_only_the_password_here(self) -> None:
+        self.remember = True
+        response, _page = self.send("GET", "/")
+        self.assertEqual(response.status, 200)
+        self.assertRegex(self.sign_in_response.getheader("Set-Cookie"), r"Max-Age=259\d{4};")
+
+    def test_a_temporary_password_isnt_remembered(self) -> None:
+        # It has to be changed first, which signs it out.
+        _account, password = self.accounts.create_account("someone", False)
+        self.remember = True
+        self.send("GET", "/", user=("someone", password))
+        self.assertNotIn("Max-Age", self.sign_in_response.getheader("Set-Cookie"))
 
     def test_on_the_local_network_its_set_up_and_turned_off(self) -> None:
         response, page = self.send("GET", "/")

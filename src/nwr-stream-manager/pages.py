@@ -55,6 +55,11 @@ def change_password_page() -> str:
     return assemble("change_password.html")
 
 
+def sign_in_page() -> str:
+    """Signing in, with a username and password."""
+    return assemble("sign_in.html")
+
+
 def two_step_page() -> str:
     """Two-step verification: asking for the code, and setting it up."""
     return assemble("two_step.html")

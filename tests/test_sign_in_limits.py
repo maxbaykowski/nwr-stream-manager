@@ -10,6 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from signing_in import sign_in
 from test_auth import load_web_control_module
 from test_restart import RestartPageTests
 
@@ -142,17 +143,17 @@ class AccountSignInLimitTests(unittest.TestCase):
     def test_the_right_password_waits_too(self) -> None:
         with self.assertLogs("nwr_stream_manager", level="WARNING") as logs:
             for i in range(5):
-                self.assertIsNone(self.store.verify_basic_account("owner", f"wrong{i}"))
+                self.assertIsNone(self.store.verify_password("owner", f"wrong{i}"))
         self.assertIn("too many wrong passwords for 'owner'", logs.output[0])
         with self.assertRaises(self.limits_module.SignInWait):
-            self.store.verify_basic_account("owner", "password1")
+            self.store.verify_password("owner", "password1")
         self.clock.now += 5
-        self.assertIsNotNone(self.store.verify_basic_account("owner", "password1"))
+        self.assertIsNotNone(self.store.verify_password("owner", "password1"))
         # Signing in doesn't give a guesser their free tries back.
         with self.assertLogs("nwr_stream_manager", level="WARNING"):
-            self.assertIsNone(self.store.verify_basic_account("owner", "again"))
+            self.assertIsNone(self.store.verify_password("owner", "again"))
         with self.assertRaises(self.limits_module.SignInWait):
-            self.store.verify_basic_account("owner", "password1")
+            self.store.verify_password("owner", "password1")
 
     def at_once(self, count: int, attempt) -> tuple[int, int]:
         """Makes count tries at the same moment: how many were checked, and how many were made to wait."""
@@ -176,11 +177,11 @@ class AccountSignInLimitTests(unittest.TestCase):
 
     def test_wrong_passwords_sent_at_once_are_counted_one_after_another(self) -> None:
         with self.assertLogs("nwr_stream_manager", level="WARNING"):
-            self.assertEqual(self.at_once(30, lambda number: self.store.verify_basic_account("owner", f"wrong{number}")), (5, 25))
+            self.assertEqual(self.at_once(30, lambda number: self.store.verify_password("owner", f"wrong{number}")), (5, 25))
 
     def test_wrong_codes_sent_at_once_are_counted_one_after_another(self) -> None:
         two_step = sys.modules["nwr_stream_manager.two_step"]
-        owner = self.store.verify_basic_account("owner", "password1")
+        owner = self.store.verify_password("owner", "password1")
         secret = self.store.start_two_step_setup(owner.id)
         self.store.enable_two_step(owner.id, secret, two_step.code_at(secret, two_step.current_step() - 1))
         right = {two_step.code_at(secret, two_step.current_step() + offset) for offset in (-1, 0, 1)}
@@ -191,19 +192,19 @@ class AccountSignInLimitTests(unittest.TestCase):
     def test_usernames_that_dont_exist_are_limited_the_same(self) -> None:
         with self.assertLogs("nwr_stream_manager", level="WARNING"):
             for i in range(5):
-                self.assertIsNone(self.store.verify_basic_account("nobody", f"wrong{i}"))
+                self.assertIsNone(self.store.verify_password("nobody", f"wrong{i}"))
         with self.assertRaises(self.limits_module.SignInWait):
-            self.store.verify_basic_account("nobody", "password1")
-        self.assertIsNotNone(self.store.verify_basic_account("owner", "password1"))
+            self.store.verify_password("nobody", "password1")
+        self.assertIsNotNone(self.store.verify_password("owner", "password1"))
 
     def test_a_new_password_works_even_if_it_was_once_wrong(self) -> None:
-        self.assertIsNone(self.store.verify_basic_account("owner", "password2"))
-        account = self.store.verify_basic_account("owner", "password1")
+        self.assertIsNone(self.store.verify_password("owner", "password2"))
+        account = self.store.verify_password("owner", "password1")
         self.store.change_password(account.id, "password1", "password2", "password2")
-        self.assertIsNotNone(self.store.verify_basic_account("owner", "password2"))
+        self.assertIsNotNone(self.store.verify_password("owner", "password2"))
 
     def test_changing_a_password_limits_guesses_at_the_current_one(self) -> None:
-        account = self.store.verify_basic_account("owner", "password1")
+        account = self.store.verify_password("owner", "password1")
         with self.assertLogs("nwr_stream_manager", level="WARNING"):
             for i in range(5):
                 with self.assertRaisesRegex(ValueError, "current password is incorrect"):
@@ -213,10 +214,10 @@ class AccountSignInLimitTests(unittest.TestCase):
             self.store.change_password(account.id, "password1", "password2", "password2")
         self.assertIn("Try again in 5 seconds", str(raised.exception))
         with self.assertRaises(self.limits_module.SignInWait):
-            self.store.verify_basic_account("owner", "password1")
+            self.store.verify_password("owner", "password1")
         self.clock.now += 5
         self.store.change_password(account.id, "password1", "password2", "password2")
-        self.assertIsNotNone(self.store.verify_basic_account("owner", "password2"))
+        self.assertIsNotNone(self.store.verify_password("owner", "password2"))
 
 
 class SignInWaitPageTests(unittest.TestCase):
@@ -231,31 +232,25 @@ class SignInWaitPageTests(unittest.TestCase):
         self.clock = Clock()
         self.accounts.sign_in_limits.clock = self.clock
 
-    def get(self, path, password):
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        self.addCleanup(connection.close)
-        auth = "Basic " + base64.b64encode(f"owner:{password}".encode()).decode()
-        connection.request("GET", path, headers={"Authorization": auth})
-        response = connection.getresponse()
-        return response, response.read().decode("utf-8")
+    def sign_in(self, password):
+        response, page, _cookies = sign_in("127.0.0.1", self.port, "owner", password)
+        return response, page
 
     def test_after_five_wrong_passwords_the_page_says_how_long_to_wait(self) -> None:
         with self.assertLogs("nwr_stream_manager", level="WARNING"):
             for i in range(5):
-                response, _page = self.get("/", f"wrong{i}")
-                self.assertEqual(response.status, 401)
-        response, page = self.get("/", "password1")
+                response, page = self.sign_in(f"wrong{i}")
+                self.assertIn("The username or password is incorrect.", page)
+        response, page = self.sign_in("password1")
         self.assertEqual(response.status, 429)
         self.assertEqual(response.getheader("Retry-After"), "5")
         self.assertIsNone(response.getheader("WWW-Authenticate"))
         self.assertIn("Too many wrong passwords for this username. Try again in 5 seconds.", page)
-        response, body = self.get("/api/status", "password1")
-        self.assertEqual(response.status, 429)
-        self.assertEqual(json.loads(body)["error"], "Too many wrong passwords for this username. Try again in 5 seconds.")
+        # Shown on the sign-in page, ready to try again.
+        self.assertIn('<form id="sign_in_form" method="post" action="/sign-in">', page)
         self.clock.now += 5
-        response, _page = self.get("/", "password1")
-        self.assertEqual(response.status, 200)
-
+        response, _page = self.sign_in("password1")
+        self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
 
 if __name__ == "__main__":
     unittest.main()

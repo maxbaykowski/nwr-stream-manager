@@ -12,6 +12,7 @@ from urllib.parse import ParseResult, parse_qs, urlencode
 from . import page_rendering
 from .accounts import AccountRecord
 from .baseline_pages import FORM_EXPIRED_MESSAGE, show_form_error, TWO_STEP_HTML, TWO_STEP_PATH
+from .constants import AUTH_SESSION_COOKIE_NAME
 from .local_network import local_networks
 from .routing import route
 from .sign_in_limits import SignInWait
@@ -19,7 +20,6 @@ from . import two_step
 
 LOG = logging.getLogger(__name__)
 
-DEVICE_COOKIE_NAME = "nwrstmgr_device"
 TWO_STEP_REQUIRED_MESSAGE = "You're accessing NWR Stream Manager via the public internet. Please enter your authenticator code to continue."
 TWO_STEP_NOT_SET_UP_MESSAGE = (
     "Accessing NWR Stream Manager over the public internet requires two-step verification to be enabled on your account. "
@@ -30,7 +30,7 @@ LOCAL_ONLY_MESSAGE = "Two-step verification can only be changed from a device on
 # What the page says after each change, by the result in its address.
 RESULTS = {
     "disabled": "Two-step verification is off.",
-    "forgotten": "Remembered devices were forgotten. They'll need a code the next time they connect from outside the local network.",
+    "forgotten": "Remembered devices were signed out. They'll need to sign in again.",
     "disabled_other": "Two-step verification was turned off for that account.",
 }
 SETUP_CODE_HINT = "A setup code works once, within 24 hours of when it was made. If yours has been used or is older, ask the owner for a new one."
@@ -58,22 +58,13 @@ class TwoStepHandlerMixin:
         host, port = (address[0], address[1]) if address and len(address) > 1 else ("", 0)
         return local_networks.is_local(str(host), self.headers, int(port or 0))
 
-    def _device_cookie(self) -> str:
-        return self._cookie_value(DEVICE_COOKIE_NAME)
-
     def _two_step_satisfied(self, account: AccountRecord) -> bool:
         """Whether this request can go ahead as far as two-step verification goes: it's from the local
-        network, its session passed it, or it's from a device that asked to be remembered."""
+        network, or its session passed it, as a remembered session did when it signed in."""
         if self._request_proven_local():
             return True
         token = getattr(self, "_auth_session_token", "")
-        if token and self.service.auth_sessions.two_step_passed(token):
-            return True
-        if self.service.accounts.device_remembered(account.id, self._device_cookie()):
-            if token:
-                self.service.auth_sessions.pass_two_step(token)
-            return True
-        return False
+        return bool(token and self.service.auth_sessions.two_step_passed(token))
 
     def _two_step_ok_or_response(self, path: str, method: str, account: AccountRecord) -> bool:
         self._two_step_code_pending = False
@@ -146,6 +137,8 @@ class TwoStepHandlerMixin:
         setup_only = getattr(self, "_two_step_setup_only", False)
         # Until the code's right, or two-step verification is set up with a setup code, there's nothing to go back to.
         page = page_rendering.set_hidden(page, "two_step_back", mode in {"verify", "unavailable"} or setup_only)
+        # Where there's nothing to go back to, signing out lets another account sign in instead.
+        page = page_rendering.set_hidden(page, "two_step_sign_out", not (mode in {"verify", "unavailable"} or setup_only))
         if mode == "verify":
             page = page_rendering.set_attribute(page, "two_step_next", "value", _safe_next(next_path))
             page = page_rendering.set_text(page, "two_step_verify_name", f"NWR Stream Manager, {two_step.authenticator_name(account.username, self.service.instance_name)}")
@@ -158,7 +151,6 @@ class TwoStepHandlerMixin:
                 )
                 page = page_rendering.set_text(page, "two_step_code_label", "Setup code")
                 page = page_rendering.set_text(page, "two_step_code_hint", SETUP_CODE_FIELD_HINT)
-                page = page_rendering.set_hidden(page, "two_step_remember_row", True)
             elif self.service.accounts.setup_code_waiting(account.id):
                 page = page_rendering.set_hidden(page, "two_step_code_setup_hint", False)
         if mode == "unavailable":
@@ -194,7 +186,7 @@ class TwoStepHandlerMixin:
             page = page_rendering.set_attribute(page, "two_step_confirm_action", "value", confirm["action"])
             page = page_rendering.set_attribute(page, "two_step_confirm_account", "value", confirm.get("account_id", ""))
         if message and kind == "error":
-            page = show_form_error(page, "two_step_message", message, "Two-step verification")
+            page = show_form_error(page, "two_step_message", message)
         elif message:
             page = page_rendering.set_text(page, "two_step_message", message)
             page = page_rendering.set_attribute(page, "two_step_message", "class", "message success")
@@ -213,7 +205,6 @@ class TwoStepHandlerMixin:
         page = page_rendering.set_hidden(page, "two_step_remote_hint", local)
         page = page_rendering.set_hidden(page, "two_step_off_actions", status["enabled"] or not local)
         page = page_rendering.set_hidden(page, "two_step_on_actions", not status["enabled"])
-        page = page_rendering.set_hidden(page, "two_step_forget_hint", not status["enabled"])
         page = page_rendering.set_hidden(page, "two_step_recovery_form", not local)
         page = page_rendering.set_hidden(page, "two_step_disable_form", not local)
         # The owner gives out setup codes, and can turn it off for someone who's lost their phone.
@@ -315,17 +306,22 @@ class TwoStepHandlerMixin:
             LOG.info("%s used a setup code from %s, to set up two-step verification", account.username, self._client_address())
             self._send_redirect(TWO_STEP_PATH)
             return
+        remembered = False
         if token:
             self.service.auth_sessions.pass_two_step(token)
+            # Asked for on the sign-in page, and only now signed in.
+            remembered = self.service.auth_sessions.remember_wanted(token)
+            if remembered:
+                self._remember_session(token)
         # Signed in now: a few wrong codes or passwords before it were most likely typing mistakes.
         self.service.accounts.forget_few_sign_in_attempts(account.id, self._visitor_host())
-        if form.get("remember") == "1":
-            device = self.service.accounts.remember_device(account.id)
-            self._pending_device_cookie = (
-                f"{self._cookie_name(DEVICE_COOKIE_NAME)}={device}; Max-Age={two_step.REMEMBER_DEVICE_SECONDS}; Path=/; HttpOnly; SameSite=Lax"
-            )
-        LOG.info("%s passed two-step verification from %s%s", account.username, self._client_address(), ", and asked to be remembered" if form.get("remember") == "1" else "")
+        LOG.info("%s passed two-step verification from %s%s", account.username, self._client_address(), ", and is remembered for 30 days" if remembered else "")
         self._send_redirect(next_path)
+
+    def _remember_session(self, token: str) -> None:
+        """Keeps this session signed in for 30 days, and the browser's cookie with it."""
+        self.service.auth_sessions.remember(token)
+        self._pending_auth_session_cookie = self.service.auth_sessions.cookie_header(self._cookie_name(AUTH_SESSION_COOKIE_NAME), token)
 
     def _enable_with_setup_code(self, account: AccountRecord, action: str, form: dict[str, str]) -> None:
         """After a setup code, the one thing a session can do: turn two-step verification on, with a new
@@ -422,8 +418,11 @@ class TwoStepHandlerMixin:
             self._send_page(self._render_two_step_page(account, "setup_code", setup_code=(other.username, code)))
             return
         if action == "forget_devices":
-            accounts.forget_devices(account.id)
-            self._pending_device_cookie = f"{self._cookie_name(DEVICE_COOKIE_NAME)}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
+            token = getattr(self, "_auth_session_token", "")
+            self.service.auth_sessions.forget_remembered(account.id, keep=token)
+            if token:
+                # This one's cookie now lasts only until the browser is quit, as an ordinary session's does.
+                self._pending_auth_session_cookie = self.service.auth_sessions.cookie_header(self._cookie_name(AUTH_SESSION_COOKIE_NAME), token)
             LOG.info("%s forgot their remembered devices", account.username)
             self._send_redirect(f"{TWO_STEP_PATH}?{urlencode({'result': 'forgotten'})}")
             return
@@ -433,12 +432,6 @@ class TwoStepHandlerMixin:
         """Every session of account but this one, which goes on."""
         self.service.auth_sessions.invalidate_account(account_id, keep=getattr(self, "_auth_session_token", ""))
 
-    def _send_pending_device_cookie(self) -> None:
-        cookie = getattr(self, "_pending_device_cookie", "")
-        if cookie:
-            self.send_header("Set-Cookie", cookie)
-            self._pending_device_cookie = ""
 
-
-__all__ = ["DEVICE_COOKIE_NAME", "TwoStepHandlerMixin", "TWO_STEP_NOT_SET_UP_MESSAGE", "TWO_STEP_REQUIRED_MESSAGE"]
+__all__ = ["TwoStepHandlerMixin", "TWO_STEP_NOT_SET_UP_MESSAGE", "TWO_STEP_REQUIRED_MESSAGE"]
 

@@ -12,6 +12,7 @@ import pytest
 from unittest import mock
 from pathlib import Path
 
+from signing_in import session_cookie, sign_in
 from test_auth import load_web_control_module
 from test_page_rendering import StandInService
 from test_restart import RestartPageTests
@@ -129,7 +130,7 @@ class AnotherSiteRequestTests(unittest.TestCase):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         self.addCleanup(connection.close)
         headers = {name.replace("_", "-"): value for name, value in headers.items()}
-        headers["Authorization"] = "Basic " + base64.b64encode(b"owner:password1").decode()
+        headers["Cookie"] = session_cookie(self.server_service, "owner")
         headers["Content-Type"] = content_type
         connection.request("POST", path, body=body, headers=headers)
         response = connection.getresponse()
@@ -185,7 +186,8 @@ class FramingTests(unittest.TestCase):
             with self.subTest(path=path, user=user):
                 connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
                 self.addCleanup(connection.close)
-                headers = {"Authorization": "Basic " + base64.b64encode(":".join(user).encode()).decode()} if user else {}
+                cookie = session_cookie(self.server_service, *user) if user else ""
+                headers = {"Cookie": cookie} if cookie else {}
                 connection.request("GET", path, headers=headers)
                 response = connection.getresponse()
                 response.read()
@@ -208,7 +210,9 @@ class HttpsCookieTests(unittest.TestCase):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         self.addCleanup(connection.close)
         headers = {name.replace("_", "-"): value for name, value in headers.items()}
-        headers["Authorization"] = "Basic " + base64.b64encode(f"owner:{password}".encode()).decode()
+        cookie = session_cookie(self.server_service, "owner", password)
+        if cookie:
+            headers["Cookie"] = cookie
         connection.request("GET", path, headers=headers)
         response = connection.getresponse()
         response.read()
@@ -218,15 +222,28 @@ class HttpsCookieTests(unittest.TestCase):
         return [value for name, value in response.getheaders() if name.lower() == "set-cookie"]
 
     def test_over_https_every_cookie_is_secure(self) -> None:
-        response = self.get("/", X_Forwarded_Proto="https", X_Forwarded_For="203.0.113.9")
-        cookies = self.cookies(response)
+        https = {"X-Forwarded-Proto": "https", "X-Forwarded-For": "203.0.113.9"}
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/sign-in", headers=https)
+        page = connection.getresponse()
+        page.read()
+        self.assertEqual(page.getheader("Strict-Transport-Security"), "max-age=31536000")
+        cookies = self.cookies(page)
+        response, _body, browser = sign_in("127.0.0.1", self.port, "owner", "password1", headers=https)
+        cookies += self.cookies(response)
         self.assertEqual({cookie.split("=", 1)[0] for cookie in cookies}, {f"nwrstmgr_session_{self.accounts.cookie_id}", f"nwrstmgr_form_{self.accounts.cookie_id}"})
         for cookie in cookies:
             self.assertTrue(cookie.endswith("; Secure"), cookie)
-        self.assertEqual(response.getheader("Strict-Transport-Security"), "max-age=31536000")
         # Signing out clears the cookie the same way, or the browser wouldn't let it be replaced.
-        response = self.get("/", password="wrong", X_Forwarded_Proto="https")
-        self.assertEqual(response.status, 401)
+        token = browser.split(f"nwrstmgr_form_{self.accounts.cookie_id}=", 1)[1].split(";", 1)[0]
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        self.addCleanup(connection.close)
+        connection.request("POST", "/sign-out", body=f"form_token={token}", headers={**https, "Cookie": browser, "Content-Type": "application/x-www-form-urlencoded"})
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.getheader("Location"), "/sign-in?signed_out=1")
+        self.assertTrue(self.cookies(response))
         self.assertTrue(all(cookie.endswith("; Secure") for cookie in self.cookies(response)))
 
     def test_tailscale_names_get_hsts_only_when_funnel_makes_them_public(self) -> None:
@@ -265,18 +282,18 @@ class LeftoverBodyTests(unittest.TestCase):
 
     def exchange(self, body_size: int) -> list[int]:
         """A DELETE whose route ignores its body, then a GET, on one connection: the statuses that come back."""
-        auth = "Basic " + base64.b64encode(b"owner:password1").decode()
+        auth = session_cookie(self.server_service, "owner")
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         self.addCleanup(connection.close)
         statuses = []
         connection.request("DELETE", "/api/iq-recording?id=nothing", body=b"x" * body_size,
-                           headers={"Authorization": auth, "Content-Type": "application/json"})
+                           headers={"Cookie": auth, "Content-Type": "application/json"})
         response = connection.getresponse()
         response.read()
         statuses.append(response.status)
         if response.will_close:
             return statuses
-        connection.request("GET", "/api/account/me", headers={"Authorization": auth})
+        connection.request("GET", "/api/account/me", headers={"Cookie": auth})
         response = connection.getresponse()
         response.read()
         statuses.append(response.status)
@@ -314,6 +331,7 @@ class SetupThroughProxyTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = service
 
     def send(self, method, path, body=None, **headers):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -366,8 +384,7 @@ class SetupThroughProxyTests(unittest.TestCase):
         response, _body = self.account()
         self.assertEqual(response.status, 200)
         self.assertTrue(self.accounts.has_account())
-        auth = "Basic " + base64.b64encode(b"owner:password1").decode()
-        response, body = self.send("GET", "/api/account/me", Authorization=auth, X_Forwarded_For="203.0.113.9")
+        response, body = self.send("GET", "/api/account/me", Cookie=session_cookie(self.server_service, "owner"), X_Forwarded_For="203.0.113.9")
         self.assertEqual((response.status, json.loads(body)["two_step"]), (403, "not_set_up"))
 
 

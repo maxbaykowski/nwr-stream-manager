@@ -28,7 +28,6 @@ DIGITS = 6
 # A code from the step before or after is accepted too, for a phone whose clock is a little off.
 ALLOWED_STEPS_OFF = 1
 RECOVERY_CODE_COUNT = 10
-REMEMBER_DEVICE_SECONDS = 30 * 24 * 3600
 SETUP_CODE_SECONDS = 24 * 3600
 
 

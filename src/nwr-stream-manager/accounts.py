@@ -49,6 +49,8 @@ SIGN_IN_ATTEMPTS_KEPT = 10_000
 SIGN_IN_ATTEMPTS_KEPT_SECONDS = 90 * 24 * 3600
 # Plenty for every browser and device someone uses.
 SESSIONS_PER_ACCOUNT = 50
+# How long a session that asked to be remembered stays signed in, from when it signed in.
+REMEMBERED_SESSION_SECONDS = 30 * 24 * 3600
 # Each request moves a session's expiry on, but it's only saved again once it's moved this far.
 SESSION_SAVE_SECONDS = 5 * 60
 
@@ -204,6 +206,10 @@ class AuthSession:
     two_step_setup_only: bool = False
     # When it was last saved to expire, so each request doesn't have to save it again.
     saved_expires_at: float = 0.0
+    # Remembered for 30 days from signing in, rather than for 12 hours from when it was last used.
+    remembered: bool = False
+    # Asked to be remembered when signing in, which it will be once its two-step verification code is right.
+    remember_wanted: bool = False
 
 
 @lru_cache(maxsize=1)
@@ -374,7 +380,6 @@ class AccountStore:
                 "UPDATE accounts SET password = ?, must_change_password = 1 WHERE id = ?",
                 (hash_account_password(secret), int(account_id)),
             )
-            connection.execute("DELETE FROM remembered_devices WHERE account_id = ?", (int(account_id),))
             row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (int(account_id),)).fetchone()
             connection.commit()
             record = self._row_to_record(row)
@@ -410,7 +415,7 @@ class AccountStore:
             if record.id == int(requester_id):
                 raise ValueError("you cannot delete the account you are using")
             connection.execute("DELETE FROM accounts WHERE id = ?", (record.id,))
-            for table in ("two_step", "two_step_recovery", "two_step_setup_codes", "remembered_devices", "sign_in_attempts", "sign_in_alerts_told"):
+            for table in ("two_step", "two_step_recovery", "two_step_setup_codes", "sign_in_attempts", "sign_in_alerts_told"):
                 connection.execute(f"DELETE FROM {table} WHERE account_id = ?", (record.id,))
             connection.commit()
             return record.to_public_dict()
@@ -444,7 +449,6 @@ class AccountStore:
                 "UPDATE accounts SET password = ?, must_change_password = 0 WHERE id = ?",
                 (new_hash, record.id),
             )
-            connection.execute("DELETE FROM remembered_devices WHERE account_id = ?", (record.id,))
             row = connection.execute("SELECT * FROM accounts WHERE id = ? LIMIT 1", (record.id,)).fetchone()
             connection.commit()
             updated = self._row_to_record(row)
@@ -452,14 +456,14 @@ class AccountStore:
                 raise ValueError("account was not found")
             return updated.to_public_dict()
 
-    def verify_basic_account(self, username: str, password: str, attempt: dict[str, str] | None = None) -> AccountRecord | None:
+    def verify_password(self, username: str, password: str, attempt: dict[str, str] | None = None) -> AccountRecord | None:
         """The account, if the password is right. Raises SignInWait after too many wrong passwords.
 
         attempt says who's trying (their address and user_agent), saved if the password's wrong."""
         with self.sign_in_limits.one_at_a_time(username):
-            return self._verify_basic_account(username, password, attempt)
+            return self._verify_password(username, password, attempt)
 
-    def _verify_basic_account(self, username: str, password: str, attempt: dict[str, str] | None) -> AccountRecord | None:
+    def _verify_password(self, username: str, password: str, attempt: dict[str, str] | None) -> AccountRecord | None:
         with self.lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM accounts WHERE username = ? LIMIT 1",
@@ -524,10 +528,9 @@ class AccountStore:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS two_step_recovery (account_id INTEGER NOT NULL, code_hash TEXT NOT NULL, PRIMARY KEY (account_id, code_hash))"
             )
-            # Devices that passed two-step verification and asked to be remembered, by a hash of the cookie they keep.
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS remembered_devices (token_hash TEXT PRIMARY KEY, account_id INTEGER NOT NULL, expires_at REAL NOT NULL)"
-            )
+            # Where devices that skipped two-step verification were once kept. A remembered device is now
+            # a session that stays signed in for 30 days (see AuthSessionStore.remember).
+            connection.execute("DROP TABLE IF EXISTS remembered_devices")
             # Setup codes the owner gave out, one at most for each account, by hash, until used or expired.
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS two_step_setup_codes (account_id INTEGER PRIMARY KEY, code_hash TEXT NOT NULL, expires_at REAL NOT NULL)"
@@ -631,7 +634,7 @@ class AccountStore:
 
     def disable_two_step(self, account_id: int) -> None:
         with self.lock, self._connect() as connection:
-            for table in ("two_step", "two_step_recovery", "remembered_devices"):
+            for table in ("two_step", "two_step_recovery"):
                 connection.execute(f"DELETE FROM {table} WHERE account_id = ?", (int(account_id),))
             connection.commit()
 
@@ -688,37 +691,6 @@ class AccountStore:
                 LOG.warning("too many wrong two-step verification codes for %r; its next try has to wait %d seconds", account.username, wait)
             return ""
         return right
-
-    def remember_device(self, account_id: int) -> str:
-        token = secrets.token_urlsafe(32)
-        with self.lock, self._connect() as connection:
-            now = time.time()
-            connection.execute("DELETE FROM remembered_devices WHERE expires_at <= ?", (now,))
-            connection.execute(
-                "INSERT INTO remembered_devices (token_hash, account_id, expires_at) VALUES (?, ?, ?)",
-                (_token_hash(token), int(account_id), now + two_step.REMEMBER_DEVICE_SECONDS),
-            )
-            connection.commit()
-        return token
-
-    def device_remembered(self, account_id: int, token: str) -> bool:
-        if not token:
-            return False
-        with self.lock, self._connect() as connection:
-            row = connection.execute(
-                "SELECT account_id, expires_at FROM remembered_devices WHERE token_hash = ?", (_token_hash(token),)
-            ).fetchone()
-        return row is not None and int(row["account_id"]) == int(account_id) and float(row["expires_at"]) > time.time()
-
-    def forget_device(self, token: str) -> None:
-        with self.lock, self._connect() as connection:
-            connection.execute("DELETE FROM remembered_devices WHERE token_hash = ?", (_token_hash(token),))
-            connection.commit()
-
-    def forget_devices(self, account_id: int) -> None:
-        with self.lock, self._connect() as connection:
-            connection.execute("DELETE FROM remembered_devices WHERE account_id = ?", (int(account_id),))
-            connection.commit()
 
     # -- wrong passwords and codes, for telling the account ----------------------
 
@@ -893,7 +865,9 @@ class AuthSessionStore:
         self.connect = connect
         self._load()
 
-    def create(self, account_id: int = 1) -> str:
+    def create(self, account_id: int = 1, *, remember: bool = False) -> str:
+        """A new session. remember: once it's signed in, two-step verification included, it's
+        remembered for 30 days (see remember)."""
         token = secrets.token_urlsafe(32)
         expires_at = time.time() + self.lifetime_seconds
         with self.lock:
@@ -903,7 +877,7 @@ class AuthSessionStore:
             mine = sorted((session.expires_at, key) for key, session in self.sessions.items() if session.account_id == int(account_id))
             for _expires, key in mine[: max(0, len(mine) - SESSIONS_PER_ACCOUNT + 1)]:
                 self._forget_locked(key)  # the longest unused first
-            session = self.sessions[_token_hash(token)] = AuthSession(account_id=int(account_id), expires_at=expires_at)
+            session = self.sessions[_token_hash(token)] = AuthSession(account_id=int(account_id), expires_at=expires_at, remember_wanted=bool(remember))
             self._save_locked(_token_hash(token), session)
         return token
 
@@ -917,8 +891,9 @@ class AuthSessionStore:
             if session.expires_at <= now:
                 self._forget_locked(key)
                 return False
-            session.expires_at = now + self.lifetime_seconds
-            if session.expires_at - session.saved_expires_at >= SESSION_SAVE_SECONDS:
+            if not session.remembered:
+                session.expires_at = now + self.lifetime_seconds
+            if not session.remembered and session.expires_at - session.saved_expires_at >= SESSION_SAVE_SECONDS:
                 self._save_locked(key, session)
             account_id = session.account_id
         if accounts is None:
@@ -929,6 +904,36 @@ class AuthSessionStore:
             return None
         accounts.touch_account_access(account.id)
         return account
+
+    def remember_wanted(self, token: str) -> bool:
+        with self.lock:
+            session = self.sessions.get(_token_hash(token))
+            return session is not None and session.remember_wanted
+
+    def remember(self, token: str) -> None:
+        """Keeps the session signed in for 30 days from now, however little it's used, and without
+        two-step verification again, until it's signed out, its password changes or it's forgotten."""
+        with self.lock:
+            session = self.sessions.get(_token_hash(token))
+            if session is not None:
+                session.remembered = True
+                session.remember_wanted = False
+                session.expires_at = time.time() + REMEMBERED_SESSION_SECONDS
+                self._save_locked(_token_hash(token), session)
+
+    def forget_remembered(self, account_id: int, keep: str = "") -> None:
+        """Signs out every remembered session of account but keep, which is only signed in as usual from now."""
+        kept = _token_hash(keep) if keep else ""
+        with self.lock:
+            for key, session in list(self.sessions.items()):
+                if session.account_id != int(account_id) or not session.remembered:
+                    continue
+                if key == kept:
+                    session.remembered = False
+                    session.expires_at = time.time() + self.lifetime_seconds
+                    self._save_locked(key, session)
+                else:
+                    self._forget_locked(key)
 
     def two_step_passed(self, token: str) -> bool:
         with self.lock:
@@ -968,10 +973,14 @@ class AuthSessionStore:
                     self._forget_locked(key)
 
     def cookie_header(self, name: str, token: str) -> str:
-        return (
-            f"{name}={token}; "
-            f"Max-Age={int(self.lifetime_seconds)}; Path=/; HttpOnly; SameSite=Lax"
-        )
+        """The cookie for the session token. A remembered session's is kept for its 30 days; any other's
+        only until the browser is quit, as well as running out on its own after 12 hours unused."""
+        with self.lock:
+            session = self.sessions.get(_token_hash(token))
+            remembered = session is not None and session.remembered
+            seconds = max(0, int(session.expires_at - time.time())) if remembered else 0
+        lasting = f"Max-Age={seconds}; " if remembered else ""
+        return f"{name}={token}; {lasting}Path=/; HttpOnly; SameSite=Lax"
 
     def _prune_locked(self, now: float) -> None:
         for key, session in list(self.sessions.items()):
@@ -988,6 +997,10 @@ class AuthSessionStore:
                     "token_hash TEXT PRIMARY KEY, account_id INTEGER NOT NULL, expires_at REAL NOT NULL, "
                     "two_step_passed INTEGER NOT NULL DEFAULT 0, two_step_setup_only INTEGER NOT NULL DEFAULT 0)"
                 )
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(auth_sessions)").fetchall()}
+                for column in ("remembered", "remember_wanted"):
+                    if column not in columns:
+                        connection.execute(f"ALTER TABLE auth_sessions ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
                 connection.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (time.time(),))
                 rows = connection.execute("SELECT * FROM auth_sessions").fetchall()
         except sqlite3.Error as exc:
@@ -995,7 +1008,10 @@ class AuthSessionStore:
             return
         for row in rows:
             expires_at = float(row[2])
-            self.sessions[str(row[0])] = AuthSession(int(row[1]), expires_at, bool(row[3]), bool(row[4]), expires_at)
+            self.sessions[str(row[0])] = AuthSession(
+                int(row["account_id"]), expires_at, bool(row["two_step_passed"]), bool(row["two_step_setup_only"]), expires_at,
+                remembered=bool(row["remembered"]), remember_wanted=bool(row["remember_wanted"]),
+            )
 
     def _save_locked(self, key: str, session: AuthSession) -> None:
         session.saved_expires_at = session.expires_at
@@ -1004,8 +1020,8 @@ class AuthSessionStore:
         try:
             with self.connect() as connection:
                 connection.execute(
-                    "INSERT OR REPLACE INTO auth_sessions (token_hash, account_id, expires_at, two_step_passed, two_step_setup_only) VALUES (?, ?, ?, ?, ?)",
-                    (key, session.account_id, session.expires_at, int(session.two_step_passed), int(session.two_step_setup_only)),
+                    "INSERT OR REPLACE INTO auth_sessions (token_hash, account_id, expires_at, two_step_passed, two_step_setup_only, remembered, remember_wanted) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (key, session.account_id, session.expires_at, int(session.two_step_passed), int(session.two_step_setup_only), int(session.remembered), int(session.remember_wanted)),
                 )
         except sqlite3.Error as exc:
             # Still signed in until NWR Stream Manager restarts.

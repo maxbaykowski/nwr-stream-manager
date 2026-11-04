@@ -49,9 +49,9 @@ class AuthTests(unittest.TestCase):
             store.create_admin("Admin_User-1", "StrongPass!1", "StrongPass!1")
 
             self.assertTrue(store.has_account())
-            self.assertIsNotNone(store.verify_basic_account("Admin_User-1", "StrongPass!1"))
-            self.assertIsNone(store.verify_basic_account("Admin_User-1", "wrong-password"))
-            self.assertIsNone(store.verify_basic_account("other", "StrongPass!1"))
+            self.assertIsNotNone(store.verify_password("Admin_User-1", "StrongPass!1"))
+            self.assertIsNone(store.verify_password("Admin_User-1", "wrong-password"))
+            self.assertIsNone(store.verify_password("other", "StrongPass!1"))
 
     def test_account_store_rejects_invalid_usernames_and_passwords(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1515,7 +1515,7 @@ class AuthTests(unittest.TestCase):
                 connection.commit()
 
             self.assertTrue(self.web_control.account_password_hash_needs_upgrade(legacy_hash))
-            self.assertIsNotNone(store.verify_basic_account("admin", password))
+            self.assertIsNotNone(store.verify_password("admin", password))
             with store._connect() as connection:
                 upgraded = connection.execute("SELECT password FROM accounts WHERE id = 1").fetchone()["password"]
 
@@ -1523,21 +1523,6 @@ class AuthTests(unittest.TestCase):
             self.assertTrue(upgraded.startswith("scrypt$v=1$"))
             self.assertFalse(self.web_control.account_password_hash_needs_upgrade(upgraded))
             self.assertTrue(self.web_control.verify_account_password(password, upgraded))
-
-    def test_handler_validates_basic_auth_header_against_account_store(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            store = self.web_control.AccountStore(Path(tempdir) / "accounts.db")
-            store.create_admin("admin", "StrongPass!1", "StrongPass!1")
-            handler = object.__new__(self.web_control.RtlControlHandler)
-            handler.service = types.SimpleNamespace(accounts=store, auth_sessions=self.web_control.AuthSessionStore())
-            token = base64.b64encode(b"admin:StrongPass!1").decode("ascii")
-            handler.headers = {"Authorization": f"Basic {token}"}
-
-            self.assertTrue(handler._basic_auth_valid())
-
-            bad_token = base64.b64encode(b"admin:wrong").decode("ascii")
-            handler.headers = {"Authorization": f"Basic {bad_token}"}
-            self.assertFalse(handler._basic_auth_valid())
 
     def test_session_cookie_authenticates_without_password_verification(self) -> None:
         sessions = self.web_control.AuthSessionStore()
@@ -1554,8 +1539,9 @@ class AuthTests(unittest.TestCase):
             has_account=lambda: True,
             account_by_id=lambda account_id: account if account_id == 1 else None,
             touch_account_access=lambda _account_id: None,
-            verify_basic_account=lambda _username, _password, attempt=None: self.fail("password hash should not be checked"),
+            verify_password=lambda _username, _password, attempt=None: self.fail("password hash should not be checked"),
             sign_in_attempts_for=lambda _account: {"own": [], "others": []},
+            two_step_enabled=lambda _account_id: False,
             cookie_id="0a1b2c3d",
         )
         handler = object.__new__(self.web_control.RtlControlHandler)
@@ -1564,22 +1550,6 @@ class AuthTests(unittest.TestCase):
         handler.client_address = ("127.0.0.1", 50000)
 
         self.assertTrue(handler._auth_ok_or_setup_response("/", "GET"))
-
-    def test_successful_basic_auth_prepares_session_cookie(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            store = self.web_control.AccountStore(Path(tempdir) / "accounts.db")
-            store.create_admin("admin", "StrongPass!1", "StrongPass!1")
-            handler = object.__new__(self.web_control.RtlControlHandler)
-            handler.service = types.SimpleNamespace(accounts=store, auth_sessions=self.web_control.AuthSessionStore())
-            token = base64.b64encode(b"admin:StrongPass!1").decode("ascii")
-            handler.headers = {"Authorization": f"Basic {token}"}
-            handler.client_address = ("127.0.0.1", 50000)
-
-            self.assertTrue(handler._auth_ok_or_setup_response("/", "GET"))
-            cookie = getattr(handler, "_pending_auth_session_cookie", "")
-            self.assertIn(f"{self.web_control.AUTH_SESSION_COOKIE_NAME}_{store.cookie_id}=", cookie)
-            self.assertIn("HttpOnly", cookie)
-            self.assertIn("SameSite=Lax", cookie)
 
     def test_owner_can_create_read_only_account_with_temporary_secret(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1591,7 +1561,7 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(account["role"], self.web_control.ACCOUNT_ROLE_READ_ONLY)
             self.assertTrue(account["must_change_password"])
             self.assertGreaterEqual(len(secret), 12)
-            record = store.verify_basic_account("listener_1", secret)
+            record = store.verify_password("listener_1", secret)
             self.assertIsNotNone(record)
             assert record is not None
             self.assertTrue(record.is_read_only)
@@ -1606,14 +1576,14 @@ class AuthTests(unittest.TestCase):
             updated = store.change_password(account["id"], secret, "NewStrong!1", "NewStrong!1")
 
             self.assertFalse(updated["must_change_password"])
-            self.assertIsNotNone(store.verify_basic_account("operator", "NewStrong!1"))
-            self.assertIsNone(store.verify_basic_account("operator", secret))
+            self.assertIsNotNone(store.verify_password("operator", "NewStrong!1"))
+            self.assertIsNone(store.verify_password("operator", secret))
 
     def test_owner_can_toggle_and_delete_non_owner_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             store = self.web_control.AccountStore(Path(tempdir) / "accounts.db")
             store.create_admin("owner", "StrongPass!1", "StrongPass!1")
-            owner = store.verify_basic_account("owner", "StrongPass!1")
+            owner = store.verify_password("owner", "StrongPass!1")
             assert owner is not None
             account, _secret = store.create_account("operator", read_only=False)
 
@@ -1890,6 +1860,7 @@ class AuthTests(unittest.TestCase):
             for method, path in paths:
                 handler = object.__new__(web_control.RtlControlHandler)
                 handler.headers, handler.client_address = {}, ("127.0.0.1", 50000)
+                handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(two_step_enabled=lambda _account_id: False))
                 refused = []
                 handler._send_json = lambda payload, status=web_control.HTTPStatus.OK: refused.append(status)
                 self.assertEqual(

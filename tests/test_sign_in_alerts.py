@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 
 import pytest
 
+from signing_in import needs_sign_in
 from test_auth import load_web_control_module
 from test_page_rendering import StandInService
 
@@ -93,14 +94,14 @@ class AccountAttemptTests(unittest.TestCase):
         self.addCleanup(tempdir.cleanup)
         self.accounts = self.wc.AccountStore(Path(tempdir.name) / "accounts.db")
         self.accounts.create_admin("owner", "password1", "password1")
-        self.owner = self.accounts.verify_basic_account("owner", "password1")
+        self.owner = self.accounts.verify_password("owner", "password1")
         self.accounts.create_account("someone", False)
         self.someone = next(record for record in map(self.accounts.account_by_id, (2,)) if record)
 
     def wrong(self, username: str, count: int, address: str = "203.0.113.9", agent: str = IPHONE, first: int = 0) -> None:
         for number in range(first, first + count):
             # Each a different password: the same one again isn't another guess.
-            self.accounts.verify_basic_account(username, f"wrong{number}", attempt={"address": address, "user_agent": agent})
+            self.accounts.verify_password(username, f"wrong{number}", attempt={"address": address, "user_agent": agent})
 
     def test_a_few_wrong_passwords_arent_worth_telling(self) -> None:
         self.wrong("owner", 3)
@@ -238,10 +239,20 @@ class SignInAlertPageTests(unittest.TestCase):
         self.cookies: dict[str, str] = {}
 
     def send(self, method, path, password="password1", form=None, body=None, **headers):
+        headers = {name.replace("_", "-"): value for name, value in headers.items()}
+        response, page = self.exchange(method, path, form, body, headers)
+        if needs_sign_in(response):
+            # Signed in on the sign-in page, as a browser would be sent to, then again.
+            self.exchange("GET", "/sign-in", None, None, headers)
+            token = next(value for name, value in self.cookies.items() if name.startswith("nwrstmgr_form_"))
+            self.exchange("POST", "/sign-in", {"form_token": token, "username": "owner", "password": password}, None, headers)
+            response, page = self.exchange(method, path, form, body, headers)
+        return response, page
+
+    def exchange(self, method, path, form, body, headers):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         self.addCleanup(connection.close)
-        headers = {name.replace("_", "-"): value for name, value in headers.items()}
-        headers["Authorization"] = "Basic " + base64.b64encode(f"owner:{password}".encode()).decode()
+        headers = dict(headers)
         headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in self.cookies.items())
         if form is not None:
             body = urlencode(form)
@@ -256,7 +267,7 @@ class SignInAlertPageTests(unittest.TestCase):
 
     def test_after_more_than_three_wrong_passwords_the_next_sign_in_is_told_first(self) -> None:
         for number in range(3):
-            self.assertEqual(self.send("GET", "/", password=f"wrong{number}", User_Agent=IPHONE)[0].status, 401)
+            self.assertTrue(needs_sign_in(self.send("GET", "/", password=f"wrong{number}", User_Agent=IPHONE)[0]))
         # A tunnel on this computer passes on who it was really from.
         self.send("GET", "/", password="wrong3", User_Agent=WINDOWS_CHROME, X_Forwarded_For="31.13.64.9")
         response, page = self.send("GET", "/?view=streams")
@@ -279,7 +290,7 @@ class SignInAlertPageTests(unittest.TestCase):
     @pytest.mark.real_local_network
     def test_wrong_codes_add_up_however_many_sessions_are_started(self) -> None:
         two_step = importlib.import_module("nwr_stream_manager.two_step")
-        owner = self.accounts.verify_basic_account("owner", "password1")
+        owner = self.accounts.verify_password("owner", "password1")
         secret = self.accounts.start_two_step_setup(owner.id)
         self.accounts.enable_two_step(owner.id, secret, two_step.code_at(secret, two_step.current_step() - 1))
         right = {two_step.code_at(secret, two_step.current_step() + offset) for offset in (-1, 0, 1)}
@@ -296,7 +307,7 @@ class SignInAlertPageTests(unittest.TestCase):
 
     def test_the_owner_is_told_about_usernames_guessed_once_each(self) -> None:
         for name in ("abc", "aaaa", "126〃-___", "abcbbgccc"):
-            self.accounts.verify_basic_account(name, "wrong", attempt={"address": "203.0.113.9", "user_agent": IPHONE})
+            self.accounts.verify_password(name, "wrong", attempt={"address": "203.0.113.9", "user_agent": IPHONE})
         response, page = self.send("GET", "/?view=rtl")
         self.assertEqual(response.status, 200)
         text = html.unescape(page)
@@ -312,7 +323,7 @@ class SignInAlertPageTests(unittest.TestCase):
         self.assertNotIn("sign_in_alert_title", page)
         for path in ("/api/status", "/dashboard/parts"):
             self.assertIs(json.loads(self.send("GET", path)[1])["sign_in_alert"], False)
-        owner = self.accounts.verify_basic_account("owner", "password1")
+        owner = self.accounts.verify_password("owner", "password1")
         for _ in range(4):
             # Wrong codes from a phone, while this computer stays signed in.
             self.accounts.record_sign_in_attempt("owner", owner.id, "code", {"address": "203.0.113.9", "user_agent": IPHONE})

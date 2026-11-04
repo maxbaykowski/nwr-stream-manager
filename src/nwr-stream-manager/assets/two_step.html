@@ -17,6 +17,7 @@ input { font: inherit; padding: 10px; border: 1px solid #aab2c0; border-radius: 
 input[type="checkbox"] { padding: 0; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; align-items: center; }
 form.inline { display: inline; margin: 0; }
+.sign-out { margin-top: 18px; }
 button, .button-link { font: inherit; padding: 10px 14px; border: 1px solid #9aa4b2; border-radius: 6px; background: #fff; color: #14181f; cursor: pointer; text-decoration: none; display: inline-block; }
 .primary { background: #174a98; color: #fff; border-color: #174a98; }
 .message { min-height: 1.5em; margin-top: 14px; font-weight: 700; }
@@ -59,7 +60,6 @@ footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
       </label>
       <p id="two_step_code_hint" class="hint">The 6-digit code your authenticator app shows for <span id="two_step_verify_name">NWR Stream Manager</span>. If you don't have your phone, enter one of your recovery codes instead.</p>
       <p id="two_step_code_setup_hint" class="hint" hidden>If the owner gave you a setup code, to set up a new authenticator app, you can enter that instead.</p>
-      <label id="two_step_remember_row" class="checkbox-row"><input name="remember" type="checkbox" value="1"> Remember this device for 30 days</label>
       <div class="actions">
         <button class="primary" type="submit">Continue</button>
       </div>
@@ -93,13 +93,15 @@ footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
         <input type="hidden" name="action" value="disable">
         <button type="submit">Turn off two-step verification</button>
       </form>
+    </div>
+    <div class="actions">
       <form class="inline" method="post" action="/two-step">
         __FORM_TOKEN_INPUT__
         <input type="hidden" name="action" value="forget_devices">
         <button type="submit" aria-describedby="two_step_forget_hint">Forget remembered devices</button>
       </form>
     </div>
-    <p id="two_step_forget_hint" class="hint" hidden>Devices you asked to be remembered will need a code again the next time they connect from outside the local network.</p>
+    <p id="two_step_forget_hint" class="hint">Every other device where you chose Remember this device for 30 days is signed out, and has to sign in again. This one stays signed in as usual.</p>
   </section>
 
   <section id="two_step_setup" class="panel" aria-labelledby="two_step_setup_title" hidden>
@@ -169,6 +171,10 @@ footer { max-width: 720px; margin: 0 auto; padding: 0 24px 32px; }
   </section>
 
   <p id="two_step_back"><a href="/">Back to NWR Stream Manager</a></p>
+  <form id="two_step_sign_out" class="sign-out" method="post" action="/sign-out" hidden>
+    __FORM_TOKEN_INPUT__
+    <button type="submit">Sign out</button>
+  </form>
 </main>
 <footer>
   <a href="/help#two-step" target="_blank" rel="noopener">Help<span class="screen-reader-only"> (opens in a new tab)</span></a>

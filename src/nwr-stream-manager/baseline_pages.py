@@ -125,6 +125,8 @@ NOTIFICATIONS_SET_UP_HTML = (
 ADVANCED_SETTINGS_PATH = "/advanced-settings"
 TAILSCALE_SETTINGS_PATH = "/tailscale"
 TWO_STEP_PATH = "/two-step"
+SIGN_IN_PATH = "/sign-in"
+SIGN_OUT_PATH = "/sign-out"
 SIGN_IN_ALERT_PATH = "/sign-in-alert"
 SIGN_IN_ALERT_API_PATH = "/api/sign-in-alert"
 GENERAL_SETTINGS_PATH = "/general-settings"
@@ -199,24 +201,24 @@ def format_account_date(epoch_seconds: Any) -> str:
     return format_local_datetime(datetime.fromtimestamp(seconds, timezone.utc))
 
 
-SIGN_IN_REQUIRED_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in required - NWR Stream Manager</title>
-</head>
-<body>
-<h1>Sign in required</h1>
-<p>Sign in with your NWR Stream Manager username and password to continue. <a href="/">Try again</a></p>
-<p><a href="/help">Help</a></p>
-</body>
-</html>
-"""
-
-
-def render_sign_in_wait_page(message: str) -> str:
-    """Shown in place of the sign-in prompt while a username has to wait."""
+def render_sign_in_page(form_token: str, next_path: str = "/", message: str = "", kind: str = "error", username: str = "", remember: bool = False) -> str:
+    """The sign-in page. message is what went wrong, or with kind "success", such as having signed out."""
+    page = SIGN_IN_HTML.replace("__FORM_TOKEN_INPUT__", page_rendering.form_token_input(form_token))
+    page = page_rendering.set_attribute(page, "sign_in_next", "value", next_path)
+    if remember:
+        page = page_rendering.set_attribute(page, "sign_in_remember", "checked", "checked")
+    if username:
+        page = page_rendering.set_attribute(page, "sign_in_username", "value", username)
+        # Back for the password, which is what was wrong, or to try again after the wait.
+        page = page_rendering.set_attribute(page, "sign_in_username", "autofocus", None)
+        page = page_rendering.set_attribute(page, "sign_in_password", "autofocus", "autofocus")
+    if message and kind == "error":
+        page = show_form_error(page, "sign_in_message", message)
+    elif message:
+        page = page_rendering.set_text(page, "sign_in_message", message)
+        page = page_rendering.set_attribute(page, "sign_in_message", "class", f"message {kind}")
+        page = page_rendering.set_attribute(page, "sign_in_message", "role", "status")
+    return page
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -241,6 +243,7 @@ MUST_CHANGE_PASSWORD_HTML = pages.change_password_page()
 
 NOTICE_PAGE_HTML = pages.notice_page()
 TWO_STEP_HTML = pages.two_step_page()
+SIGN_IN_HTML = pages.sign_in_page()
 SIGN_IN_ALERT_HTML = pages.sign_in_alert_page()
 INDEX_HTML = pages.index_page(APP_VERSION)
 INDEX_VIEWS = page_rendering.page_views(INDEX_HTML)
@@ -255,12 +258,10 @@ def form_message(message: str) -> str:
     return text if text[-1] in ".!?" else f"{text}."
 
 
-def show_form_error(page: str, message_id: str, message: str, title: str) -> str:
-    # In the page title too, so it's the first thing read when the page loads.
+def show_form_error(page: str, message_id: str, message: str) -> str:
     page = page_rendering.set_text(page, message_id, message)
     page = page_rendering.set_attribute(page, message_id, "class", "message error")
-    page = page_rendering.set_attribute(page, message_id, "role", "alert")
-    return page_rendering.set_title(page, f"Error: {message} - {title}")
+    return page_rendering.set_attribute(page, message_id, "role", "alert")
 
 
 def render_setup_page(step: str, form_token: str, message: str = "", username: str = "") -> str:
@@ -274,7 +275,7 @@ def render_setup_page(step: str, form_token: str, message: str = "", username: s
     if username:
         page = page_rendering.set_attribute(page, "setup_username", "value", username)
     if message:
-        page = show_form_error(page, "setup_message", message, "NWR Stream Manager Setup")
+        page = show_form_error(page, "setup_message", message)
     return page
 
 
@@ -343,7 +344,7 @@ def render_account_secret_page(summary: str, secret: str, setup_code: str = "") 
 def render_change_password_page(form_token: str, message: str = "") -> str:
     page = MUST_CHANGE_PASSWORD_HTML.replace("__FORM_TOKEN_INPUT__", page_rendering.form_token_input(form_token))
     if message:
-        page = show_form_error(page, "password_message", message, "Change Account Password")
+        page = show_form_error(page, "password_message", message)
     return page
 
 

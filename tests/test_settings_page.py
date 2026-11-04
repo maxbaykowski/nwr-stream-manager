@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -170,6 +171,7 @@ class SettingsPermissionTests(unittest.TestCase):
         web_control = self.web_control
         handler = object.__new__(web_control.RtlControlHandler)
         handler.headers, handler.client_address = {}, ("127.0.0.1", 50000)
+        handler.service = types.SimpleNamespace(accounts=types.SimpleNamespace(two_step_enabled=lambda _account_id: False))
         sent = []
         handler._send_json = lambda payload, status=None: sent.append((payload, status))
         account = web_control.AccountRecord(

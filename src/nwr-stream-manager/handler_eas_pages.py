@@ -133,7 +133,7 @@ class EasAlertPageHandlerMixin:
             page = page_rendering.set_text(page, "eas-alert-detail-result", message)
             page = page_rendering.set_attribute(page, "eas-alert-detail-result", "class", "message error")
             page = page_rendering.set_attribute(page, "eas-alert-detail-result", "role", "alert")
-            return page, f"Error: {message} - {title}"
+            return page, title
         event = alert.get("event_type") or "EAS alert"
         page = page_rendering.set_text(page, "eas_alert_detail_title", event)
         page = page_rendering.set_text(page, "eas_detail_event", alert.get("event_type") or "Unknown event")

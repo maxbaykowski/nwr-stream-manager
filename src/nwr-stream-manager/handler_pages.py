@@ -261,8 +261,10 @@ class PageHandlerMixin:
             page = page_rendering.set_text(page, element_id, message)
             page = page_rendering.set_attribute(page, element_id, "class", f"message {kind}")
             page = page_rendering.set_attribute(page, element_id, "role", "alert" if kind == "error" else "status")
-            # In the title too, so it's the first thing read when the page loads.
-            title = f"Error: {message} - {title}" if kind == "error" else f"{message} - {title}"
+            # What happened is in the title too, so it's the first thing read when the page loads.
+            # Not an error, which is read out from the page.
+            if kind != "error":
+                title = f"{message} - {title}"
         return page_rendering.set_title(page, title)
 
     def _index_page_address(self, query: dict[str, str]) -> str | None:

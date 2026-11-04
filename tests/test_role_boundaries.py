@@ -7,6 +7,7 @@ import sys
 import threading
 import unittest
 
+from signing_in import session_cookie
 from test_auth import load_web_control_module
 from test_restart import RestartPageTests
 
@@ -24,7 +25,7 @@ class RoleBoundaryTests(unittest.TestCase):
     def send(self, user, method, path, body=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         self.addCleanup(connection.close)
-        headers = {"Authorization": "Basic " + base64.b64encode(":".join(user).encode()).decode()}
+        headers = {"Cookie": session_cookie(self.server_service, *user)}
         if body is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(body)
@@ -81,12 +82,12 @@ class ClientLogTests(unittest.TestCase):
         forged = "hello\n2026-10-22 09:00:00,000 INFO nwr_stream_manager.service_restart: restart requested by owner"
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         self.addCleanup(connection.close)
-        auth = "Basic " + base64.b64encode(b"viewer:password3").decode()
+        auth = session_cookie(self.server_service, "viewer")
         with self.assertLogs("nwr_stream_manager", level="INFO") as logs:
             connection.request(
                 "POST", "/api/client-log",
                 body=json.dumps({"level": "info", "area": "page\nscript", "message": forged}),
-                headers={"Authorization": auth, "Content-Type": "application/json"},
+                headers={"Cookie": auth, "Content-Type": "application/json"},
             )
             response = connection.getresponse()
             response.read()

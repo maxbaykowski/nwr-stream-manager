@@ -17,7 +17,6 @@ STATE_DIRECTORY_NAME = "nwr-stream-manager"
 STATE_FILE_NAME = "rtl-control.json"
 LOG_FILE_NAME = "nwr-stream-manager.log"
 ACCOUNTS_DATABASE_FILE_NAME = "accounts.db"
-AUTH_REALM = "NWR Stream Manager"
 AUTH_SESSION_COOKIE_NAME = "nwrstmgr_session"
 AUTH_SESSION_SECONDS = 12 * 60 * 60
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")

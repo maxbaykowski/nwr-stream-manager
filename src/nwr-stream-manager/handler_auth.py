@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import logging
 from http import HTTPStatus
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
+from . import page_rendering
 from .accounts import AccountRecord
 from .baseline_pages import (
     ACCOUNT_FORM_PATHS,
@@ -23,17 +22,19 @@ from .baseline_pages import (
     render_change_password_page,
     render_notice_page,
     render_setup_page,
-    render_sign_in_wait_page,
+    render_sign_in_page,
     SETUP_FORM_PATH,
-    SIGN_IN_REQUIRED_HTML,
     STREAM_ARCHIVE_DOWNLOAD_PATH,
     STREAM_ARCHIVE_PLAY_PATH,
     SIGN_IN_ALERT_API_PATH,
     SIGN_IN_ALERT_PATH,
+    SIGN_IN_PATH,
+    SIGN_OUT_PATH,
     TAILSCALE_SETTINGS_PATH,
     TWO_STEP_PATH,
 )
-from .constants import AUTH_REALM, AUTH_SESSION_COOKIE_NAME
+from .constants import AUTH_SESSION_COOKIE_NAME
+from .handler_two_step import _safe_next
 from .request_origin import (
     ANOTHER_SITE_MESSAGE,
     forwarded_client_address,
@@ -44,6 +45,19 @@ from .sign_in_limits import SignInWait
 
 
 LOG = logging.getLogger(__name__)
+# Said the same whichever was wrong, so it doesn't tell anyone which usernames are accounts.
+WRONG_PASSWORD_MESSAGE = "The username or password is incorrect."
+SIGN_IN_EXPIRED_MESSAGE = "This page had expired. Please sign in again."
+SIGN_IN_COOKIES_MESSAGE = "To sign in, your browser has to accept cookies from NWR Stream Manager. Turn cookies on for this site, then sign in again."
+SIGNED_OUT_MESSAGE = "You've signed out."
+
+
+def _sign_in_next(value: str) -> str:
+    """Where to go once signed in: only somewhere on this server, and not back to signing in or out."""
+    target = _safe_next(value)
+    if urlparse(target).path in {SIGN_IN_PATH, SIGN_OUT_PATH}:
+        return "/"
+    return target
 
 
 class AuthHandlerMixin:
@@ -70,8 +84,7 @@ class AuthHandlerMixin:
         # One connection can carry several requests.
         self._new_form_token = ""
         self._auth_session_token = ""
-        self._new_auth_session = False
-        self._sign_in_wait: SignInWait | None = None
+        self._pending_auth_session_cookie = ""
         if request_from_another_site(method, path, self.headers):
             self._send_another_site_refused(path)
             allowed = False
@@ -124,23 +137,114 @@ class AuthHandlerMixin:
             self._discard_request_body()
             self._send_redirect("/")
             return False
-        if path == "/notification":
-            return self._notification_auth_ok_or_response(path, method)
+        if path == SIGN_IN_PATH:
+            if method == "POST":
+                self._post_sign_in()
+            elif method == "GET":
+                self._get_sign_in()
+            else:
+                self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
+            return False
+        if path == SIGN_OUT_PATH:
+            if method == "POST":
+                self._post_sign_out()
+            else:
+                self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
+            return False
         account = self._session_auth_valid()
         if isinstance(account, AccountRecord):
             self.current_account = account
             if not self._account_authorized_or_response(path, method, account):
                 return False
             return True
-        account = self._basic_auth_valid()
-        if isinstance(account, AccountRecord):
-            self.current_account = account
-            self._start_auth_session(account)
-            if not self._account_authorized_or_response(path, method, account):
-                return False
-            return True
         self._send_auth_required()
         return False
+
+    # -- signing in and out -------------------------------------------------
+
+    def _get_sign_in(self) -> None:
+        query = parse_qs(urlparse(self.path).query)
+        next_path = _sign_in_next(query.get("next", ["/"])[0])
+        if isinstance(self._session_auth_valid(), AccountRecord):
+            # Already signed in, such as in another tab.
+            self._send_redirect(next_path)
+            return
+        message = SIGNED_OUT_MESSAGE if query.get("signed_out", [""])[0] == "1" else ""
+        self._send_page(render_sign_in_page(self._form_token(), next_path, message, kind="success"))
+
+    def _post_sign_in(self) -> None:
+        form = self._read_form()
+        next_path = _sign_in_next(form.get("next", "/"))
+        username = form.get("username", "").strip()[:64]
+        remember = form.get("remember") == "1"
+        if not self._form_token_ok(form):
+            # A form from another site, or one left open from before this browser's form token, or
+            # a browser that doesn't keep cookies at all, which can't stay signed in either.
+            no_cookie = not self._cookie_value(page_rendering.FORM_TOKEN_COOKIE_NAME)
+            message = SIGN_IN_COOKIES_MESSAGE if no_cookie else SIGN_IN_EXPIRED_MESSAGE
+            self._send_sign_in_refused(message, next_path, username, remember, HTTPStatus.FORBIDDEN)
+            return
+        try:
+            account = self.service.accounts.verify_password(username, form.get("password", ""), attempt=self._sign_in_attempt_details())
+        except SignInWait as wait:
+            self._send_sign_in_refused(str(wait), next_path, username, remember, HTTPStatus.TOO_MANY_REQUESTS, {"Retry-After": str(wait.seconds)})
+            return
+        if not isinstance(account, AccountRecord):
+            self._send_sign_in_refused(WRONG_PASSWORD_MESSAGE, next_path, username, remember)
+            return
+        # A new session every time, never one the browser already had, which could have been
+        # given to it by someone else, or be another account's.
+        self._invalidate_request_auth_session_cookie()
+        self.current_account = account
+        # Not with a temporary password, which has to be changed first, signing it out.
+        remember = remember and not account.must_change_password
+        self._start_auth_session(account, remember=remember)
+        if self._two_step_satisfied(account):
+            if remember:
+                self._remember_session(self._auth_session_token)
+            # Signed in, two-step verification included: a few wrong passwords or codes before it,
+            # from the same address, were most likely typing mistakes. Not before then, or someone with the password could
+            # start session after session, and their wrong codes would never add up.
+            self.service.accounts.forget_few_sign_in_attempts(account.id, self._visitor_host())
+            LOG.info("%s signed in from %s%s", account.username, self._client_address(), ", and is remembered for 30 days" if remember else "")
+        else:
+            LOG.info("%s entered the right password from %s; two-step verification is next", account.username, self._client_address())
+        # Two-step verification, a password change or a sign-in alert come next, where it's going.
+        if self._sign_in_from_page():
+            self._send_json({"next": next_path})
+        else:
+            self._send_redirect(next_path)
+
+    def _sign_in_from_page(self) -> bool:
+        # The sign-in page's script, which stays on the page when a sign-in doesn't work, so browsers
+        # don't take it for one that did and offer to save a wrong password.
+        return "application/json" in self.headers.get("Accept", "")
+
+    def _send_sign_in_refused(
+        self,
+        message: str,
+        next_path: str,
+        username: str,
+        remember: bool,
+        status: HTTPStatus = HTTPStatus.OK,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        if self._sign_in_from_page():
+            # With the form token, which the page may not have had yet.
+            self._send_json({"error": message, "form_token": self._form_token()}, status, headers)
+        else:
+            self._send_page(render_sign_in_page(self._form_token(), next_path, message, username=username, remember=remember), status, headers)
+
+    def _post_sign_out(self) -> None:
+        form = self._read_form()
+        account = self._session_auth_valid()
+        if not self._form_token_ok(form):
+            self._send_redirect("/")
+            return
+        self._invalidate_request_auth_session_cookie()
+        if isinstance(account, AccountRecord):
+            LOG.info("%s signed out from %s", account.username, self._client_address())
+        self._send_redirect(f"{SIGN_IN_PATH}?signed_out=1")
 
     def _send_another_site_refused(self, path: str) -> None:
         self.current_account = None
@@ -166,37 +270,14 @@ class AuthHandlerMixin:
         self._auth_session_token = token
         return account
 
-    def _basic_auth_valid(self) -> AccountRecord | None:
-        header = self.headers.get("Authorization", "")
-        if not header.startswith("Basic "):
-            return None
-        try:
-            decoded = base64.b64decode(header[6:].strip().encode("ascii"), validate=True).decode("utf-8")
-        except (UnicodeDecodeError, binascii.Error):
-            return None
-        username, separator, password = decoded.partition(":")
-        if not separator:
-            return None
-        try:
-            return self.service.accounts.verify_basic_account(username, password, attempt=self._sign_in_attempt_details())
-        except SignInWait as wait:
-            self._sign_in_wait = wait
-            return None
-
-    def _start_auth_session(self, account: AccountRecord) -> None:
-        self._auth_session_token = self.service.auth_sessions.create(account.id)
-        self._new_auth_session = True
+    def _start_auth_session(self, account: AccountRecord, remember: bool = False) -> None:
+        self._auth_session_token = self.service.auth_sessions.create(account.id, remember=remember)
         self._pending_auth_session_cookie = self.service.auth_sessions.cookie_header(self._cookie_name(AUTH_SESSION_COOKIE_NAME), self._auth_session_token)
 
     def _account_authorized_or_response(self, path: str, method: str, account: AccountRecord) -> bool:
         # From outside the local network, a password isn't enough.
         if not self._two_step_ok_or_response(path, method, account):
             return False
-        if getattr(self, "_new_auth_session", False) and not getattr(self, "_two_step_code_pending", False) and not getattr(self, "_two_step_setup_only", False):
-            # Signed in, two-step verification included: a few wrong passwords or codes before it,
-            # from the same address, were most likely typing mistakes. Not before then, or someone with the password could
-            # start session after session, and their wrong codes would never add up.
-            self.service.accounts.forget_few_sign_in_attempts(account.id, self._visitor_host())
         # Told about wrong passwords and codes since it last signed in, before anything else.
         if not self._sign_in_alert_or_continue(path, method, account):
             return False
@@ -223,29 +304,6 @@ class AuthHandlerMixin:
             return True
         if account.is_read_only and not self._read_only_request_allowed(path, method):
             self._send_json({"error": "this account is read-only"}, status=HTTPStatus.FORBIDDEN)
-            return False
-        return True
-
-    def _notification_auth_ok_or_response(self, path: str, method: str) -> bool:
-        if method != "GET":
-            self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
-            return False
-        if not self.headers.get("Authorization", "").startswith("Basic "):
-            self._invalidate_request_auth_session_cookie()
-            self._send_auth_required()
-            return False
-        account = self._basic_auth_valid()
-        if not isinstance(account, AccountRecord):
-            self._invalidate_request_auth_session_cookie()
-            self._send_auth_required()
-            return False
-        self.current_account = account
-        # The browser's session goes on if it's this account's, along with whether it passed
-        # two-step verification; otherwise the link would ask for a code every time.
-        existing = self._session_auth_valid()
-        if not (isinstance(existing, AccountRecord) and existing.id == account.id):
-            self._start_auth_session(account)
-        if not self._account_authorized_or_response(path, method, account):
             return False
         return True
 
@@ -308,49 +366,14 @@ class AuthHandlerMixin:
         self._pending_auth_session_cookie = f"{self._cookie_name(AUTH_SESSION_COOKIE_NAME)}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
 
     def _send_auth_required(self) -> None:
-        wait = getattr(self, "_sign_in_wait", None)
-        if wait is not None:
-            self._send_sign_in_wait(wait)
+        """Not signed in: the sign-in page, coming back here after, or for the page script, a
+        401 that says so, which it answers by loading the page again."""
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/"):
+            self._send_json({"error": "Sign-in is required.", "sign_in": SIGN_IN_PATH}, status=HTTPStatus.UNAUTHORIZED)
             return
-        payload = b'{"error":"authentication required"}'
-        content_type = "application/json"
-        if not urlparse(self.path).path.startswith("/api/"):
-            # Shown if the sign-in prompt is cancelled.
-            payload = SIGN_IN_REQUIRED_HTML.encode("utf-8")
-            content_type = "text/html; charset=utf-8"
-        # Any request body is left unread, so the connection can't be used again.
-        self.close_connection = True
-        self.send_response(HTTPStatus.UNAUTHORIZED)
-        self.send_header("WWW-Authenticate", f'Basic realm="{AUTH_REALM}", charset="UTF-8"')
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Set-Cookie", f"{self._cookie_name(AUTH_SESSION_COOKIE_NAME)}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        try:
-            self.wfile.write(payload)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            LOG.debug("client disconnected before auth response could be written")
-
-    def _send_sign_in_wait(self, wait: SignInWait) -> None:
-        """Too many wrong passwords: says how long to wait, without asking for a password again yet."""
-        if urlparse(self.path).path.startswith("/api/"):
-            payload = json.dumps({"error": str(wait)}).encode("utf-8")
-            content_type = "application/json"
-        else:
-            payload = render_sign_in_wait_page(str(wait)).encode("utf-8")
-            content_type = "text/html; charset=utf-8"
-        self.close_connection = True
-        self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
-        self.send_header("Retry-After", str(wait.seconds))
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        try:
-            self.wfile.write(payload)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            LOG.debug("client disconnected before the sign-in wait could be written")
+        next_path = self.path if self.command == "GET" else "/"
+        self._send_redirect(f"{SIGN_IN_PATH}?next={quote(_sign_in_next(next_path), safe='')}")
 
     def _send_notification_forbidden(self) -> None:
         data = (
@@ -376,7 +399,6 @@ class AuthHandlerMixin:
         if cookie:
             self.send_header("Set-Cookie", cookie)
             self._pending_auth_session_cookie = ""
-        self._send_pending_device_cookie()
 
     def _change_own_password(self, account: AccountRecord, current: str, new: str, confirm: str) -> dict[str, Any]:
         updated = self.service.accounts.change_password(account.id, current, new, confirm)

@@ -385,6 +385,9 @@ async function request(path, options = {}) {
   // From outside the local network, once this session no longer counts as verified: loading the
   // page again asks for the code, then comes back here.
   if (response.status === 403 && data.two_step) window.location.reload();
+  // Signed out, such as from another tab, or by a password change: loading the page again goes
+  // to the sign-in page, then comes back here.
+  if (response.status === 401 && data.sign_in) window.location.reload();
   if (!response.ok) throw new Error(data.error || response.statusText);
   return data;
 }
@@ -10753,12 +10756,16 @@ for (const button of document.querySelectorAll("[data-baseline-submit]")) {
 (() => {
   const menu = document.getElementById("nav_more_menu");
   menu.setAttribute("role", "menu");
-  for (const item of menu.querySelectorAll("a")) item.setAttribute("role", "menuitem");
+  for (const item of menu.querySelectorAll("a, #nav_sign_out")) item.setAttribute("role", "menuitem");
+  document.getElementById("nav_sign_out_form").setAttribute("role", "none");
   menu.hidden = true;
   document.getElementById("nav_more_button").hidden = false;
 })();
 document.getElementById("nav_more_button").addEventListener("click", () => {
   toggleNavMoreMenu();
+});
+document.getElementById("nav_sign_out_form").addEventListener("submit", event => {
+  if (!confirmDiscardNavigation()) event.preventDefault();
 });
 
 document.getElementById("nav_more_button").addEventListener("keydown", event => {

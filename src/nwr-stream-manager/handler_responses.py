@@ -170,13 +170,16 @@ class ResponseHandlerMixin:
 
         self._send_json_result(run, failure)
 
-    def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK, headers: dict[str, str] | None = None) -> None:
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self._send_pending_auth_session_cookie()
+        self._send_new_form_token_cookie()
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -212,9 +215,11 @@ class ResponseHandlerMixin:
             return
         self._send_audio(data, "audio/mpeg")
 
-    def _send_html(self, content: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_html(self, content: str, status: HTTPStatus = HTTPStatus.OK, headers: dict[str, str] | None = None) -> None:
         data = content.encode("utf-8")
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
@@ -353,14 +358,14 @@ class ResponseHandlerMixin:
         self._send_pending_auth_session_cookie()
         self.end_headers()
 
-    def _send_page(self, page: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_page(self, page: str, status: HTTPStatus = HTTPStatus.OK, headers: dict[str, str] | None = None) -> None:
         """Sends a page the server filled in, adjusted for this browser."""
         # Signed in, a page is titled with the instance name. Anyone else sees only NWR Stream Manager.
         if getattr(self, "current_account", None) is not None:
             page = page_rendering.set_site_name(page, self.service.instance_name)
         if page_rendering.old_internet_explorer(self.headers.get("User-Agent", "")):
             page = page_rendering.mark_hidden_for_old_internet_explorer(page)
-        self._send_html(page, status)
+        self._send_html(page, status, headers)
 
     def _send_index_page(self, parsed) -> None:
         query = {name: values[0] for name, values in parse_qs(parsed.query).items()}

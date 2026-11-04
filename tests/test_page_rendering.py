@@ -1,5 +1,6 @@
 import base64
 import html
+import json
 import http.client
 import re
 import tempfile
@@ -10,8 +11,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
+from signing_in import session_cookie
 from test_auth import load_web_control_module
 
 
@@ -186,19 +188,21 @@ class BaselinePageServerTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
-    def request(self, method: str, path: str, *, fields=None, cookie="", user=None):
+    def request(self, method: str, path: str, *, fields=None, cookie="", user=None, accept=""):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         self.addCleanup(connection.close)
-        headers = {}
+        headers = {"Accept": accept} if accept else {}
         body = None
         if fields is not None:
             body = urlencode(fields)
             headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if user:
+            # Signed in as user, as long as the password's right.
+            cookie = "; ".join(part for part in (cookie, session_cookie(self.server_service, user[0], user[1])) if part)
         if cookie:
             headers["Cookie"] = cookie
-        if user:
-            headers["Authorization"] = "Basic " + base64.b64encode(f"{user[0]}:{user[1]}".encode()).decode()
         connection.request(method, path, body=body, headers=headers)
         response = connection.getresponse()
         return response, response.read().decode("utf-8")
@@ -227,7 +231,7 @@ class BaselinePageServerTests(unittest.TestCase):
         fields = {"username": "owner", "password": "password1", "confirm_password": "password2", "form_token": token}
         response, page = self.request("POST", "/setup", fields=fields, cookie=f"{self.form_cookie_name}={token}")
         self.assertEqual(response.status, 400)
-        self.assertEqual(self.title(page), "Error: Passwords do not match. - NWR Stream Manager Setup")
+        self.assertEqual(self.title(page), "NWR Stream Manager Setup")
         self.assertIn('role="alert"', page)
         self.assertIn('value="owner"', page)
         self.assertFalse(self.accounts.has_account())
@@ -248,14 +252,200 @@ class BaselinePageServerTests(unittest.TestCase):
             self.assertIn("This page had expired", page)
         self.assertFalse(self.accounts.has_account())
 
-    def test_pages_ask_for_a_sign_in_with_a_page_and_the_api_with_json(self) -> None:
+    def sign_in_form(self, next_path="/"):
+        """The sign-in page's form token and the form cookie it gave."""
+        response, page = self.request("GET", f"/sign-in?next={quote(next_path, safe='')}")
+        token = self.form_token(response)
+        self.assertIn(f'name="form_token" value="{token}"', page)
+        return token, f"{self.form_cookie_name}={token}"
+
+    def send_sign_in(self, username, password, next_path="/", cookie=""):
+        token, form_cookie = self.sign_in_form(next_path)
+        fields = {"form_token": token, "next": next_path, "username": username, "password": password}
+        return self.request("POST", "/sign-in", fields=fields, cookie="; ".join(part for part in (form_cookie, cookie) if part))
+
+    @staticmethod
+    def session_from(response) -> str:
+        match = re.search(r"(nwrstmgr_session_\w+)=([^;]*)", response.getheader("Set-Cookie") or "")
+        return f"{match.group(1)}={match.group(2)}" if match and match.group(2) else ""
+
+    def test_pages_go_to_the_sign_in_page_and_the_api_says_so_in_json(self) -> None:
         self.accounts.create_admin("owner", "password1", "password1")
 
-        response, page = self.request("GET", "/?view=logs")
-        self.assertEqual(response.status, 401)
-        self.assertIn("<title>Sign in required - NWR Stream Manager</title>", page)
+        response, _ = self.request("GET", "/?view=logs")
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.getheader("Location"), "/sign-in?next=%2F%3Fview%3Dlogs")
+        # No browser sign-in box any more.
+        self.assertIsNone(response.getheader("WWW-Authenticate"))
         response, page = self.request("GET", "/api/status")
-        self.assertEqual((response.status, page), (401, '{"error":"authentication required"}'))
+        self.assertEqual(response.status, 401)
+        self.assertIsNone(response.getheader("WWW-Authenticate"))
+        self.assertEqual(json.loads(page), {"error": "Sign-in is required.", "sign_in": "/sign-in"})
+        # A notification's link signs in first, then goes where it points.
+        response, _ = self.request("GET", "/notification?next=%2F%3Fview%3Dstreams")
+        self.assertEqual(response.getheader("Location"), "/sign-in?next=%2Fnotification%3Fnext%3D%252F%253Fview%253Dstreams")
+
+        response, page = self.request("GET", "/sign-in?next=%2F%3Fview%3Dlogs")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.title(page), "Sign in - NWR Stream Manager")
+        self.assertIn('<form id="sign_in_form" method="post" action="/sign-in">', page)
+        self.assertIn('<input id="sign_in_next" type="hidden" name="next" value="/?view=logs">', page)
+        self.assertIn('autocomplete="username"', page)
+        self.assertIn('autocomplete="current-password"', page)
+        # Nothing about this computer to anyone who isn't signed in.
+        self.assertNotIn(" on ", self.title(page))
+
+    def test_a_password_sent_the_old_way_signs_no_one_in(self) -> None:
+        # HTTP Basic authentication, which the sign-in page replaces, even with the right password.
+        self.accounts.create_admin("owner", "password1", "password1")
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self.addCleanup(connection.close)
+        basic = "Basic " + base64.b64encode(b"owner:password1").decode()
+        for path in ("/?view=logs", "/api/status", "/notification?next=%2F"):
+            with self.subTest(path=path):
+                connection.request("GET", path, headers={"Authorization": basic})
+                response = connection.getresponse()
+                response.read()
+                self.assertIn(response.status, (303, 401))
+                self.assertNotIn("nwrstmgr_session", response.getheader("Set-Cookie") or "")
+
+    def test_signing_in_starts_a_new_session_and_goes_where_it_was_going(self) -> None:
+        self.accounts.create_admin("owner", "password1", "password1")
+        self.accounts.create_account("viewer", True)
+        old = session_cookie(self.server_service, "viewer")
+
+        response, _ = self.send_sign_in("owner", "password1", "/?view=logs", cookie=old)
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.getheader("Location"), "/?view=logs")
+        session = self.session_from(response)
+        self.assertTrue(session)
+        self.assertIn("HttpOnly", response.getheader("Set-Cookie"))
+        self.assertIn("SameSite=Lax", response.getheader("Set-Cookie"))
+        self.assertNotEqual(session, old)
+        response, page = self.request("GET", "/?view=logs", cookie=session)
+        self.assertEqual((response.status, self.title(page)), (200, "Logs - NWR Stream Manager"))
+        # The session the browser had before, someone else's, is over.
+        response, _ = self.request("GET", "/?view=logs", cookie=old)
+        self.assertEqual(response.status, 303)
+        # Already signed in, the sign-in page goes on to where it was going.
+        response, _ = self.request("GET", "/sign-in?next=%2F%3Fview%3Dstreams", cookie=session)
+        self.assertEqual(response.getheader("Location"), "/?view=streams")
+
+    def test_a_wrong_username_or_password_is_said_the_same_way(self) -> None:
+        self.accounts.create_admin("owner", "password1", "password1")
+        for username, password in (("owner", "wrong-password"), ("nobody", "password1")):
+            with self.subTest(username=username):
+                response, page = self.send_sign_in(username, password)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(self.session_from(response), "")
+                self.assertEqual(self.title(page), "Sign in - NWR Stream Manager")
+                self.assertIn('<div id="sign_in_message" aria-live="polite" class="message error" role="alert">The username or password is incorrect.</div>', page)
+                # Back for the password.
+                self.assertIn(f'name="username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="64" required value="{username}">', page)
+                self.assertRegex(page, r'id="sign_in_password"[^>]*autofocus="autofocus"')
+
+    def test_signing_in_needs_the_pages_own_form_token(self) -> None:
+        # Such as a form on another site, in a browser that doesn't say where a request came from.
+        self.accounts.create_admin("owner", "password1", "password1")
+        _token, form_cookie = self.sign_in_form()
+        fields = {"form_token": "made-up", "next": "/", "username": "owner", "password": "password1"}
+        response, page = self.request("POST", "/sign-in", fields=fields, cookie=form_cookie)
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.session_from(response), "")
+        self.assertIn("This page had expired. Please sign in again.", page)
+        # A browser that keeps no cookies at all is told what to do about it.
+        response, page = self.request("POST", "/sign-in", fields=fields)
+        self.assertEqual(self.session_from(response), "")
+        self.assertIn("To sign in, your browser has to accept cookies from NWR Stream Manager.", page)
+
+    def test_signing_in_only_goes_on_to_this_server(self) -> None:
+        self.accounts.create_admin("owner", "password1", "password1")
+        for next_path in ("//evil.example/", "https://evil.example/", "/\\evil.example", "/sign-out", "/sign-in?next=/"):
+            with self.subTest(next_path=next_path):
+                response, _ = self.send_sign_in("owner", "password1", next_path)
+                self.assertEqual(response.getheader("Location"), "/")
+
+    def test_too_many_wrong_passwords_have_to_wait_even_for_the_right_one(self) -> None:
+        self.accounts.create_admin("owner", "password1", "password1")
+        for number in range(5):
+            self.send_sign_in("owner", f"wrong{number}")
+        response, page = self.send_sign_in("owner", "password1")
+        self.assertEqual(response.status, 429)
+        self.assertTrue(response.getheader("Retry-After"))
+        self.assertEqual(self.session_from(response), "")
+        self.assertIn("role=\"alert\">Too many wrong passwords", page)
+
+    def test_signing_out_ends_the_session_here_only(self) -> None:
+        self.accounts.create_admin("owner", "password1", "password1")
+        elsewhere = session_cookie(self.server_service, "owner")
+        response, _ = self.send_sign_in("owner", "password1")
+        session = self.session_from(response)
+        response, page = self.request("GET", "/?view=logs", cookie=session)
+        token = re.search(r'<form id="nav_sign_out_form" class="nav-sign-out" method="post" action="/sign-out">\s*<input type="hidden" name="form_token" value="([^"]+)">', page).group(1)
+        form_cookie = f"{self.form_cookie_name}={token}" if hasattr(self, "form_cookie_name") else ""
+
+        # Without the page's form token, nothing happens.
+        response, _ = self.request("POST", "/sign-out", fields={"form_token": "made-up"}, cookie=f"{session}; {form_cookie}")
+        self.assertEqual(response.getheader("Location"), "/")
+        self.assertEqual(self.request("GET", "/?view=logs", cookie=session)[0].status, 200)
+
+        response, _ = self.request("POST", "/sign-out", fields={"form_token": token}, cookie=f"{session}; {form_cookie}")
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.getheader("Location"), "/sign-in?signed_out=1")
+        self.assertIn("Max-Age=0", response.getheader("Set-Cookie"))
+        self.assertEqual(self.request("GET", "/?view=logs", cookie=session)[0].status, 303)
+        # Signed in elsewhere still.
+        self.assertEqual(self.request("GET", "/?view=logs", cookie=elsewhere)[0].status, 200)
+        _, page = self.request("GET", "/sign-in?signed_out=1")
+        self.assertIn('<div id="sign_in_message" aria-live="polite" class="message success" role="status">You&#x27;ve signed out.</div>', page)
+
+    def test_a_sign_in_thats_not_remembered_ends_when_the_browser_is_quit(self) -> None:
+        self.accounts.create_admin("owner", "password1", "password1")
+        response, _ = self.send_sign_in("owner", "password1")
+        cookie = [value for name, value in response.getheaders() if name.lower() == "set-cookie" and "nwrstmgr_session_" in value][-1]
+        self.assertNotIn("Max-Age", cookie)
+        self.assertNotIn("Expires", cookie)
+        # Ticked, it lasts 30 days, even after the browser is quit.
+        token, form_cookie = self.sign_in_form()
+        fields = {"form_token": token, "next": "/", "username": "owner", "password": "password1", "remember": "1"}
+        response, _ = self.request("POST", "/sign-in", fields=fields, cookie=form_cookie)
+        self.assertRegex(response.getheader("Set-Cookie"), r"nwrstmgr_session_\w+=[^;]+; Max-Age=259\d{4};")
+        # And a page that comes back with the box ticked keeps it ticked.
+        fields["password"] = "wrong"
+        _response, page = self.request("POST", "/sign-in", fields=fields, cookie=form_cookie)
+        self.assertIn('id="sign_in_remember" name="remember" type="checkbox" value="1" checked="checked">', page)
+
+    def test_the_sign_in_pages_script_stays_on_the_page_when_signing_in_doesnt_work(self) -> None:
+        # So browsers don't take a wrong password for one that worked, and offer to save it.
+        self.accounts.create_admin("owner", "password1", "password1")
+        token, form_cookie = self.sign_in_form("/?view=logs")
+        fields = {"form_token": token, "next": "/?view=logs", "username": "owner", "password": "wrong"}
+        response, body = self.request("POST", "/sign-in", fields=fields, cookie=form_cookie, accept="application/json")
+        self.assertEqual((response.status, response.getheader("Content-Type")), (200, "application/json"))
+        self.assertEqual(json.loads(body), {"error": "The username or password is incorrect.", "form_token": token})
+        self.assertEqual(self.session_from(response), "")
+        # A form token from before, with the one to use instead.
+        response, body = self.request("POST", "/sign-in", fields={**fields, "form_token": "old"}, cookie=form_cookie, accept="application/json")
+        self.assertEqual(response.status, 403)
+        self.assertEqual(json.loads(body), {"error": "This page had expired. Please sign in again.", "form_token": token})
+
+        response, body = self.request("POST", "/sign-in", fields={**fields, "password": "password1"}, cookie=form_cookie, accept="application/json")
+        self.assertEqual(json.loads(body), {"next": "/?view=logs"})
+        session = self.session_from(response)
+        self.assertEqual(self.request("GET", "/?view=logs", cookie=session)[0].status, 200)
+
+        for number in range(5):
+            self.request("POST", "/sign-in", fields={**fields, "password": f"wrong{number}"}, cookie=form_cookie, accept="application/json")
+        response, body = self.request("POST", "/sign-in", fields={**fields, "password": "password1"}, cookie=form_cookie, accept="application/json")
+        self.assertEqual(response.status, 429)
+        self.assertTrue(response.getheader("Retry-After"))
+        self.assertTrue(json.loads(body)["error"].startswith("Too many wrong passwords"))
+        self.assertEqual(self.session_from(response), "")
+
+        _, page = self.request("GET", "/sign-in")
+        self.assertIn('<script type="text/x-nwr-app">', page)
+        # The message isn't in the form, which goes once signing in has worked.
+        self.assertIn('</form>\n    <div id="sign_in_message"', page)
 
     def test_logs_are_filled_in_and_other_pages_say_they_need_a_newer_browser(self) -> None:
         self.accounts.create_admin("owner", "password1", "password1")
@@ -326,7 +516,7 @@ class BaselinePageServerTests(unittest.TestCase):
 
         response, page = self.request("POST", "/accounts/create", fields={"username": "bad name", "read_only": "1", "form_token": token}, cookie=cookie, user=owner)
         self.assertEqual(response.status, 400)
-        self.assertTrue(self.title(page).startswith("Error: Username may contain only letters"))
+        self.assertIn("role=\"alert\">Username may contain only letters", page)
         self.assertIn('value="bad name"', page)
         self.assertRegex(page, r'<input id="new_account_read_only"[^>]* checked="checked">')
 
@@ -336,7 +526,7 @@ class BaselinePageServerTests(unittest.TestCase):
         self.assertEqual(self.title(page), "Account helper created. - Temporary password - NWR Stream Manager")
         self.assertNotIn('id="view_settings"', page)
         secret = re.search(r'<input id="notice_copy_value" readonly value="([^"]+)">', page).group(1)
-        self.assertIsNotNone(self.accounts.verify_basic_account("helper", secret))
+        self.assertIsNotNone(self.accounts.verify_password("helper", secret))
         # With a setup code, for two-step verification from outside the local network.
         self.assertIn("If this user must access NWR Stream Manager via the public internet, also share this setup code with them.", page)
         self.assertRegex(page, r'<label>Setup code <input id="notice_setup_code" readonly value="[a-z0-9]{5}-[a-z0-9]{5}"></label>')
@@ -387,7 +577,7 @@ class BaselinePageServerTests(unittest.TestCase):
         fields = {"current_password": "wrong", "new_password": "password3", "confirm_password": "password3", "form_token": token}
         response, page = self.request("POST", "/change-password", fields=fields, cookie=cookie, user=helper)
         self.assertEqual(response.status, 400)
-        self.assertEqual(self.title(page), "Error: Current password is incorrect. - Account - Settings - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Account - Settings - NWR Stream Manager")
 
         _, page = self.request("GET", "/?view=settings&section=account", cookie=cookie, user=owner)
         self.assertRegex(page, r'<div id="settings_owner_password_page">\s*<h3>Change account password</h3>\s*<form id="change_password_form"')
@@ -405,12 +595,12 @@ class BaselinePageServerTests(unittest.TestCase):
 
         response, page = self.request("POST", "/change-password", fields=fields, cookie=cookie, user=user)
         self.assertEqual(response.status, 400)
-        self.assertEqual(self.title(page), "Error: Current password is incorrect. - Change Account Password")
+        self.assertEqual(self.title(page), "Change Account Password")
 
         response, _ = self.request("POST", "/change-password", fields={**fields, "current_password": secret}, cookie=cookie, user=user)
         self.assertEqual((response.status, response.getheader("Location")), (303, "/"))
         self.assertEqual(self.revoked, [account["id"]])
-        self.assertIsNotNone(self.accounts.verify_basic_account("viewer", "password2"))
+        self.assertIsNotNone(self.accounts.verify_password("viewer", "password2"))
 
 
 class EasAlertServiceStandIn(StandInService):
@@ -479,6 +669,7 @@ class EasAlertPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def alert_ids(self) -> list[str]:
         return [alert["id"] for page in (1, 2) for alert in self.service.eas_alerts("s1", page, 25)["alerts"]]
@@ -526,7 +717,7 @@ class EasAlertPageTests(unittest.TestCase):
         self.assertRegex(page, r'<a id="eas_alert_next_link"[^>]* hidden>')
 
         response, page = self.request("GET", "/?view=eas_alert_detail&stream=s1&alert=missing", user=self.owner)
-        self.assertEqual(self.title(page), "Error: EAS alert was not found. - EAS Alert Details - NWR Stream Manager")
+        self.assertEqual(self.title(page), "EAS Alert Details - NWR Stream Manager")
         self.assertRegex(page, r'<div id="eas_alert_player" class="baseline-only" hidden>')
 
     def test_an_alert_is_removed_after_a_confirmation(self) -> None:
@@ -557,8 +748,7 @@ class EasAlertPageTests(unittest.TestCase):
 
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         self.addCleanup(connection.close)
-        authorization = "Basic " + base64.b64encode(b"viewer:password2").decode()
-        connection.request("GET", "/eas-alerts/export?stream=s1&eas_export_mode=all", headers={"Authorization": authorization})
+        connection.request("GET", "/eas-alerts/export?stream=s1&eas_export_mode=all", headers={"Cookie": session_cookie(self.server_service, "viewer")})
         response = connection.getresponse()
         self.assertEqual(response.status, 200)
         self.assertEqual(response.getheader("Content-Disposition"), 'attachment; filename="WXN99-eas-alerts.zip"')
@@ -571,7 +761,7 @@ class EasAlertPageTests(unittest.TestCase):
                   "eas_export_end_hour": "12", "eas_export_end_minute": "0", "eas_export_end_ampm": "AM"}
         response, page = self.request("GET", "/eas-alerts/export?" + urlencode(fields), user=self.viewer)
         self.assertEqual(response.status, 400)
-        self.assertEqual(self.title(page), "Error: No alerts were issued during this time. - Export Alerts - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Export Alerts - NWR Stream Manager")
         # What was chosen is kept.
         self.assertIn('value="manual" checked', page)
         self.assertIn(f'<option value="{datetime.now().year - 5}" selected>', page)
@@ -677,6 +867,7 @@ class IqRecorderPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def token(self):
         response, _ = self.request("GET", "/?view=iq_recorder", user=self.owner)
@@ -738,7 +929,7 @@ class IqRecorderPageTests(unittest.TestCase):
         fields = {"iq_recording_mode": "spectrum", "sample_rate": "1024000", "duration_minutes": "abc", "form_token": token}
         response, page = self.request("POST", "/iq-recorder/start", fields=fields, cookie=cookie, user=self.owner)
         self.assertEqual(response.status, 400)
-        self.assertEqual(self.title(page), "Error: Enter a number of minutes from 0 to 1440. - New I/Q Recording - NWR Stream Manager")
+        self.assertEqual(self.title(page), "New I/Q Recording - NWR Stream Manager")
         self.assertIn('<option value="1024000" selected>', page)
         self.assertIn('id="iq_mode_spectrum" name="iq_recording_mode" type="radio" value="spectrum" checked="checked">', page)
         self.assertIn('value="abc"', page)
@@ -778,7 +969,7 @@ class IqRecorderPageTests(unittest.TestCase):
         response, _ = self.request("POST", "/iq-recordings/remove", fields=fields, cookie=cookie, user=self.viewer)
         self.assertEqual(response.status, 403)
         response, page = self.request("POST", "/iq-recordings/remove", fields={"recording": "missing", "form_token": token}, cookie=cookie, user=self.owner)
-        self.assertEqual(self.title(page), "Error: I/Q recording was not found. - I/Q Recorder - NWR Stream Manager")
+        self.assertEqual(self.title(page), "I/Q Recorder - NWR Stream Manager")
         response, _ = self.request("POST", "/iq-recordings/remove", fields=fields, cookie=cookie, user=self.owner)
         self.assertEqual(response.getheader("Location"), "/?view=iq_recorder&result=removed")
         _, page = self.request("GET", response.getheader("Location"), user=self.owner)
@@ -793,8 +984,7 @@ class IqRecorderPageTests(unittest.TestCase):
 
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         self.addCleanup(connection.close)
-        authorization = "Basic " + base64.b64encode(b"viewer:password2").decode()
-        connection.request("GET", "/iq-recordings/download?id=rec0&format=s16", headers={"Authorization": authorization})
+        connection.request("GET", "/iq-recordings/download?id=rec0&format=s16", headers={"Cookie": session_cookie(self.server_service, "viewer")})
         response = connection.getresponse()
         self.assertEqual(response.status, 200)
         self.assertIn("attachment", response.getheader("Content-Disposition"))
@@ -802,7 +992,7 @@ class IqRecorderPageTests(unittest.TestCase):
 
         response, page = self.request("GET", "/iq-recordings/download?id=rec0&format=wav", user=self.viewer)
         self.assertEqual(response.status, 400)
-        self.assertTrue(self.title(page).startswith("Error: "))
+        self.assertIn('role="alert"', page)
         _, page = self.request("GET", "/?view=iq_recording_download&recording=missing", user=self.viewer)
         self.assertIn('<p id="iq_download_recording_label" class="hint">I/Q recording was not found.</p>', page)
         self.assertRegex(page, r'<button id="iq_download_recording" type="submit" data-baseline-submit disabled')
@@ -849,6 +1039,7 @@ class RtlSettingsPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def status(self, read_only=False):
         remote = self.settings["source_mode"] == "remote"
@@ -938,7 +1129,7 @@ class RtlSettingsPageTests(unittest.TestCase):
                                 ({"ppm_correction": "150", "bias_tee": "1"}, "The RTL-SDR could not be opened.")):
             response, page = self.request("POST", "/rtl-settings", fields={**fields, **change}, cookie=cookie, user=self.owner)
             self.assertEqual(response.status, 400)
-            self.assertEqual(self.title(page), f"Error: {message} - Configure RTL-SDR - NWR Stream Manager")
+            self.assertEqual(self.title(page), "Configure RTL-SDR - NWR Stream Manager")
         self.assertEqual(len(self.updates), 2)
         # What was entered stays, and so does what the page first had.
         self.assertIn('value="150"', page)
@@ -1025,6 +1216,7 @@ class StreamPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def status(self, read_only=False):
         return {
@@ -1111,7 +1303,7 @@ class StreamPageTests(unittest.TestCase):
         self.assertRegex(page, r'<a id="tab_link_notifications" [^>]* hidden')
         # A stream that's gone goes back to the list.
         _, page = self.request("GET", "/?view=stream_settings&stream=gone", user=self.owner)
-        self.assertEqual(self.title(page), "Error: Stream was not found. - Manage Streams - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Manage Streams - NWR Stream Manager")
 
     def test_only_the_settings_changed_are_saved(self) -> None:
         token, cookie = self.token()
@@ -1144,7 +1336,7 @@ class StreamPageTests(unittest.TestCase):
         ):
             response, page = self.request("POST", "/streams/settings", fields={**fields, **change}, cookie=cookie, user=self.owner)
             self.assertEqual(response.status, 400)
-            self.assertEqual(html.unescape(self.title(page)), f"Error: {message} - Audio effects - Edit stream WXN99 - NWR Stream Manager")
+            self.assertEqual(html.unescape(self.title(page)), "Audio effects - Edit stream WXN99 - NWR Stream Manager")
         # Nothing is saved when anything is wrong, and what was entered stays.
         self.assertEqual(self.calls, [])
         self.assertIn('aria-describedby="eas_max_seconds_hint" value="0">', page)
@@ -1220,6 +1412,7 @@ class OutputPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def token(self):
         response, _ = self.request("GET", "/?view=streams", user=self.owner)
@@ -1241,7 +1434,7 @@ class OutputPageTests(unittest.TestCase):
         self.assertIn('<a class="button-link" href="/?view=stream_output&amp;stream=s1&amp;output=o1" aria-label="Edit output icecast.example:8000/wxn99.mp3">Edit output</a>', page)
         self.assertIn('<a id="open_add_output_link" class="baseline-only button-link" href="/?view=add_stream&amp;stream=s1">Add output</a>', page)
         _, page = self.request("GET", "/?view=stream_output&stream=s1&output=gone", user=self.owner)
-        self.assertEqual(self.title(page), "Error: Stream output was not found. - Edit stream WXN99 - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Edit stream WXN99 - NWR Stream Manager")
 
     def test_an_icecast_output_is_edited_and_only_changes_are_saved(self) -> None:
         token, cookie = self.token()
@@ -1263,7 +1456,7 @@ class OutputPageTests(unittest.TestCase):
         self.auth_ok = False
         response, page = self.request("POST", "/streams/outputs/save", fields={**fields, "password": "wrong"}, cookie=cookie, user=self.owner)
         self.assertEqual(response.status, 400)
-        self.assertTrue(self.title(page).startswith("Error: Invalid Icecast username or password. - Edit output"))
+        self.assertTrue(self.title(page).startswith("Edit output"))
         self.assertIn('aria-describedby="settings_icecast_port_hint" value="8001">', page)
 
     def test_a_service_change_shows_its_own_settings_and_its_notice(self) -> None:
@@ -1338,7 +1531,7 @@ class OutputPageTests(unittest.TestCase):
         self.auth_ok = False
         response, page, step, _ = self.wizard(token, cookie, {**fields, "step": "credentials", "password": "wrong"})
         self.assertEqual((response.status, step), (400, "credentials"))
-        self.assertEqual(self.title(page), "Error: Invalid Icecast username or password. - Add output for WXN99 - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Add output for WXN99 - NWR Stream Manager")
         self.auth_ok = True
         _, page, step, _ = self.wizard(token, cookie, {**fields, "step": "credentials", "password": "right"})
         self.assertEqual(step, "quality")
@@ -1384,7 +1577,7 @@ class OutputPageTests(unittest.TestCase):
         self.assertIn('<option value="WZ2560|162.550|MI|Cannonsburg|Cannonsburg">WZ2560 162.550 MHz, Cannonsburg, MI</option>', page)
         response, page, step, _ = self.wizard(token, cookie, fields)
         self.assertEqual((response.status, step), (400, "station"))
-        self.assertEqual(self.title(page), "Error: Select a station to continue. - Add Stream - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Add Stream - NWR Stream Manager")
         fields["station_key"] = "WZ2560|162.550|MI|Cannonsburg|Cannonsburg"
         _, page, step, _ = self.wizard(token, cookie, fields)
         self.assertEqual(step, "type")
@@ -1464,6 +1657,7 @@ class FallbackAudioPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def token(self):
         response, _ = self.request("GET", "/?view=settings&section=fallback_audio", user=self.owner)
@@ -1481,8 +1675,7 @@ class FallbackAudioPageTests(unittest.TestCase):
         headers = {
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Content-Length": str(length if length is not None else len(body)),
-            "Cookie": cookie,
-            "Authorization": "Basic " + base64.b64encode(":".join(user or self.owner).encode()).decode(),
+            "Cookie": "; ".join(part for part in (cookie, session_cookie(self.server_service, *(user or self.owner))) if part),
         }
         connection.putrequest("POST", "/fallback-audio/upload")
         for name, value in headers.items():
@@ -1525,12 +1718,12 @@ class FallbackAudioPageTests(unittest.TestCase):
         self.assertEqual(response.status, 400)
         self.assertEqual(self.calls, [])
         response, page = self.upload(token, cookie, b"not audio")
-        self.assertTrue(html.unescape(self.title(page)).startswith("Error: This isn't an MP3, OGG or WAV file"))
+        self.assertIn("This isn&#x27;t an MP3, OGG or WAV file", page)
         response, page = self.upload(token, cookie, b"")
-        self.assertTrue(self.title(page).startswith("Error: Choose a file to upload."))
+        self.assertIn("role=\"alert\">Choose a file to upload.", page)
         response, page = self.upload(token, cookie, b"RIFF", length=11 * 1024 * 1024)
         self.assertEqual(response.status, 400)
-        self.assertTrue(self.title(page).startswith("Error: The file is 10 MB or larger."))
+        self.assertIn("role=\"alert\">The file is 10 MB or larger.", page)
         audio = b"RIFF\x00\r\n\x01\x02" * 100
         response, _ = self.upload(token, cookie, audio)
         self.assertEqual(response.getheader("Location"), "/?view=settings&section=fallback_audio&result=uploaded")
@@ -1581,6 +1774,7 @@ class AdvancedPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def saved(self):
         return self.web_address.load_web_address_settings(self.path)
@@ -1612,7 +1806,7 @@ class AdvancedPageTests(unittest.TestCase):
 
         response, page = self.request("POST", "/advanced-settings", fields={**fields, "port": "70000"}, cookie=cookie, user=self.owner)
         self.assertEqual(response.status, 400)
-        self.assertEqual(self.title(page), "Error: Enter a port number from 1 to 65535. - Advanced - Settings - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Advanced - Settings - NWR Stream Manager")
         self.assertRegex(page, r'<input id="advanced_port" [^>]*value="70000">')
         self.assertEqual(self.saved().port, 9090)
 
@@ -1685,6 +1879,7 @@ class NotificationPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def token(self):
         response, _ = self.request("GET", "/?view=settings&section=notifications", user=self.owner)
@@ -1708,7 +1903,7 @@ class NotificationPageTests(unittest.TestCase):
         self.assertEqual(step, "server_url")
         response, page, step, _ = self.setup_step(token, cookie, {**fields, "step": "server_url", "server_url": "not a url"})
         self.assertEqual((response.status, step), (400, "server_url"))
-        self.assertEqual(self.title(page), "Error: Enter a valid ntfy server URL, such as ntfy.example.com or https://ntfy.example.com. - Set up notifications - Notifications - Settings - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Set up notifications - Notifications - Settings - NWR Stream Manager")
         fields["server_url"] = "ntfy.example.com"
         _, page, step, _ = self.setup_step(token, cookie, {**fields, "step": "server_url"})
         self.assertEqual(step, "app_install")
@@ -1841,6 +2036,7 @@ class SdrSharingPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def token(self):
         response, _ = self.request("GET", "/?view=settings&section=sdr_sharing", user=self.owner)
@@ -1885,9 +2081,9 @@ class SdrSharingPageTests(unittest.TestCase):
         fields = {"device": choice, "code": "000000", "form_token": token}
         response, page = self.request("POST", "/sdr-sharing/pair", fields=fields, cookie=cookie, user=self.owner)
         self.assertEqual(response.status, 400)
-        self.assertEqual(self.title(page), "Error: The pairing code is incorrect. - Find devices - Settings - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Find devices - Settings - NWR Stream Manager")
         response, page = self.request("POST", "/sdr-sharing/pair", fields={**fields, "code": "12345"}, cookie=cookie, user=self.owner)
-        self.assertEqual(self.title(page), "Error: Enter the 6-digit pairing code shown on the other device. - Find devices - Settings - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Find devices - Settings - NWR Stream Manager")
         response, _ = self.request("POST", "/sdr-sharing/pair", fields={**fields, "code": "123 456"}, cookie=cookie, user=self.owner)
         self.assertEqual(response.getheader("Location"), "/?view=settings&section=sdr_sharing&result=paired&name=Attic+Pi")
         self.assertEqual(self.calls[-1][1], {"address": "192.168.1.30", "host_id": "host2", "addresses": ["192.168.1.30", "100.64.0.5"], "port": 47432, "code": "123456"})
@@ -1951,6 +2147,7 @@ class DashboardPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def test_the_dashboard_is_filled_in_as_the_page_script_fills_it(self) -> None:
         _, page = self.request("GET", "/", user=self.owner)
@@ -2074,6 +2271,7 @@ class TailscalePageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = handler.service
 
     def test_the_owner_connects_signs_in_and_signs_out(self) -> None:
         response, page = self.request("GET", "/?view=settings&section=tailscale", user=self.owner)
@@ -2202,7 +2400,7 @@ class TailscalePageTests(unittest.TestCase):
         def get(host, proto=""):
             connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
             self.addCleanup(connection.close)
-            headers = {"Host": host, "Authorization": "Basic " + base64.b64encode(b"owner:password1").decode()}
+            headers = {"Host": host, "Cookie": session_cookie(self.server_service, "owner")}
             if proto:
                 headers["X-Forwarded-Proto"] = proto
             connection.request("GET", "/?view=streams", headers=headers)

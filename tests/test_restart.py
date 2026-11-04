@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode
 
+from signing_in import session_cookie
 from test_auth import load_web_control_module
 from test_page_rendering import StandInService
 
@@ -101,15 +102,18 @@ class RestartPageTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.port = server.server_address[1]
+        self.server_service = service
 
     def request(self, method, path, user, fields=None, cookie=""):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         self.addCleanup(connection.close)
-        headers = {"Authorization": "Basic " + base64.b64encode(":".join(user).encode()).decode()}
+        headers = {}
         body = None
         if fields is not None:
             body = urlencode(fields)
             headers["Content-Type"] = "application/x-www-form-urlencoded"
+        # Signed in as user, as long as the password's right.
+        cookie = "; ".join(part for part in (cookie, session_cookie(self.server_service, *user)) if part)
         if cookie:
             headers["Cookie"] = cookie
         connection.request(method, path, body=body, headers=headers)
@@ -135,7 +139,7 @@ class RestartPageTests(unittest.TestCase):
         cookie = f"{cookie_name}={token}"
         response, page = self.request("POST", "/restart", owner, {"instance": "run0", "form_token": token}, cookie)
         self.assertEqual(response.status, 400)
-        self.assertEqual(self.title(page), "Error: NWR Stream Manager has already restarted since this page was opened. - Restart NWR Stream Manager? - NWR Stream Manager")
+        self.assertEqual(self.title(page), "Restart NWR Stream Manager? - NWR Stream Manager")
         self.assertEqual(self.requests, [])
 
         response, page = self.request("POST", "/restart", ("helper", "password2"), {"instance": "run1", "form_token": token}, cookie)
@@ -152,7 +156,7 @@ class RestartPageTests(unittest.TestCase):
         for path, body in (("/restart", {"instance": "run1"}), ("/api/restart", None)):
             connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
             self.addCleanup(connection.close)
-            headers = {"Authorization": "Basic " + base64.b64encode(b"viewer:password3").decode(), "Content-Type": "application/json"}
+            headers = {"Cookie": session_cookie(self.server_service, "viewer"), "Content-Type": "application/json"}
             connection.request("POST", path, body='{"instance": "run1"}', headers=headers)
             self.assertEqual(connection.getresponse().status, 403, path)
         self.assertEqual(self.requests, [])
