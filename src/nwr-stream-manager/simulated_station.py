@@ -35,7 +35,7 @@ from .constants import (
     STREAM_TEST_MODE_TONE_PEAK,
     STREAM_TEST_MODE_TRANSMIT_EQ_POINTS,
 )
-from .dsp import as_complex64
+from .numpy_adapters import complex64 as as_complex64
 from .encoder import PcmResampler
 from .nfm import NfmModulator
 from .packaged_audio import read_packaged_audio
@@ -395,7 +395,7 @@ class SyntheticNwrTestModeSource:
         return start, end
 
     def _fm_modulate(self, audio: np.ndarray, signal_start_dbfs: float, signal_end_dbfs: float) -> np.ndarray:
-        carrier = self.modulator.process(audio)
+        carrier = as_complex64(self.modulator.process(np.asarray(audio, dtype=np.float32)))
         if abs(signal_end_dbfs - signal_start_dbfs) < 1e-6:
             amplitude = dbfs_to_linear(signal_end_dbfs)
         else:

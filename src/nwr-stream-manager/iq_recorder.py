@@ -37,7 +37,8 @@ from .constants import (
     STORAGE_CRITICAL_FREE_PERCENT,
 )
 from .dsp import (
-    complex64_to_interleaved_f32,
+    iq_bytes,
+    iq_count,
     create_decimator,
     DEFAULT_ALIAS_ATTENUATION_DB,
     IqChannelizer,
@@ -198,7 +199,7 @@ class IqRecorderWorker:
                     except queue.Empty:
                         continue
                     iq = iq_batch_complex(batch)
-                    if len(iq) == 0:
+                    if iq_count(iq) == 0:
                         continue
                     if self.config.mode == IQ_RECORDER_MODE_STREAM:
                         if self.config.target_frequency_hz is None:
@@ -271,11 +272,11 @@ class IqRecorderWorker:
                                 )
                                 decimator_alias_filter_strength = alias_filter_strength
                             recorded_iq = decimator.process(iq)
-                    if len(recorded_iq) == 0:
+                    if iq_count(recorded_iq) == 0:
                         continue
-                    data = complex64_to_interleaved_f32(recorded_iq)
+                    data = iq_bytes(recorded_iq)
                     output.write(data)
-                    self._add_written(len(recorded_iq), len(data))
+                    self._add_written(iq_count(recorded_iq), len(data))
                 else:
                     self._set_finished("stopped")
         except Exception as exc:

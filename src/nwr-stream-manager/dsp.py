@@ -1,18 +1,34 @@
+"""The receiver's DSP: moving a station to the centre, decimating it to the channel rate,
+and the filters for that, through liquid-dsp and NWR Stream Manager's own native library.
+
+I/Q is float32 I then Q, and audio float32, in any buffer going in (array.array, memoryview,
+bytes, or still a numpy array from code not yet moved off numpy); both come out as
+array.array("f").
+"""
+
 from __future__ import annotations
 
+import array
 import math
 from dataclasses import dataclass, field
 from fractions import Fraction
-
-import numpy as np
-from numpy.typing import NDArray
+from typing import Any
 
 from . import native
-from .liquid_dsp import FirDecimator, IqDcRemover, Oscillator
+from .liquid_dsp import (
+    FirDecimator,
+    FirFilter as _LiquidFirFilter,
+    IqDcRemover,
+    Oscillator,
+    float_taps,
+    kaiser_lowpass,
+    kaiser_window,
+)
 
 
-ComplexArray = NDArray[np.complex64]
-FloatArray = NDArray[np.float32]
+# Float32 I then Q, and float32 audio.
+ComplexArray = array.array
+FloatArray = array.array
 
 
 DEFAULT_OUTPUT_SAMPLE_RATE = 24_000
@@ -31,44 +47,39 @@ FAST_INTERMEDIATE_OUTPUT_RATE = 192_000
 FAST_INTERMEDIATE_HALFBAND_TAPS = 15
 
 
-def rtl_u8_to_complex64(chunk: bytes | bytearray | memoryview) -> ComplexArray:
-    """Convert RTL-SDR unsigned 8-bit interleaved IQ bytes to complex float32."""
+def iq_count(samples: Any) -> int:
+    """How many I/Q pairs float32 I/Q holds."""
+    return memoryview(samples).nbytes // 8
+
+
+def iq_array(samples: Any) -> array.array:
+    """Float32 I/Q as an array.array("f"): itself if it already is one, otherwise a copy."""
+    if isinstance(samples, array.array) and samples.typecode == "f":
+        return samples
+    return native.float_samples(samples)
+
+
+def rtl_u8_to_iq(chunk: bytes | bytearray | memoryview) -> array.array:
+    """RTL-SDR unsigned 8-bit I/Q bytes as float32 I then Q, from -1 to 1."""
     pairs = len(chunk) // 2
-    iq = np.empty(pairs, dtype=np.complex64)
+    iq = native.floats(2 * pairs)
     if pairs:
         native.u8_iq_to_f32(chunk, iq, pairs)
     return iq
 
 
-_FLOAT_FORMATS = ("f", "<f", "=f")
-
-
-def as_complex64(data) -> ComplexArray:
-    """I/Q as complex64 for the DSP here: a numpy array as it is, and any other float32
-    buffer, such as an array.array("f") of I then Q, read where it is."""
-    if isinstance(data, np.ndarray):
-        return data.astype(np.complex64, copy=False)
-    view = memoryview(data)
-    if view.format not in _FLOAT_FORMATS:
-        raise TypeError(f"expected float32 I/Q, not {view.format!r}")
-    if view.nbytes == 0:
-        return np.empty(0, dtype=np.complex64)
-    return np.frombuffer(data, dtype=np.complex64)
-
-
-def iq_to_complex64(data) -> ComplexArray:
-    """A batch's I/Q as complex64: bytes are the RTL-SDR's own 8-bit samples; anything
-    else is float32 I/Q (see as_complex64)."""
+def iq_samples(data: Any) -> array.array:
+    """A batch's I/Q as float32 I then Q: bytes are the RTL-SDR's own 8-bit samples;
+    anything else is already float32 I/Q."""
     if isinstance(data, (bytes, bytearray)) or (isinstance(data, memoryview) and data.format in ("B", "b", "c")):
-        return rtl_u8_to_complex64(data)
-    return as_complex64(data)
+        return rtl_u8_to_iq(data)
+    return iq_array(data)
 
 
-def complex64_to_interleaved_f32(samples: ComplexArray) -> bytes:
-    interleaved = np.empty(samples.size * 2, dtype="<f4")
-    interleaved[0::2] = samples.real
-    interleaved[1::2] = samples.imag
-    return interleaved.tobytes()
+def iq_bytes(samples: Any) -> bytes:
+    """Float32 I/Q as bytes, I then Q, as .cf32 files hold it."""
+    view = memoryview(iq_array(samples))
+    return view.cast("B").tobytes() if view.nbytes else b""
 
 
 @dataclass
@@ -87,9 +98,7 @@ class IqDcBlocker:
             raise ValueError("max_block_seconds must be greater than 0")
         self._remover = IqDcRemover(self.sample_rate, self.time_constant_seconds, self.max_block_seconds)
 
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
+    def process(self, samples: Any) -> ComplexArray:
         return self._remover.process(samples)
 
 
@@ -115,13 +124,14 @@ def design_lowpass_taps(
     taps = max(min_taps, min(max_taps, taps))
     if taps % 2 == 0:
         taps += 1
-    n = np.arange(taps, dtype=np.float64) - (taps - 1) / 2.0
-    normalized_cutoff = cutoff_hz / float(sample_rate)
-    response = 2.0 * normalized_cutoff * np.sinc(2.0 * normalized_cutoff * n)
-    window = np.kaiser(taps, _kaiser_beta(attenuation_db))
-    response *= window
-    response /= np.sum(response)
-    return response.astype(np.float32)
+    # liquid-dsp's Kaiser-windowed sinc, with the same Kaiser window for the attenuation as
+    # _kaiser_beta, scaled to pass 0 Hz unchanged.
+    return _unity_gain(kaiser_lowpass(taps, cutoff_hz / float(sample_rate), attenuation_db))
+
+
+def _unity_gain(taps: array.array) -> array.array:
+    total = math.fsum(taps)
+    return array.array("f", (value / total for value in taps))
 
 
 def _kaiser_beta(attenuation_db: float) -> float:
@@ -179,48 +189,14 @@ class FrequencyShifter:
     def phase(self, radians: float) -> None:
         self._oscillator.phase = radians
 
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        if samples.size == 0 or self._offset_hz == 0.0:
-            return samples.astype(np.complex64, copy=False)
+    def process(self, samples: Any) -> ComplexArray:
+        if self._offset_hz == 0.0 or iq_count(samples) == 0:
+            return iq_array(samples)
         return self._oscillator.mix_up(samples)
 
 
-@dataclass
-class FirFilter:
-    taps: FloatArray
-    _history: ComplexArray = field(init=False)
-
-    def __post_init__(self) -> None:
-        taps = np.asarray(self.taps, dtype=np.float32)
-        if taps.ndim != 1 or taps.size == 0:
-            raise ValueError("FIR taps must be a non-empty one-dimensional array")
-        self.taps = taps
-        self._history = np.zeros(taps.size - 1, dtype=np.complex64)
-
-    def update_taps(self, taps: FloatArray) -> None:
-        taps = np.asarray(taps, dtype=np.float32)
-        if taps.ndim != 1 or taps.size == 0:
-            raise ValueError("FIR taps must be a non-empty one-dimensional array")
-        keep = taps.size - 1
-        if keep <= 0:
-            history = np.array([], dtype=np.complex64)
-        elif self._history.size >= keep:
-            history = self._history[-keep:].copy()
-        else:
-            history = np.zeros(keep, dtype=np.complex64)
-            if self._history.size:
-                history[-self._history.size :] = self._history
-        self.taps = taps
-        self._history = history
-
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
-        work = np.concatenate((self._history, samples.astype(np.complex64, copy=False)))
-        filtered = np.convolve(work, self.taps, mode="valid").astype(np.complex64)
-        keep = self.taps.size - 1
-        self._history = work[-keep:].copy() if keep else np.array([], dtype=np.complex64)
-        return filtered
+class FirFilter(_LiquidFirFilter):
+    """Filter complex samples with real taps, through liquid-dsp."""
 
 
 @dataclass
@@ -256,10 +232,9 @@ class IntegerDecimator:
     def is_integer_decimation(self) -> bool:
         return True
 
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        samples = samples.astype(np.complex64, copy=False)
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
+    def process(self, samples: Any) -> ComplexArray:
+        if iq_count(samples) == 0:
+            return array.array("f")
         return self.fir.process(samples)
 
     def update_alias_filter(
@@ -292,16 +267,14 @@ def design_halfband_taps(
 ) -> FloatArray:
     if taps_count < 7 or taps_count % 4 != 3:
         raise ValueError("half-band FIR tap count must be 4m+3 and at least 7")
-    n = np.arange(taps_count, dtype=np.float64) - (taps_count - 1) / 2.0
-    response = 0.5 * np.sinc(0.5 * n)
-    response *= np.kaiser(taps_count, _kaiser_beta(attenuation_db))
+    response = [0.5 * value for value in kaiser_lowpass(taps_count, 0.25, attenuation_db)]
     center = taps_count // 2
     response[center] = 0.5
     for index in range(taps_count):
         if index != center and (index - center) % 2 == 0:
             response[index] = 0.0
-    response /= np.sum(response)
-    return response.astype(np.float32)
+    total = math.fsum(response)
+    return array.array("f", (value / total for value in response))
 
 
 class HalfBandDecimator2x:
@@ -311,9 +284,9 @@ class HalfBandDecimator2x:
         self.fir = FirDecimator(2, self._checked(taps))
 
     @staticmethod
-    def _checked(taps: FloatArray) -> FloatArray:
-        taps = np.asarray(taps, dtype=np.float32)
-        if taps.ndim != 1 or taps.size < 7 or taps.size % 4 != 3:
+    def _checked(taps: Any) -> FloatArray:
+        taps = float_taps(taps)
+        if len(taps) < 7 or len(taps) % 4 != 3:
             raise ValueError("half-band FIR taps must be one-dimensional with 4m+3 taps")
         return taps
 
@@ -328,10 +301,9 @@ class HalfBandDecimator2x:
     def update_taps(self, taps: FloatArray) -> None:
         self.fir.update_taps(self._checked(taps))
 
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        samples = samples.astype(np.complex64, copy=False)
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
+    def process(self, samples: Any) -> ComplexArray:
+        if iq_count(samples) == 0:
+            return array.array("f")
         return self.fir.process(samples)
 
 
@@ -370,9 +342,9 @@ class FixedFactor8IntermediateDecimator:
     def is_integer_decimation(self) -> bool:
         return True
 
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
+    def process(self, samples: Any) -> ComplexArray:
+        if iq_count(samples) == 0:
+            return array.array("f")
         return self.final_stage.process(self.second_stage.process(self.first_stage.process(samples)))
 
     def update_alias_filter(
@@ -454,9 +426,9 @@ class TwoStageChannelDecimator:
     def is_integer_decimation(self) -> bool:
         return True
 
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
+    def process(self, samples: Any) -> ComplexArray:
+        if iq_count(samples) == 0:
+            return array.array("f")
         return self.final_stage.process(self.first_stage.process(samples))
 
     def update_alias_filter(
@@ -485,8 +457,8 @@ class IdentityDecimator:
     def is_integer_decimation(self) -> bool:
         return True
 
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        return samples.astype(np.complex64, copy=False)
+    def process(self, samples: Any) -> ComplexArray:
+        return iq_array(samples)
 
 
 @dataclass
@@ -500,8 +472,9 @@ class RationalResampler:
     _input_samples_seen: int = 0
     _next_output_position: float = 0.0
     _filtered_tail: ComplexArray = field(init=False)
-    _interp_offsets: NDArray[np.int64] = field(init=False)
-    _interp_window: NDArray[np.float32] = field(init=False)
+    _interp_left: int = field(init=False)
+    _interp_right: int = field(init=False)
+    _interp_window: FloatArray = field(init=False)
 
     def __post_init__(self) -> None:
         if self.input_rate <= 0 or self.output_rate <= 0:
@@ -514,61 +487,47 @@ class RationalResampler:
             attenuation_db=self.attenuation_db,
         )
         self.fir = FirFilter(taps)
-        self._filtered_tail = np.array([], dtype=np.complex64)
-        left_taps = (RATIONAL_INTERPOLATOR_TAPS // 2) - 1
-        right_taps = RATIONAL_INTERPOLATOR_TAPS - left_taps - 1
-        self._interp_offsets = np.arange(-left_taps, right_taps + 1, dtype=np.int64)
-        self._interp_window = np.kaiser(
+        self._filtered_tail = array.array("f")
+        self._interp_left = (RATIONAL_INTERPOLATOR_TAPS // 2) - 1
+        self._interp_right = RATIONAL_INTERPOLATOR_TAPS - self._interp_left - 1
+        self._interp_window = kaiser_window(
             RATIONAL_INTERPOLATOR_TAPS,
             _kaiser_beta(RATIONAL_INTERPOLATOR_ATTENUATION_DB),
-        ).astype(np.float32)
+        )
 
     @property
     def is_integer_decimation(self) -> bool:
         return False
 
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        samples = samples.astype(np.complex64, copy=False)
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
+    def process(self, samples: Any) -> ComplexArray:
+        if iq_count(samples) == 0:
+            return array.array("f")
         start = self._input_samples_seen
         filtered = self.fir.process(samples)
-        end = start + int(filtered.size)
-        work = (
-            np.concatenate((self._filtered_tail, filtered))
-            if self._filtered_tail.size
-            else filtered
-        )
-        work_start = start - int(self._filtered_tail.size)
-        left_taps = int(-self._interp_offsets[0])
-        right_taps = int(self._interp_offsets[-1])
+        end = start + iq_count(filtered)
+        work = self._filtered_tail + filtered if self._filtered_tail else filtered
+        work_start = start - iq_count(self._filtered_tail)
+        left_taps = self._interp_left
+        right_taps = self._interp_right
         first_position = work_start + left_taps
-        max_position = work_start + work.size - right_taps
+        max_position = work_start + iq_count(work) - right_taps
         step = float(self.input_rate) / float(self.output_rate)
         position = self._next_output_position
         if position < first_position:
             missed = math.ceil((first_position - position) / step)
             position += missed * step
+        self._input_samples_seen = end
+        self._filtered_tail = work[-2 * RATIONAL_INTERPOLATOR_TAPS :]
 
         if position >= max_position:
             self._next_output_position = position
-            self._input_samples_seen = end
-            self._filtered_tail = work[-RATIONAL_INTERPOLATOR_TAPS:].copy()
-            return np.array([], dtype=np.complex64)
+            return array.array("f")
 
         output_count = int(math.ceil((max_position - position) / step))
-        positions = position + step * np.arange(output_count, dtype=np.float64)
         self._next_output_position = float(position + step * output_count)
-        self._input_samples_seen = end
-        self._filtered_tail = work[-RATIONAL_INTERPOLATOR_TAPS:].copy()
-
-        local_positions = positions - float(work_start)
-        centers = np.floor(local_positions).astype(np.int64)
-        indices = centers[:, None] + self._interp_offsets[None, :]
-        relative = local_positions[:, None] - indices.astype(np.float64)
-        weights = (np.sinc(relative) * self._interp_window[None, :]).astype(np.float32)
-        weights /= np.sum(weights, axis=1, keepdims=True)
-        return np.sum(work[indices] * weights, axis=1).astype(np.complex64, copy=False)
+        return native.cf32_interpolate(
+            work, self._interp_window, left_taps, float(work_start), position, step, output_count
+        )
 
     def update_alias_filter(
         self,
@@ -644,9 +603,9 @@ class StagedDecimator:
     def is_integer_decimation(self) -> bool:
         return self.first_stage.is_integer_decimation and self.final_stage.is_integer_decimation
 
-    def process(self, samples: ComplexArray) -> ComplexArray:
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
+    def process(self, samples: Any) -> ComplexArray:
+        if iq_count(samples) == 0:
+            return array.array("f")
         return self.final_stage.process(self.first_stage.process(samples))
 
     def update_alias_filter(
@@ -717,7 +676,7 @@ class StagedDecimator:
         attenuation_db: float = 60.0,
     ) -> FloatArray:
         if intermediate_rate >= input_rate:
-            return np.array([1.0], dtype=np.float32)
+            return array.array("f", [1.0])
         intermediate_nyquist = intermediate_rate / 2.0
         output_nyquist = float(output_rate) / 2.0
         if output_rate >= STAGED_DECIMATOR_MAX_INTERMEDIATE_RATE:
@@ -869,7 +828,7 @@ class IqChannelizer:
     def mode(self) -> str:
         return "integer" if self.decimator.is_integer_decimation else "fractional"
 
-    def process_complex(self, samples: ComplexArray) -> ComplexArray:
+    def process_complex(self, samples: Any) -> ComplexArray:
         shifted = self.shifter.process(samples)
         return self.decimator.process(shifted)
 

@@ -6,6 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .liquid_dsp import AudioFirFilter
+from .numpy_adapters import float32
 
 
 # The receive curve as levels in dB relative to 1 kHz, joined smoothly on a log-frequency axis.
@@ -54,7 +55,7 @@ class DeemphasisFilter:
         self._fir = AudioFirFilter(self.curve, DEEMPHASIS_BLOCK_SAMPLES)
 
     def process_float(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        return self._fir.process(samples)
+        return float32(self._fir.process(samples))
 
 
 def generate_nwr_deemphasis_curve(

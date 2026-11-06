@@ -14,6 +14,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_PATH = REPO_ROOT / "src" / "nwr-stream-manager"
 
 
+def iq(samples) -> np.ndarray:
+    """The DSP's float32 I then Q, as complex64."""
+    return np.frombuffer(samples, dtype=np.complex64) if len(samples) else np.empty(0, dtype=np.complex64)
+
+
+def real(samples) -> np.ndarray:
+    """The DSP's float32 audio, as a numpy array."""
+    return np.frombuffer(samples, dtype=np.float32) if len(samples) else np.empty(0, dtype=np.float32)
+
+
 def load_dsp_module():
     package = types.ModuleType("nwr_stream_manager")
     package.__path__ = [str(PACKAGE_PATH)]  # type: ignore[attr-defined]
@@ -32,7 +42,7 @@ class DspTests(unittest.TestCase):
         blocker = self.dsp.IqDcBlocker(sample_rate=sample_rate, time_constant_seconds=1.0)
         chunks = [np.ones(50, dtype=np.complex64) for _index in range(20)]
 
-        outputs = [blocker.process(chunk) for chunk in chunks]
+        outputs = [iq(blocker.process(chunk)) for chunk in chunks]
         output = np.concatenate(outputs)
 
         self.assertGreater(abs(output[0]), 0.99)
@@ -50,7 +60,7 @@ class DspTests(unittest.TestCase):
         # Odd chunk sizes leave partial blocks at the end of each chunk.
         for size in (153_600, 1_000, 77_777, 153_600):
             samples = (rng.normal(size=size) + 1j * rng.normal(size=size) + (0.3 - 0.2j)).astype(np.complex64)
-            actual_parts.append(blocker.process(samples))
+            actual_parts.append(iq(blocker.process(samples)))
             expected = np.empty_like(samples)
             for start in range(0, size, block_size):
                 block = samples[start : start + block_size]
@@ -66,10 +76,10 @@ class DspTests(unittest.TestCase):
         fast = self.dsp.IqDcBlocker(sample_rate=2000, time_constant_seconds=1.0)
 
         slow_output = np.concatenate(
-            [slow.process(np.ones(50, dtype=np.complex64)) for _index in range(20)]
+            [iq(slow.process(np.ones(50, dtype=np.complex64))) for _index in range(20)]
         )
         fast_output = np.concatenate(
-            [fast.process(np.ones(50, dtype=np.complex64)) for _index in range(20)]
+            [iq(fast.process(np.ones(50, dtype=np.complex64))) for _index in range(20)]
         )
 
         self.assertLess(abs(slow_output[-1]), abs(fast_output[-1]))
@@ -82,7 +92,7 @@ class DspTests(unittest.TestCase):
         tone = np.exp(1j * 2.0 * np.pi * 1000.0 * time_axis).astype(np.complex64)
         blocker = self.dsp.IqDcBlocker(sample_rate=sample_rate, time_constant_seconds=1.0)
 
-        output = blocker.process(tone)
+        output = iq(blocker.process(tone))
 
         self.assertGreater(float(np.mean(np.abs(output[-1000:]))), 0.99)
 
@@ -91,7 +101,7 @@ class DspTests(unittest.TestCase):
         blocker = self.dsp.IqDcBlocker(sample_rate=sample_rate, time_constant_seconds=1.0)
         samples = np.ones(round(sample_rate * 0.02), dtype=np.complex64)
 
-        output = blocker.process(samples)
+        output = iq(blocker.process(samples))
         block_samples = round(sample_rate * blocker.max_block_seconds)
         differences = np.abs(np.diff(output.real))
         boundary_difference = float(differences[block_samples - 1])
@@ -108,7 +118,7 @@ class DspTests(unittest.TestCase):
             transition_hz=4_000,
             attenuation_db=60,
         )
-        reference_filter = self.dsp.FirFilter(decimator.fir.taps.copy())
+        reference_filter = self.dsp.FirFilter(decimator.fir.taps[:])
         reference_seen = 0
         actual_parts = []
         expected_parts = []
@@ -117,8 +127,8 @@ class DspTests(unittest.TestCase):
             samples = (
                 rng.normal(size=size) + 1j * rng.normal(size=size)
             ).astype(np.complex64)
-            actual_parts.append(decimator.process(samples))
-            filtered = reference_filter.process(samples)
+            actual_parts.append(iq(decimator.process(samples)))
+            filtered = iq(reference_filter.process(samples))
             offset = (-reference_seen) % decimator.factor
             expected_parts.append(filtered[offset :: decimator.factor])
             reference_seen += int(filtered.size)
@@ -150,11 +160,11 @@ class DspTests(unittest.TestCase):
         actual_parts = []
         offset = 0
         for size in (101, 503, 257):
-            actual_parts.append(resampler.process(samples[offset : offset + size]))
+            actual_parts.append(iq(resampler.process(samples[offset : offset + size])))
             offset += size
 
         actual = np.concatenate(actual_parts)
-        expected = single_pass.process(samples)
+        expected = iq(single_pass.process(samples))
         count = min(actual.size, expected.size)
         self.assertGreater(count, 100)
         np.testing.assert_allclose(actual[:count], expected[:count], rtol=1e-5, atol=1e-5)
@@ -183,15 +193,15 @@ class DspTests(unittest.TestCase):
                 decimator = self.dsp.create_decimator(1_536_000, output_rate)
                 self.assertNotIsInstance(decimator, self.dsp.StagedDecimator)
                 if isinstance(decimator, self.dsp.FixedFactor8IntermediateDecimator):
-                    self.assertLess(decimator.first_stage.taps.size, 1_200)
-                    self.assertLess(decimator.second_stage.taps.size, 1_200)
-                    self.assertLess(decimator.final_stage.fir.taps.size, 1_200)
+                    self.assertLess(len(decimator.first_stage.taps), 1_200)
+                    self.assertLess(len(decimator.second_stage.taps), 1_200)
+                    self.assertLess(len(decimator.final_stage.fir.taps), 1_200)
                 else:
                     taps = getattr(getattr(decimator, "fir", None), "taps", None)
                     self.assertIsNotNone(taps)
-                    self.assertLess(taps.size, 1_200)
+                    self.assertLess(len(taps), 1_200)
                 samples = np.ones(4096, dtype=np.complex64)
-                output = decimator.process(samples)
+                output = iq(decimator.process(samples))
                 self.assertGreater(output.size, 0)
 
     def test_fixed_rtl_intermediate_rate_uses_fast_factor8_decimator(self) -> None:
@@ -201,8 +211,8 @@ class DspTests(unittest.TestCase):
         self.assertIsInstance(decimator.first_stage, self.dsp.HalfBandDecimator2x)
         self.assertIsInstance(decimator.second_stage, self.dsp.HalfBandDecimator2x)
         self.assertIsInstance(decimator.final_stage, self.dsp.IntegerDecimator)
-        self.assertEqual(decimator.first_stage.taps.size, 15)
-        self.assertEqual(decimator.second_stage.taps.size, 15)
+        self.assertEqual(len(decimator.first_stage.taps), 15)
+        self.assertEqual(len(decimator.second_stage.taps), 15)
         self.assertTrue(decimator.is_integer_decimation)
 
     def test_wide_spectrum_transition_bandwidth_matches_intermediate_path(self) -> None:
@@ -231,8 +241,8 @@ class DspTests(unittest.TestCase):
         edge_sideband = np.exp(1j * 2.0 * np.pi * 87_000.0 * time_axis).astype(np.complex64)
         out_of_band = np.exp(1j * 2.0 * np.pi * 150_000.0 * time_axis).astype(np.complex64)
 
-        edge_output = self.dsp.create_decimator(sample_rate, output_rate).process(edge_sideband)
-        rejected_output = self.dsp.create_decimator(sample_rate, output_rate).process(out_of_band)
+        edge_output = iq(self.dsp.create_decimator(sample_rate, output_rate).process(edge_sideband))
+        rejected_output = iq(self.dsp.create_decimator(sample_rate, output_rate).process(out_of_band))
 
         self.assertGreater(float(np.mean(np.abs(edge_output[-4096:]))), 0.55)
         self.assertLess(float(np.mean(np.abs(rejected_output[-4096:]))), 0.08)
@@ -245,8 +255,8 @@ class DspTests(unittest.TestCase):
         edge_sideband = np.exp(1j * 2.0 * np.pi * 87_000.0 * time_axis).astype(np.complex64)
         out_of_band = np.exp(1j * 2.0 * np.pi * 120_000.0 * time_axis).astype(np.complex64)
 
-        edge_output = self.dsp.create_decimator(sample_rate, output_rate).process(edge_sideband)
-        rejected_output = self.dsp.create_decimator(sample_rate, output_rate).process(out_of_band)
+        edge_output = iq(self.dsp.create_decimator(sample_rate, output_rate).process(edge_sideband))
+        rejected_output = iq(self.dsp.create_decimator(sample_rate, output_rate).process(out_of_band))
 
         self.assertGreater(float(np.mean(np.abs(edge_output[-4096:]))), 0.65)
         self.assertLess(float(np.mean(np.abs(rejected_output[-4096:]))), 0.05)
@@ -267,7 +277,7 @@ class DspTests(unittest.TestCase):
 
         def settled_rms(decimator, frequency_hz: float) -> float:
             samples = np.exp(1j * 2.0 * np.pi * frequency_hz * time_axis).astype(np.complex64)
-            output = decimator.process(samples)
+            output = iq(decimator.process(samples))
             if output.size > discard * 2:
                 output = output[discard:-discard]
             return float(np.sqrt(np.mean(np.abs(output) ** 2)))
@@ -287,7 +297,7 @@ class DspTests(unittest.TestCase):
         first_stage = decimator.first_stage
         second_stage = decimator.second_stage
         final_stage = decimator.final_stage
-        final_taps = final_stage.fir.taps.copy()
+        final_taps = final_stage.fir.taps[:]
 
         decimator.update_alias_filter(
             1_536_000,
@@ -309,16 +319,16 @@ class DspTests(unittest.TestCase):
         desired_sideband = np.exp(1j * 2.0 * np.pi * 11_000.0 * time_axis).astype(np.complex64)
         rejected = np.exp(1j * 2.0 * np.pi * 16_000.0 * time_axis).astype(np.complex64)
 
-        desired_output = self.dsp.create_decimator(
+        desired_output = iq(self.dsp.create_decimator(
             sample_rate,
             output_rate,
             transition_hz=1_000,
-        ).process(desired_sideband)
-        rejected_output = self.dsp.create_decimator(
+        ).process(desired_sideband))
+        rejected_output = iq(self.dsp.create_decimator(
             sample_rate,
             output_rate,
             transition_hz=1_000,
-        ).process(rejected)
+        ).process(rejected))
 
         self.assertGreater(float(np.mean(np.abs(desired_output[-2048:]))), 0.65)
         self.assertLess(float(np.mean(np.abs(rejected_output[-2048:]))), 0.05)
@@ -334,7 +344,7 @@ class DspTests(unittest.TestCase):
         decimator = channelizer.decimator
         self.assertIsInstance(decimator, self.dsp.TwoStageChannelDecimator)
         fir = decimator.final_stage.fir
-        original_taps = fir.taps.copy()
+        original_taps = fir.taps[:]
 
         channelizer.update_alias_filter(transition_hz=4_000)
 
@@ -349,8 +359,8 @@ class DspTests(unittest.TestCase):
             transition_hz=1_000,
         )
         self.assertIsInstance(decimator, self.dsp.StagedDecimator)
-        first_taps = decimator.first_stage.fir.taps.copy()
-        final_taps = decimator.final_stage.fir.taps.copy()
+        first_taps = decimator.first_stage.fir.taps[:]
+        final_taps = decimator.final_stage.fir.taps[:]
 
         decimator.update_alias_filter(
             1_536_000,
@@ -370,10 +380,10 @@ class DspTests(unittest.TestCase):
         chunked = self.dsp.FrequencyShifter(sample_rate, offset_hz)
         single = self.dsp.FrequencyShifter(sample_rate, offset_hz)
 
-        output = np.concatenate([chunked.process(tone[index : index + 19_201]) for index in range(0, count, 19_201)])
+        output = np.concatenate([iq(chunked.process(tone[index : index + 19_201])) for index in range(0, count, 19_201)])
 
         # Chunk boundaries make no difference...
-        np.testing.assert_allclose(output, single.process(tone), rtol=0, atol=1e-5)
+        np.testing.assert_allclose(output, iq(single.process(tone)), rtol=0, atol=1e-5)
         # ...the station lands on 0 Hz, and the shift adds no audible spurious tones.
         spectrum = np.abs(np.fft.fft(output.astype(np.complex128) * np.hanning(count))) ** 2
         spectrum /= spectrum.max()
@@ -406,7 +416,7 @@ class DspTests(unittest.TestCase):
 
         self.assertIsInstance(decimator, self.dsp.IdentityDecimator)
         samples = np.array([1 + 2j, 3 + 4j], dtype=np.complex64)
-        np.testing.assert_array_equal(decimator.process(samples), samples)
+        np.testing.assert_array_equal(iq(decimator.process(samples)), samples)
 
     def test_staged_decimator_preserves_baseband_and_rejects_out_of_band_aliases(self) -> None:
         sample_rate = 1_024_000
@@ -416,8 +426,8 @@ class DspTests(unittest.TestCase):
         desired = np.exp(1j * 2.0 * np.pi * 1_000.0 * time_axis).astype(np.complex64)
         adjacent = np.exp(1j * 2.0 * np.pi * 100_000.0 * time_axis).astype(np.complex64)
 
-        desired_output = self.dsp.create_decimator(sample_rate, 24_000).process(desired)
-        adjacent_output = self.dsp.create_decimator(sample_rate, 24_000).process(adjacent)
+        desired_output = iq(self.dsp.create_decimator(sample_rate, 24_000).process(desired))
+        adjacent_output = iq(self.dsp.create_decimator(sample_rate, 24_000).process(adjacent))
 
         self.assertGreater(float(np.mean(np.abs(desired_output[-1000:]))), 0.5)
         self.assertLess(float(np.mean(np.abs(adjacent_output[-1000:]))), 0.05)
@@ -434,7 +444,7 @@ class DspTests(unittest.TestCase):
             target_frequency_hz=162_425_000,
         )
 
-        output = channelizer.process_complex(samples)
+        output = iq(channelizer.process_complex(samples))
         settled = output[-2048:]
         spectrum = np.fft.fftshift(np.fft.fft(settled))
         frequencies = np.fft.fftshift(np.fft.fftfreq(settled.size, d=1 / 24_000))
@@ -475,7 +485,7 @@ class DspTests(unittest.TestCase):
                     center_frequency_hz=center_frequency_hz,
                     target_frequency_hz=target_frequency_hz,
                 )
-                demodulated_iq = channelizer.process_complex(dc_blocker.process(samples))
+                demodulated_iq = iq(channelizer.process_complex(dc_blocker.process(samples)))
                 previous = demodulated_iq[:-1]
                 current = demodulated_iq[1:]
                 audio = (np.angle(current * np.conj(previous)) / np.pi * 1.5).astype(np.float32)
@@ -495,7 +505,7 @@ class DspTests(unittest.TestCase):
         def level_db(frequency_hz: float) -> float:
             decimator = self.dsp.create_decimator(sample_rate, output_rate, transition_hz=1_000)
             tone = np.exp(1j * 2.0 * np.pi * frequency_hz * time_axis).astype(np.complex64)
-            output = np.concatenate([decimator.process(tone[i : i + 19_200]) for i in range(0, tone.size, 19_200)])
+            output = np.concatenate([iq(decimator.process(tone[i : i + 19_200])) for i in range(0, tone.size, 19_200)])
             settled = output[output_rate // 10 :]
             return 10.0 * np.log10(float(np.mean(np.abs(settled) ** 2)) + 1e-20)
 
@@ -514,10 +524,10 @@ class DspTests(unittest.TestCase):
         steady = self.dsp.IntegerDecimator.create(192_000, 24_000, transition_hz=1_000, attenuation_db=80)
         updated = self.dsp.IntegerDecimator.create(192_000, 24_000, transition_hz=1_000, attenuation_db=80)
 
-        expected = np.concatenate([steady.process(samples[:7_003]), steady.process(samples[7_003:])])
-        first = updated.process(samples[:7_003])
-        updated.fir.update_taps(updated.fir.taps.copy())
-        actual = np.concatenate([first, updated.process(samples[7_003:])])
+        expected = np.concatenate([iq(steady.process(samples[:7_003])), iq(steady.process(samples[7_003:]))])
+        first = iq(updated.process(samples[:7_003]))
+        updated.fir.update_taps(updated.fir.taps[:])
+        actual = np.concatenate([first, iq(updated.process(samples[7_003:]))])
 
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
@@ -544,8 +554,91 @@ class DspTests(unittest.TestCase):
             worker.join(timeout=10)
 
         self.assertEqual(errors, [])
-        self.assertGreater(decimator.process(samples).size, 0)
+        self.assertGreater(iq(decimator.process(samples)).size, 0)
 
+
+    def test_filter_design_matches_the_numpy_design_it_replaced(self) -> None:
+        def numpy_lowpass(sample_rate, cutoff_hz, transition_hz, attenuation_db):
+            transition_radians = 2.0 * np.pi * transition_hz / float(sample_rate)
+            taps = max(63, min(65_535, int(np.ceil((attenuation_db - 8.0) / (2.285 * transition_radians)))))
+            taps += 1 - taps % 2
+            n = np.arange(taps, dtype=np.float64) - (taps - 1) / 2.0
+            fc = cutoff_hz / float(sample_rate)
+            response = 2.0 * fc * np.sinc(2.0 * fc * n) * np.kaiser(taps, self.dsp._kaiser_beta(attenuation_db))
+            return (response / np.sum(response)).astype(np.float32)
+
+        for rate, cutoff, transition, attenuation in (
+            (192_000, 12_000, 24_000, 80), (48_000, 11_500, 1_000, 80), (128_000, 11_500, 1_000, 80),
+            (384_000, 92_000, 8_000, 70), (2_400_000, 20_000, 150_000, 60),
+        ):
+            with self.subTest(rate=rate, cutoff=cutoff):
+                actual = np.asarray(self.dsp.design_lowpass_taps(rate, cutoff, transition, attenuation_db=attenuation))
+                expected = numpy_lowpass(rate, cutoff, transition, attenuation)
+                self.assertEqual(actual.size, expected.size)
+                np.testing.assert_allclose(actual, expected, rtol=0, atol=3e-7)
+        n = np.arange(15, dtype=np.float64) - 7.0
+        halfband = 0.5 * np.sinc(0.5 * n) * np.kaiser(15, self.dsp._kaiser_beta(60.0))
+        halfband[7] = 0.5
+        halfband[1::2] = 0.0  # every other tap from the centre
+        halfband[7] = 0.5
+        np.testing.assert_allclose(np.asarray(self.dsp.design_halfband_taps(15)), halfband / halfband.sum(), rtol=0, atol=3e-7)
+
+    def test_rational_resampler_matches_the_numpy_interpolation_it_replaced(self) -> None:
+        rng = np.random.default_rng(99)
+        samples = (rng.normal(size=20_000) + 1j * rng.normal(size=20_000)).astype(np.complex64)
+        resampler = self.dsp.RationalResampler(128_000, 24_000, transition_hz=1_000)
+        actual = np.concatenate([iq(resampler.process(samples[i : i + 2_560])) for i in range(0, samples.size, 2_560)])
+
+        # The old numpy code, in one pass over the same filtered samples.
+        taps = np.asarray(resampler.fir.taps)
+        work = np.convolve(samples, taps)[: samples.size].astype(np.complex64)
+        left, right = 7, 8
+        window = np.kaiser(16, self.dsp._kaiser_beta(60.0)).astype(np.float32)
+        step = 128_000 / 24_000
+        position = np.ceil(left / step) * step  # the first whole step with history before it
+        positions = position + step * np.arange(int(np.ceil((work.size - right - position) / step)))
+        centers = np.floor(positions).astype(np.int64)
+        indices = centers[:, None] + np.arange(-left, right + 1)[None, :]
+        weights = (np.sinc(positions[:, None] - indices) * window[None, :]).astype(np.float32)
+        weights /= np.sum(weights, axis=1, keepdims=True)
+        expected = np.sum(work[indices] * weights, axis=1).astype(np.complex64)
+
+        self.assertGreater(actual.size, 3_000)
+        np.testing.assert_allclose(actual, expected[: actual.size], rtol=0, atol=2e-5)
+
+    def test_fir_filter_matches_direct_convolution_across_new_taps(self) -> None:
+        rng = np.random.default_rng(5)
+        samples = (rng.normal(size=5_000) + 1j * rng.normal(size=5_000)).astype(np.complex64)
+        old_taps = rng.normal(size=65).astype(np.float32)
+        new_taps = rng.normal(size=33).astype(np.float32)
+        fir = self.dsp.FirFilter(old_taps)
+        first = iq(fir.process(samples[:2_001]))
+        fir.update_taps(new_taps)
+        second = iq(fir.process(samples[2_001:]))
+
+        np.testing.assert_allclose(first, np.convolve(samples, old_taps)[:2_001], rtol=0, atol=1e-4)
+        # The new taps start from the real samples before them, not silence.
+        np.testing.assert_allclose(second, np.convolve(samples, new_taps)[2_001:5_000], rtol=0, atol=1e-4)
+
+    def test_dsp_takes_plain_buffers_and_refuses_the_wrong_type(self) -> None:
+        import array
+
+        decimator = self.dsp.create_decimator(192_000, 24_000)
+        output = decimator.process(array.array("f", [1.0, 0.0]) * 19_200)
+        self.assertIsInstance(output, array.array)
+        self.assertEqual(output.typecode, "f")
+        self.assertEqual(self.dsp.iq_count(output), 2_400 - 0)
+        with self.assertRaises(TypeError):
+            decimator.process(np.zeros(100, dtype=np.complex128))
+
+    def test_liquid_dsp_objects_are_destroyed_once_unused(self) -> None:
+        liquid_dsp = self._liquid_dsp()
+        destroyed = []
+        owned = liquid_dsp._Owned(1234, destroyed.append, "a test object")
+        del owned
+        self.assertEqual(destroyed, [1234])
+        with self.assertRaises(RuntimeError):
+            liquid_dsp._Owned(None, destroyed.append, "a test object")
 
     def _liquid_dsp(self):
         package = self.dsp.__name__.rsplit(".", 1)[0]
@@ -562,7 +655,7 @@ class DspTests(unittest.TestCase):
         sizes.append(samples.size - sum(sizes))
         outputs, position = [], 0
         for size in sizes:
-            output = fir.process(samples[position : position + size])
+            output = real(fir.process(samples[position : position + size]))
             self.assertEqual(output.size, size)
             outputs.append(output)
             position += size
@@ -582,9 +675,9 @@ class DspTests(unittest.TestCase):
         fir = liquid_dsp.DelayedFftFirFilter(old_taps, 1024)
 
         before = 480 * 25
-        first = np.concatenate([fir.process(samples[i : i + 480]) for i in range(0, before, 480)])
+        first = np.concatenate([real(fir.process(samples[i : i + 480])) for i in range(0, before, 480)])
         fir.update_taps(new_taps)
-        second = np.concatenate([fir.process(samples[i : i + 480]) for i in range(before, samples.size, 480)])
+        second = np.concatenate([real(fir.process(samples[i : i + 480])) for i in range(before, samples.size, 480)])
         actual = np.concatenate((first, second))[fir.delay :]
 
         # Blocks already filtered keep the old taps; every later block uses the new taps

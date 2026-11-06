@@ -95,7 +95,9 @@ class IqFileSourceTests(unittest.TestCase):
 
         output = self.web_control.iq_batch_complex(batch)
 
-        self.assertIs(output, samples)
+        # Float32 I then Q, the same samples.
+        self.assertEqual(output.typecode, "f")
+        np.testing.assert_array_equal(np.frombuffer(output, dtype=np.complex64), samples)
 
     def test_iq_test_sources_are_development_gated(self) -> None:
         web_control = self.web_control
@@ -153,8 +155,8 @@ class IqFileSourceTests(unittest.TestCase):
             intermediate.stop()
 
         self.assertEqual(output.sample_rate, 192_000)
-        self.assertEqual(output.data.dtype, np.complex64)
-        self.assertGreater(output.data.size, 0)
+        self.assertEqual(output.data.typecode, "f")  # float32 I then Q
+        self.assertGreater(len(output.data), 0)
 
     def test_raw_fanout_source_swap_preserves_existing_subscribers(self) -> None:
         web_control = self.web_control

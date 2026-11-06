@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .liquid_dsp import Oscillator
+from .numpy_adapters import complex64
 
 
 TONE_WAVEFORMS = ("sine", "square", "triangle", "sawtooth")
@@ -187,7 +188,7 @@ class ToneGeneratorBank:
                     voice.oscillator = Oscillator()
                 voice.oscillator.set_frequency(2.0 * math.pi * frequency / self.sample_rate)
                 voice.frequency = frequency
-            return voice.oscillator.generate(count).imag.astype(np.float64)
+            return complex64(voice.oscillator.generate(count)).imag.astype(np.float64)
         if voice.table is None or frequency != voice.frequency:
             voice.table = band_limited_wavetable(name, frequency, self.max_frequency_hz)
             voice.frequency = frequency

@@ -25,7 +25,8 @@ from .constants import (
     USB_VENDOR_NAMES,
 )
 from .diagnostics import channel_audio_diagnostics, raw_iq_diagnostics
-from .dsp import rtl_u8_to_complex64
+from .dsp import rtl_u8_to_iq
+from .numpy_adapters import complex64
 from .iq_pipeline import subscribe_raw_fanout
 from .remote_sdr import RemoteSdrError
 from .rtl import (
@@ -579,7 +580,7 @@ class DeviceServiceMixin:
         if not batches:
             raise ValueError("RTL-SDR produced no samples for diagnostics")
         raw = b"".join(batch.data for batch in batches)
-        iq = rtl_u8_to_complex64(raw)
+        iq = complex64(rtl_u8_to_iq(raw))
         if target_samples > 0 and iq.size > target_samples:
             iq = iq[-target_samples:]
         raw_stats = raw_iq_diagnostics(iq, sample_rate, center_frequency_hz, raw)

@@ -22,6 +22,7 @@ setup(
             sources=["src/nwr-stream-manager/native/nwr_native.c"],
             extra_compile_args=_native.COMPILE_FLAGS,
             extra_link_args=_native.LINK_FLAGS,
+            libraries=_native.LIBRARIES,
         )
     ],
 )

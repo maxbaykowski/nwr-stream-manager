@@ -19,6 +19,7 @@ import numpy as np
 
 from .encoder import PcmResampler
 from .liquid_dsp import Oscillator
+from .numpy_adapters import complex64
 
 
 LOG = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ def generate_same_burst(
             bit_samples = int(round(sample_target)) - sample_cursor
             sample_cursor += bit_samples
             oscillator.set_frequency(mark_step if ((byte >> bit_index) & 1) else space_step)
-            parts.append(oscillator.generate(bit_samples))
+            parts.append(complex64(oscillator.generate(bit_samples)))
     return (float(amplitude) * np.concatenate(parts).imag).astype(np.float32)
 
 
@@ -110,7 +111,7 @@ def generate_attention_tone(sample_rate: int, *, seconds: float = 8.0, amplitude
     if sample_rate <= 0:
         raise ValueError("sample rate must be positive")
     oscillator = Oscillator(2.0 * math.pi * SAME_ATTENTION_TONE_HZ / sample_rate)
-    samples = oscillator.generate(max(0, round(float(seconds) * sample_rate)))
+    samples = complex64(oscillator.generate(max(0, round(float(seconds) * sample_rate))))
     return (float(amplitude) * samples.imag).astype(np.float32)
 
 

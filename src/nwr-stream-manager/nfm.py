@@ -1,8 +1,12 @@
+"""Narrowband FM, through liquid-dsp. Audio is float32 and I/Q float32 I then Q, in any
+buffer going in, and array.array("f") coming out."""
+
 from __future__ import annotations
 
-import numpy as np
-from numpy.typing import NDArray
+import array
+from typing import Any
 
+from . import native
 from .liquid_dsp import FmDemodulator, FmModulator
 
 
@@ -22,14 +26,14 @@ class NfmDemodulator:
         self._demodulator.reset()
         self._started = False
 
-    def process(self, iq: NDArray[np.complex64]) -> NDArray[np.float32]:
-        if len(iq) == 0:
-            return np.array([], dtype=np.float32)
+    def process(self, iq: Any) -> array.array:
+        if memoryview(iq).nbytes < 8:
+            return array.array("f")
         audio = self._demodulator.demodulate(iq)
         if not self._started:
             # The very first sample has nothing before it to measure a phase change from.
             self._started = True
-            audio = audio[1:]
+            del audio[0]
         return audio
 
 
@@ -39,10 +43,12 @@ class NfmModulator:
     def __init__(self, sample_rate: int, deviation_hz: float) -> None:
         self._modulator = FmModulator(float(deviation_hz) / float(sample_rate))
 
-    def process(self, audio: NDArray[np.float32]) -> NDArray[np.complex64]:
-        return self._modulator.modulate(np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0))
+    def process(self, audio: Any) -> array.array:
+        clipped = native.floats(memoryview(audio).nbytes // 4)
+        native.f32_clip(audio, clipped, -1.0, 1.0)
+        return self._modulator.modulate(clipped)
 
 
-def float_to_s16(samples: NDArray[np.float32]) -> bytes:
-    pcm = np.clip(samples * PCM_SCALE, -32768, 32767).astype("<i2")
-    return pcm.tobytes()
+def float_to_s16(samples: Any) -> bytes:
+    """Float32 audio as 16-bit samples: scaled by 32768, clipped, then truncated."""
+    return native.float_to_s16(samples, PCM_SCALE, truncate=True)

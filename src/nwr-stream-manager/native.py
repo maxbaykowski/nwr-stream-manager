@@ -29,16 +29,17 @@ from typing import Any
 PACKAGE_DIRECTORY = Path(__file__).resolve().parent
 SOURCE = PACKAGE_DIRECTORY / "native" / "nwr_native.c"
 # Matches NWR_NATIVE_ABI in the C source.
-ABI = 3
+ABI = 5
 # How it's compiled, here and by setup.py on installation:
 # - fast on weak CPUs: optimized, and free to turn loops into vector instructions, since
-#   nothing relies on floating-point exception flags;
+#   nothing relies on floating-point exception flags. -O3, because at -O2 older gcc (14, on
+#   Raspberry Pi OS and Debian 13) leaves every loop here unvectorized;
 # - the same results on every computer: no fused multiply-adds, and nothing that changes
 #   how float arithmetic rounds (so never -ffast-math or -march=native);
 # - harder to exploit: stack protection, relocations made read-only once loaded, and a stack
 #   that can't run code.
 COMPILE_FLAGS = [
-    "-O2",
+    "-O3",
     "-std=c11",
     "-ffp-contract=off",
     "-fno-trapping-math",
@@ -48,6 +49,8 @@ COMPILE_FLAGS = [
     "-fstack-clash-protection",
 ]
 LINK_FLAGS = ["-Wl,-z,relro", "-Wl,-z,now", "-Wl,-z,noexecstack"]
+# The C math library, for the resampler's sinc.
+LIBRARIES = ["m"]
 # Flags for nwr_f32_to_s16, as in the C source.
 ROUND_TRUNCATE = 1
 CLIP_SYMMETRIC = 2
@@ -86,7 +89,8 @@ def _build_in_checkout(root: Path) -> Path:
     os.close(handle)
     try:
         result = subprocess.run(
-            [compiler, *COMPILE_FLAGS, "-fPIC", "-shared", *LINK_FLAGS, "-o", temporary, str(SOURCE)],
+            [compiler, *COMPILE_FLAGS, "-fPIC", "-shared", *LINK_FLAGS, "-o", temporary, str(SOURCE),
+             *(f"-l{name}" for name in LIBRARIES)],
             capture_output=True,
             text=True,
         )
@@ -138,6 +142,14 @@ def native_library() -> ctypes.CDLL:
         library.nwr_f32_to_u8.argtypes = [pointer, size, pointer, size, size]
         library.nwr_f32_downmix.restype = status
         library.nwr_f32_downmix.argtypes = [pointer, size, pointer, size, size, size]
+        library.nwr_f32_clip.restype = status
+        library.nwr_f32_clip.argtypes = [pointer, size, pointer, size, size, ctypes.c_float, ctypes.c_float]
+        library.nwr_cf32_interpolate.restype = status
+        library.nwr_cf32_interpolate.argtypes = [
+            pointer, size, pointer, size, size, ctypes.c_double, ctypes.c_double, ctypes.c_double, pointer, size, size
+        ]
+        library.nwr_cf32_fir.restype = status
+        library.nwr_cf32_fir.argtypes = [pointer, size, pointer, size, pointer, size, size]
         library.nwr_s16_to_f32.restype = status
         library.nwr_s16_to_f32.argtypes = [pointer, size, pointer, size, size, ctypes.c_float]
         _library = library
@@ -178,6 +190,16 @@ class _Buffer:
         self._keep = view
         self.nbytes = view.nbytes
         self.address = ctypes.addressof(ctypes.c_char.from_buffer(view)) if self.nbytes else 0
+
+
+def readable(buffer: Any, formats: tuple[str, ...] = FLOAT32) -> _Buffer:
+    """A buffer's address and size for a C library to read, checked to hold that type of sample."""
+    return _Buffer(buffer, formats)
+
+
+def writable(buffer: Any, formats: tuple[str, ...] = FLOAT32) -> _Buffer:
+    """A buffer's address and size for a C library to write into."""
+    return _Buffer(buffer, formats, writable=True)
 
 
 def _need(buffer: _Buffer, nbytes: int, what: str) -> None:
@@ -254,14 +276,63 @@ def s16_to_f32(pcm: Any, out: Any, scale: float) -> None:
     )
 
 
+def f32_clip(samples: Any, out: Any, low: float, high: float) -> None:
+    """Float32 audio clipped to low through high. Something that isn't a number becomes silence."""
+    source, target = _Buffer(samples, FLOAT32), _Buffer(out, FLOAT32, writable=True)
+    count = source.nbytes // 4
+    _need(target, count * 4, "the output")
+    _checked(
+        native_library().nwr_f32_clip(source.address, count, target.address, target.nbytes // 4, count, low, high),
+        "clipping audio",
+    )
+
+
+def cf32_interpolate(
+    samples: Any, window: Any, left: int, origin: float, start: float, step: float, count: int
+) -> array.array:
+    """count I/Q samples interpolated from float32 I/Q at positions start, start + step, ...,
+    where origin is the position of the first input sample; see nwr_cf32_interpolate."""
+    source, weights = _Buffer(samples, FLOAT32), _Buffer(window, FLOAT32)
+    out = floats(2 * count)
+    target = _Buffer(out, FLOAT32, writable=True)
+    _checked(
+        native_library().nwr_cf32_interpolate(
+            source.address, source.nbytes // 8, weights.address, weights.nbytes // 4, left,
+            origin, start, step, target.address, count, count,
+        ),
+        "interpolating I/Q",
+    )
+    return out
+
+
+def cf32_fir(samples: Any, taps: Any) -> array.array:
+    """Float32 I/Q filtered with real float32 taps, the first len(taps) - 1 samples being
+    history: as many outputs as samples after the history."""
+    source, weights = _Buffer(samples, FLOAT32), _Buffer(taps, FLOAT32)
+    tap_count = weights.nbytes // 4
+    count = max(0, source.nbytes // 8 - (tap_count - 1))
+    out = floats(2 * count)
+    target = _Buffer(out, FLOAT32, writable=True)
+    _checked(
+        native_library().nwr_cf32_fir(source.address, source.nbytes // 8, weights.address, tap_count, target.address, count, count),
+        "filtering I/Q",
+    )
+    return out
+
+
+# Repeated to make zeroed arrays: twice as fast as converting zeroed bytes.
+_ZERO_FLOAT = array.array("f", [0.0])
+_ZERO_SHORT = array.array("h", [0])
+
+
 def floats(count: int) -> array.array:
     """count float32s, all zero."""
-    return array.array("f", bytes(4 * count))
+    return _ZERO_FLOAT * count
 
 
 def shorts(count: int) -> array.array:
     """count signed 16-bit samples, all zero."""
-    return array.array("h", bytes(2 * count))
+    return _ZERO_SHORT * count
 
 
 def float_samples(data: Any) -> array.array:

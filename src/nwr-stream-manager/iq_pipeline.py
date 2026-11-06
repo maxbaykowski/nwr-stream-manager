@@ -42,7 +42,8 @@ from .dsp import (
     DEFAULT_ALIAS_ATTENUATION_DB,
     IqChannelizer,
     IqDcBlocker,
-    iq_to_complex64,
+    iq_count,
+    iq_samples,
     update_decimator_alias_filter,
 )
 from .models import IqFileSourceConfig, IqSampleBatch
@@ -706,12 +707,12 @@ class ProcessedIqFanout:
                     cleared,
                 )
             iq = iq_batch_complex(source_batch)
-            if len(iq) == 0:
+            if iq_count(iq) == 0:
                 continue
             process_started_at = time.monotonic()
             output, output_rate = self._process(source_batch, iq)
             process_seconds = time.monotonic() - process_started_at
-            batch_seconds = float(len(iq)) / float(max(1, source_batch.sample_rate))
+            batch_seconds = float(iq_count(iq)) / float(max(1, source_batch.sample_rate))
             if process_seconds > batch_seconds and process_started_at - last_slow_batch_log_at >= 10.0:
                 last_slow_batch_log_at = process_started_at
                 LOG.warning(
@@ -724,9 +725,9 @@ class ProcessedIqFanout:
                 )
             with self.subscribers_lock:
                 self.read_batches += 1
-                self.read_samples += len(iq)
+                self.read_samples += iq_count(iq)
                 self.output_rate = int(output_rate)
-            if len(output) == 0:
+            if iq_count(output) == 0:
                 continue
             batch = IqSampleBatch(
                 data=output,
@@ -1429,7 +1430,8 @@ def drain_queue_to_latest(source: queue.Queue, first_item: Any) -> Any:
 
 
 def iq_batch_complex(batch: RtlSampleBatch | IqSampleBatch) -> ComplexArray:
-    return iq_to_complex64(batch.data)
+    """A batch's I/Q as float32 I then Q, whatever form the batch holds it in."""
+    return iq_samples(batch.data)
 
 
 def validate_iq_recording_sample_rate(raw: Any) -> int:

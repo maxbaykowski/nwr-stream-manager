@@ -2212,7 +2212,7 @@ class EasAlertTests(unittest.TestCase):
             notch=config.NotchConfig(enabled=True, frequency=3000, width=100),
         ))
         eq_filter = processor.eq_filter
-        taps = eq_filter.taps.copy()
+        taps = eq_filter.taps[:]
         comfort_noise = processor.comfort_noise
         deemphasis = processor.deemphasis
 
@@ -2603,12 +2603,13 @@ class EasAlertTests(unittest.TestCase):
         framed = nfm.NfmModulator(sample_rate, deviation_hz)
         whole = nfm.NfmModulator(sample_rate, deviation_hz)
 
-        iq = np.concatenate([framed.process(audio[index : index + 480]) for index in range(0, audio.size, 480)])
-        np.testing.assert_allclose(iq, whole.process(audio), rtol=0, atol=1e-5)
+        as_iq = lambda samples: np.frombuffer(samples, dtype=np.complex64)  # float32 I then Q
+        iq = np.concatenate([as_iq(framed.process(audio[index : index + 480])) for index in range(0, audio.size, 480)])
+        np.testing.assert_allclose(iq, as_iq(whole.process(audio)), rtol=0, atol=1e-5)
         np.testing.assert_allclose(np.abs(iq), 1.0, atol=1e-3)
 
         # Our demodulator's full scale is 1.5 at 1/3 of the sample rate; scale back to audio.
-        recovered = nfm.NfmDemodulator().process(iq) / nfm.NFM_DEVIATION_GAIN * (sample_rate / (2.0 * deviation_hz))
+        recovered = np.asarray(nfm.NfmDemodulator().process(iq)) / nfm.NFM_DEVIATION_GAIN * (sample_rate / (2.0 * deviation_hz))
         error_db = 10 * np.log10(np.mean((recovered - audio[1:]) ** 2) / np.mean(audio ** 2))
         self.assertLess(error_db, -45.0)
 
@@ -3108,9 +3109,10 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual({batch.sample_rate for batch in first}, {sample_rate})
         for mine, theirs in zip(first, batches["wideband"]):
             self.assertIs(mine.data, theirs.data)
-        last_second = np.concatenate([batch.data for batch in first[-10:]])
+        as_iq = lambda samples: np.frombuffer(samples, dtype=np.complex64)  # float32 I then Q
+        last_second = np.concatenate([as_iq(batch.data) for batch in first[-10:]])
         # After four seconds the offset (0.22) is nearly gone and the station is untouched.
-        self.assertGreater(abs(complex(np.mean(first[0].data[:1000]))), 0.2)
+        self.assertGreater(abs(complex(np.mean(as_iq(first[0].data)[:1000]))), 0.2)
         self.assertLess(abs(complex(np.mean(last_second))), 0.01)
         self.assertAlmostEqual(float(np.mean(np.abs(last_second - np.mean(last_second)))), 0.5, delta=0.02)
 
@@ -3275,9 +3277,9 @@ class EasAlertTests(unittest.TestCase):
             attenuation_db=web_control.INTERMEDIATE_IQ_ALIAS_ATTENUATION_DB,
         )
         self.assertIsInstance(decimator, self.dsp.FixedFactor8IntermediateDecimator)
-        self.assertLess(decimator.first_stage.taps.size, 900)
-        self.assertLess(decimator.second_stage.taps.size, 900)
-        self.assertLess(decimator.final_stage.fir.taps.size, 900)
+        self.assertLess(len(decimator.first_stage.taps), 900)
+        self.assertLess(len(decimator.second_stage.taps), 900)
+        self.assertLess(len(decimator.final_stage.fir.taps), 900)
         iq = np.exp(1j * 2 * np.pi * 1000 * np.arange(65_536, dtype=np.float32) / input_rate).astype(np.complex64)
         raw = self._complex_to_rtl_u8(iq)
         intermediate.start()

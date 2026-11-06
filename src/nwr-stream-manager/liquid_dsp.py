@@ -2,17 +2,23 @@
 
 Calls through ctypes release Python's global interpreter lock, so streams can filter on
 separate CPU cores at the same time.
+
+Samples go in as any float32 buffer (array.array, memoryview, bytes; complex I/Q as I then
+Q) and come out as array.array("f"). Everything liquid-dsp creates is destroyed by a
+weakref.finalize once its Python object is gone, even if that's never closed.
 """
 
 from __future__ import annotations
 
+import array
 import ctypes
 import ctypes.util
 import math
 import threading
+import weakref
+from typing import Any, Callable
 
-import numpy as np
-from numpy.typing import NDArray
+from . import native
 
 LIQUID_SONAMES = ("libliquid.so.1", "libliquid.so.2", "libliquid.so")
 # liquid-dsp's precise oscillator (LIQUID_VCO); the default table-based one adds
@@ -101,6 +107,16 @@ def liquid_library() -> ctypes.CDLL:
         library.freqdem_demodulate_block.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
         library.freqdem_destroy.restype = ctypes.c_int
         library.freqdem_destroy.argtypes = [pointer]
+        library.firfilt_rrrf_create.restype = pointer
+        library.firfilt_rrrf_create.argtypes = [pointer, ctypes.c_uint]
+        library.firfilt_rrrf_execute_block.restype = ctypes.c_int
+        library.firfilt_rrrf_execute_block.argtypes = [pointer, pointer, ctypes.c_uint, pointer]
+        library.firfilt_rrrf_destroy.restype = ctypes.c_int
+        library.firfilt_rrrf_destroy.argtypes = [pointer]
+        library.liquid_firdes_kaiser.restype = ctypes.c_int
+        library.liquid_firdes_kaiser.argtypes = [ctypes.c_uint, ctypes.c_float, ctypes.c_float, ctypes.c_float, pointer]
+        library.liquid_kaiser.restype = ctypes.c_float
+        library.liquid_kaiser.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_float]
         library.fftfilt_rrrf_create.restype = pointer
         library.fftfilt_rrrf_create.argtypes = [pointer, ctypes.c_uint, ctypes.c_uint]
         library.fftfilt_rrrf_reset.restype = ctypes.c_int
@@ -115,6 +131,69 @@ def liquid_library() -> ctypes.CDLL:
         return library
 
 
+def _destroy(destroy: Callable[[int], Any], handle: int, lock: threading.RLock | None) -> None:
+    if lock is None:
+        destroy(handle)
+    else:
+        with lock:
+            destroy(handle)
+
+
+class _Owned:
+    """Something liquid-dsp created, destroyed once nothing uses it any more."""
+
+    def __init__(self, handle: int | None, destroy: Callable[[int], Any], what: str, lock: threading.RLock | None = None) -> None:
+        if not handle:
+            raise RuntimeError(f"liquid-dsp could not create {what}")
+        self.handle = handle
+        self._finalizer = weakref.finalize(self, _destroy, destroy, handle, lock)
+
+
+def _bytes(samples: Any) -> memoryview:
+    """A float32 buffer's bytes, read where they are; anything else is refused."""
+    view = memoryview(samples)
+    if view.format not in native.FLOAT32 and view.format not in native.RAW:
+        raise TypeError(f"expected float32 samples, not {view.format!r}")
+    if not view.c_contiguous:
+        raise ValueError("samples must be contiguous")
+    return view if view.format == "B" and view.ndim == 1 else view.cast("B")
+
+
+def _floats(data: Any) -> array.array:
+    """A copy of float32 samples as an array.array("f")."""
+    samples = array.array("f")
+    samples.frombytes(_bytes(data))
+    return samples
+
+
+def float_taps(taps: Any) -> array.array:
+    """Filter taps as an array.array("f"): from any float32 buffer, or a sequence of numbers."""
+    if isinstance(taps, array.array) and taps.typecode == "f":
+        result = array.array("f", taps)
+    else:
+        try:
+            result = _floats(taps)
+        except TypeError:
+            result = array.array("f", (float(value) for value in taps))
+    if not result:
+        raise ValueError("FIR taps must be a non-empty one-dimensional array")
+    return result
+
+
+def kaiser_lowpass(count: int, cutoff: float, attenuation_db: float) -> array.array:
+    """liquid-dsp's Kaiser-windowed sinc low-pass of count taps, cutoff as a fraction of the
+    sample rate, not yet scaled."""
+    taps = native.floats(count)
+    if liquid_library().liquid_firdes_kaiser(count, cutoff, attenuation_db, 0.0, native.writable(taps).address):
+        raise ValueError("liquid-dsp could not design the filter")
+    return taps
+
+
+def kaiser_window(count: int, beta: float) -> array.array:
+    library = liquid_library()
+    return array.array("f", (library.liquid_kaiser(index, count, beta) for index in range(count)))
+
+
 class FirDecimator:
     """Low-pass filter complex samples and keep every `factor`-th output.
 
@@ -122,77 +201,100 @@ class FirDecimator:
     2 * factor, ... counted from the very first input sample, across any chunk sizes.
     """
 
-    def __init__(self, factor: int, taps: NDArray[np.float32]) -> None:
+    def __init__(self, factor: int, taps: Any) -> None:
         factor = int(factor)
         if factor < 2:
             raise ValueError("liquid-dsp decimation factor must be at least 2")
         self.factor = factor
         self._library = liquid_library()
         self._lock = threading.Lock()
-        self._handle: int | None = None
-        self.taps = np.zeros(0, dtype=np.float32)
+        self.taps = array.array("f")
         self._create(taps)
         # liquid-dsp outputs on the first sample of each group of `factor`, so its outputs
         # already line up with filtered samples 0, factor, 2 * factor, ...
-        self._pending = np.zeros(0, dtype=np.complex64)
-        self._recent = np.zeros(0, dtype=np.complex64)
+        self._pending = array.array("f")
+        self._recent = array.array("f")
 
-    def _create(self, taps: NDArray[np.float32]) -> None:
-        taps = np.ascontiguousarray(taps, dtype=np.float32)
-        if taps.ndim != 1 or taps.size == 0:
-            raise ValueError("FIR taps must be a non-empty one-dimensional array")
-        handle = self._library.firdecim_crcf_create(self.factor, taps.ctypes.data, taps.size)
-        if not handle:
-            raise RuntimeError("liquid-dsp could not create the decimating filter")
+    def _create(self, taps: Any) -> None:
+        taps = float_taps(taps)
+        self._filter = _Owned(
+            self._library.firdecim_crcf_create(self.factor, native.readable(taps).address, len(taps)),
+            self._library.firdecim_crcf_destroy,
+            "the decimating filter",
+        )
         self.taps = taps  # liquid-dsp copies the taps, but keep them for inspection
-        self._handle = handle
 
-    def process(self, samples: NDArray[np.complex64]) -> NDArray[np.complex64]:
-        samples = np.asarray(samples, dtype=np.complex64)
-        if samples.size == 0:
-            return np.array([], dtype=np.complex64)
+    def process(self, samples: Any) -> array.array:
+        data = _bytes(samples)
+        if not data.nbytes:
+            return array.array("f")
         with self._lock:
-            work = np.concatenate((self._pending, samples)) if self._pending.size else np.ascontiguousarray(samples)
-            usable = work.size - (work.size % self.factor)
-            output = np.empty(usable // self.factor, dtype=np.complex64)
-            if output.size:
+            if self._pending:
+                work: Any = self._pending
+                work.frombytes(data)
+                data = _bytes(work)
+            usable = (data.nbytes // 8) - (data.nbytes // 8) % self.factor
+            output = native.floats(2 * (usable // self.factor))
+            if output:
                 self._library.firdecim_crcf_execute_block(
-                    self._handle, work.ctypes.data, output.size, output.ctypes.data
+                    self._filter.handle, native.readable(data).address, len(output) // 2, native.writable(output).address
                 )
-                self._remember(work[:usable])
-            self._pending = work[usable:].copy()
+                self._remember(data[: usable * 8])
+            self._pending = _floats(data[usable * 8 :])
             return output
 
-    def update_taps(self, taps: NDArray[np.float32]) -> None:
+    def update_taps(self, taps: Any) -> None:
         """Switch to new coefficients without restarting from silence."""
         with self._lock:
-            old_handle = self._handle
             self._create(taps)
-            if self._recent.size:
+            if self._recent:
                 # Whole groups of `factor`, so the decimation phase carries on unchanged.
-                discard = np.empty(self._recent.size // self.factor, dtype=np.complex64)
+                discard = native.floats(2 * (len(self._recent) // 2 // self.factor))
                 self._library.firdecim_crcf_execute_block(
-                    self._handle, self._recent.ctypes.data, discard.size, discard.ctypes.data
+                    self._filter.handle, native.readable(self._recent).address, len(discard) // 2,
+                    native.writable(discard).address,
                 )
-            if old_handle:
-                self._library.firdecim_crcf_destroy(old_handle)
 
-    def _remember(self, consumed: NDArray[np.complex64]) -> None:
-        keep = int(math.ceil(max(FIR_DECIMATOR_HISTORY_SAMPLES, self.taps.size) / self.factor)) * self.factor
-        if consumed.size >= keep:
-            self._recent = consumed[-keep:].copy()
+    def _remember(self, consumed: memoryview) -> None:
+        keep = int(math.ceil(max(FIR_DECIMATOR_HISTORY_SAMPLES, len(self.taps)) / self.factor)) * self.factor
+        if consumed.nbytes >= keep * 8:
+            self._recent = _floats(consumed[-keep * 8 :])
         else:
-            self._recent = np.concatenate((self._recent, consumed))[-keep:]
+            recent = self._recent
+            recent.frombytes(consumed)
+            del recent[: max(0, len(recent) - keep * 2)]
 
-    def __del__(self) -> None:
-        handle = getattr(self, "_handle", None)
-        library = getattr(self, "_library", None)
-        if handle and library is not None:
-            try:
-                library.firdecim_crcf_destroy(handle)
-            except Exception:
-                pass
-            self._handle = None
+
+class FirFilter:
+    """Filter complex samples with real taps, carrying on across chunks of any length.
+
+    NWR Stream Manager's own native filter: liquid-dsp's is several times slower where
+    it's built without vector instructions, as some distributions' builds are.
+    """
+
+    def __init__(self, taps: Any) -> None:
+        self.taps = float_taps(taps)
+        # The last len(taps) - 1 inputs, which the next chunk, or new taps, start from.
+        self._history = native.floats(2 * (len(self.taps) - 1))
+
+    def update_taps(self, taps: Any) -> None:
+        """Switch to new coefficients, starting from the same recent input."""
+        taps = float_taps(taps)
+        keep = 2 * (len(taps) - 1)
+        if len(self._history) >= keep:
+            self._history = self._history[len(self._history) - keep :]
+        else:
+            self._history = native.floats(keep - len(self._history)) + self._history
+        self.taps = taps
+
+    def process(self, samples: Any) -> array.array:
+        data = _bytes(samples)
+        if not data.nbytes:
+            return array.array("f")
+        work = self._history + _floats(data)
+        keep = 2 * (len(self.taps) - 1)
+        self._history = work[len(work) - keep :] if keep else array.array("f")
+        return native.cf32_fir(work, self.taps)
 
 
 class IqDcRemover:
@@ -211,47 +313,41 @@ class IqDcRemover:
         self.block_size = max(1, int(round(self.sample_rate * float(block_seconds))))
         self.mean = 0j
         self._library = liquid_library()
-        self._ones = np.ones(self.block_size, dtype=np.float32)
-        self._sum = np.zeros(1, dtype=np.complex64)
+        self._ones = array.array("f", [1.0]) * self.block_size
+        self._sum = _FloatComplex()
         self._full_block_decay = self._decay(self.block_size)
-        self._handle = self._library.dotprod_crcf_create(self._ones.ctypes.data, self.block_size)
-        if not self._handle:
-            raise RuntimeError("liquid-dsp could not create the DC offset averager")
+        self._averager = _Owned(
+            self._library.dotprod_crcf_create(native.readable(self._ones).address, self.block_size),
+            self._library.dotprod_crcf_destroy,
+            "the DC offset averager",
+        )
 
     def _decay(self, samples: int) -> float:
         return math.exp(-samples / (self.sample_rate * self.time_constant_seconds))
 
-    def process(self, samples: NDArray[np.complex64]) -> NDArray[np.complex64]:
-        samples = np.ascontiguousarray(samples, dtype=np.complex64)
-        output = np.empty_like(samples)
-        if samples.size == 0:
+    def process(self, samples: Any) -> array.array:
+        source = native.readable(samples)
+        count_total = source.nbytes // 8
+        output = native.floats(2 * count_total)
+        if count_total == 0:
             return output
         library = self._library
-        item = samples.itemsize
-        source, target, total = samples.ctypes.data, output.ctypes.data, self._sum.ctypes.data
-        for start in range(0, samples.size, self.block_size):
-            count = min(self.block_size, samples.size - start)
+        target = native.writable(output)
+        total = ctypes.addressof(self._sum)
+        ones = native.readable(self._ones).address
+        for start in range(0, count_total, self.block_size):
+            count = min(self.block_size, count_total - start)
             if count == self.block_size:
-                library.dotprod_crcf_execute(self._handle, source + start * item, total)
+                library.dotprod_crcf_execute(self._averager.handle, source.address + start * 8, total)
                 decay = self._full_block_decay
             else:
-                library.dotprod_crcf_run4(self._ones.ctypes.data, source + start * item, count, total)
+                library.dotprod_crcf_run4(ones, source.address + start * 8, count, total)
                 decay = self._decay(count)
-            average = complex(self._sum[0]) / count
+            average = complex(self._sum.real, self._sum.imag) / count
             offset = _FloatComplex(-self.mean.real, -self.mean.imag)
-            library.liquid_vectorcf_addscalar(source + start * item, count, offset, target + start * item)
+            library.liquid_vectorcf_addscalar(source.address + start * 8, count, offset, target.address + start * 8)
             self.mean = average + (self.mean - average) * decay
         return output
-
-    def __del__(self) -> None:
-        handle = getattr(self, "_handle", None)
-        library = getattr(self, "_library", None)
-        if handle and library is not None:
-            try:
-                library.dotprod_crcf_destroy(handle)
-            except Exception:
-                pass
-            self._handle = None
 
 
 class AudioDcBlocker:
@@ -261,30 +357,22 @@ class AudioDcBlocker:
         if not 0.0 < coefficient < 1.0:
             raise ValueError("DC blocker coefficient must be between 0 and 1")
         self._library = liquid_library()
-        self._handle = self._library.iirfilt_rrrf_create_dc_blocker(1.0 - float(coefficient))
-        if not self._handle:
-            raise RuntimeError("liquid-dsp could not create the audio DC blocker")
+        self._filter = _Owned(
+            self._library.iirfilt_rrrf_create_dc_blocker(1.0 - float(coefficient)),
+            self._library.iirfilt_rrrf_destroy,
+            "the audio DC blocker",
+        )
         # liquid-dsp turns the level down very slightly by default; keep it unchanged.
-        self._library.iirfilt_rrrf_set_scale(self._handle, 1.0)
+        self._library.iirfilt_rrrf_set_scale(self._filter.handle, 1.0)
 
-    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        samples = np.ascontiguousarray(samples, dtype=np.float32)
-        output = np.empty_like(samples)
-        if samples.size:
+    def process(self, samples: Any) -> array.array:
+        source = native.readable(samples)
+        output = native.floats(source.nbytes // 4)
+        if output:
             self._library.iirfilt_rrrf_execute_block(
-                self._handle, samples.ctypes.data, samples.size, output.ctypes.data
+                self._filter.handle, source.address, len(output), native.writable(output).address
             )
         return output
-
-    def __del__(self) -> None:
-        handle = getattr(self, "_handle", None)
-        library = getattr(self, "_library", None)
-        if handle and library is not None:
-            try:
-                library.iirfilt_rrrf_destroy(handle)
-            except Exception:
-                pass
-            self._handle = None
 
 
 class Oscillator:
@@ -293,48 +381,38 @@ class Oscillator:
     def __init__(self, radians_per_sample: float = 0.0) -> None:
         self._library = liquid_library()
         self._lock = threading.Lock()
-        self._handle = self._library.nco_crcf_create(LIQUID_PRECISE_OSCILLATOR)
-        if not self._handle:
-            raise RuntimeError("liquid-dsp could not create the oscillator")
+        self._oscillator = _Owned(
+            self._library.nco_crcf_create(LIQUID_PRECISE_OSCILLATOR), self._library.nco_crcf_destroy, "the oscillator"
+        )
         self.set_frequency(radians_per_sample)
 
     def set_frequency(self, radians_per_sample: float) -> None:
         with self._lock:
-            self._library.nco_crcf_set_frequency(self._handle, float(radians_per_sample))
+            self._library.nco_crcf_set_frequency(self._oscillator.handle, float(radians_per_sample))
 
     @property
     def phase(self) -> float:
         with self._lock:
-            return float(self._library.nco_crcf_get_phase(self._handle))
+            return float(self._library.nco_crcf_get_phase(self._oscillator.handle))
 
     @phase.setter
     def phase(self, radians: float) -> None:
         with self._lock:
-            self._library.nco_crcf_set_phase(self._handle, float(radians))
+            self._library.nco_crcf_set_phase(self._oscillator.handle, float(radians))
 
-    def generate(self, count: int) -> NDArray[np.complex64]:
-        """The oscillator itself, exp(j * phase), for `count` samples."""
-        return self.mix_up(np.ones(max(0, int(count)), dtype=np.complex64))
+    def generate(self, count: int) -> array.array:
+        """The oscillator itself, exp(j * phase), for `count` samples, as I then Q."""
+        return self.mix_up(array.array("f", [1.0, 0.0]) * max(0, int(count)))
 
-    def mix_up(self, samples: NDArray[np.complex64]) -> NDArray[np.complex64]:
-        samples = np.ascontiguousarray(samples, dtype=np.complex64)
-        output = np.empty_like(samples)
-        if samples.size:
+    def mix_up(self, samples: Any) -> array.array:
+        source = native.readable(samples)
+        output = native.floats(source.nbytes // 4)
+        if output:
             with self._lock:
                 self._library.nco_crcf_mix_block_up(
-                    self._handle, samples.ctypes.data, output.ctypes.data, samples.size
+                    self._oscillator.handle, source.address, native.writable(output).address, len(output) // 2
                 )
         return output
-
-    def __del__(self) -> None:
-        handle = getattr(self, "_handle", None)
-        library = getattr(self, "_library", None)
-        if handle and library is not None:
-            try:
-                library.nco_crcf_destroy(handle)
-            except Exception:
-                pass
-            self._handle = None
 
 
 class FmDemodulator:
@@ -343,31 +421,21 @@ class FmDemodulator:
     def __init__(self, gain: float) -> None:
         self._library = liquid_library()
         # liquid-dsp outputs the phase change divided by 2 * pi * kf.
-        self._handle = self._library.freqdem_create(1.0 / (2.0 * float(gain)))
-        if not self._handle:
-            raise RuntimeError("liquid-dsp could not create the FM demodulator")
+        self._demodulator = _Owned(
+            self._library.freqdem_create(1.0 / (2.0 * float(gain))), self._library.freqdem_destroy, "the FM demodulator"
+        )
 
     def reset(self) -> None:
-        self._library.freqdem_reset(self._handle)
+        self._library.freqdem_reset(self._demodulator.handle)
 
-    def demodulate(self, samples: NDArray[np.complex64]) -> NDArray[np.float32]:
-        samples = np.ascontiguousarray(samples, dtype=np.complex64)
-        output = np.empty(samples.size, dtype=np.float32)
-        if samples.size:
+    def demodulate(self, samples: Any) -> array.array:
+        source = native.readable(samples)
+        output = native.floats(source.nbytes // 8)
+        if output:
             self._library.freqdem_demodulate_block(
-                self._handle, samples.ctypes.data, samples.size, output.ctypes.data
+                self._demodulator.handle, source.address, len(output), native.writable(output).address
             )
         return output
-
-    def __del__(self) -> None:
-        handle = getattr(self, "_handle", None)
-        library = getattr(self, "_library", None)
-        if handle and library is not None:
-            try:
-                library.freqdem_destroy(handle)
-            except Exception:
-                pass
-            self._handle = None
 
 
 class FmModulator:
@@ -375,26 +443,21 @@ class FmModulator:
 
     def __init__(self, kf: float) -> None:
         self._library = liquid_library()
-        self._handle = self._library.freqmod_create(float(kf))
-        if not self._handle:
-            raise RuntimeError("liquid-dsp could not create the FM modulator")
+        self._modulator = _Owned(self._library.freqmod_create(float(kf)), self._library.freqmod_destroy, "the FM modulator")
 
-    def modulate(self, audio: NDArray[np.float32]) -> NDArray[np.complex64]:
-        audio = np.ascontiguousarray(audio, dtype=np.float32)
-        output = np.empty(audio.size, dtype=np.complex64)
-        if audio.size:
-            self._library.freqmod_modulate_block(self._handle, audio.ctypes.data, audio.size, output.ctypes.data)
+    def modulate(self, audio: Any) -> array.array:
+        source = native.readable(audio)
+        count = source.nbytes // 4
+        output = native.floats(2 * count)
+        if count:
+            self._library.freqmod_modulate_block(self._modulator.handle, source.address, count, native.writable(output).address)
         return output
 
-    def __del__(self) -> None:
-        handle = getattr(self, "_handle", None)
-        library = getattr(self, "_library", None)
-        if handle and library is not None:
-            try:
-                library.freqmod_destroy(handle)
-            except Exception:
-                pass
-            self._handle = None
+
+def _fft_filter(library: ctypes.CDLL, taps: array.array, block: int) -> _Owned:
+    with _fft_plan_lock:
+        handle = library.fftfilt_rrrf_create(native.readable(taps).address, len(taps), block)
+    return _Owned(handle, library.fftfilt_rrrf_destroy, "the FFT filter", _fft_plan_lock)
 
 
 class AudioFirFilter:
@@ -402,74 +465,68 @@ class AudioFirFilter:
 
     Chunks made of whole `block`-sample blocks, which is what every audio path sends,
     go through the FFT filter. Any other length is filtered directly from the same
-    history, so the output is identical whatever lengths arrive, with no added delay.
+    history, so the output is the same whatever lengths arrive, with no added delay.
     """
 
-    def __init__(self, taps: NDArray[np.float32], block: int) -> None:
-        taps = np.ascontiguousarray(taps, dtype=np.float32)
-        if taps.ndim != 1 or taps.size == 0:
-            raise ValueError("FIR taps must be a non-empty one-dimensional array")
-        if int(block) < taps.size - 1:
+    def __init__(self, taps: Any, block: int) -> None:
+        taps = float_taps(taps)
+        if int(block) < len(taps) - 1:
             raise ValueError("FFT filter block must be at least the filter length minus one")
         self.taps = taps
         self.block = int(block)
         self._library = liquid_library()
-        with _fft_plan_lock:
-            self._handle = self._library.fftfilt_rrrf_create(taps.ctypes.data, taps.size, self.block)
-        if not self._handle:
-            raise RuntimeError("liquid-dsp could not create the FFT filter")
-        self._history = np.zeros(taps.size - 1, dtype=np.float32)
+        self._filter = _fft_filter(self._library, taps, self.block)
+        self._history = native.floats(len(taps) - 1)
         self._in_step = True  # the FFT filter's own state matches self._history
 
-    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        samples = np.ascontiguousarray(samples, dtype=np.float32)
-        if samples.size == 0:
-            return samples.copy()
-        if samples.size % self.block:
-            output = np.convolve(np.concatenate((self._history, samples)), self.taps, mode="valid").astype(np.float32)
+    def process(self, samples: Any) -> array.array:
+        data = _bytes(samples)
+        count = data.nbytes // 4
+        if count == 0:
+            return array.array("f")
+        output = native.floats(count)
+        if count % self.block:
+            self._filter_directly(data, output)
             self._in_step = False
         else:
             if not self._in_step:
                 self._prime()
-            output = np.empty_like(samples)
-            item = samples.itemsize
-            for start in range(0, samples.size, self.block):
-                self._library.fftfilt_rrrf_execute(
-                    self._handle, samples.ctypes.data + start * item, output.ctypes.data + start * item
-                )
-        self._remember(samples)
+            source, target = native.readable(data), native.writable(output)
+            for start in range(0, count, self.block):
+                self._library.fftfilt_rrrf_execute(self._filter.handle, source.address + start * 4, target.address + start * 4)
+        self._remember(data)
         return output
+
+    def _filter_directly(self, data: memoryview, output: array.array) -> None:
+        """A FIR filter starting from the remembered history, for lengths the FFT filter can't take."""
+        library = self._library
+        direct = _Owned(
+            library.firfilt_rrrf_create(native.readable(self.taps).address, len(self.taps)),
+            library.firfilt_rrrf_destroy,
+            "the filter",
+        )
+        if self._history:
+            discard = native.floats(len(self._history))
+            library.firfilt_rrrf_execute_block(
+                direct.handle, native.readable(self._history).address, len(self._history), native.writable(discard).address
+            )
+        library.firfilt_rrrf_execute_block(direct.handle, native.readable(data).address, len(output), native.writable(output).address)
 
     def _prime(self) -> None:
         # Run one block ending in the remembered input, so the FFT filter carries on
         # from exactly where direct filtering left off.
-        primer = np.zeros(self.block, dtype=np.float32)
-        if self._history.size:
-            primer[-self._history.size :] = self._history
-        discard = np.empty_like(primer)
-        self._library.fftfilt_rrrf_reset(self._handle)
-        self._library.fftfilt_rrrf_execute(self._handle, primer.ctypes.data, discard.ctypes.data)
+        primer = native.floats(self.block - len(self._history)) + self._history
+        discard = native.floats(self.block)
+        self._library.fftfilt_rrrf_reset(self._filter.handle)
+        self._library.fftfilt_rrrf_execute(self._filter.handle, native.readable(primer).address, native.writable(discard).address)
         self._in_step = True
 
-    def _remember(self, samples: NDArray[np.float32]) -> None:
-        keep = self._history.size
+    def _remember(self, data: memoryview) -> None:
+        keep = len(self._history)
         if not keep:
             return
-        if samples.size >= keep:
-            self._history = samples[-keep:].copy()
-        else:
-            self._history = np.concatenate((self._history[samples.size :], samples))
-
-    def __del__(self) -> None:
-        handle = getattr(self, "_handle", None)
-        library = getattr(self, "_library", None)
-        if handle and library is not None:
-            try:
-                with _fft_plan_lock:
-                    library.fftfilt_rrrf_destroy(handle)
-            except Exception:
-                pass
-            self._handle = None
+        self._history.frombytes(data[-keep * 4 :])
+        del self._history[:-keep]
 
 
 class DelayedFftFirFilter:
@@ -480,68 +537,48 @@ class DelayedFftFirFilter:
     samples, which lets every call return exactly as many samples as it was given.
     """
 
-    def __init__(self, taps: NDArray[np.float32], block: int) -> None:
+    def __init__(self, taps: Any, block: int) -> None:
         self.block = int(block)
         self.delay = self.block - 1
         self._library = liquid_library()
-        self._handle = None
-        self.taps = np.zeros(0, dtype=np.float32)
+        self.taps = array.array("f")
         self._create(taps)
-        self._pending = np.zeros(0, dtype=np.float32)
-        self._ready = np.zeros(self.delay, dtype=np.float32)
-        self._recent = np.zeros(self.block, dtype=np.float32)
+        self._pending = array.array("f")
+        self._ready = native.floats(self.delay)
+        self._recent = native.floats(self.block)
 
-    def _create(self, taps: NDArray[np.float32]) -> None:
-        taps = np.ascontiguousarray(taps, dtype=np.float32)
-        if taps.ndim != 1 or taps.size == 0:
-            raise ValueError("FIR taps must be a non-empty one-dimensional array")
-        if self.block < taps.size - 1:
+    def _create(self, taps: Any) -> None:
+        taps = float_taps(taps)
+        if self.block < len(taps) - 1:
             raise ValueError("FFT filter block must be at least the filter length minus one")
-        with _fft_plan_lock:
-            handle = self._library.fftfilt_rrrf_create(taps.ctypes.data, taps.size, self.block)
-        if not handle:
-            raise RuntimeError("liquid-dsp could not create the FFT filter")
+        self._filter = _fft_filter(self._library, taps, self.block)
         self.taps = taps
-        self._handle = handle
 
-    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        samples = np.asarray(samples, dtype=np.float32)
-        if samples.size == 0:
-            return samples.copy()
-        work = np.concatenate((self._pending, samples))
-        whole = work.size - work.size % self.block
+    def process(self, samples: Any) -> array.array:
+        data = _bytes(samples)
+        count = data.nbytes // 4
+        if count == 0:
+            return array.array("f")
+        work = self._pending
+        work.frombytes(data)
+        whole = len(work) - len(work) % self.block
         if whole:
-            work = np.ascontiguousarray(work)
-            filtered = np.empty(whole, dtype=np.float32)
-            item = work.itemsize
+            filtered = native.floats(whole)
+            source, target = native.readable(work), native.writable(filtered)
             for start in range(0, whole, self.block):
-                self._library.fftfilt_rrrf_execute(
-                    self._handle, work.ctypes.data + start * item, filtered.ctypes.data + start * item
-                )
-            self._recent = work[whole - self.block : whole].copy()
-            self._ready = np.concatenate((self._ready, filtered))
-        self._pending = work[whole:].copy()
-        output = self._ready[: samples.size]
-        self._ready = self._ready[samples.size :]
+                self._library.fftfilt_rrrf_execute(self._filter.handle, source.address + start * 4, target.address + start * 4)
+            del source, target
+            self._recent = work[whole - self.block : whole]
+            self._ready.extend(filtered)
+        del work[:whole]
+        output = self._ready[:count]
+        del self._ready[:count]
         return output
 
-    def update_taps(self, taps: NDArray[np.float32]) -> None:
+    def update_taps(self, taps: Any) -> None:
         """Switch to new taps, carrying on from the latest audio instead of silence."""
-        old_handle = self._handle
         self._create(taps)
-        discard = np.empty(self.block, dtype=np.float32)
-        self._library.fftfilt_rrrf_execute(self._handle, self._recent.ctypes.data, discard.ctypes.data)
-        if old_handle:
-            with _fft_plan_lock:
-                self._library.fftfilt_rrrf_destroy(old_handle)
-
-    def __del__(self) -> None:
-        handle = getattr(self, "_handle", None)
-        library = getattr(self, "_library", None)
-        if handle and library is not None:
-            try:
-                with _fft_plan_lock:
-                    library.fftfilt_rrrf_destroy(handle)
-            except Exception:
-                pass
-            self._handle = None
+        discard = native.floats(self.block)
+        self._library.fftfilt_rrrf_execute(
+            self._filter.handle, native.readable(self._recent).address, native.writable(discard).address
+        )

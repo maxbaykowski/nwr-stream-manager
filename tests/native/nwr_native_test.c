@@ -19,6 +19,11 @@ int nwr_u8_iq_to_f32(const uint8_t *in, size_t in_bytes, float *out, size_t out_
 int nwr_f32_to_s16(const float *in, size_t in_count, int16_t *out, size_t out_count, size_t count, float scale,
                    int flags);
 int nwr_f32_to_u8(const float *in, size_t in_count, uint8_t *out, size_t out_count, size_t count);
+int nwr_f32_clip(const float *in, size_t in_count, float *out, size_t out_count, size_t count, float low, float high);
+int nwr_cf32_interpolate(const float *in, size_t in_samples, const float *window, size_t taps, size_t left, double origin,
+                         double start, double step, float *out, size_t out_samples, size_t count);
+int nwr_cf32_fir(const float *in, size_t in_samples, const float *taps, size_t tap_count, float *out, size_t out_samples,
+                 size_t count);
 int nwr_f32_downmix(const float *in, size_t in_count, float *out, size_t out_count, size_t frames, size_t channels);
 int nwr_s16_to_f32(const int16_t *in, size_t in_count, float *out, size_t out_count, size_t count, float scale);
 
@@ -200,14 +205,129 @@ static void test_16_bit_to_float(void)
     free(out);
 }
 
+static void test_clip(void)
+{
+    float in[5] = {-2.0f, -0.5f, 0.25f, 3.0f, NAN};
+    float *out = exactly(5 * sizeof(float));
+    CHECK(nwr_f32_clip(in, 5, out, 5, 5, -1.0f, 1.0f) == 0);
+    CHECK(out[0] == -1.0f && out[1] == -0.5f && out[2] == 0.25f && out[3] == 1.0f && out[4] == 0.0f);
+    float untouched[2] = {7.0f, 7.0f};
+    CHECK(nwr_f32_clip(in, 1, untouched, 2, 2, -1.0f, 1.0f) == -1);
+    CHECK(nwr_f32_clip(in, 2, untouched, 2, 2, 1.0f, -1.0f) == -1);
+    CHECK(nwr_f32_clip(in, 2, untouched, 2, 2, NAN, 1.0f) == -1);
+    CHECK(nwr_f32_clip(untouched, 2, untouched, 2, 2, -1.0f, 1.0f) == -1);
+    CHECK(untouched[0] == 7.0f && untouched[1] == 7.0f);
+    free(out);
+}
+
+static void test_interpolate(void)
+{
+    /* 64 I/Q samples of a constant: every interpolated sample is that constant, since the
+     * weights add up to one. */
+    size_t samples = 64, taps = 16, left = 7;
+    float *in = exactly(samples * 2 * sizeof(float));
+    float *window = exactly(taps * sizeof(float));
+    for (size_t i = 0; i < samples; i++) {
+        in[i * 2] = 0.5f;
+        in[i * 2 + 1] = -0.25f;
+    }
+    for (size_t k = 0; k < taps; k++) {
+        window[k] = 1.0f;
+    }
+    /* From position 7 (left samples before it) to the last with 8 after it: 55.5. */
+    size_t count = 10;
+    float *out = exactly(count * 2 * sizeof(float));
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 100.0, 107.0, 5.35, out, count, count) == 0);
+    for (size_t i = 0; i < count; i++) {
+        CHECK(fabsf(out[i * 2] - 0.5f) < 1e-6f && fabsf(out[i * 2 + 1] + 0.25f) < 1e-6f);
+    }
+    /* A whole position lands exactly on its sample. */
+    for (size_t i = 0; i < samples; i++) {
+        in[i * 2] = (float)i;
+    }
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, 20.0, 1.0, out, count, 1) == 0);
+    CHECK(fabsf(out[0] - 20.0f) < 1e-4f);
+
+    /* Refused, writing nothing: reading before the first sample or past the last, steps that
+     * aren't forward, too many taps, too little output, null, overlapping. */
+    float untouched[4] = {7.0f, 7.0f, 7.0f, 7.0f};
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, 6.9, 1.0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, 50.0, 6.0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, 56.0, 1.0, untouched, 2, 1) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, 10.0, 0.0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, 10.0, -1.0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, NAN, 1.0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, 10.0, INFINITY, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, 65, left, 0.0, 10.0, 1.0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, taps, 0.0, 20.0, 1.0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, 10.0, 1.0, untouched, 1, 2) == -1);
+    CHECK(nwr_cf32_interpolate(NULL, samples, window, taps, left, 0.0, 10.0, 1.0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, NULL, taps, left, 0.0, 10.0, 1.0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, samples, window, taps, left, 0.0, 10.0, 1.0, in + 4, 2, 2) == -1);
+    CHECK(nwr_cf32_interpolate(in, SIZE_MAX, window, taps, left, 0.0, 10.0, 1.0, untouched, 2, 2) == -1);
+    CHECK(untouched[0] == 7.0f && untouched[1] == 7.0f && untouched[2] == 7.0f && untouched[3] == 7.0f);
+    free(in);
+    free(window);
+    free(out);
+}
+
+static void test_fir(void)
+{
+    /* Every tap count from 1 to 11, across more than one block of outputs, against the
+     * filter written out directly. */
+    size_t count = 1300;
+    for (size_t tap_count = 1; tap_count <= 11; tap_count++) {
+        size_t samples = count + tap_count - 1;
+        float *in = exactly(samples * 2 * sizeof(float));
+        float *taps = exactly(tap_count * sizeof(float));
+        float *out = exactly(count * 2 * sizeof(float));
+        for (size_t i = 0; i < samples * 2; i++) {
+            in[i] = (float)((i * 37) % 101) / 50.0f - 1.0f;
+        }
+        for (size_t k = 0; k < tap_count; k++) {
+            taps[k] = (float)(k + 1) / (float)tap_count - 0.3f;
+        }
+        CHECK(nwr_cf32_fir(in, samples, taps, tap_count, out, count, count) == 0);
+        for (size_t n = 0; n < count; n++) {
+            double real = 0.0, imag = 0.0;
+            for (size_t k = 0; k < tap_count; k++) {
+                real += (double)taps[k] * (double)in[2 * (n + tap_count - 1 - k)];
+                imag += (double)taps[k] * (double)in[2 * (n + tap_count - 1 - k) + 1];
+            }
+            CHECK(fabs((double)out[2 * n] - real) < 1e-4 && fabs((double)out[2 * n + 1] - imag) < 1e-4);
+        }
+        free(in);
+        free(taps);
+        free(out);
+    }
+
+    /* Refused, writing nothing: too little input for the history, too little output, no
+     * taps, null, overlapping, sizes that would overflow. */
+    float in[16] = {0}, taps[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float untouched[4] = {7.0f, 7.0f, 7.0f, 7.0f};
+    CHECK(nwr_cf32_fir(in, 4, taps, 4, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_fir(in, 8, taps, 4, untouched, 1, 2) == -1);
+    CHECK(nwr_cf32_fir(in, 8, taps, 0, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_fir(NULL, 8, taps, 4, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_fir(in, 8, NULL, 4, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_fir(untouched, 2, taps, 1, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_fir(in, 8, untouched, 4, untouched, 2, 2) == -1);
+    CHECK(nwr_cf32_fir(in, SIZE_MAX, taps, 4, untouched, SIZE_MAX, SIZE_MAX / 8) == -1);
+    CHECK(nwr_cf32_fir(in, SIZE_MAX, taps, SIZE_MAX, untouched, 2, 2) == -1);
+    CHECK(untouched[0] == 7.0f && untouched[1] == 7.0f && untouched[2] == 7.0f && untouched[3] == 7.0f);
+}
+
 int main(void)
 {
-    CHECK(nwr_native_abi() == 3);
+    CHECK(nwr_native_abi() == 5);
     test_rtl_conversion();
     test_float_to_16_bit();
     test_16_bit_to_float();
     test_float_to_8_bit();
     test_downmix();
+    test_clip();
+    test_interpolate();
+    test_fir();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

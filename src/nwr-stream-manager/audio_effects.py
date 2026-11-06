@@ -18,6 +18,7 @@ from .config import (
 )
 from .deemphasis import DeemphasisFilter
 from .liquid_dsp import AudioDcBlocker, DelayedFftFirFilter
+from .numpy_adapters import float32
 
 
 FILTER_TAPS = 1025
@@ -68,7 +69,7 @@ class DcBlocker:
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         if len(samples) == 0:
             return samples
-        return self._filter.process(samples)
+        return float32(self._filter.process(samples))
 
 
 @dataclass
@@ -85,11 +86,11 @@ class AudioEffectsProcessor:
 
     def process(self, samples) -> NDArray[np.float32]:
         # Frames come as any float32 buffer, such as an array.array, read where they are.
-        audio = self.comfort_noise.process(np.asarray(samples, dtype=np.float32))
+        audio = self.comfort_noise.process(float32(samples))
         audio = self.deemphasis.process_float(audio) * NWR_DEEMPHASIS_MAKEUP_GAIN
         audio = self.dc_blocker.process(audio)
         if self.eq_filter is not None:
-            audio = self.eq_filter.process(audio)
+            audio = float32(self.eq_filter.process(audio))
         if self.config.volume.enabled:
             audio = audio * self.config.volume.multiplier
         return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)

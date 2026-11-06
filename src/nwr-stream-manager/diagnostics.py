@@ -18,6 +18,7 @@ from .constants import (
 from .dsp import ComplexArray, DEFAULT_ALIAS_ATTENUATION_DB, IqChannelizer, IqDcBlocker
 from .iq_pipeline import alias_filter_attenuation_db, alias_filter_transition_hz, receiver_frequency_mhz
 from .nfm import NfmDemodulator
+from .numpy_adapters import complex64, float32
 
 
 def rms_float(samples: np.ndarray) -> float:
@@ -113,8 +114,8 @@ def channel_audio_diagnostics(
         ),
     )
     demodulator = NfmDemodulator()
-    channel_iq = channelizer.process_complex(dc_blocker.process(iq))
-    audio = demodulator.process(channel_iq)
+    channel_iq = complex64(channelizer.process_complex(dc_blocker.process(iq)))
+    audio = float32(demodulator.process(channel_iq))
     tone_peak_hz = None
     if audio.size >= 64:
         count = min(int(audio.size), RTL_DIAGNOSTIC_CHANNEL_FFT_SIZE)

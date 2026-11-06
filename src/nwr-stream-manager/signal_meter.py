@@ -62,6 +62,7 @@ from typing import Any, Callable
 import numpy as np
 
 from .dsp import ComplexArray
+from .numpy_adapters import complex64
 
 
 SIGNAL_METER_FFT_SIZE = 1024
@@ -224,9 +225,10 @@ class ChannelSignalMeter:
             self._measurement = None
 
     def process(self, samples: ComplexArray) -> None:
+        samples = complex64(samples)
         if samples.size == 0:
             return
-        self._pending.append(np.asarray(samples, dtype=np.complex64))
+        self._pending.append(samples)
         self._pending_count += int(samples.size)
         if self._pending_count < self.block_samples:
             return

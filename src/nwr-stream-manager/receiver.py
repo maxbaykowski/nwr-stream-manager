@@ -16,7 +16,7 @@ from .constants import (
     RECEIVER_AUDIO_CONFIG,
     STREAM_FRAME_SAMPLES,
 )
-from .dsp import DEFAULT_ALIAS_ATTENUATION_DB, IqChannelizer
+from .dsp import DEFAULT_ALIAS_ATTENUATION_DB, iq_count, IqChannelizer
 from .iq_pipeline import (
     alias_filter_attenuation_db,
     alias_filter_transition_hz,
@@ -218,7 +218,7 @@ class WeatherReceiverWorker:
             process_started_at = time.monotonic()
             audio = demodulator.process(channelizer.process_complex(iq))
             process_seconds = time.monotonic() - process_started_at
-            batch_seconds = float(iq.size) / float(max(1, batch.sample_rate))
+            batch_seconds = float(iq_count(iq)) / float(max(1, batch.sample_rate))
             if process_seconds > batch_seconds and process_started_at - last_slow_batch_log_at >= 60.0:
                 last_slow_batch_log_at = process_started_at
                 LOG.warning(
