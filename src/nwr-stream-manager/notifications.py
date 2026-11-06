@@ -269,6 +269,38 @@ def rtl_problem_messages(category: str, device_name: str) -> tuple[str, str]:
     return f"{device} is not connected.", f"{device} is now connected."
 
 
+def icecast_problem_message(problem: str, callsign: str, destination: str) -> str:
+    """Failure notification text for an Icecast output's problem."""
+    return {
+        "wrong_login": f"{callsign}: the username or password was rejected for the Icecast mountpoint at {destination}.",
+        "mountpoint_in_use": f"{callsign}: the Icecast mountpoint at {destination} is already in use.",
+        "mountpoint_not_found": f"{callsign}: the Icecast mountpoint at {destination} doesn't exist.",
+        "server_full": f"{callsign}: the Icecast server for {destination} has too many streams connected.",
+        "format_not_accepted": f"{callsign}: the Icecast server for {destination} doesn't accept the audio format.",
+        "rejected": f"{callsign}: the Icecast server rejected the stream to {destination}.",
+        "server_not_found": f"{callsign}: the Icecast server address for {destination} couldn't be found.",
+        "refused": f"{callsign}: the Icecast server for {destination} refused the connection.",
+        "unreachable": f"{callsign}: the Icecast server for {destination} can't be reached.",
+        "timeout": f"{callsign}: the Icecast server for {destination} took too long to respond.",
+        "secure_connection": f"{callsign}: the secure connection to the Icecast server for {destination} failed.",
+        "connection_lost": f"{callsign}: the connection to the Icecast mountpoint at {destination} was lost.",
+    }.get(problem, f"{callsign}: failed to connect to the Icecast mountpoint at {destination}.")
+
+
+def soundcard_problem_messages(problem: str, callsign: str, name: str) -> tuple[str, str]:
+    """Failure and recovery notification text for a sound card output's problem."""
+    if problem == "disconnected":
+        return f"{callsign}: sound card {name} is not connected.", f"{callsign}: sound card {name} is now connected."
+    message = {
+        "busy": f"{callsign}: sound card {name} is in use by another program.",
+        "permission": f"{callsign}: NWR Stream Manager doesn't have permission to use sound card {name}.",
+        "format": f"{callsign}: sound card {name} can't play the audio.",
+        "resetting": f"{callsign}: sound card {name} is being reset.",
+        "error": f"{callsign}: sound card {name} has stopped working.",
+    }.get(problem, f"{callsign}: sound card {name} needs attention.")
+    return message, f"{callsign}: sound card {name} is working again."
+
+
 def sentence_case(text: str) -> str:
     """Capitalize the first letter, for names that can start a sentence."""
     return text[:1].upper() + text[1:]
@@ -303,13 +335,14 @@ def stream_notification_failures(
             if not settings.soundcard_failures:
                 continue
             name = soundcard_notification_name(output)
+            message, recovery_message = soundcard_problem_messages(str(output.get("problem") or ""), callsign, name)
             failures.append(
                 {
                     "key": f"{stream_id}:soundcard:{output_id}",
                     "category": "soundcard",
                     "target_path": stream_output_route_path(stream_id, output_id),
-                    "message": f"{callsign}: sound card {name} is not connected.",
-                    "recovery_message": f"{callsign}: sound card {name} is now connected.",
+                    "message": message,
+                    "recovery_message": recovery_message,
                 }
             )
         else:
@@ -322,7 +355,7 @@ def stream_notification_failures(
                     "key": f"{stream_id}:icecast:{output_id}",
                     "category": "icecast",
                     "target_path": stream_output_route_path(stream_id, output_id),
-                    "message": f"{callsign}: failed to connect to the Icecast mountpoint at {destination}.",
+                    "message": icecast_problem_message(str(output.get("problem") or ""), callsign, destination),
                     "recovery_message": f"{callsign}: successfully connected to the Icecast mountpoint at {destination}.",
                 }
             )

@@ -330,6 +330,7 @@ def public_stream_output(output: dict[str, Any]) -> dict[str, Any]:
         "type": output_type,
         "status": output.get("status", ""),
         "error": output.get("error", ""),
+        "problem": output.get("problem", ""),
     }
     if output_type == "soundcard":
         soundcard = output.get("soundcard") if isinstance(output.get("soundcard"), dict) else {}

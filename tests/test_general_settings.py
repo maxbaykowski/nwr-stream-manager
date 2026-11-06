@@ -71,7 +71,7 @@ class DashboardLocationTests(unittest.TestCase):
     def test_the_location_shows_on_the_dashboard_only_once_set(self) -> None:
         load_web_control_module()
         parts = sys.modules["nwr_stream_manager.page_sections"].dashboard_parts
-        shown = parts({"location": "Attic SDR (Grand Rapids, MI)", "capture_error": "gone"}, "none", False, 0)
+        shown = parts({"location": "Attic SDR (Grand Rapids, MI)", "sdr_problem": "The configured RTL-SDR is not connected."}, "none", False, 0)
         self.assertEqual(shown["text"]["summary_location"], "Attic SDR (Grand Rapids, MI)")
         # Shown even while the SDR needs attention and its details are hidden.
         self.assertFalse(shown["hidden"]["dashboard_location"])

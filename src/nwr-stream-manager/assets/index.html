@@ -173,10 +173,13 @@ __INDEX_STYLES__</style>
     <p>This feature requires an up-to-date browser, such as a current version of Firefox, Chrome, Edge or Safari. <a href="/">Go to the dashboard</a></p>
   </section>
   <div id="view_dashboard" class="view">
+    <p id="dashboard_location" hidden>Location: <span id="summary_location"></span></p>
     <section id="dashboard_sdr_section">
       <h2>Configured SDR</h2>
-      <p id="dashboard_location" hidden>Location: <span id="summary_location"></span></p>
-      <p id="dashboard_sdr_attention" class="status-text status-needs-attention" hidden>RTL-SDR requires attention. Check the SDR immediately.</p>
+      <div id="dashboard_sdr_attention" hidden>
+        <p class="status-text status-needs-attention">RTL-SDR requires attention!</p>
+        <p id="dashboard_sdr_problem"></p>
+      </div>
       <dl id="dashboard_sdr_details" class="details-list">
         <dt>Source</dt><dd id="summary_source">RTL-SDR</dd>
         <dt>Device</dt><dd id="summary_sdr">none</dd>
@@ -216,6 +219,12 @@ __INDEX_STYLES__</style>
     __FORM_TOKEN_INPUT__
     <section>
       <h2>Configure RTL-SDR</h2>
+      <div aria-live="polite">
+        <div id="rtl_sdr_attention" hidden>
+          <p class="status-text status-needs-attention">RTL-SDR requires attention!</p>
+          <p id="rtl_sdr_problem"></p>
+        </div>
+      </div>
       <label>Active SDR
         <select id="serial" name="serial" aria-describedby="serial_hint"></select>
       </label>
@@ -1412,7 +1421,7 @@ __INDEX_STYLES__</style>
               </label>
               <label class="checkbox-row">
                 <input id="stream_notify_soundcard_failures" name="stream_notify_soundcard_failures" value="1" type="checkbox">
-                Disconnected sound cards
+                Sound card problems
               </label>
               <label class="checkbox-row">
                 <input id="stream_notify_bad_reception" name="stream_notify_bad_reception" value="1" type="checkbox">

@@ -204,5 +204,92 @@ class IcecastAddressTests(unittest.TestCase):
         self.assertEqual(source.response_status_code, 200)
 
 
+    def test_a_failed_output_says_whats_wrong(self) -> None:
+        icecast = sys.modules["nwr_stream_manager.icecast"]
+
+        def problem_when_answered(answer: bytes) -> str:
+            server = OldIcecastServer()
+            server_answer = answer
+
+            def serve() -> None:
+                client, _ = server.server.accept()
+                with client:
+                    client.recv(4096)
+                    client.sendall(server_answer)
+
+            server.server.close()
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            server.server = listener
+            threading.Thread(target=serve, daemon=True).start()
+            config = self.web_control.IcecastConfig(
+                host="127.0.0.1", port=listener.getsockname()[1], mount="/live",
+                username="source", password="secret", format="mp3", sample_rate=22050, bitrate=32,
+            )
+            try:
+                self.web_control.IcecastSource(config, "audio/mpeg", timeout_seconds=5).connect()
+            except Exception as exc:
+                return icecast.icecast_problem(exc)
+            finally:
+                listener.close()
+            return ""
+
+        for answer, problem in (
+            (b"HTTP/1.0 401 Authentication Required\r\n\r\n", "wrong_login"),
+            (b"HTTP/1.0 403 Mountpoint in use\r\n\r\n", "mountpoint_in_use"),
+            (b"HTTP/1.0 403 too many sources connected\r\n\r\n", "server_full"),
+            (b"HTTP/1.0 403 Content-type not supported\r\n\r\n", "format_not_accepted"),
+            (b"HTTP/1.0 404 File Not Found\r\n\r\n", "mountpoint_not_found"),
+            (b"HTTP/1.0 500 Internal Server Error\r\n\r\n", "rejected"),
+            (b"", "rejected"),
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual(problem_when_answered(answer), problem)
+
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+        for host, port, problem in (("127.0.0.1", port, "refused"), ("nowhere.invalid", 8000, "server_not_found")):
+            with self.subTest(host=host):
+                config = self.web_control.IcecastConfig(
+                    host=host, port=port, mount="/live", username="source", password="secret", format="mp3", sample_rate=22050, bitrate=32,
+                )
+                with self.assertRaises(OSError) as raised:
+                    self.web_control.IcecastSource(config, "audio/mpeg", timeout_seconds=5).connect()
+                self.assertEqual(icecast.icecast_problem(raised.exception), problem)
+        self.assertEqual(icecast.icecast_problem(TimeoutError()), "timeout")
+        self.assertEqual(icecast.icecast_problem(BrokenPipeError()), "connection_lost")
+        self.assertEqual(icecast.icecast_problem(ValueError()), "error")
+
+    def test_the_outputs_table_dashboard_and_notifications_say_whats_wrong(self) -> None:
+        sections = sys.modules["nwr_stream_manager.page_sections"]
+        notifications = sys.modules["nwr_stream_manager.notifications"]
+        stream = {"id": "s1", "enabled": True, "station": {"callsign": "WXN99"}}
+        output = {"id": "o1", "type": "icecast", "icecast": {"host": "radio.example.com", "port": 8000, "mount": "/wxn99"}}
+
+        def status(problem):
+            return {
+                "streams": [stream],
+                "active_streams": [{"id": "s1", "status": "needs-attention", "station": {"callsign": "WXN99"},
+                                    "outputs": [{**output, "problem": problem}]}],
+            }
+
+        row = sections.stream_output_row_html(stream, output, status("wrong_login"), [])
+        self.assertIn(">Wrong username or password</td>", row)
+        self.assertEqual(
+            sections.stream_attention_items(status("mountpoint_in_use"))[0]["detail"],
+            "One or more Icecast mountpoints are already in use.",
+        )
+        self.assertIn(">Failed to connect</td>", sections.stream_output_row_html(stream, output, status(""), []))
+        # A stream that isn't running at all.
+        self.assertIn(">Not running</td>", sections.stream_output_row_html(stream, output, {"active_streams": []}, []))
+        self.assertEqual(
+            notifications.icecast_problem_message("refused", "WXN99", "http://radio.example.com:8000/wxn99"),
+            "WXN99: the Icecast server for http://radio.example.com:8000/wxn99 refused the connection.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

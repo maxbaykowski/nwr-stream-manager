@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
 import logging
 import os
 import pwd
@@ -60,12 +61,55 @@ ALSA_PLAYBACK_FORMATS = (
 )
 
 
+# What can be wrong with a sound card, as a stream's output says it.
+SOUNDCARD_DISCONNECTED = "disconnected"
+SOUNDCARD_BUSY = "busy"
+SOUNDCARD_PERMISSION = "permission"
+SOUNDCARD_FORMAT = "format"
+SOUNDCARD_RESETTING = "resetting"
+SOUNDCARD_ERROR = "error"
+
+# ALSA's errors, which are the system's error numbers, negated.
+_SOUNDCARD_PROBLEM_FOR_ERRNO = {
+    errno.ENODEV: SOUNDCARD_DISCONNECTED,
+    errno.ENOENT: SOUNDCARD_DISCONNECTED,
+    errno.ENXIO: SOUNDCARD_DISCONNECTED,
+    errno.ESHUTDOWN: SOUNDCARD_DISCONNECTED,
+    errno.EBUSY: SOUNDCARD_BUSY,
+    errno.EAGAIN: SOUNDCARD_BUSY,
+    errno.EACCES: SOUNDCARD_PERMISSION,
+    errno.EPERM: SOUNDCARD_PERMISSION,
+}
+
+
 class AlsaError(RuntimeError):
     """Raised when ALSA hardware discovery cannot be completed."""
+
+    # What's wrong with the sound card, one of the SOUNDCARD_ problems.
+    problem = SOUNDCARD_ERROR
+
+    def __init__(self, message: str = "", problem: str = "") -> None:
+        super().__init__(message)
+        if problem:
+            self.problem = problem
 
 
 class SoundCardAccessError(AlsaError):
     """The computer has sound cards, but NWR Stream Manager can't use them."""
+
+    problem = SOUNDCARD_PERMISSION
+
+
+def soundcard_problem(exc: BaseException) -> str:
+    """What's wrong with a sound card, from what went wrong using it."""
+    return exc.problem if isinstance(exc, AlsaError) else SOUNDCARD_ERROR
+
+
+def _soundcard_problem_for_result(result: int, operation: str = "") -> str:
+    if result == -errno.EINVAL and operation.startswith("snd_pcm_hw_params"):
+        # It can't take the sample rate, channels or format it was asked for.
+        return SOUNDCARD_FORMAT
+    return _SOUNDCARD_PROBLEM_FOR_ERRNO.get(-int(result), SOUNDCARD_ERROR)
 
 
 @dataclass(frozen=True)
@@ -531,6 +575,7 @@ class AlsaStreamPlaybackTap:
         self.lock = threading.Lock()
         self.status = "disabled"
         self.error = ""
+        self.problem = ""
         self.device: AlsaPlaybackDevice | None = None
         self.playback: AlsaPcmPlayback | None = None
         self.reopen_block_until = 0.0
@@ -585,11 +630,13 @@ class AlsaStreamPlaybackTap:
         with self.lock:
             status = self.status
             error = self.error
+            problem = self.problem
             device = self.device
             playback = self.playback
         return {
             "status": status,
             "error": error,
+            "problem": problem if status == "needs-attention" else "",
             "stable_id": self.config.stable_id,
             "device": device.hw_device if device is not None else "",
             "display_name": device.display_name if device is not None else "",
@@ -613,7 +660,7 @@ class AlsaStreamPlaybackTap:
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
-                self._set_status("needs-attention", str(exc))
+                self._set_status("needs-attention", str(exc), soundcard_problem(exc))
                 self._close_playback()
                 self.stop_event.wait(ALSA_STREAM_RECONNECT_SECONDS)
         self._close_playback()
@@ -621,7 +668,7 @@ class AlsaStreamPlaybackTap:
     def _open_playback(self) -> None:
         device = resolve_playback_device(self.config.stable_id, devices=self.devices_provider())
         if device is None:
-            self._set_status("needs-attention", "soundcard is not currently connected")
+            self._set_status("needs-attention", "soundcard is not currently connected", SOUNDCARD_DISCONNECTED)
             self.stop_event.wait(ALSA_STREAM_RECONNECT_SECONDS)
             return
         playback = self.playback_factory(
@@ -648,10 +695,14 @@ class AlsaStreamPlaybackTap:
             except Exception:
                 LOG.debug("failed to close ALSA stream tap playback", exc_info=True)
 
-    def _set_status(self, status: str, error: str = "") -> None:
+    def _set_status(self, status: str, error: str = "", problem: str = "") -> None:
         with self.lock:
+            changed = error != self.error
             self.status = status
             self.error = error
+            self.problem = problem
+        if error and changed:
+            LOG.warning("sound card %s: %s", self.config.stable_id, error)
 
 
 @dataclass(frozen=True)
@@ -738,6 +789,7 @@ class AlsaSharedPlaybackTap:
         self.lock = threading.Lock()
         self.status = "disabled"
         self.error = ""
+        self.problem = ""
         self.device: AlsaPlaybackDevice | None = None
         self.playback: AlsaPcmPlayback | None = None
         self.reopen_block_until = 0.0
@@ -782,12 +834,14 @@ class AlsaSharedPlaybackTap:
         with self.lock:
             status = self.status
             error = self.error
+            problem = self.problem
             device = self.device
             playback = self.playback
             input_stats = {key: buffer.stats() for key, (_config, buffer) in self.inputs.items()}
         return {
             "status": status,
             "error": error,
+            "problem": problem if status == "needs-attention" else "",
             "stable_id": self.stable_id,
             "device": device.hw_device if device is not None else "",
             "display_name": device.display_name if device is not None else "",
@@ -804,7 +858,7 @@ class AlsaSharedPlaybackTap:
             for _config, buffer in self.inputs.values():
                 buffer.clear()
             self.reopen_block_until = max(self.reopen_block_until, time.monotonic() + max(0.0, float(hold_seconds)))
-        self._set_status("needs-attention", "soundcard is being reset")
+        self._set_status("needs-attention", "soundcard is being reset", SOUNDCARD_RESETTING)
         self._close_playback()
 
     def _run(self) -> None:
@@ -833,7 +887,7 @@ class AlsaSharedPlaybackTap:
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
-                self._set_status("needs-attention", str(exc))
+                self._set_status("needs-attention", str(exc), soundcard_problem(exc))
                 self._close_playback()
                 self.stop_event.wait(ALSA_STREAM_RECONNECT_SECONDS)
         self._close_playback()
@@ -858,7 +912,7 @@ class AlsaSharedPlaybackTap:
         if device is None:
             with self.lock:
                 self.device = None
-            self._set_status("needs-attention", "soundcard is not currently connected")
+            self._set_status("needs-attention", "soundcard is not currently connected", SOUNDCARD_DISCONNECTED)
             self.stop_event.wait(ALSA_STREAM_RECONNECT_SECONDS)
             return
         playback = self.playback_factory(
@@ -885,10 +939,14 @@ class AlsaSharedPlaybackTap:
             except Exception:
                 LOG.debug("failed to close shared ALSA stream tap playback", exc_info=True)
 
-    def _set_status(self, status: str, error: str = "") -> None:
+    def _set_status(self, status: str, error: str = "", problem: str = "") -> None:
         with self.lock:
+            changed = error != self.error
             self.status = status
             self.error = error
+            self.problem = problem
+        if error and changed:
+            LOG.warning("sound card %s: %s", self.stable_id, error)
 
 
 class AlsaPcmPlayback:
@@ -1005,7 +1063,10 @@ class AlsaPcmPlayback:
                 if written < 0:
                     recovered = self.lib.snd_pcm_recover(handle, int(written), 1)
                     if recovered < 0:
-                        raise AlsaError(f"snd_pcm_writei failed: {_decode(self.lib.snd_strerror(int(written)))}")
+                        raise AlsaError(
+                            f"snd_pcm_writei failed: {_decode(self.lib.snd_strerror(int(written)))}",
+                            _soundcard_problem_for_result(int(written)),
+                        )
                     self.recoveries += 1
                     continue
                 if written == 0:
@@ -1135,7 +1196,7 @@ class AlsaPcmPlayback:
                 self.sample_bytes = sample_bytes
                 return
             errors.append(f"{name}: {_decode(self.lib.snd_strerror(int(result)))}")
-        raise AlsaError("ALSA playback device does not support a usable PCM format: " + "; ".join(errors))
+        raise AlsaError("ALSA playback device does not support a usable PCM format: " + "; ".join(errors), SOUNDCARD_FORMAT)
 
     def _set_software_params(self, period_frames: int) -> None:
         frames = max(1, int(period_frames))
@@ -1762,7 +1823,7 @@ def _check_alsa(result: int, lib: ctypes.CDLL, operation: str) -> None:
     if result >= 0:
         return
     error = _decode(lib.snd_strerror(int(result)))
-    raise AlsaError(f"{operation} failed: {error or result}")
+    raise AlsaError(f"{operation} failed: {error or result}", _soundcard_problem_for_result(result, operation))
 
 
 def _decode(value: bytes | str | None) -> str:

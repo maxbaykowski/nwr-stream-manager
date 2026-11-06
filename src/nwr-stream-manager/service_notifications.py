@@ -323,6 +323,25 @@ class NotificationServiceMixin:
             return {"category": "no-data", "device_name": device_name}
         return None
 
+    def _sdr_problem_locked(self, now: float) -> str:
+        """What's wrong with the SDR in use, as the dashboard and Configure RTL-SDR say it, or ""
+        if nothing is. The same problems notifications are sent for, as soon as they're found."""
+        if self.settings.uses_remote_sdr:
+            failure = self._remote_rtl_notification_failure_locked()
+            return str(failure["message"]) if failure is not None else ""
+        if self.iq_file_source_config is not None:
+            return ""
+        problem = self._local_rtl_problem_locked(now)
+        if problem is None:
+            return ""
+        if problem["category"] == "no-data":
+            # Just started, or started again, it hasn't had time to send anything yet.
+            since = max(float(self.last_batch_at or 0.0), float(self.capture_started_at or 0.0))
+            if now - since < RTL_NOTIFICATION_NO_DATA_SECONDS:
+                return ""
+        message, _recovery_message = rtl_problem_messages(problem["category"], problem["device_name"])
+        return message
+
     def _remote_rtl_notification_failure_locked(self) -> dict[str, Any] | None:
         host_id = self.settings.remote_host_id
         client = self.remote_client

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import logging
 import socket
 import ssl
@@ -19,6 +20,61 @@ LOG = logging.getLogger(__name__)
 
 class IcecastError(RuntimeError):
     """Raised when Icecast rejects the source connection."""
+
+    def __init__(self, message: str, status_code: int | None = None, reason: str = "") -> None:
+        super().__init__(message)
+        # The server's HTTP status and its reason, such as 403 and "Mountpoint in use".
+        self.status_code = status_code
+        self.reason = reason
+
+
+# What can be wrong with an Icecast output, as it says it.
+ICECAST_WRONG_LOGIN = "wrong_login"
+ICECAST_MOUNTPOINT_IN_USE = "mountpoint_in_use"
+ICECAST_MOUNTPOINT_NOT_FOUND = "mountpoint_not_found"
+ICECAST_SERVER_FULL = "server_full"
+ICECAST_FORMAT_NOT_ACCEPTED = "format_not_accepted"
+ICECAST_REJECTED = "rejected"
+ICECAST_SERVER_NOT_FOUND = "server_not_found"
+ICECAST_REFUSED = "refused"
+ICECAST_UNREACHABLE = "unreachable"
+ICECAST_TIMEOUT = "timeout"
+ICECAST_SECURE_CONNECTION = "secure_connection"
+ICECAST_CONNECTION_LOST = "connection_lost"
+ICECAST_ERROR = "error"
+
+
+def icecast_problem(exc: BaseException) -> str:
+    """What's wrong with an Icecast output, from what went wrong connecting or streaming to it."""
+    if isinstance(exc, IcecastError):
+        reason = exc.reason.lower()
+        if exc.status_code == 401:
+            return ICECAST_WRONG_LOGIN
+        if exc.status_code == 403:
+            # Icecast says which, in the reason.
+            if "too many" in reason or "limit" in reason:
+                return ICECAST_SERVER_FULL
+            if "content" in reason or "type" in reason or "format" in reason:
+                return ICECAST_FORMAT_NOT_ACCEPTED
+            return ICECAST_MOUNTPOINT_IN_USE
+        if exc.status_code == 404:
+            return ICECAST_MOUNTPOINT_NOT_FOUND
+        if exc.status_code == 415:
+            return ICECAST_FORMAT_NOT_ACCEPTED
+        return ICECAST_REJECTED
+    if isinstance(exc, socket.gaierror):
+        return ICECAST_SERVER_NOT_FOUND
+    if isinstance(exc, ssl.SSLError):
+        return ICECAST_SECURE_CONNECTION
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return ICECAST_TIMEOUT
+    if isinstance(exc, ConnectionRefusedError):
+        return ICECAST_REFUSED
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return ICECAST_CONNECTION_LOST
+    if isinstance(exc, OSError) and exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EHOSTDOWN, errno.ENETDOWN):
+        return ICECAST_UNREACHABLE
+    return ICECAST_ERROR
 
 
 @dataclass(frozen=True)
@@ -111,7 +167,8 @@ class IcecastSource:
                 response,
             )
             if status_code != 200:
-                raise IcecastError(f"Icecast source connection rejected: {response}")
+                parts = response.split(maxsplit=2)
+                raise IcecastError(f"Icecast source connection rejected: {response}", status_code, parts[2] if len(parts) > 2 else "")
             self.response_status_code = status_code
             LOG.info(
                 "Icecast accepted source connection at %s:%s%s with HTTP %s",

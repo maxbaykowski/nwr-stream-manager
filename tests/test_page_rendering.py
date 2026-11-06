@@ -2169,11 +2169,12 @@ class DashboardPageTests(unittest.TestCase):
 
     def test_low_storage_comes_first_and_the_rtl_sdr_problem_shows(self) -> None:
         self.status["storage"].update(status="low", message="Storage is running low.")
-        self.status.update(active=False, capture_error="The RTL-SDR could not be opened.")
+        self.status.update(active=False, sdr_problem="RTLSDRBlog Blog V4 has stopped outputting data.")
         _, page = self.request("GET", "/", user=self.owner)
         self.assertLess(page.index('id="dashboard_storage_section"'), page.index('id="dashboard_sdr_section"'))
         self.assertIn('<div id="storage-warning" class="storage-warning">Storage is running low.</div>', page)
-        self.assertIn('<p id="dashboard_sdr_attention" class="status-text status-needs-attention">RTL-SDR requires attention.', page)
+        self.assertRegex(page, r'<div id="dashboard_sdr_attention">\s*<p class="status-text status-needs-attention">RTL-SDR requires attention!</p>\s*'
+                         r'<p id="dashboard_sdr_problem">RTLSDRBlog Blog V4 has stopped outputting data.</p>')
         self.assertRegex(page, r'<dl id="dashboard_sdr_details" class="details-list" hidden>')
 
     def test_the_parts_keep_a_page_up_to_date(self) -> None:

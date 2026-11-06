@@ -35,6 +35,8 @@ PAGE_FUNCTIONS = (
     "previousNumberValue",
     "setMessage",
     "renderSdrReset",
+    "renderRtlSdrProblem",
+    "sdrProblem",
     "setSdrResetButtonsDisabled",
     "resetSdr",
     "renderActiveSdrChoices",

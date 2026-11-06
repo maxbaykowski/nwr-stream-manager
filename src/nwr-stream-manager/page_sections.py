@@ -266,11 +266,61 @@ OUTPUT_STATUS_LABELS = {
     "disabled": "Disabled",
 }
 
+# What's wrong with an output that isn't working, as its status says it, in place of Needs attention;
+# the page script says the same.
+SOUNDCARD_PROBLEM_LABELS = {
+    "disconnected": "Not connected",
+    "busy": "In use by another program",
+    "permission": "No permission to use it",
+    "format": "Can't play the audio",
+    "resetting": "Being reset",
+    "error": "Stopped working",
+}
+ICECAST_PROBLEM_LABELS = {
+    "wrong_login": "Wrong username or password",
+    "mountpoint_in_use": "Mountpoint in use",
+    "mountpoint_not_found": "Mountpoint not found",
+    "server_full": "Server full",
+    "format_not_accepted": "Format not accepted",
+    "rejected": "Rejected by the server",
+    "server_not_found": "Server not found",
+    "refused": "Connection refused",
+    "unreachable": "Server unreachable",
+    "timeout": "Server not responding",
+    "secure_connection": "Secure connection failed",
+    "connection_lost": "Connection lost",
+    "error": "Failed to connect",
+}
+# The stream isn't running, so neither is the output.
+OUTPUT_NOT_RUNNING_LABEL = "Not running"
+
+
+def output_problem(stream: dict[str, Any], output: dict[str, Any], status: dict[str, Any]) -> str | None:
+    """What's wrong with an output, such as "busy" or "wrong_login": "" if it doesn't say, and
+    None if it isn't running at all."""
+    for item in status.get("active_streams") or []:
+        if item.get("id") != stream.get("id"):
+            continue
+        for active in item.get("outputs") or []:
+            if active.get("id") == output.get("id"):
+                return str(active.get("problem") or "")
+    return None
+
+
+def output_problem_label(output: dict[str, Any], problem: str | None) -> str:
+    if problem is None:
+        return OUTPUT_NOT_RUNNING_LABEL
+    if output.get("type") == "soundcard":
+        return SOUNDCARD_PROBLEM_LABELS.get(problem, SOUNDCARD_PROBLEM_LABELS["error"])
+    return ICECAST_PROBLEM_LABELS.get(problem, ICECAST_PROBLEM_LABELS["error"])
+
 
 def stream_output_row_html(stream: dict[str, Any], output: dict[str, Any], status: dict[str, Any], soundcards: list[dict[str, Any]]) -> str:
     """A row of a stream's outputs, keyed and labelled as the page script makes them."""
     state = stream_output_status(stream, output, status)
     label = OUTPUT_STATUS_LABELS[state]
+    if state == "needs-attention":
+        label = output_problem_label(output, output_problem(stream, output, status))
     if output.get("type") == "soundcard":
         soundcard = output.get("soundcard") or {}
         label = "Enabled" if state == "connected" else label
@@ -831,6 +881,30 @@ def remote_pair_target(form: dict[str, str]) -> dict[str, Any]:
 
 
 RECEPTION_PROBLEM_REASONS = {"bad_reception": "bad reception", "no_signal": "no signal"}
+SOUNDCARD_PROBLEM_REASONS = {
+    "disconnected": "one or more sound cards are not connected",
+    "busy": "one or more sound cards are in use by another program",
+    "permission": "NWR Stream Manager doesn't have permission to use one or more sound cards",
+    "format": "one or more sound cards can't play the audio",
+    "resetting": "one or more sound cards are being reset",
+    "error": "one or more sound cards have stopped working",
+}
+SOUNDCARD_PROBLEM_UNKNOWN_REASON = "one or more sound cards need attention"
+ICECAST_PROBLEM_REASONS = {
+    "wrong_login": "the username or password was rejected for one or more Icecast mountpoints",
+    "mountpoint_in_use": "one or more Icecast mountpoints are already in use",
+    "mountpoint_not_found": "one or more Icecast mountpoints don't exist",
+    "server_full": "one or more Icecast servers have too many streams connected",
+    "format_not_accepted": "one or more Icecast servers don't accept the audio format",
+    "rejected": "one or more Icecast servers rejected the stream",
+    "server_not_found": "one or more Icecast server addresses couldn't be found",
+    "refused": "one or more Icecast servers refused the connection",
+    "unreachable": "one or more Icecast servers can't be reached",
+    "timeout": "one or more Icecast servers took too long to respond",
+    "secure_connection": "the secure connection to one or more Icecast servers failed",
+    "connection_lost": "the connection to one or more Icecast servers was lost",
+}
+ICECAST_PROBLEM_UNKNOWN_REASON = "one or more Icecast destinations failed to connect"
 
 
 def sentence_list(items: list[str]) -> str:
@@ -857,7 +931,7 @@ def stream_attention_items(status: dict[str, Any]) -> list[dict[str, Any]]:
 
     def item_for(stream_id: str, station: dict[str, Any]) -> dict[str, Any]:
         return items.setdefault(stream_id, {
-            "id": stream_id, "callsign": station.get("callsign") or "Unknown", "icecast": False, "soundcard": False,
+            "id": stream_id, "callsign": station.get("callsign") or "Unknown", "icecast": [], "soundcard": [],
             "reception": None, "errors": [],
         })
 
@@ -875,7 +949,10 @@ def stream_attention_items(status: dict[str, Any]) -> list[dict[str, Any]]:
         for output in active.get("outputs") or []:
             if str(output.get("status") or active.get("status") or "").lower().replace("_", "-") != "needs-attention":
                 continue
-            item["soundcard" if output.get("type") == "soundcard" else "icecast"] = True
+            problems = item["soundcard" if output.get("type") == "soundcard" else "icecast"]
+            problem = str(output.get("problem") or "")
+            if problem not in problems:
+                problems.append(problem)
     for stream in configured.values():
         signal = (status.get("stream_signals") or {}).get(stream.get("id")) if stream_enabled(stream) else None
         problem = stream_reception_problem(signal)
@@ -886,10 +963,14 @@ def stream_attention_items(status: dict[str, Any]) -> list[dict[str, Any]]:
         reasons = []
         if item["reception"]:
             reasons.append(RECEPTION_PROBLEM_REASONS[item["reception"]])
-        if item["icecast"]:
-            reasons.append("one or more Icecast destinations failed to connect")
-        if item["soundcard"]:
-            reasons.append("one or more sound cards are not connected")
+        for problem in item["icecast"]:
+            reason = ICECAST_PROBLEM_REASONS.get(problem, ICECAST_PROBLEM_UNKNOWN_REASON)
+            if reason not in reasons:
+                reasons.append(reason)
+        for problem in item["soundcard"]:
+            reason = SOUNDCARD_PROBLEM_REASONS.get(problem, SOUNDCARD_PROBLEM_UNKNOWN_REASON)
+            if reason not in reasons:
+                reasons.append(reason)
         if not reasons:
             detail = item["errors"][0] if item["errors"] else "This stream needs attention."
         elif len(reasons) == 1 and item["reception"]:
@@ -923,8 +1004,9 @@ def dashboard_parts(status: dict[str, Any], sdr_label: str, read_only: bool, now
     text: dict[str, str] = {}
     markup: dict[str, str] = {}
     iq_file = source.get("kind") == "iq_file"
-    attention = not iq_file and bool(status.get("capture_error") or (settings.get("serial") and not status.get("active")))
-    hidden = {"dashboard_sdr_attention": not attention, "dashboard_sdr_details": attention, "dashboard_configure_sdr": read_only}
+    problem = str(status.get("sdr_problem") or "")
+    hidden = {"dashboard_sdr_attention": not problem, "dashboard_sdr_details": bool(problem), "dashboard_configure_sdr": read_only}
+    text["dashboard_sdr_problem"] = problem
     location = str(status.get("location") or "")
     text["summary_location"] = location
     hidden["dashboard_location"] = not location

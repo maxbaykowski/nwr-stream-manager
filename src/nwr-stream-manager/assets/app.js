@@ -5420,8 +5420,53 @@ function outputStatusLabel(status) {
   return "Disabled";
 }
 
-function outputStatusLabelForOutput(output, status) {
-  if ((output.type || "icecast") === "soundcard" && status === "connected") return "Enabled";
+// What's wrong with an output that isn't working, as its status says it, in place of Needs attention;
+// the server says the same.
+const SOUNDCARD_PROBLEM_LABELS = {
+  disconnected: "Not connected",
+  busy: "In use by another program",
+  permission: "No permission to use it",
+  format: "Can't play the audio",
+  resetting: "Being reset",
+  error: "Stopped working"
+};
+const ICECAST_PROBLEM_LABELS = {
+  wrong_login: "Wrong username or password",
+  mountpoint_in_use: "Mountpoint in use",
+  mountpoint_not_found: "Mountpoint not found",
+  server_full: "Server full",
+  format_not_accepted: "Format not accepted",
+  rejected: "Rejected by the server",
+  server_not_found: "Server not found",
+  refused: "Connection refused",
+  unreachable: "Server unreachable",
+  timeout: "Server not responding",
+  secure_connection: "Secure connection failed",
+  connection_lost: "Connection lost",
+  error: "Failed to connect"
+};
+// The stream isn't running, so neither is the output.
+const OUTPUT_NOT_RUNNING_LABEL = "Not running";
+
+// What's wrong with an output, such as "busy" or "wrong_login": "" if it doesn't say, and null if
+// it isn't running at all.
+function outputProblem(stream, output) {
+  for (const snapshot of activeStreamSnapshots) {
+    if (snapshot.id !== stream.id) continue;
+    const active = streamOutputs(snapshot).find(item => item.id === output.id);
+    if (active) return String(active.problem || "");
+  }
+  return null;
+}
+
+function outputStatusLabelForOutput(output, status, problem = "") {
+  const soundcard = (output.type || "icecast") === "soundcard";
+  if (soundcard && status === "connected") return "Enabled";
+  if (status === "needs-attention") {
+    if (problem === null) return OUTPUT_NOT_RUNNING_LABEL;
+    const labels = soundcard ? SOUNDCARD_PROBLEM_LABELS : ICECAST_PROBLEM_LABELS;
+    return labels[problem] || labels.error;
+  }
   return outputStatusLabel(status);
 }
 
@@ -5478,7 +5523,8 @@ function outputRows(stream) {
     output,
     icecast: output.icecast || {},
     soundcard: output.soundcard || {},
-    status: outputStatusFor(stream, output)
+    status: outputStatusFor(stream, output),
+    problem: outputProblem(stream, output)
   }));
 }
 
@@ -5496,7 +5542,8 @@ function outputTableNextSignature(rows) {
     sample_rate: outputRowSampleRate(row.output),
     bitrate: outputRowBitrate(row.output),
     bus: row.output.type === "soundcard" ? (soundcardDeviceForStableId((row.output.soundcard || {}).stable_id || "") || {}).bus || "" : "",
-    status: row.status
+    status: row.status,
+    problem: row.problem
   })));
 }
 
@@ -5550,7 +5597,7 @@ function icecastOutputRow(row) {
   tr.appendChild(tableCell(outputRowFormat(row.output)));
   tr.appendChild(tableCell(outputRowSampleRate(row.output)));
   tr.appendChild(tableCell(outputRowBitrate(row.output)));
-  const statusCell = tableCell(outputStatusLabelForOutput(row.output, row.status));
+  const statusCell = tableCell(outputStatusLabelForOutput(row.output, row.status, row.problem));
   statusCell.className = `status-text status-${row.status}`;
   tr.appendChild(statusCell);
   tr.appendChild(outputActionsCell(row.stream, row.output, row.status));
@@ -5568,7 +5615,7 @@ function soundcardOutputRow(row) {
   const soundcard = row.output.soundcard || {};
   tr.appendChild(tableCell(soundcardDestination(soundcard)));
   tr.appendChild(tableCell(soundcardChannelLabel(soundcard.channel_mode || "both")));
-  const statusCell = tableCell(outputStatusLabelForOutput(row.output, row.status));
+  const statusCell = tableCell(outputStatusLabelForOutput(row.output, row.status, row.problem));
   statusCell.className = `status-text status-${row.status}`;
   tr.appendChild(statusCell);
   tr.appendChild(outputActionsCell(row.stream, row.output, row.status));
@@ -5776,8 +5823,8 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
         callsign: station.callsign || "Unknown",
         frequency: station.frequency || "",
         status: "needs-attention",
-        icecastFailed: false,
-        soundcardFailed: false,
+        icecastProblems: [],
+        soundcardProblems: [],
         receptionProblem: null,
         errors: []
       };
@@ -5789,11 +5836,9 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
       const type = output.type || "icecast";
       const outputStatus = normalizeStreamStatus(output.status || active.status);
       if (outputStatus !== "needs-attention") continue;
-      if (type === "soundcard") {
-        item.soundcardFailed = true;
-      } else {
-        item.icecastFailed = true;
-      }
+      const problems = type === "soundcard" ? item.soundcardProblems : item.icecastProblems;
+      const problem = String(output.problem || "");
+      if (!problems.includes(problem)) problems.push(problem);
     }
   }
   for (const stream of configured || []) {
@@ -5807,8 +5852,8 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
         callsign: station.callsign || "Unknown",
         frequency: station.frequency || "",
         status: "needs-attention",
-        icecastFailed: false,
-        soundcardFailed: false,
+        icecastProblems: [],
+        soundcardProblems: [],
         receptionProblem: null,
         errors: []
       };
@@ -5820,8 +5865,14 @@ function streamAttentionItems(activeStreams, configured = configuredStreams) {
     // One sentence per stream, listing every problem it currently has.
     const reasons = [];
     if (item.receptionProblem) reasons.push(RECEPTION_PROBLEM_REASONS[item.receptionProblem]);
-    if (item.icecastFailed) reasons.push("one or more Icecast destinations failed to connect");
-    if (item.soundcardFailed) reasons.push("one or more sound cards are not connected");
+    for (const problem of item.icecastProblems) {
+      const reason = ICECAST_PROBLEM_REASONS[problem] || ICECAST_PROBLEM_UNKNOWN_REASON;
+      if (!reasons.includes(reason)) reasons.push(reason);
+    }
+    for (const problem of item.soundcardProblems) {
+      const reason = SOUNDCARD_PROBLEM_REASONS[problem] || SOUNDCARD_PROBLEM_UNKNOWN_REASON;
+      if (!reasons.includes(reason)) reasons.push(reason);
+    }
     let detail;
     if (!reasons.length) {
       detail = item.errors[0] || "This stream needs attention.";
@@ -5988,6 +6039,30 @@ const RECEPTION_PROBLEM_DETAILS = {
   no_signal: "No signal: only static is being received."
 };
 const RECEPTION_PROBLEM_REASONS = {bad_reception: "bad reception", no_signal: "no signal"};
+const SOUNDCARD_PROBLEM_REASONS = {
+  disconnected: "one or more sound cards are not connected",
+  busy: "one or more sound cards are in use by another program",
+  permission: "NWR Stream Manager doesn't have permission to use one or more sound cards",
+  format: "one or more sound cards can't play the audio",
+  resetting: "one or more sound cards are being reset",
+  error: "one or more sound cards have stopped working"
+};
+const SOUNDCARD_PROBLEM_UNKNOWN_REASON = "one or more sound cards need attention";
+const ICECAST_PROBLEM_REASONS = {
+  wrong_login: "the username or password was rejected for one or more Icecast mountpoints",
+  mountpoint_in_use: "one or more Icecast mountpoints are already in use",
+  mountpoint_not_found: "one or more Icecast mountpoints don't exist",
+  server_full: "one or more Icecast servers have too many streams connected",
+  format_not_accepted: "one or more Icecast servers don't accept the audio format",
+  rejected: "one or more Icecast servers rejected the stream",
+  server_not_found: "one or more Icecast server addresses couldn't be found",
+  refused: "one or more Icecast servers refused the connection",
+  unreachable: "one or more Icecast servers can't be reached",
+  timeout: "one or more Icecast servers took too long to respond",
+  secure_connection: "the secure connection to one or more Icecast servers failed",
+  connection_lost: "the connection to one or more Icecast servers was lost"
+};
+const ICECAST_PROBLEM_UNKNOWN_REASON = "one or more Icecast destinations failed to connect";
 
 function streamSignalFor(streamId) {
   const signal = streamSignals && streamSignals[streamId];
@@ -9056,12 +9131,9 @@ function sourceIsIqFile(data) {
   return data && data.source && data.source.kind === "iq_file";
 }
 
-function rtlRequiresAttention(data) {
-  if (!data || sourceIsIqFile(data)) return false;
-  const settings = data.settings || {};
-  if (data.capture_error) return true;
-  if (settings.serial && !data.active) return true;
-  return false;
+// What's wrong with the SDR in use, as the server finds it, or "".
+function sdrProblem(data) {
+  return String((data && data.sdr_problem) || "");
 }
 
 // Such as "2 days, 7 hours, 5 minutes", leaving out what's zero, as the server says it.
@@ -9081,13 +9153,15 @@ function formatUptime(seconds) {
 function renderDashboardSdr(data) {
   const settings = data.settings || {};
   const source = data.source || {};
-  const attention = rtlRequiresAttention(data);
+  const problem = sdrProblem(data);
+  const attention = Boolean(problem);
   const attentionElement = document.getElementById("dashboard_sdr_attention");
   const detailsElement = document.getElementById("dashboard_sdr_details");
   // Shown whether or not the SDR needs attention, and only once it's set.
   const location = String(data.location || "");
   setText("summary_location", location);
   setHidden("dashboard_location", !location);
+  setText("dashboard_sdr_problem", problem);
   if (attentionElement) attentionElement.hidden = !attention;
   if (detailsElement) detailsElement.hidden = attention;
   if (attention) return;
@@ -9970,6 +10044,7 @@ function applyStatus(data, options = {}) {
     setText("bytes", data.received_bytes);
     setText("last", data.last_batch_at ? `${data.last_batch_at.toFixed(3)}s` : "never");
     setText("capture-error", data.capture_error || "");
+    renderRtlSdrProblem(data);
     renderSdrReset(data);
     if (data.remote_sdr && data.remote_sdr.identity) renderRemoteSdr(data);
     renderLogs(data.logs || []);
@@ -11399,6 +11474,12 @@ async function resetSdr(remote) {
 function setSdrResetButtonsDisabled(disabled) {
   setDisabled(document.getElementById("reset_rtl_device"), disabled);
   setDisabled(document.getElementById("reset_remote_sdr"), disabled);
+}
+
+function renderRtlSdrProblem(data) {
+  const problem = sdrProblem(data);
+  setText("rtl_sdr_problem", problem);
+  setHidden("rtl_sdr_attention", !problem);
 }
 
 // Every page shows a reset as it happens, whoever started it and on whichever

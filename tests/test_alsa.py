@@ -5,6 +5,7 @@ import ctypes
 import sys
 import tempfile
 import types
+import time
 import unittest
 from pathlib import Path
 
@@ -516,6 +517,47 @@ class AlsaDiscoveryTests(unittest.TestCase):
         self.assertEqual(tap.snapshot()["inputs"]["stream"]["buffered_samples"], 0)
         tap._close_playback()
 
+    def test_sound_card_errors_say_whats_wrong_rather_than_all_being_a_disconnect(self) -> None:
+        class Lib:
+            @staticmethod
+            def snd_strerror(code):
+                return {-16: b"Device or resource busy", -13: b"Permission denied", -22: b"Invalid argument", -5: b"Input/output error", -19: b"No such device"}[code]
+
+        for code, operation, problem in (
+            (-16, "snd_pcm_open('hw:1,0')", "busy"),
+            (-13, "snd_pcm_open('hw:1,0')", "permission"),
+            (-19, "snd_pcm_open('hw:1,0')", "disconnected"),
+            (-22, "snd_pcm_hw_params_set_rate_near", "format"),
+            (-5, "snd_pcm_prepare", "error"),
+        ):
+            with self.subTest(code=code):
+                with self.assertRaises(self.alsa.AlsaError) as raised:
+                    self.alsa._check_alsa(code, Lib(), operation)
+                self.assertEqual(self.alsa.soundcard_problem(raised.exception), problem)
+        self.assertEqual(self.alsa.soundcard_problem(self.alsa.SoundCardAccessError("no")), "permission")
+        self.assertEqual(self.alsa.soundcard_problem(ValueError("no")), "error")
+
+        # A sound card that's there, but in use by another program.
+        device = self.alsa.playback_device_from_info(self.card(2), self.pcm())
+
+        def busy(*_args, **_kwargs):
+            self.alsa._check_alsa(-16, Lib(), "snd_pcm_open('hw:2,0')")
+
+        connected = [device]
+        tap = self.alsa.AlsaSharedPlaybackTap(device.stable_id, output_sample_rate=24_000, devices_provider=lambda: connected, playback_factory=busy)
+        tap.start()
+        self.addCleanup(tap.stop)
+        deadline = time.monotonic() + 5
+        while tap.snapshot()["problem"] != "busy" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual((tap.snapshot()["status"], tap.snapshot()["problem"]), ("needs-attention", "busy"))
+        # Then unplugged.
+        connected.clear()
+        deadline = time.monotonic() + 5
+        while tap.snapshot()["problem"] != "disconnected" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(tap.snapshot()["problem"], "disconnected")
+
     def test_playback_close_drops_realtime_audio_instead_of_draining_when_available(self) -> None:
         class Lib:
             def __init__(self) -> None:
@@ -681,6 +723,34 @@ class AlsaDiscoveryTests(unittest.TestCase):
         self.assertEqual(self.alsa.mixer_unity_target_mb(-6000, 1200), 0)
         self.assertEqual(self.alsa.mixer_unity_target_mb(-6000, -300), -300)
         self.assertIsNone(self.alsa.mixer_unity_target_mb(100, 1200))
+
+
+class SoundcardProblemPageTests(unittest.TestCase):
+    """What the dashboard and a stream's outputs say is wrong with a sound card; the page script says the same."""
+
+    def test_the_dashboard_and_outputs_say_whats_wrong(self) -> None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_auth import load_web_control_module
+
+        load_web_control_module()
+        sections = sys.modules["nwr_stream_manager.page_sections"]
+        stream = {"id": "s1", "enabled": True, "station": {"callsign": "WXN99"}}
+        output = {"id": "o1", "type": "soundcard", "soundcard": {"display_name": "Yeti X"}}
+        for problem, reason, label in (
+            ("busy", "One or more sound cards are in use by another program.", "In use by another program"),
+            ("disconnected", "One or more sound cards are not connected.", "Not connected"),
+            ("permission", "NWR Stream Manager doesn't have permission to use one or more sound cards.", "No permission to use it"),
+            ("error", "One or more sound cards have stopped working.", "Stopped working"),
+        ):
+            with self.subTest(problem=problem):
+                status = {
+                    "streams": [stream],
+                    "active_streams": [{"id": "s1", "status": "needs-attention", "station": {"callsign": "WXN99"},
+                                        "outputs": [{"id": "o1", "type": "soundcard", "status": "needs-attention", "problem": problem}]}],
+                }
+                self.assertEqual(sections.stream_attention_items(status)[0]["detail"], reason)
+                self.assertIn(f">{label}</td>", sections.stream_output_row_html(stream, output, status, []))
+
 
 
 if __name__ == "__main__":

@@ -332,6 +332,37 @@ class AuthTests(unittest.TestCase):
         service._process_rtl_notifications_locked(4902.0)
         self.assertEqual(len(sent), 4)
 
+    def test_the_sdrs_problem_is_shown_at_once_whether_or_not_notifications_are_on(self) -> None:
+        service = object.__new__(self.web_control.RtlControlService)
+        service.settings = self.web_control.RtlControlSettings(serial="00000001", notify_sdr_failures=False)
+        service.iq_file_source_config = None
+        service.capture = None
+        service.capture_error = ""
+        service.last_batch_at = None
+        service.capture_started_at = None
+        service.rtl_device_name_cache = {}
+        connected = [{"serial": "00000001", "name": "RTLSDRBlog Blog V4", "vendor": ""}]
+        service.devices = lambda: {"devices": []}
+        self.assertEqual(service._sdr_problem_locked(1000.0), "The configured RTL-SDR is not connected.")
+        service.devices = lambda: {"devices": connected}
+        service.capture = object()
+        # Just started, it has 30 seconds to send something.
+        service.capture_started_at = 1000.0
+        self.assertEqual(service._sdr_problem_locked(1029.0), "")
+        self.assertEqual(service._sdr_problem_locked(1030.0), "RTLSDRBlog Blog V4 has stopped outputting data.")
+        service.last_batch_at = 1031.0
+        self.assertEqual(service._sdr_problem_locked(1040.0), "")
+        # Stopped sending while still capturing, as the SDR did on the Pi.
+        self.assertEqual(service._sdr_problem_locked(1061.0), "RTLSDRBlog Blog V4 has stopped outputting data.")
+        service.capture_error = "usb_claim_interface error -6: resource busy"
+        self.assertEqual(service._sdr_problem_locked(1040.0), "Failed to claim RTLSDRBlog Blog V4.")
+        # Nothing for an I/Q file, or with no SDR chosen.
+        service.iq_file_source_config = object()
+        self.assertEqual(service._sdr_problem_locked(1061.0), "")
+        service.iq_file_source_config = None
+        service.settings = self.web_control.RtlControlSettings(serial="")
+        self.assertEqual(service._sdr_problem_locked(1061.0), "")
+
     def _stream_notification_service(self, streams, signals=None):
         wc = self.web_control
         service = object.__new__(wc.RtlControlService)
@@ -437,7 +468,7 @@ class AuthTests(unittest.TestCase):
             return [{
                 "id": "stream-1",
                 "status": status,
-                "outputs": [{"id": "sc-1", "type": "soundcard", "status": status, "soundcard": {"display_name": "Yeti X"}}],
+                "outputs": [{"id": "sc-1", "type": "soundcard", "status": status, "soundcard": {"display_name": "Yeti X"}, "problem": "disconnected"}],
             }]
 
         self._run_notifications(service, snapshot("needs-attention"), 1000.0)
@@ -585,6 +616,21 @@ class AuthTests(unittest.TestCase):
             [],
         )
 
+    def test_soundcard_notifications_say_whats_wrong(self) -> None:
+        messages = sys.modules["nwr_stream_manager.notifications"].soundcard_problem_messages
+        for problem, message in (
+            ("disconnected", "KEC49: sound card Yeti X is not connected."),
+            ("busy", "KEC49: sound card Yeti X is in use by another program."),
+            ("permission", "KEC49: NWR Stream Manager doesn't have permission to use sound card Yeti X."),
+            ("format", "KEC49: sound card Yeti X can't play the audio."),
+            ("resetting", "KEC49: sound card Yeti X is being reset."),
+            ("error", "KEC49: sound card Yeti X has stopped working."),
+            ("", "KEC49: sound card Yeti X needs attention."),
+        ):
+            with self.subTest(problem=problem):
+                self.assertEqual(messages(problem, "KEC49", "Yeti X")[0], message)
+        self.assertEqual(messages("busy", "KEC49", "Yeti X")[1], "KEC49: sound card Yeti X is working again.")
+
     def test_stream_notification_failures_include_enabled_soundcard_failure(self) -> None:
         stream = {
             "id": "stream-1",
@@ -599,6 +645,7 @@ class AuthTests(unittest.TestCase):
                     "type": "soundcard",
                     "status": "needs-attention",
                     "soundcard": {"display_name": "Yeti X"},
+                    "problem": "disconnected",
                 }
             ],
         }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -346,6 +347,7 @@ class CaptureServiceMixin:
 
     def _new_rtl_capture_source(self, config: RtlConfig) -> RtlCaptureSource:
         source = RtlCaptureSource(config)
+        self.capture_started_at = time.monotonic()
         source.set_device_providers(
             rtl_devices_provider=self._cached_rtl_devices,
             usb_rtl_devices_provider=self._cached_usb_rtl_devices,

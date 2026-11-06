@@ -482,6 +482,8 @@ class RtlControlService(
         self.sdr_reset_count = 0
         self.capture_error: str | None = None
         self.last_batch_at: float | None = None
+        # When the current RTL-SDR capture started, before which it can't have sent anything.
+        self.capture_started_at: float | None = None
         self.received_chunks = 0
         self.received_bytes = 0
         remote_directory = state_path.parent / REMOTE_SDR_DIRECTORY_NAME
@@ -709,6 +711,7 @@ class RtlControlService(
                 "source": source_payload,
                 "remote_sdr": {} if read_only else self._remote_sdr_status_locked(),
                 "capture_error": capture_error,
+                "sdr_problem": self._sdr_problem_locked(time.monotonic()),
                 "sdr_reset": sdr_reset,
                 "capture_stats": capture_stats,
                 "raw_fanout_stats": fanout_stats,

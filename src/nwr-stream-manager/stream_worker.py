@@ -40,7 +40,7 @@ from .eas_alerts import eas_config_from_stream, eas_recording_settings_from_stre
 from .eas_recording import EasRecorderOutput
 from .encoder import create_audio_encoder
 from .fallback_settings import stream_fallback_action_from_stream
-from .icecast import IcecastSource
+from .icecast import IcecastSource, icecast_problem
 from .iq_pipeline import (
     alias_filter_attenuation_db,
     alias_filter_transition_hz,
@@ -391,6 +391,7 @@ class IcecastStreamWorker:
                                 "pcm_name": snapshot.get("pcm_name", "") or configured_soundcard.get("pcm_name", ""),
                             },
                             "error": snapshot.get("error", ""),
+                            "problem": snapshot.get("problem", ""),
                         }
                     ],
                 }
@@ -1440,6 +1441,8 @@ class IcecastOutputWriter:
         )
         self.status = "disabled"
         self.error: str | None = None
+        # What's wrong, one of icecast's ICECAST_ problems, while it needs attention.
+        self.problem = ""
         self.started_at: float | None = None
         self.lock = threading.Lock()
         self.connection_lock = threading.Lock()
@@ -1464,13 +1467,14 @@ class IcecastOutputWriter:
         with self.lock:
             status = self.status
             error = self.error
+            problem = self.problem if status == "needs-attention" else ""
             started_at = self.started_at
         with self.runtime.lock:
             last_audio_at = self.runtime.last_audio_at
         return {
             "id": self.runtime.id,
             "station": self.runtime.stream["station"],
-            "outputs": [self.output],
+            "outputs": [{**self.output, "problem": problem}],
             "status": status,
             "error": error,
             "started_at": started_at,
@@ -1500,10 +1504,11 @@ class IcecastOutputWriter:
             except Exception:
                 pass
 
-    def _set_status(self, status: str, error: str | None = None) -> None:
+    def _set_status(self, status: str, error: str | None = None, problem: str = "") -> None:
         with self.lock:
             self.status = status
             self.error = error
+            self.problem = problem
             if status == "enabled" and self.started_at is None:
                 self.started_at = time.time()
 
@@ -1550,7 +1555,7 @@ class IcecastOutputWriter:
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
-                self._set_status("needs-attention", friendly_stream_error(exc))
+                self._set_status("needs-attention", friendly_stream_error(exc), icecast_problem(exc))
                 # Retried every few seconds: said once, and again only if it fails differently,
                 # so a server that stays down doesn't push everything else out of the log.
                 failure = str(exc)

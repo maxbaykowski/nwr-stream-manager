@@ -437,7 +437,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
   <h3 id="outputs-tab">Outputs</h3>
   <p>The Outputs section lists every output the stream is sent to. Use the <strong>Show outputs</strong> selector to switch between <strong>Icecast outputs</strong> and <strong>Sound card outputs</strong>; you can only view one output type at a time.</p>
-  <p>Each output shows its status: <strong>Connected</strong> (or <strong>Enabled</strong> for sound cards) when it's working, <strong>Needs attention</strong> when it isn't, and <strong>Disabled</strong> when you've turned it off. Its <strong>More actions</strong> menu lets you disable or enable it, edit it, or remove it. For USB sound cards, the menu also has <strong>Reset USB sound card</strong>.</p>
+  <p>Each output shows its status: <strong>Connected</strong> (or <strong>Enabled</strong> for sound cards) when it's working, what's wrong when it isn't, and <strong>Disabled</strong> when you've turned it off. An Icecast output might say <strong>Wrong username or password</strong>, <strong>Mountpoint in use</strong> or <strong>Server not responding</strong>, and a sound card <strong>Not connected</strong>, <strong>In use by another program</strong> or <strong>Stopped working</strong>. An output whose stream isn't running says <strong>Not running</strong>. Its <strong>More actions</strong> menu lets you disable or enable it, edit it, or remove it. For USB sound cards, the menu also has <strong>Reset USB sound card</strong>.</p>
   <p>To add another output, select <strong>Add output</strong>, then choose Icecast mountpoint or Sound card. The steps are the same as when you <a href="#first-stream">set up your first stream</a>:</p>
   <ul>
     <li><strong>Icecast:</strong> choose the streaming service, then enter its details. See <a href="#streaming-services">Streaming services</a>.</li>
@@ -508,7 +508,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>Once you've set up <a href="#notifications">notifications</a>, a <strong>Notifications</strong> section appears in stream settings. Choose which problems with this stream should notify you:</p>
   <ul>
     <li><strong>Failed Icecast mountpoints:</strong> a streaming service can't be reached.</li>
-    <li><strong>Disconnected sound cards.</strong></li>
+    <li><strong>Sound card problems:</strong> a sound card is disconnected, in use by another program, or has stopped working.</li>
     <li><strong>Bad reception or no signal.</strong></li>
     <li><strong>Recorded EAS alerts:</strong> a new alert has been saved (when EAS recording is on).</li>
   </ul>

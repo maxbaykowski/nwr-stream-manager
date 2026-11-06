@@ -774,6 +774,9 @@ class SettingsPageHandlerMixin:
             ),
         )
         page = page_rendering.set_text(page, "device-errors", " | ".join(devices.get("errors") or []))
+        problem = str(status.get("sdr_problem") or "")
+        page = page_rendering.set_hidden(page, "rtl_sdr_attention", not problem)
+        page = page_rendering.set_text(page, "rtl_sdr_problem", problem)
         reset = status.get("sdr_reset") or None
         resetting = bool(reset and reset.get("state") == "resetting")
         page = page_rendering.set_hidden(page, "reset_rtl_device", uses_remote)
