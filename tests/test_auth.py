@@ -33,6 +33,17 @@ def load_web_control_module():
     return module
 
 
+
+def delivered_to(sent: list) -> object:
+    """Stands in for sending a notification, which ntfy always receives."""
+
+    def send(failure: dict, on_delivered=None) -> None:
+        sent.append(failure)
+        if on_delivered is not None:
+            on_delivered()
+
+    return send
+
 class AuthTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -302,7 +313,7 @@ class AuthTests(unittest.TestCase):
         service.rtl_device_name_cache = {}
         service.devices = lambda: {"devices": [{"serial": "00000001", "name": "RTLSDRBlog Blog V4", "vendor": ""}]}
         sent: list[dict[str, object]] = []
-        service._send_stream_problem_notification_async = sent.append
+        service._send_stream_problem_notification_async = delivered_to(sent)
 
         service._process_rtl_notifications_locked(1000.0)
         service._process_rtl_notifications_locked(1029.0)
@@ -376,7 +387,7 @@ class AuthTests(unittest.TestCase):
         service._process_recorded_eas_alert_notifications_locked = lambda: None
         service._stream_signals_locked = lambda: dict(signals or {})
         sent: list[dict[str, object]] = []
-        service._send_stream_problem_notification_async = sent.append
+        service._send_stream_problem_notification_async = delivered_to(sent)
         return service, sent
 
     def _run_notifications(self, service, snapshots, at: float) -> None:
@@ -408,13 +419,13 @@ class AuthTests(unittest.TestCase):
         stream = self._icecast_stream()
         service, sent = self._stream_notification_service([stream])
         self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1000.0)
-        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1031.0)
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1121.0)
         self.assertEqual(len(sent), 1)
 
-        self._run_notifications(service, self._icecast_snapshot("enabled"), 1040.0)
-        self._run_notifications(service, self._icecast_snapshot("enabled"), 1060.0)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1130.0)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1150.0)
         self.assertEqual(len(sent), 1)  # still inside the 30 s recovery period
-        self._run_notifications(service, self._icecast_snapshot("enabled"), 1062.0)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1161.0)
 
         self.assertEqual(len(sent), 2)
         self.assertEqual(
@@ -423,6 +434,53 @@ class AuthTests(unittest.TestCase):
         )
         self.assertEqual(sent[-1]["priority"], 3)
         self.assertEqual(service.stream_notification_states, {})
+
+    def test_an_icecast_server_down_for_under_two_minutes_is_not_notified(self) -> None:
+        # Icecast servers restarting, and the connection to them dropping, for a minute or so.
+        service, sent = self._stream_notification_service([self._icecast_stream()])
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1000.0)
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1077.0)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1078.0)
+        self.assertEqual(service.stream_notification_states, {})
+        # Down again soon after: its own two minutes, not the rest of the last one's.
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1090.0)
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1209.0)
+        self.assertEqual(sent, [])
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1210.0)
+        self.assertEqual([item["message"] for item in sent], ["KEC49: failed to connect to the Icecast mountpoint at http://radio.example.com:8000/kec49."])
+
+    def test_a_failure_ntfy_couldnt_be_reached_for_is_retried_and_never_followed_by_a_recovery_alone(self) -> None:
+        service, sent = self._stream_notification_service([self._icecast_stream()])
+        reachable = {"value": False}
+
+        def send(failure, on_delivered=None) -> None:
+            if reachable["value"]:
+                sent.append(failure)
+                if on_delivered is not None:
+                    on_delivered()
+
+        service._send_stream_problem_notification_async = send
+        # The connection is down, so neither the Icecast server nor ntfy can be reached.
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1000.0)
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1120.0)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1130.0)
+        reachable["value"] = True
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 1200.0)
+        self.assertEqual(sent, [])
+        self.assertEqual(service.stream_notification_states, {})
+
+        # Still failing when ntfy is back: tried again a minute later, not an hour.
+        reachable["value"] = False
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 2000.0)
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 2120.0)
+        reachable["value"] = True
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 2179.0)
+        self.assertEqual(sent, [])
+        self._run_notifications(service, self._icecast_snapshot("needs-attention"), 2180.0)
+        self.assertEqual(len(sent), 1)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 2200.0)
+        self._run_notifications(service, self._icecast_snapshot("enabled"), 2231.0)
+        self.assertEqual(sent[-1]["message"], "KEC49: successfully connected to the Icecast mountpoint at http://radio.example.com:8000/kec49.")
 
     def test_no_recovery_notice_when_failure_was_never_announced(self) -> None:
         service, sent = self._stream_notification_service([self._icecast_stream()])
@@ -438,7 +496,7 @@ class AuthTests(unittest.TestCase):
                 stream = self._icecast_stream()
                 service, sent = self._stream_notification_service([stream])
                 self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1000.0)
-                self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1031.0)
+                self._run_notifications(service, self._icecast_snapshot("needs-attention"), 1121.0)
                 self.assertEqual(len(sent), 1)
                 snapshots = self._icecast_snapshot("disabled")
                 if change == "disable_stream":
@@ -448,8 +506,8 @@ class AuthTests(unittest.TestCase):
                     snapshots = self._icecast_snapshot("enabled")
                 else:
                     snapshots = []
-                self._run_notifications(service, snapshots, 1040.0)
-                self._run_notifications(service, snapshots, 1100.0)
+                self._run_notifications(service, snapshots, 1130.0)
+                self._run_notifications(service, snapshots, 1190.0)
 
                 self.assertEqual(len(sent), 1)
                 self.assertEqual(service.stream_notification_states, {})
@@ -497,7 +555,7 @@ class AuthTests(unittest.TestCase):
         service.rtl_device_name_cache = {}
         service.devices = lambda: {"devices": []}
         sent: list[dict[str, object]] = []
-        service._send_stream_problem_notification_async = sent.append
+        service._send_stream_problem_notification_async = delivered_to(sent)
 
         service._process_rtl_notifications_locked(1000.0)
         service._process_rtl_notifications_locked(1031.0)
@@ -524,7 +582,7 @@ class AuthTests(unittest.TestCase):
         service.rtl_device_name_cache = {}
         service.devices = lambda: {"devices": [{"serial": "00000001", "name": "RTLSDRBlog Blog V4", "vendor": ""}]}
         sent: list[dict[str, object]] = []
-        service._send_stream_problem_notification_async = sent.append
+        service._send_stream_problem_notification_async = delivered_to(sent)
 
         service._process_rtl_notifications_locked(1000.0)
         service.capture = object()

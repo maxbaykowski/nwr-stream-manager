@@ -215,6 +215,22 @@ class StreamFallbackActionWorkerTests(unittest.TestCase):
         self.assertFalse(worker.icecast_disconnected.is_set())
         self.assertNotIn("fallback", self.kinds_since(0))
 
+    def test_do_nothing_sends_silence_in_time_without_radio_audio(self) -> None:
+        # Without any, Icecast servers drop the stream after their timeout, while it looks
+        # connected here. Sent in time, not as fast as the loop can go.
+        worker, _fanout = self.start_worker("none", 0.2)
+        time.sleep(1.5)  # a second without radio audio before it counts as stopped
+        start = self.mark()
+        cpu_before = time.process_time()
+        time.sleep(1.0)
+        cpu_used = time.process_time() - cpu_before
+        kinds = self.kinds_since(start)
+
+        self.assertEqual(set(kinds), {"silence"})
+        self.assertGreater(len(kinds), 35)  # 50 frames a second
+        self.assertLess(len(kinds), 70)
+        self.assertLess(cpu_used, 0.5)
+
     def test_choosing_another_announcement_switches_to_it_while_it_plays(self) -> None:
         wc = self.web_control
 
@@ -324,6 +340,128 @@ class IcecastOutputHeldOffTests(unittest.TestCase):
 
             runtime.icecast_disconnected.clear()
             wait_for(lambda: writer.status == "enabled" and len(connections) == 2)
+
+    def test_an_output_the_server_drops_while_about_to_be_disconnected_stays_off_until_audio_returns(self) -> None:
+        # Its Icecast server dropped it while the stream had no station audio and was going to
+        # disconnect anyway: reconnecting would only put it back on to be disconnected again.
+        wc = self.web_control
+        connections = []
+
+        class Sink:
+            def __init__(self) -> None:
+                self.dropped = False
+
+            def write(self, data) -> None:
+                if self.dropped:
+                    raise BrokenPipeError(32, "Broken pipe")
+
+            def close(self) -> None:
+                pass
+
+        class Source:
+            def __init__(self, config, content_type) -> None:
+                pass
+
+            def connect(self):
+                sink = Sink()
+                connections.append(sink)
+                return sink
+
+            def close(self) -> None:
+                pass
+
+        encoder_group = types.SimpleNamespace(header=lambda: b"", add_output=lambda output: None, remove_output=lambda output: None)
+        action = {"value": wc.WebStreamFallbackAction(action="disconnect_icecast", delay_seconds=30.0)}
+        runtime = types.SimpleNamespace(
+            id="stream-1",
+            lock=threading.Lock(),
+            icecast_disconnected=threading.Event(),
+            fallback_since=None,
+            fallback_action=lambda: action["value"],
+            encoder_group_for=lambda config: encoder_group,
+            _stop_unused_encoder_groups=lambda: None,
+        )
+        output = {
+            "id": "icecast-1",
+            "type": "icecast",
+            "enabled": True,
+            "icecast": {
+                "host": "icecast.example.com", "port": 8000, "mount": "/wxn99", "username": "source",
+                "password": "secret", "format": "mp3", "sample_rate": 24000, "bitrate": 64,
+            },
+        }
+        with mock.patch.object(sys.modules[wc.IcecastOutputWriter.__module__], "IcecastSource", Source):
+            writer = wc.IcecastOutputWriter(runtime, output)
+            writer.start()
+            self.addCleanup(writer.stop)
+            wait_for(lambda: writer.status == "enabled")
+
+            runtime.fallback_since = time.monotonic()  # the station audio stops
+            connections[0].dropped = True
+            writer.encoded_queue.put(b"silence")
+            wait_for(lambda: writer.status == "standby")
+            time.sleep(sys.modules["nwr_stream_manager.constants"].STREAM_RECONNECT_SECONDS + 1.0)
+            self.assertEqual(len(connections), 1)  # not reconnected to be disconnected again
+            self.assertEqual(writer.status, "standby")
+
+            runtime.fallback_since = None  # the station audio is back
+            wait_for(lambda: writer.status == "enabled" and len(connections) == 2)
+
+    def test_an_output_that_keeps_streaming_without_station_audio_reconnects_after_a_drop(self) -> None:
+        # Playing fallback audio, or doing nothing, it still has audio to send.
+        wc = self.web_control
+        connections = []
+
+        class Sink:
+            def __init__(self) -> None:
+                self.dropped = False
+
+            def write(self, data) -> None:
+                if self.dropped:
+                    raise BrokenPipeError(32, "Broken pipe")
+
+            def close(self) -> None:
+                pass
+
+        class Source:
+            def __init__(self, config, content_type) -> None:
+                pass
+
+            def connect(self):
+                sink = Sink()
+                connections.append(sink)
+                return sink
+
+            def close(self) -> None:
+                pass
+
+        encoder_group = types.SimpleNamespace(header=lambda: b"", add_output=lambda output: None, remove_output=lambda output: None)
+        runtime = types.SimpleNamespace(
+            id="stream-1",
+            lock=threading.Lock(),
+            icecast_disconnected=threading.Event(),
+            fallback_since=time.monotonic(),
+            fallback_action=lambda: wc.WebStreamFallbackAction(action="play_fallback_audio", delay_seconds=30.0),
+            encoder_group_for=lambda config: encoder_group,
+            _stop_unused_encoder_groups=lambda: None,
+        )
+        output = {
+            "id": "icecast-1",
+            "type": "icecast",
+            "enabled": True,
+            "icecast": {
+                "host": "icecast.example.com", "port": 8000, "mount": "/wxn99", "username": "source",
+                "password": "secret", "format": "mp3", "sample_rate": 24000, "bitrate": 64,
+            },
+        }
+        with mock.patch.object(sys.modules[wc.IcecastOutputWriter.__module__], "IcecastSource", Source):
+            writer = wc.IcecastOutputWriter(runtime, output)
+            writer.start()
+            self.addCleanup(writer.stop)
+            wait_for(lambda: writer.status == "enabled")
+            connections[0].dropped = True
+            writer.encoded_queue.put(b"audio")
+            wait_for(lambda: len(connections) == 2, timeout=sys.modules["nwr_stream_manager.constants"].STREAM_RECONNECT_SECONDS + 3.0)
 
 
 class IcecastOutputRetryLogTests(unittest.TestCase):

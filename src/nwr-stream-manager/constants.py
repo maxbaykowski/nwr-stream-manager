@@ -71,6 +71,36 @@ STREAM_SERVICE_HOSTS = {
     "wxradio.org": STREAM_SERVICE_NWRORG,
 }
 STREAM_SAMPLE_RATES = {8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000}
+# The bitrates, in Kbps, each format can stream mono audio at, by sample rate. An MP3 can only use
+# the bitrates MPEG has for its sample rate, and LAME quietly swaps any other for the nearest one.
+# libvorbis won't start at all outside the range it's tuned for at each sample rate. The page script
+# has the same table.
+_MPEG1_BITRATES = (32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320)
+_MPEG2_BITRATES = (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160)
+_MPEG25_BITRATES = (8, 16, 24, 32, 40, 48, 56, 64)
+STREAM_BITRATES = {
+    "mp3": {
+        8000: _MPEG25_BITRATES,
+        11025: _MPEG25_BITRATES,
+        16000: _MPEG2_BITRATES,
+        22050: _MPEG2_BITRATES,
+        24000: _MPEG2_BITRATES,
+        32000: _MPEG1_BITRATES,
+        44100: _MPEG1_BITRATES,
+        48000: _MPEG1_BITRATES,
+    },
+    "ogg": {
+        8000: tuple(range(8, 41, 8)),
+        11025: tuple(range(16, 49, 8)),
+        16000: tuple(range(16, 97, 8)),
+        22050: tuple(range(16, 89, 8)),
+        24000: tuple(range(16, 89, 8)),
+        32000: tuple(range(32, 185, 8)),
+        44100: tuple(range(32, 241, 8)),
+        48000: tuple(range(32, 241, 8)),
+    },
+}
+STREAM_FORMAT_NAMES = {"mp3": "MP3", "ogg": "OGG"}
 STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
@@ -158,6 +188,11 @@ CUSTOM_FALLBACK_AUDIO_FILE_NAME = "fallback_custom.wav"
 NOTIFICATION_STATE_FILE_NAME = "notifications.json"
 SOUNDCARD_DEVICE_NAMES_FILE_NAME = "soundcard-devices.json"
 STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS = 30.0
+# Icecast servers restart, and the connection to them drops, for a minute or so at a time, which
+# is no reason to tell anyone. Outages that matter go on far longer.
+STREAM_NOTIFICATION_ICECAST_GRACE_SECONDS = 120.0
+# How soon a notification ntfy couldn't be reached for is tried again.
+STREAM_NOTIFICATION_RETRY_SECONDS = 60.0
 STREAM_NOTIFICATION_RECOVERY_SECONDS = 30.0
 STREAM_NOTIFICATION_REPEAT_SECONDS = 3600.0
 RTL_NOTIFICATION_NO_DATA_SECONDS = 30.0

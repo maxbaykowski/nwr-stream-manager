@@ -25,6 +25,27 @@ def tone(seconds: float, offset: float = 0.0) -> np.ndarray:
     return (signal * 32767 * 0.5).astype("<i2")
 
 
+class StreamListAddressTests(unittest.TestCase):
+    def test_choosing_a_stream_from_a_list_leaves_the_address_alone(self) -> None:
+        # Screen readers read out the address bar's text as it changes, such as "&stream=" and the
+        # stream's ID, while someone's still on the list.
+        page = load_web_control_module().INDEX_HTML
+        for select_id, view in (("stream_archive_stream", "stream_archives"), ("eas_alert_stream", "eas_alerts")):
+            with self.subTest(select=select_id):
+                start = page.index(f'document.getElementById("{select_id}").addEventListener("change"')
+                handler = page[start : page.index("\n});\n", start)]
+                self.assertIn(f'rememberCurrentRoute("{view}"', handler)
+                self.assertNotIn("replaceCurrentRoute(", handler)
+                self.assertNotIn("navigateTo(", handler)
+        remember = page[page.index("function rememberCurrentRoute(") :]
+        self.assertIn('history.replaceState(routeState(view, params), "", window.location.href);', remember[: remember.index("\n}\n")])
+        # The archive list is changed in place rather than remade under the person on it.
+        render = page[page.index("function renderStreamArchives(") :]
+        render = render[: render.index("\n}\n")]
+        self.assertIn("syncSelectOptions(select,", render)
+        self.assertNotIn("replaceChildren(...streamArchives", render)
+
+
 class Clock:
     def __init__(self, start: float = START) -> None:
         self.now = start

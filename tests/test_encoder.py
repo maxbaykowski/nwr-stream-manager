@@ -133,6 +133,41 @@ class EncoderTests(unittest.TestCase):
         self.assertIn(b"OggS", encoded)
         self.assertGreater(len(encoded), 0)
 
+    def test_the_bitrates_offered_are_exactly_the_ones_each_library_streams_at(self) -> None:
+        import ctypes
+
+        constants = importlib.import_module("nwr_stream_manager.constants")
+        for stream_format in ("mp3", "ogg"):
+            for sample_rate in sorted(constants.STREAM_SAMPLE_RATES):
+                allowed = constants.STREAM_BITRATES[stream_format][sample_rate]
+                works = []
+                for bitrate in range(8, 321, 8):
+                    config = self.config_module.IcecastConfig(
+                        host="example.invalid", port=8000, mount="/test", username="source", password="secret",
+                        format=stream_format, sample_rate=sample_rate, bitrate=bitrate,
+                    )
+                    if stream_format == "mp3":
+                        # LAME never refuses: it swaps in the nearest bitrate MPEG has.
+                        encoder = self.encoder_module.Mp3Encoder(config)
+                        encoder.lame.lame_get_brate.restype = ctypes.c_int
+                        encoder.lame.lame_get_brate.argtypes = [ctypes.c_void_p]
+                        if encoder.lame.lame_get_brate(encoder.gfp) == bitrate:
+                            works.append(bitrate)
+                        encoder.close()
+                        continue
+                    try:
+                        encoder = self.encoder_module.OggVorbisEncoder(config)
+                    except self.encoder_module.EncoderError:
+                        continue
+                    works.append(bitrate)
+                    if bitrate in (allowed[0], allowed[-1]):
+                        # Really streams at the ends of its range, not only starts.
+                        tone = (np.sin(2 * np.pi * 440 * np.arange(24_000) / 24_000) * 8000).astype("<i2").tobytes()
+                        self.assertIn(b"OggS", encoder.encode(tone) + encoder.flush())
+                    encoder.close()
+                with self.subTest(format=stream_format, sample_rate=sample_rate):
+                    self.assertEqual(tuple(works), allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

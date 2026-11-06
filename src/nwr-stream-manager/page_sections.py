@@ -24,6 +24,7 @@ from .config import notch_max_width
 from .constants import (
     IQ_RECORDER_MODE_SPECTRUM,
     IQ_RECORDER_MODE_STREAM,
+    STREAM_BITRATES,
     STREAM_SERVICE_CUSTOM,
     STREAM_SERVICE_GWES,
     STREAM_SERVICE_HOSTS,
@@ -369,7 +370,6 @@ NWRORG_SUBMISSION_HTML = (
     "for NOAA Weather Radio Org before your stream will appear on the website.</p>"
 )
 STREAM_SAMPLE_RATE_CHOICES = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000)
-STREAM_BITRATE_CHOICES = tuple(range(8, 321, 8))
 # The Icecast fields that a form keeps, by their form names.
 ICECAST_FORM_FIELDS = ("host", "port", "username", "password", "mount", "format", "sample_rate", "bitrate", "alt_enabled", "alt_number")
 
@@ -441,6 +441,26 @@ def icecast_value_allowed(service: str, name: str, value: int) -> bool:
     if service == STREAM_SERVICE_NWRORG:
         return value == (32 if name == "bitrate" else 22050)
     return True
+
+
+def closest_choice(choices: list[int], wanted: int) -> int:
+    """The choice closest to wanted, the lower one when two are as close."""
+    return min(choices, key=lambda choice: (abs(choice - wanted), choice))
+
+
+def icecast_quality_choices(service: str, stream_format: str, sample_rate: int, bitrate: int) -> tuple[list[int], int, list[int], int]:
+    """The sample rates and bitrates an Icecast output can be set to, and the ones closest to those
+    asked for, as the page script lists them: only what the format can stream at and the service
+    allows."""
+    table = STREAM_BITRATES["ogg" if stream_format == "ogg" else "mp3"]
+
+    def bitrates_at(rate: int) -> list[int]:
+        return [value for value in table[rate] if icecast_value_allowed(service, "bitrate", value)]
+
+    sample_rates = [rate for rate in STREAM_SAMPLE_RATE_CHOICES if icecast_value_allowed(service, "sample_rate", rate) and bitrates_at(rate)]
+    chosen_rate = sample_rate if sample_rate in sample_rates else closest_choice(sample_rates, sample_rate)
+    bitrates = bitrates_at(chosen_rate)
+    return sample_rates, chosen_rate, bitrates, closest_choice(bitrates, bitrate)
 
 
 def icecast_payload(raw: dict[str, Any]) -> dict[str, Any]:
@@ -554,18 +574,14 @@ def fill_icecast_fields(page: str, prefix: str, values: dict[str, str], service:
         page = page_rendering.set_attribute(page, f"{prefix}_format_{stream_format}", "checked", "checked" if shown["format"] == stream_format else None)
     page = page_rendering.set_attribute(page, f"{prefix}_alt_enabled", "checked", "checked" if values.get("alt_enabled") == "1" else None)
     page = page_rendering.set_attribute(page, f"{prefix}_alt_number", "value", values.get("alt_number") or "1")
-    for name, choices, unit in (("sample_rate", STREAM_SAMPLE_RATE_CHOICES, "Hz"), ("bitrate", STREAM_BITRATE_CHOICES, "Kbps")):
-        allowed = [value for value in choices if icecast_value_allowed(service, name, value)]
-        chosen = number_or(preset[name], allowed[0])
-        if chosen not in allowed:
-            chosen = allowed[0]
+    sample_rates, sample_rate, bitrates, bitrate = icecast_quality_choices(
+        service, shown["format"], number_or(preset["sample_rate"], 24000), number_or(preset["bitrate"], 64)
+    )
+    for name, choices, chosen, unit in (("sample_rate", sample_rates, sample_rate, "Hz"), ("bitrate", bitrates, bitrate, "Kbps")):
         page = page_rendering.set_content(
             page,
             f"{prefix}_{name}",
-            "".join(
-                f'<option value="{value}"{" selected" if value == chosen else ""}{"" if value in allowed else " disabled"}>{value} {unit}</option>'
-                for value in choices
-            ),
+            "".join(f'<option value="{value}"{" selected" if value == chosen else ""}>{value} {unit}</option>' for value in choices),
         )
     return page
 

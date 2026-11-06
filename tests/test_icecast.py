@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
 import socket
+import subprocess
+import tempfile
 import sys
 import threading
 import types
@@ -289,6 +293,92 @@ class IcecastAddressTests(unittest.TestCase):
             notifications.icecast_problem_message("refused", "WXN99", "http://radio.example.com:8000/wxn99"),
             "WXN99: the Icecast server for http://radio.example.com:8000/wxn99 refused the connection.",
         )
+
+
+class StreamBitrateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.web_control = load_web_control_module()
+        cls.constants = sys.modules["nwr_stream_manager.constants"]
+        cls.stream_config = sys.modules["nwr_stream_manager.stream_config"]
+        cls.sections = sys.modules["nwr_stream_manager.page_sections"]
+
+    def payload(self, stream_format: str, sample_rate: int, bitrate: int) -> dict:
+        return {
+            "service": "custom", "host": "radio.example.com", "port": 8000, "username": "source", "password": "secret",
+            "mount": "/live", "format": stream_format, "sample_rate": sample_rate, "bitrate": bitrate,
+        }
+
+    def test_saving_refuses_a_bitrate_the_format_cant_stream_at_that_sample_rate(self) -> None:
+        # libvorbis won't start at 128 Kbps with 24 kHz; LAME would quietly use 64 at 8 kHz.
+        for stream_format, sample_rate, bitrate in (("ogg", 24000, 128), ("mp3", 8000, 128), ("mp3", 44100, 144), ("ogg", 48000, 320)):
+            with self.subTest(format=stream_format, sample_rate=sample_rate, bitrate=bitrate):
+                with self.assertRaisesRegex(ValueError, f"can't stream at {bitrate} Kbps with a sample rate of {sample_rate} Hz"):
+                    self.web_control.validate_icecast_payload(self.payload(stream_format, sample_rate, bitrate))
+        self.assertEqual(self.web_control.validate_icecast_payload(self.payload("ogg", 24000, 88))["bitrate"], 88)
+        self.assertEqual(self.web_control.validate_icecast_payload(self.payload("mp3", 24000, 144))["bitrate"], 144)
+
+    def test_outputs_saved_with_a_bitrate_that_cant_be_used_get_the_closest_one(self) -> None:
+        stream = {"id": "s1", "outputs": [
+            {"id": "a", "type": "icecast", "icecast": {"format": "ogg", "sample_rate": 24000, "bitrate": 128}},
+            {"id": "b", "type": "icecast", "icecast": {"format": "mp3", "sample_rate": 32000, "bitrate": 144}},
+            {"id": "c", "type": "icecast", "icecast": {"format": "mp3", "sample_rate": 24000, "bitrate": 64}},
+            {"id": "d", "type": "soundcard", "soundcard": {"stable_id": "x"}},
+        ]}
+        self.assertTrue(self.stream_config.fix_stream_bitrates(stream))
+        # LAME used 128 for 144 at 32 kHz, so that's what the output has been streaming at.
+        self.assertEqual([o["icecast"]["bitrate"] for o in stream["outputs"][:3]], [88, 128, 64])
+        self.assertFalse(self.stream_config.fix_stream_bitrates(stream))
+
+    def test_the_lists_only_offer_what_the_format_and_service_allow(self) -> None:
+        choices = self.sections.icecast_quality_choices
+        self.assertEqual(choices("custom", "ogg", 24000, 128), (list(self.sections.STREAM_SAMPLE_RATE_CHOICES), 24000, list(range(16, 89, 8)), 88))
+        # GWES needs at least 64 Kbps, which MP3 at 8 kHz can just do.
+        self.assertEqual(choices("gwes", "mp3", 8000, 32)[2:], ([64], 64))
+        # WeatherUSA's 32 to 56 Kbps, at 22050 Hz at most.
+        rates, rate, bitrates, bitrate = choices("weatherusa", "ogg", 48000, 128)
+        self.assertEqual((rates[-1], rate, bitrates, bitrate), (22050, 22050, [32, 40, 48, 56], 56))
+        self.assertEqual(choices("nwrorg", "mp3", 24000, 64), ([22050], 22050, [32], 32))
+
+    def test_the_page_script_lists_the_same_choices(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        page = self.web_control.INDEX_HTML
+        parts = []
+        for start_text in ("const DEFAULT_STREAM_BITRATES", "const STREAM_SERVICE_CUSTOM", "const STREAM_SERVICE_GWES",
+                           "const STREAM_SERVICE_WEATHERUSA", "const STREAM_SERVICE_NWRORG", "const STREAM_SAMPLE_RATE_CHOICES",
+                           "const MPEG1_BITRATES", "const MPEG2_BITRATES", "const MPEG25_BITRATES"):
+            start = page.index(start_text + " ")
+            parts.append(page[start : page.index(";\n", start) + 2])
+        for name in ("bitrateSteps", "icecastValueAllowed", "closestChoice", "icecastQualityChoices"):
+            start = page.index(f"function {name}(")
+            parts.append(page[start : page.index("\n}\n", start) + 2])
+        start = page.index("const STREAM_BITRATES ")
+        parts.append(page[start : page.index("\n};\n", start) + 4])
+        cases = [
+            [service, stream_format, sample_rate, bitrate]
+            for service in ("custom", "gwes", "weatherusa", "nwrorg")
+            for stream_format in ("mp3", "ogg")
+            for sample_rate in (8000, 11025, 22050, 24000, 44100, 48000)
+            for bitrate in (8, 32, 64, 72, 128, 144, 240, 320)
+        ]
+        script = "\n".join(parts) + f"""
+const cases = {json.dumps(cases)};
+console.log(JSON.stringify({{
+  table: STREAM_BITRATES,
+  choices: cases.map(([s, f, r, b]) => {{ const c = icecastQualityChoices(s, f, r, b); return [c.sampleRates, c.sampleRate, c.bitrates, c.bitrate]; }})
+}}));
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "choices.js"
+            path.write_text(script, encoding="utf-8")
+            result = subprocess.run([node, str(path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        found = json.loads(result.stdout)
+        table = {fmt: {str(rate): list(bitrates) for rate, bitrates in rates.items()} for fmt, rates in self.constants.STREAM_BITRATES.items()}
+        self.assertEqual(found["table"], table)
+        self.assertEqual(found["choices"], [list(self.sections.icecast_quality_choices(*case)) for case in cases])
 
 
 if __name__ == "__main__":

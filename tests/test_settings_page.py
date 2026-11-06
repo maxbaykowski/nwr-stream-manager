@@ -248,6 +248,7 @@ let role = "owner";
 const accountIsOwner = () => role === "owner";
 const accountIsReadOnly = () => role === "read_only";
 const window = {location: {search: ""}};
+const history = {state: null};
 const results = {};
 for (const name of ["owner", "administrator", "read_only"]) {
   role = name;

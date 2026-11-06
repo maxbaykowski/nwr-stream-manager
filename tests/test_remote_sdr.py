@@ -1906,7 +1906,12 @@ class RemoteSdrServiceTests(unittest.TestCase):
         client.remote_devices.add("h" * 64, "weather-pi", token="t" * 43, peer_token="p" * 43, address="127.0.0.1", port=1)
         client.update({"notify_sdr_failures": True})
         sent: list[str] = []
-        client._send_stream_problem_notification_async = lambda failure: sent.append(failure["message"])
+        def send(failure, on_delivered=None) -> None:
+            sent.append(failure["message"])
+            if on_delivered is not None:
+                on_delivered()
+
+        client._send_stream_problem_notification_async = send
         reachable = {"value": True}
 
         def use_remote() -> None:
@@ -1945,6 +1950,21 @@ class RemoteSdrServiceTests(unittest.TestCase):
         self.assertEqual(sent, [])
         tick(2000.0 + grace)
         self.assertEqual(sent, ["The remote SDR on weather-pi is not reachable."])
+
+    def test_reachable_again_is_only_said_after_not_reachable_was(self) -> None:
+        client, sent, reachable, use_remote, tick = self.notification_harness()
+        grace = self.wc.STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS
+        # The network is down, so ntfy can't be reached either.
+        client._send_stream_problem_notification_async = lambda failure, on_delivered=None: None
+        use_remote()
+        reachable["value"] = False
+        tick(1000.0)
+        tick(1000.0 + grace)
+        client._send_stream_problem_notification_async = lambda failure, on_delivered=None: sent.append(failure["message"])
+        reachable["value"] = True
+        tick(1100.0)
+        tick(1200.0)
+        self.assertEqual(sent, [])
 
     def test_a_brief_outage_does_not_shorten_the_grace_period_of_the_next(self) -> None:
         client, sent, reachable, use_remote, tick = self.notification_harness()

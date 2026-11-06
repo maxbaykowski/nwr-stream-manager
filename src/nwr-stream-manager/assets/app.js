@@ -1,6 +1,30 @@
 const controls = ["serial", "gain", "ppm_correction", "bias_tee", "gain_auto", "alias_filter_strength", "notify_sdr_failures"];
 const DEFAULT_STREAM_SAMPLE_RATE = 24000;
 const DEFAULT_STREAM_BITRATES = {mp3: 64, ogg: 48};
+const STREAM_SAMPLE_RATE_CHOICES = [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000];
+// The bitrates, in Kbps, each format can stream mono audio at, by sample rate. An MP3 can only use
+// the bitrates MPEG has for its sample rate, and libvorbis won't start outside the range it's tuned
+// for. The server has the same table.
+const MPEG1_BITRATES = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const MPEG2_BITRATES = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+const MPEG25_BITRATES = [8, 16, 24, 32, 40, 48, 56, 64];
+function bitrateSteps(lowest, highest) {
+  const steps = [];
+  for (let bitrate = lowest; bitrate <= highest; bitrate += 8) steps.push(bitrate);
+  return steps;
+}
+const STREAM_BITRATES = {
+  mp3: {
+    8000: MPEG25_BITRATES, 11025: MPEG25_BITRATES,
+    16000: MPEG2_BITRATES, 22050: MPEG2_BITRATES, 24000: MPEG2_BITRATES,
+    32000: MPEG1_BITRATES, 44100: MPEG1_BITRATES, 48000: MPEG1_BITRATES
+  },
+  ogg: {
+    8000: bitrateSteps(8, 40), 11025: bitrateSteps(16, 48),
+    16000: bitrateSteps(16, 96), 22050: bitrateSteps(16, 88), 24000: bitrateSteps(16, 88),
+    32000: bitrateSteps(32, 184), 44100: bitrateSteps(32, 240), 48000: bitrateSteps(32, 240)
+  }
+};
 const STREAM_SERVICE_CUSTOM = "custom";
 const STREAM_SERVICE_GWES = "gwes";
 const STREAM_SERVICE_WEATHERUSA = "weatherusa";
@@ -2487,16 +2511,8 @@ function canDisableEasRecording(stream) {
 }
 
 function populateBitrates() {
-  for (const select of [document.getElementById("icecast_bitrate"), document.getElementById("settings_icecast_bitrate")]) {
-    if (!select || select.options.length) continue;
-    for (let bitrate = 8; bitrate <= 320; bitrate += 8) {
-      const option = document.createElement("option");
-      option.value = String(bitrate);
-      option.textContent = `${bitrate} Kbps`;
-      if (bitrate === 48) option.selected = true;
-      select.appendChild(option);
-    }
-  }
+  clampServiceFields("icecast", STREAM_SERVICE_CUSTOM);
+  clampServiceFields("settings_icecast", STREAM_SERVICE_CUSTOM);
 }
 
 function streamOutputs(stream) {
@@ -2629,41 +2645,66 @@ function setSelectDisabled(id, disabled) {
   if (element) element.disabled = disabled;
 }
 
-function setOptionAvailability(selectId, predicate) {
-  const select = document.getElementById(selectId);
+function icecastValueAllowed(service, name, value) {
+  if (service === STREAM_SERVICE_GWES) return name === "bitrate" ? value >= 64 : true;
+  if (service === STREAM_SERVICE_WEATHERUSA) return name === "bitrate" ? value >= 32 && value <= 56 : value <= 22050;
+  if (service === STREAM_SERVICE_NWRORG) return value === (name === "bitrate" ? 32 : 22050);
+  return true;
+}
+
+function closestChoice(choices, wanted) {
+  // The lower one when two are as close.
+  let closest = choices[0];
+  for (const choice of choices) {
+    if (Math.abs(choice - wanted) < Math.abs(closest - wanted)) closest = choice;
+  }
+  return closest;
+}
+
+// The sample rates and bitrates an Icecast output can be set to, and the ones closest to those
+// asked for: only what the format can stream at and the service allows.
+function icecastQualityChoices(service, format, sampleRate, bitrate) {
+  const table = STREAM_BITRATES[format === "ogg" ? "ogg" : "mp3"];
+  const bitratesAt = rate => table[rate].filter(value => icecastValueAllowed(service, "bitrate", value));
+  const sampleRates = STREAM_SAMPLE_RATE_CHOICES.filter(rate => icecastValueAllowed(service, "sample_rate", rate) && bitratesAt(rate).length);
+  const chosenRate = sampleRates.includes(sampleRate) ? sampleRate : closestChoice(sampleRates, sampleRate);
+  const bitrates = bitratesAt(chosenRate);
+  return {sampleRates, sampleRate: chosenRate, bitrates, bitrate: closestChoice(bitrates, bitrate)};
+}
+
+// What the person last chose, or what the form was filled with, which a list keeps coming back to
+// when it can, such as after trying another sample rate.
+function setPreferredChoice(id, value) {
+  const select = document.getElementById(id);
   if (!select) return;
-  let selectedStillAvailable = false;
-  for (const option of select.options) {
-    const allowed = predicate(Number(option.value));
-    option.disabled = !allowed;
-    if (option.selected && allowed) selectedStillAvailable = true;
-  }
-  if (!selectedStillAvailable) {
-    for (const option of select.options) {
-      if (!option.disabled) {
-        select.value = option.value;
-        break;
-      }
-    }
-  }
+  select.dataset.preferred = String(value);
+  setValue(id, value);
+}
+
+function preferredChoice(select, fallback) {
+  const preferred = Number(select.dataset.preferred || select.value);
+  return Number.isFinite(preferred) && preferred > 0 ? preferred : fallback;
+}
+
+function setSelectChoices(select, values, chosen, unit) {
+  // Changed in place, so the choices that stay aren't remade while someone's on the list.
+  syncSelectOptions(select, values.map(value => ({value, label: `${value} ${unit}`})));
+  if (select.value !== String(chosen)) select.value = String(chosen);
 }
 
 function clampServiceFields(prefix, service) {
-  if (service === STREAM_SERVICE_GWES) {
-    setOptionAvailability(`${prefix}_bitrate`, value => value >= 64);
-    setOptionAvailability(`${prefix}_sample_rate`, () => true);
-  } else if (service === STREAM_SERVICE_WEATHERUSA) {
-    setOptionAvailability(`${prefix}_bitrate`, value => value >= 32 && value <= 56);
-    setOptionAvailability(`${prefix}_sample_rate`, value => value <= 22050);
-  } else if (service === STREAM_SERVICE_NWRORG) {
-    setOptionAvailability(`${prefix}_bitrate`, value => value === 32);
-    setOptionAvailability(`${prefix}_sample_rate`, value => value === 22050);
-    setValue(`${prefix}_bitrate`, 32);
-    setValue(`${prefix}_sample_rate`, 22050);
-  } else {
-    setOptionAvailability(`${prefix}_bitrate`, () => true);
-    setOptionAvailability(`${prefix}_sample_rate`, () => true);
-  }
+  const sampleRateSelect = document.getElementById(`${prefix}_sample_rate`);
+  const bitrateSelect = document.getElementById(`${prefix}_bitrate`);
+  if (!sampleRateSelect || !bitrateSelect) return;
+  const format = prefix === "settings_icecast" ? selectedSettingsFormat() : selectedWizardFormat();
+  const choices = icecastQualityChoices(
+    service,
+    format,
+    preferredChoice(sampleRateSelect, 24000),
+    preferredChoice(bitrateSelect, DEFAULT_STREAM_BITRATES[format] || 64)
+  );
+  setSelectChoices(sampleRateSelect, choices.sampleRates, choices.sampleRate, "Hz");
+  setSelectChoices(bitrateSelect, choices.bitrates, choices.bitrate, "Kbps");
 }
 
 function applyServiceControls(prefix, service) {
@@ -2711,8 +2752,8 @@ function setIcecastForm(icecast) {
   const format = (icecast && icecast.format) || "mp3";
   setChecked("icecast_format_mp3", preset.format === "mp3");
   setChecked("icecast_format_ogg", preset.format === "ogg");
-  setValue("icecast_sample_rate", preset.sample_rate || 24000);
-  setValue("icecast_bitrate", preset.bitrate || (format === "mp3" ? 64 : 48));
+  setPreferredChoice("icecast_sample_rate", preset.sample_rate || 24000);
+  setPreferredChoice("icecast_bitrate", preset.bitrate || (format === "mp3" ? 64 : 48));
   setServiceHelp("icecast_service_help", service);
   applyServiceControls("icecast", service);
 }
@@ -2792,8 +2833,8 @@ function setSettingsIcecastForm(icecast) {
   const format = preset.format || "mp3";
   setChecked("settings_icecast_format_mp3", format === "mp3");
   setChecked("settings_icecast_format_ogg", format === "ogg");
-  setValue("settings_icecast_sample_rate", preset.sample_rate || 24000);
-  setValue("settings_icecast_bitrate", preset.bitrate || (format === "mp3" ? 64 : 48));
+  setPreferredChoice("settings_icecast_sample_rate", preset.sample_rate || 24000);
+  setPreferredChoice("settings_icecast_bitrate", preset.bitrate || (format === "mp3" ? 64 : 48));
   setServiceHelp("settings_icecast_service_help", service);
   applyServiceControls("settings_icecast", service);
 }
@@ -3460,13 +3501,9 @@ function renderStreamArchives(resetTimes) {
   }
   form.hidden = false;
   if (!streamArchives.some(item => item.id === streamArchiveStreamId)) streamArchiveStreamId = streamArchives[0].id;
-  select.replaceChildren(...streamArchives.map(item => {
-    const option = document.createElement("option");
-    option.value = item.id;
-    option.textContent = item.label;
-    return option;
-  }));
-  select.value = streamArchiveStreamId;
+  // Changed in place, so the list someone's on isn't remade under them.
+  syncSelectOptions(select, streamArchives.map(item => ({value: item.id, label: item.label})));
+  if (select.value !== streamArchiveStreamId) select.value = streamArchiveStreamId;
   const archive = streamArchives.find(item => item.id === streamArchiveStreamId);
   setText("stream_archives_heading", downloadOfPlayer ? `Download archived audio from ${archive.callsign || "stream"}` : "Stream archives");
   setText("stream_archives_intro", playing
@@ -8578,6 +8615,11 @@ const SETTINGS_SECTIONS_FROM_OLD_VIEWS = {notifications: "notifications", accoun
 function routeFromLocation() {
   const query = new URLSearchParams(window.location.search);
   const view = query.get("view") || "dashboard";
+  // A choice remembered without changing the address.
+  const kept = history.state;
+  if (kept && typeof kept === "object" && kept.view === view && ["stream_archives", "eas_alerts"].includes(view)) {
+    return routeState(view, kept);
+  }
   if (SETTINGS_SECTIONS_FROM_OLD_VIEWS[view]) {
     return routeState("settings", {section: SETTINGS_SECTIONS_FROM_OLD_VIEWS[view]});
   }
@@ -8615,6 +8657,14 @@ function routeState(view, params = {}) {
 
 function replaceCurrentRoute(view, params = {}) {
   history.replaceState(routeState(view, params), "", routeForView(view, params));
+}
+
+// For a choice made from a list, such as which stream to show: kept where reloading the page and
+// Back and Forward find it, but without changing the address. Screen readers can read out the
+// change to the address bar's text, such as "&stream=" and a stream's ID, while someone's still
+// on the list.
+function rememberCurrentRoute(view, params = {}) {
+  history.replaceState(routeState(view, params), "", window.location.href);
 }
 
 function applyRoute(route) {
@@ -11643,6 +11693,13 @@ for (const formatControl of document.querySelectorAll("input[name='icecast_forma
   });
 }
 
+// First, so the lists below are remade around what was just chosen.
+for (const id of ["icecast_sample_rate", "icecast_bitrate", "settings_icecast_sample_rate", "settings_icecast_bitrate"]) {
+  document.getElementById(id).addEventListener("change", event => {
+    event.target.dataset.preferred = event.target.value;
+  });
+}
+
 document.getElementById("icecast_service").addEventListener("change", event => {
   wizardDirty = true;
   resetWizardForService(event.target.value || STREAM_SERVICE_CUSTOM);
@@ -11717,7 +11774,7 @@ for (const id of [
       resetSettingsForService(event.target.value || STREAM_SERVICE_CUSTOM);
       return;
     }
-    if (id === "settings_icecast_alt_enabled" || id === "settings_icecast_alt_number") {
+    if (id === "settings_icecast_alt_enabled" || id === "settings_icecast_alt_number" || id === "settings_icecast_sample_rate") {
       applyServiceControls("settings_icecast", document.getElementById("settings_icecast_service").value || STREAM_SERVICE_CUSTOM);
     }
     updateOutputFormButtons();
@@ -11733,6 +11790,7 @@ for (const formatControl of document.querySelectorAll("input[name='settings_icec
     if (service === STREAM_SERVICE_WEATHERUSA && (!mount.trim() || isWeatherUsaGeneratedMount(mount, station))) {
       setValue("settings_icecast_mount", weatherUsaMount(station, selectedSettingsFormat()));
     }
+    applyServiceControls("settings_icecast", service);
     updateOutputFormButtons();
   });
 }
@@ -12298,7 +12356,8 @@ document.getElementById("eas_alert_stream").addEventListener("change", event => 
   easAlertPage = 1;
   easAlertListSignature = "";
   easBulkOptionsSignature = "";
-  navigateTo("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}, true, true);
+  rememberCurrentRoute("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage});
+  applyRoute(routeState("eas_alerts", {streamId: easAlertStreamId, page: easAlertPage}));
 });
 
 document.getElementById("open_eas_export").addEventListener("click", () => {
@@ -12860,7 +12919,7 @@ document.getElementById("archive_enabled").addEventListener("change", () => send
 document.getElementById("archive_retention").addEventListener("change", () => sendArchiveSettings());
 document.getElementById("stream_archive_stream").addEventListener("change", event => {
   streamArchiveStreamId = event.target.value;
-  replaceCurrentRoute("stream_archives", {streamId: streamArchiveStreamId});
+  rememberCurrentRoute("stream_archives", {streamId: streamArchiveStreamId});
   renderStreamArchives(true);
 });
 document.getElementById("stream_archive_download_form").addEventListener("submit", () => {

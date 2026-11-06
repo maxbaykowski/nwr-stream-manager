@@ -1536,7 +1536,11 @@ class OutputPageTests(unittest.TestCase):
         _, page, step, _ = self.wizard(token, cookie, {**fields, "step": "credentials", "password": "right"})
         self.assertEqual(step, "quality")
         self.assertIn('<option value="56" selected>56 Kbps</option>', page)
-        self.assertIn('<option value="64" disabled>64 Kbps</option>', page)
+        # Only what WeatherUSA allows is listed at all.
+        bitrates = re.search(r'id="icecast_bitrate".*?</select>', page, re.S).group(0)
+        sample_rates = re.search(r'id="icecast_sample_rate".*?</select>', page, re.S).group(0)
+        self.assertEqual(re.findall(r'value="(\d+)"', bitrates), ["32", "40", "48", "56"])
+        self.assertNotIn('value="24000"', sample_rates)
         _, _, step, _ = self.wizard(token, cookie, {**fields, "step": "quality"}, "Back")
         self.assertEqual(step, "credentials")
         response, _, _, _ = self.wizard(token, cookie, {**fields, "step": "quality", "password": "right", "bitrate": "48", "sample_rate": "22050"}, "Finish")

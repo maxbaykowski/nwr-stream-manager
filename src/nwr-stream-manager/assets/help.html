@@ -479,7 +479,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   <p>The Fallback action section chooses what the stream does when it stops getting audio from the radio, or when there's no signal from the station.</p>
   <dl>
     <dt>Do nothing</dt>
-    <dd>Exactly what it sounds like; it does nothing. Users hear whatever garbage is being streamed, like static.</dd>
+    <dd>Exactly what it sounds like; it does nothing. Users hear whatever garbage is being streamed, like static. If the SDR becomes unplugged or in a locked state users will hear silence.</dd>
     <dt>Disconnect from Icecast outputs</dt>
     <dd>The stream disconnects from all of its Icecast servers, so it drops off the streaming services instead of sending dead air. The stream's Icecast outputs show as <strong>Disconnected (no station audio)</strong> when this happens. Sound card outputs keep playing.</dd>
     <dt>Play fallback audio</dt>

@@ -30,6 +30,8 @@ from .config import (
 from .constants import (
     DEFAULT_STREAM_BITRATES,
     DEFAULT_STREAM_SAMPLE_RATE,
+    STREAM_BITRATES,
+    STREAM_FORMAT_NAMES,
     STATIONS_ASSET_PATH,
     STREAM_CONFIG_FILE_NAME,
     STREAM_SAMPLE_RATES,
@@ -119,8 +121,9 @@ def load_streams(streams_directory: Path, legacy_path: Path) -> list[dict[str, A
             migrate_stream_notch_width(stream)
             migrate_stream_volume_multiplier(stream)
             removed = remove_stream_deemphasis_setting(stream) or removed
+            removed = fix_stream_bitrates(stream) or removed
         if removed:
-            LOG.info("removed the old NWR de-emphasis setting from saved streams; every stream now always has it")
+            LOG.info("updated saved streams to current settings")
             save_streams(streams_directory, streams)
         return streams
     if (streams_directory / STREAMS_DIRECTORY_MARKER_FILE_NAME).exists():
@@ -130,6 +133,7 @@ def load_streams(streams_directory: Path, legacy_path: Path) -> list[dict[str, A
         migrate_stream_notch_width(stream)
         migrate_stream_volume_multiplier(stream)
         remove_stream_deemphasis_setting(stream)
+        fix_stream_bitrates(stream)
     if streams:
         LOG.info("migrating %s stream configuration(s) from %s to %s", len(streams), legacy_path, streams_directory)
         save_streams(streams_directory, streams)
@@ -159,6 +163,40 @@ def migrate_stream_volume_multiplier(stream: dict[str, Any]) -> None:
     if limited != multiplier:
         LOG.info("volume multiplier %s for stream %s is out of range; using %s", multiplier, stream.get("id"), limited)
         volume["multiplier"] = limited
+
+
+def nearest_stream_bitrate(stream_format: str, sample_rate: int, bitrate: int) -> int:
+    """The bitrate a format can use at a sample rate that's closest to bitrate, the lower one
+    when two are as close, which is the one LAME uses for an MP3."""
+    return min(STREAM_BITRATES[stream_format][sample_rate], key=lambda allowed: (abs(allowed - bitrate), allowed))
+
+
+def fix_stream_bitrates(stream: dict[str, Any]) -> bool:
+    """Saved before bitrates were limited to what each format can use at its sample rate: an MP3
+    output gets the bitrate LAME has really been streaming at, and an OGG one, which libvorbis
+    wouldn't start, the closest it can use."""
+    fixed = False
+    for output in stream_outputs(stream):
+        icecast = output.get("icecast")
+        if not isinstance(icecast, dict):
+            continue
+        stream_format = icecast.get("format", "mp3")
+        try:
+            sample_rate = int(icecast.get("sample_rate", DEFAULT_STREAM_SAMPLE_RATE))
+            bitrate = int(icecast.get("bitrate", DEFAULT_STREAM_BITRATES.get(stream_format, 64)))
+        except (TypeError, ValueError):
+            continue
+        if stream_format not in STREAM_BITRATES or sample_rate not in STREAM_BITRATES[stream_format]:
+            continue
+        if bitrate in STREAM_BITRATES[stream_format][sample_rate]:
+            continue
+        icecast["bitrate"] = nearest_stream_bitrate(stream_format, sample_rate, bitrate)
+        LOG.info(
+            "changed the bitrate of an Icecast output for stream %s from %s to %s Kbps, the closest %s can use at %s Hz",
+            stream.get("id"), bitrate, icecast["bitrate"], STREAM_FORMAT_NAMES[stream_format], sample_rate,
+        )
+        fixed = True
+    return fixed
 
 
 def remove_stream_deemphasis_setting(stream: dict[str, Any]) -> bool:
@@ -660,8 +698,11 @@ def validate_icecast_payload(raw: Any) -> dict[str, Any]:
         bitrate = int(raw.get("bitrate", DEFAULT_STREAM_BITRATES[stream_format]))
     except (TypeError, ValueError) as exc:
         raise ValueError("Icecast bitrate must be a number") from exc
-    if bitrate < 8 or bitrate > 320 or bitrate % 8 != 0:
-        raise ValueError("Icecast bitrate must be from 8 through 320 Kbps in 8 Kbps steps")
+    if bitrate not in STREAM_BITRATES[stream_format][sample_rate]:
+        raise ValueError(
+            f"{STREAM_FORMAT_NAMES[stream_format]} can't stream at {bitrate} Kbps with a sample rate of {sample_rate} Hz. "
+            "Choose another bitrate or sample rate."
+        )
     if service == STREAM_SERVICE_GWES:
         if normalized_host != "ingest.wxr.gwes-cdn.net" or port != 10000:
             raise ValueError("GWES Weather Radio requires its predefined Icecast server.")

@@ -270,6 +270,9 @@ class IcecastStreamWorker:
         self._soundcard_owner = object()
         # Set while this stream's fallback action has its Icecast outputs disconnected.
         self.icecast_disconnected = threading.Event()
+        # When the stream last lost its station audio, the SDR delivering no IQ or no usable
+        # signal; None while it has it.
+        self.fallback_since: float | None = None
         self.lock = threading.Lock()
 
     @property
@@ -635,7 +638,6 @@ class IcecastStreamWorker:
         # the station having no signal, or one handing over to the other. It is
         # only cleared once IQ is flowing and the signal is not lost, so a
         # dropout during a no-signal period does not restart the delay.
-        fallback_since: float | None = None
         idle_output_active = False
         idle_next_frame_at: float | None = None
         source_generation = getattr(self.fanout, "generation", 0)
@@ -775,7 +777,7 @@ class IcecastStreamWorker:
                 except queue.Empty:
                     pass
                 end_fallback()
-                fallback_since = None
+                self.fallback_since = None
                 frame_buffer.clear()
                 idle_next_frame_at = None
                 test_mode_next_frame_at = None
@@ -792,7 +794,7 @@ class IcecastStreamWorker:
                     real_test_iq_frame_buffer.clear()
                     real_test_iq_frames.clear()
                     end_fallback()
-                    fallback_since = None
+                    self.fallback_since = None
                     idle_next_frame_at = None
                     test_mode_next_frame_at = time.monotonic()
                     test_crossfade_state = "enter"
@@ -848,7 +850,7 @@ class IcecastStreamWorker:
                     alias_filter_transition_hz(CHANNEL_IQ_ALIAS_TRANSITION_HZ, self.alias_filter_strength_provider())
                 )
                 self.signal_presence.reset()
-                fallback_since = None
+                self.fallback_since = None
                 test_frame_buffer.clear()
                 real_test_iq_frame_buffer.clear()
                 real_test_iq_frames.clear()
@@ -881,15 +883,16 @@ class IcecastStreamWorker:
                     self._end_fallback_action(fallback_engaged_as)
                     fallback_engaged = False
                     fallback_state.reset()
-                if fallback_since is None:
-                    fallback_since = last_real_audio
-                idle_seconds = time.monotonic() - fallback_since
-                if fallback_action.action == STREAM_FALLBACK_NONE:
-                    fallback_state.reset()
-                    idle_next_frame_at = None
-                    continue
+                if self.fallback_since is None:
+                    self.fallback_since = last_real_audio
+                idle_seconds = time.monotonic() - self.fallback_since
                 for _ in range(frames_due):
-                    if not fallback_engaged and idle_seconds < fallback_action.delay_seconds:
+                    # Doing nothing still sends silence, in time, like the other actions before
+                    # their delay: without any, Icecast servers drop the stream after their own
+                    # timeout, while it looks connected here.
+                    if fallback_action.action == STREAM_FALLBACK_NONE or (
+                        not fallback_engaged and idle_seconds < fallback_action.delay_seconds
+                    ):
                         fallback_state.reset()
                         self._write_pcm(STREAM_SILENCE_FRAME, STREAM_SILENCE_FLOAT_FRAME)
                     else:
@@ -956,7 +959,7 @@ class IcecastStreamWorker:
                     self.signal_meter.reset()
                     self.signal_presence.reset()
                     end_fallback()
-                    fallback_since = None
+                    self.fallback_since = None
                 channelizer = IqChannelizer(
                     input_rate=batch.sample_rate,
                     center_frequency_hz=batch.center_frequency_hz,
@@ -986,7 +989,7 @@ class IcecastStreamWorker:
                     self.signal_meter.reset()
                     self.signal_presence.reset()
                     end_fallback()
-                    fallback_since = None
+                    self.fallback_since = None
             current_gain = self.gain_provider()
             if current_gain != signal_meter_gain:
                 # RTL-SDR gain scales signal and noise together, so a step
@@ -1023,18 +1026,18 @@ class IcecastStreamWorker:
             if fallback_action.action != STREAM_FALLBACK_NONE and self.signal_presence.lost:
                 # Keep demodulating so the meter sees the signal return, but after
                 # the fallback delay take the stream's fallback action.
-                if fallback_since is None:
-                    fallback_since = now
-                if not fallback_engaged and now - fallback_since >= fallback_action.delay_seconds:
+                if self.fallback_since is None:
+                    self.fallback_since = now
+                if not fallback_engaged and now - self.fallback_since >= fallback_action.delay_seconds:
                     fallback_engaged = True
                     fallback_engaged_as = fallback_action.action
-                    self._begin_fallback_action(fallback_engaged_as, now - fallback_since, "without a usable signal")
+                    self._begin_fallback_action(fallback_engaged_as, now - self.fallback_since, "without a usable signal")
             else:
                 if fallback_engaged:
                     self._end_fallback_action(fallback_engaged_as)
                     fallback_engaged = False
                 fallback_state.reset()
-                fallback_since = None
+                self.fallback_since = None
             with self.lock:
                 self.last_audio_at = time.time()
             for frame in frame_buffer.push(audio):
@@ -1135,9 +1138,11 @@ class IcecastStreamWorker:
     def _has_connected_outputs(self) -> bool:
         return (
             any(encoder_group.has_outputs() for encoder_group in list(self.encoder_groups.values()))
-            # Icecast outputs held off by the fallback action still count, or the
-            # stream would stop listening for the station to come back.
+            # Icecast outputs held off by the fallback action, or kept off after being dropped
+            # while it was coming, still count, or the stream would stop listening for the
+            # station to come back.
             or (self.icecast_disconnected.is_set() and bool(self.outputs))
+            or any(getattr(output, "held_off", False) for output in list(self.outputs.values()))
             or self.has_monitor_sources()
             or self.has_soundcard_taps()
             or self.has_eas_recorder()
@@ -1448,6 +1453,10 @@ class IcecastOutputWriter:
         self.connection_lock = threading.Lock()
         self.current_source: IcecastSource | None = None
         self.current_sink = None
+        # Dropped by the server while the stream had no station audio and was going to
+        # disconnect anyway: kept off until the audio is back, not reconnected only to be
+        # disconnected again.
+        self.held_off = False
 
     def start(self) -> None:
         self.thread.start()
@@ -1504,6 +1513,14 @@ class IcecastOutputWriter:
             except Exception:
                 pass
 
+    def _disconnecting_without_station_audio(self) -> bool:
+        """Whether the stream has lost its station audio and its fallback action disconnects
+        Icecast outputs: such an output that's dropped stays off rather than reconnecting."""
+        if getattr(self.runtime, "fallback_since", None) is None:
+            return False
+        fallback_action = getattr(self.runtime, "fallback_action", None)
+        return fallback_action is not None and fallback_action().action == STREAM_FALLBACK_DISCONNECT_ICECAST
+
     def _set_status(self, status: str, error: str | None = None, problem: str = "") -> None:
         with self.lock:
             self.status = status
@@ -1517,12 +1534,13 @@ class IcecastOutputWriter:
         # The last connection failure logged, so the same one isn't logged again on every retry.
         last_failure = ""
         while not self.stop_event.is_set():
-            if disconnected is not None and disconnected.is_set():
+            if (disconnected is not None and disconnected.is_set()) or (self.held_off and self._disconnecting_without_station_audio()):
                 # The stream's fallback action: stay off the Icecast server until
                 # the station is back, rather than retrying as after a failure.
                 self._set_status("standby")
                 self.stop_event.wait(0.5)
                 continue
+            self.held_off = False
             source = None
             sink = None
             encoder_group = None
@@ -1555,6 +1573,15 @@ class IcecastOutputWriter:
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
+                if self._disconnecting_without_station_audio():
+                    LOG.info(
+                        "Icecast output %s was dropped while its stream has no station audio; staying disconnected until it returns: %s",
+                        self.output.get("id"),
+                        exc,
+                    )
+                    self.held_off = True
+                    self._set_status("standby")
+                    continue
                 self._set_status("needs-attention", friendly_stream_error(exc), icecast_problem(exc))
                 # Retried every few seconds: said once, and again only if it fails differently,
                 # so a server that stays down doesn't push everything else out of the log.

@@ -6,13 +6,15 @@ import logging
 import threading
 import time
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Callable
 
 from .constants import (
     RTL_NOTIFICATION_NO_DATA_SECONDS,
     STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS,
+    STREAM_NOTIFICATION_ICECAST_GRACE_SECONDS,
     STREAM_NOTIFICATION_RECOVERY_SECONDS,
     STREAM_NOTIFICATION_REPEAT_SECONDS,
+    STREAM_NOTIFICATION_RETRY_SECONDS,
 )
 from .eas_alerts import (
     eas_alert_id,
@@ -201,22 +203,31 @@ class NotificationServiceMixin:
             )
             state["last_seen"] = now
             state["failure"] = failure
-            if now - float(state.get("first_seen", now)) < STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS:
+            grace = (
+                STREAM_NOTIFICATION_ICECAST_GRACE_SECONDS
+                if failure.get("category") == "icecast"
+                else STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS
+            )
+            if now - float(state.get("first_seen", now)) < grace:
                 continue
-            last_sent = float(state.get("last_sent", 0.0))
-            if last_sent and now - last_sent < STREAM_NOTIFICATION_REPEAT_SECONDS:
+            if not self._stream_notification_due(state, now):
                 continue
-            self._send_stream_problem_notification_async(failure)
+            self._send_stream_problem_notification_async(failure, on_delivered=lambda state=state: state.update(delivered=True))
             state["last_sent"] = now
         for key, state in list(self.stream_notification_states.items()):
             if key in active_failure_keys:
                 continue
             last_seen = float(state.get("last_seen", 0.0))
+            if not state.get("delivered") and key in healthy_keys:
+                # Working again before anyone was told: forgotten at once, so another failure
+                # soon after waits its own grace period instead of finishing this one's.
+                self.stream_notification_states.pop(key, None)
+                continue
             if now - last_seen >= STREAM_NOTIFICATION_RECOVERY_SECONDS:
                 self.stream_notification_states.pop(key, None)
                 # Only announce a recovery the user was told about the failure
                 # for, and only when the output or signal is seen working.
-                if state.get("last_sent") and key in healthy_keys:
+                if state.get("delivered") and key in healthy_keys:
                     self._send_stream_recovery_notification_async(state.get("failure") or {})
         self._process_recorded_eas_alert_notifications_locked()
 
@@ -261,12 +272,24 @@ class NotificationServiceMixin:
         state["last_seen"] = now
         if now - float(state.get("first_seen", now)) < STREAM_NOTIFICATION_FAILURE_GRACE_SECONDS:
             return
-        last_sent = float(state.get("last_sent", 0.0))
-        if last_sent and now - last_sent < STREAM_NOTIFICATION_REPEAT_SECONDS:
+        if not self._stream_notification_due(state, now):
             return
-        self._send_stream_problem_notification_async(failure)
+
+        def delivered(state: dict[str, Any] = state, failure: dict[str, Any] = failure) -> None:
+            state.update(delivered=True, notified_failure=failure)
+
+        self._send_stream_problem_notification_async(failure, on_delivered=delivered)
         state["last_sent"] = now
-        state["notified_failure"] = failure
+
+    @staticmethod
+    def _stream_notification_due(state: dict[str, Any], now: float) -> bool:
+        """Whether a problem should be notified now: the first time, again an hour after it was
+        last sent, or sooner when ntfy couldn't be reached to send it."""
+        last_sent = float(state.get("last_sent", 0.0))
+        if not last_sent:
+            return True
+        wait = STREAM_NOTIFICATION_REPEAT_SECONDS if state.get("delivered") else STREAM_NOTIFICATION_RETRY_SECONDS
+        return now - last_sent >= wait
 
     def _rtl_notification_failure_locked(self, now: float) -> dict[str, Any] | None:
         if not self.settings.notify_sdr_failures:
@@ -441,7 +464,11 @@ class NotificationServiceMixin:
             }
         )
 
-    def _send_stream_problem_notification_async(self, failure: dict[str, Any]) -> None:
+    def _send_stream_problem_notification_async(
+        self, failure: dict[str, Any], on_delivered: Callable[[], None] | None = None
+    ) -> None:
+        """Sends a notification in the background. on_delivered is called once ntfy has it, so a
+        recovery is only announced for a failure someone was told about."""
         settings = self.notification_settings
         base_url = self.notification_effective_access_url_for_settings(settings)
         target_path = str(failure.get("target_path", "/") or "/")
@@ -470,5 +497,9 @@ class NotificationServiceMixin:
                 LOG.info("sent stream notification: %s", message)
             except Exception as exc:
                 LOG.warning("failed to send stream notification: %s", exc)
+                return
+            if on_delivered is not None:
+                with self.lock:
+                    on_delivered()
 
         threading.Thread(target=send, name="stream-notification-send", daemon=True).start()
