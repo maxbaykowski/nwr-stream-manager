@@ -7,6 +7,7 @@ from fractions import Fraction
 import numpy as np
 from numpy.typing import NDArray
 
+from . import native
 from .liquid_dsp import FirDecimator, IqDcRemover, Oscillator
 
 
@@ -32,14 +33,11 @@ FAST_INTERMEDIATE_HALFBAND_TAPS = 15
 
 def rtl_u8_to_complex64(chunk: bytes | bytearray | memoryview) -> ComplexArray:
     """Convert RTL-SDR unsigned 8-bit interleaved IQ bytes to complex float32."""
-    usable = len(chunk) - (len(chunk) % 2)
-    if usable <= 0:
-        return np.array([], dtype=np.complex64)
-    raw = np.frombuffer(memoryview(chunk)[:usable], dtype=np.uint8).astype(np.float32)
-    centered = (raw - 127.5) / 127.5
-    iq = centered[0::2].astype(np.complex64, copy=False)
-    iq = iq + 1j * centered[1::2].astype(np.complex64, copy=False)
-    return iq.astype(np.complex64, copy=False)
+    pairs = len(chunk) // 2
+    iq = np.empty(pairs, dtype=np.complex64)
+    if pairs:
+        native.u8_iq_to_f32(chunk, iq, pairs)
+    return iq
 
 
 def complex64_to_interleaved_f32(samples: ComplexArray) -> bytes:

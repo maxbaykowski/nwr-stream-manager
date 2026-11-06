@@ -7,6 +7,8 @@ import shutil
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
+from . import native
+
 
 class DependencyCheckError(RuntimeError):
     """Raised when startup dependencies are missing or unusable."""
@@ -194,6 +196,7 @@ def gather_dependency_results(
     find_library: Callable[[str], str | None] = ctypes.util.find_library,
     load_library: Callable[[str], object] = ctypes.CDLL,
     which: Callable[[str], str | None] = shutil.which,
+    load_native: Callable[[], object] | None = None,
 ) -> list[DependencyCheckResult]:
     results: list[DependencyCheckResult] = []
     for dependency in PYTHON_DEPENDENCIES:
@@ -220,6 +223,8 @@ def gather_dependency_results(
             )
         )
 
+    results.append(_check_own_native_library(load_native or native.native_library))
+
     for executable in EXECUTABLE_DEPENDENCIES:
         path = which(executable)
         results.append(
@@ -244,6 +249,15 @@ def format_dependency_summary(results: Iterable[DependencyCheckResult]) -> str:
         f"{kind}: {', '.join(sorted(names))}"
         for kind, names in sorted(grouped.items())
     )
+
+
+def _check_own_native_library(load_native: Callable[[], object]) -> DependencyCheckResult:
+    """NWR Stream Manager's own native library, built when it's installed."""
+    try:
+        load_native()
+    except OSError as exc:
+        return DependencyCheckResult(name="nwr_native", kind="native", required=True, available=False, detail=str(exc))
+    return DependencyCheckResult(name="nwr_native", kind="native", required=True, available=True, detail="NWR Stream Manager's native library")
 
 
 def _check_native_dependency(

@@ -110,6 +110,23 @@ class DependencyCheckTests(unittest.TestCase):
         self.assertFalse(multimon.available)
         self.assertIn("PATH", multimon.detail)
 
+    def test_a_missing_native_library_is_reported(self) -> None:
+        def load_native():
+            raise self.dependency_check.native.NativeLibraryError("NWR Stream Manager's native library is missing.")
+
+        results = self.dependency_check.gather_dependency_results(
+            find_spec=self.all_python_modules_present,
+            find_library=self.all_native_libraries_present,
+            load_library=self.load_complete_library,
+            which=lambda name: f"/usr/bin/{name}",
+            load_native=load_native,
+        )
+        own = next(result for result in results if result.name == "nwr_native")
+
+        self.assertFalse(own.available)
+        self.assertTrue(own.required)
+        self.assertIn("native library is missing", own.detail)
+
 
 if __name__ == "__main__":
     unittest.main()

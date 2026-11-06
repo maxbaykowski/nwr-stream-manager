@@ -29,6 +29,8 @@ need:
 - `libmicrohttpd` runtime library for the web interface (`libmicrohttpd12` on
   Debian and Raspberry Pi OS, `libmicrohttpd12t64` on newer Debian releases,
   `libmicrohttpd` on Fedora)
+- a C compiler, `gcc`, which builds NWR Stream Manager's own native library
+  while it installs and upgrades (`gcc` on Debian, Raspberry Pi OS and Fedora)
 - optionally, `libqrencode` for the QR code shown when setting up two-step
   verification (`libqrencode4` on Debian and Raspberry Pi OS, `qrencode-libs` on
   Fedora); without it, the key is typed into the authenticator app instead
