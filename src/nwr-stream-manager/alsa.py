@@ -597,8 +597,9 @@ class AlsaStreamPlaybackTap:
     def push_pcm(self, pcm_s16le: bytes) -> None:
         self.buffer.push_mono_pcm(pcm_s16le)
 
-    def push_float(self, samples: np.ndarray) -> None:
-        self.buffer.push_mono_float(samples)
+    def push_float(self, samples) -> None:
+        # Streams give any float32 buffer, such as an array.array.
+        self.buffer.push_mono_float(np.asarray(samples, dtype=np.float32))
 
     def set_channel_mode(self, channel_mode: str) -> None:
         if channel_mode not in ALSA_CHANNEL_MODES:
@@ -824,11 +825,12 @@ class AlsaSharedPlaybackTap:
         with self.lock:
             return bool(self.inputs)
 
-    def push_float(self, input_id: str, samples: np.ndarray) -> None:
+    def push_float(self, input_id: str, samples) -> None:
         with self.lock:
             item = self.inputs.get(str(input_id))
         if item is not None:
-            item[1].push(samples)
+            # Streams give any float32 buffer, such as an array.array.
+            item[1].push(np.asarray(samples, dtype=np.float32))
 
     def snapshot(self) -> dict[str, object]:
         with self.lock:
@@ -1264,12 +1266,12 @@ class FloatPcmResampler:
             return np.empty(0, dtype=np.float32)
         if self.stream is None:
             return samples
-        return self.stream.process(samples)
+        return np.asarray(self.stream.process(samples), dtype=np.float32)
 
     def flush(self) -> np.ndarray:
         if self.stream is None:
             return np.empty(0, dtype=np.float32)
-        return self.stream.process(np.empty(0, dtype=np.float32), last=True)
+        return np.asarray(self.stream.process(b"", last=True), dtype=np.float32)
 
 
 def s16le_to_float32(pcm_s16le: bytes) -> np.ndarray:

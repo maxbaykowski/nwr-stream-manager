@@ -83,8 +83,9 @@ class AudioEffectsProcessor:
         # Highpass, lowpass and notch combined into one filter; None while all are off.
         self.eq_filter = _build_eq_filter(None, self.config, self.sample_rate)
 
-    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
-        audio = self.comfort_noise.process(samples)
+    def process(self, samples) -> NDArray[np.float32]:
+        # Frames come as any float32 buffer, such as an array.array, read where they are.
+        audio = self.comfort_noise.process(np.asarray(samples, dtype=np.float32))
         audio = self.deemphasis.process_float(audio) * NWR_DEEMPHASIS_MAKEUP_GAIN
         audio = self.dc_blocker.process(audio)
         if self.eq_filter is not None:

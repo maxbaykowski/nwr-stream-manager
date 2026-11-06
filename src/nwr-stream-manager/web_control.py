@@ -291,7 +291,7 @@ from .state_files import (
     systemd_directory_path,
 )
 from .storage import directory_size_bytes, format_storage_bytes, storage_status_message, StorageMonitor
-from .stream_audio import FloatFrameBuffer, load_web_fallback_audio, next_web_fallback_frame
+from .stream_audio import ComplexFrameBuffer, FloatFrameBuffer, load_web_fallback_audio, next_web_fallback_frame
 from .stream_archive import stream_archive_directory
 from .stream_config import (
     audio_config_from_stream,

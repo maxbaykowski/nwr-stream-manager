@@ -15,6 +15,7 @@ never closed.
 
 from __future__ import annotations
 
+import array
 import ctypes
 import glob
 import os
@@ -28,7 +29,7 @@ from typing import Any
 PACKAGE_DIRECTORY = Path(__file__).resolve().parent
 SOURCE = PACKAGE_DIRECTORY / "native" / "nwr_native.c"
 # Matches NWR_NATIVE_ABI in the C source.
-ABI = 2
+ABI = 3
 # How it's compiled, here and by setup.py on installation:
 # - fast on weak CPUs: optimized, and free to turn loops into vector instructions, since
 #   nothing relies on floating-point exception flags;
@@ -47,8 +48,9 @@ COMPILE_FLAGS = [
     "-fstack-clash-protection",
 ]
 LINK_FLAGS = ["-Wl,-z,relro", "-Wl,-z,now", "-Wl,-z,noexecstack"]
-ROUND_NEAREST = 0
+# Flags for nwr_f32_to_s16, as in the C source.
 ROUND_TRUNCATE = 1
+CLIP_SYMMETRIC = 2
 
 _library: ctypes.CDLL | None = None
 _library_lock = threading.Lock()
@@ -132,16 +134,29 @@ def native_library() -> ctypes.CDLL:
         library.nwr_u8_iq_to_f32.argtypes = [pointer, size, pointer, size, size]
         library.nwr_f32_to_s16.restype = status
         library.nwr_f32_to_s16.argtypes = [pointer, size, pointer, size, size, ctypes.c_float, ctypes.c_int]
+        library.nwr_f32_to_u8.restype = status
+        library.nwr_f32_to_u8.argtypes = [pointer, size, pointer, size, size]
+        library.nwr_f32_downmix.restype = status
+        library.nwr_f32_downmix.argtypes = [pointer, size, pointer, size, size, size]
         library.nwr_s16_to_f32.restype = status
         library.nwr_s16_to_f32.argtypes = [pointer, size, pointer, size, size, ctypes.c_float]
         _library = library
         return library
 
 
+# Buffer formats (as memoryview gives them) taken as each type of sample. Plain bytes, such as
+# bytes and bytearrays, are taken as any type; anything else of the wrong type, such as a
+# float64 numpy array, is refused rather than misread.
+RAW = ("B", "b", "c", "<B", "<b", "<c", "=B", "=b", "=c")
+FLOAT32 = ("f", "<f", "=f", "Zf", "<Zf", "=Zf")
+INT16 = ("h", "<h", "=h")
+UINT8 = RAW
+
+
 class _Buffer:
     """A buffer's address and size, kept alive for as long as C uses it."""
 
-    def __init__(self, buffer: Any, writable: bool = False) -> None:
+    def __init__(self, buffer: Any, formats: tuple[str, ...], writable: bool = False) -> None:
         if isinstance(buffer, bytes) and not writable:
             # Bytes can't be written, but C can read them where they are.
             self._keep: Any = buffer
@@ -149,6 +164,8 @@ class _Buffer:
             self.nbytes = len(buffer)
             return
         view = memoryview(buffer)
+        if view.format not in formats and view.format not in RAW:
+            raise TypeError(f"the native library expected {formats[0]!r} samples, not {view.format!r}")
         if not view.c_contiguous:
             raise ValueError("native library buffers must be contiguous")
         if view.format != "B" or view.ndim != 1:
@@ -177,7 +194,7 @@ def _checked(status: int, what: str) -> None:
 def u8_iq_to_f32(data: Any, out: Any, pairs: int) -> None:
     """RTL-SDR samples, unsigned 8-bit I then Q, to interleaved float32 I/Q from -1 to 1.
     out holds pairs * 2 float32s, such as pairs complex64s."""
-    source, target = _Buffer(data), _Buffer(out, writable=True)
+    source, target = _Buffer(data, UINT8), _Buffer(out, FLOAT32, writable=True)
     _need(source, pairs * 2, "the RTL-SDR samples")
     _need(target, pairs * 8, "the output")
     _checked(
@@ -186,27 +203,87 @@ def u8_iq_to_f32(data: Any, out: Any, pairs: int) -> None:
     )
 
 
-def f32_to_s16(samples: Any, out: Any, scale: float, *, truncate: bool = False) -> None:
+def f32_to_s16(samples: Any, out: Any, scale: float, *, truncate: bool = False, symmetric: bool = False) -> None:
     """Float32 audio to signed 16-bit: multiplied by scale, clipped to the 16-bit range, then
-    rounded to the nearest (halves to even) or, with truncate, toward zero. Something that
-    isn't a number becomes silence."""
-    source, target = _Buffer(samples), _Buffer(out, writable=True)
+    rounded to the nearest (halves to even) or, with truncate, toward zero. With symmetric,
+    clipped to -32767 rather than -32768, as audio clipped to -1.0 to 1.0, then scaled by
+    32767, is. Something that isn't a number becomes silence."""
+    source, target = _Buffer(samples, FLOAT32), _Buffer(out, INT16, writable=True)
     count = source.nbytes // 4
     _need(target, count * 2, "the output")
+    flags = (ROUND_TRUNCATE if truncate else 0) | (CLIP_SYMMETRIC if symmetric else 0)
     _checked(
-        native_library().nwr_f32_to_s16(
-            source.address, count, target.address, target.nbytes // 2, count, scale, ROUND_TRUNCATE if truncate else ROUND_NEAREST
-        ),
+        native_library().nwr_f32_to_s16(source.address, count, target.address, target.nbytes // 2, count, scale, flags),
         "converting audio to 16-bit",
+    )
+
+
+def f32_to_u8(samples: Any, out: Any) -> None:
+    """Float32 I/Q from -1 to 1 to the RTL-SDR's unsigned 8-bit samples, 127.5 being zero."""
+    source, target = _Buffer(samples, FLOAT32), _Buffer(out, UINT8, writable=True)
+    count = source.nbytes // 4
+    _need(target, count, "the output")
+    _checked(
+        native_library().nwr_f32_to_u8(source.address, count, target.address, target.nbytes, count),
+        "converting I/Q to 8-bit",
+    )
+
+
+def f32_downmix(samples: Any, out: Any, channels: int) -> None:
+    """Interleaved float32 audio with that many channels to mono, each frame averaged.
+    An average that isn't a finite number becomes silence."""
+    if channels < 1:
+        raise ValueError("audio needs at least one channel")
+    source, target = _Buffer(samples, FLOAT32), _Buffer(out, FLOAT32, writable=True)
+    frames = source.nbytes // 4 // channels
+    _need(target, frames * 4, "the output")
+    _checked(
+        native_library().nwr_f32_downmix(source.address, source.nbytes // 4, target.address, target.nbytes // 4, frames, channels),
+        "mixing audio to mono",
     )
 
 
 def s16_to_f32(pcm: Any, out: Any, scale: float) -> None:
     """Signed 16-bit audio to float32, divided by scale."""
-    source, target = _Buffer(pcm), _Buffer(out, writable=True)
+    source, target = _Buffer(pcm, INT16), _Buffer(out, FLOAT32, writable=True)
     count = source.nbytes // 2
     _need(target, count * 4, "the output")
     _checked(
         native_library().nwr_s16_to_f32(source.address, count, target.address, target.nbytes // 4, count, scale),
         "converting 16-bit audio",
     )
+
+
+def floats(count: int) -> array.array:
+    """count float32s, all zero."""
+    return array.array("f", bytes(4 * count))
+
+
+def shorts(count: int) -> array.array:
+    """count signed 16-bit samples, all zero."""
+    return array.array("h", bytes(2 * count))
+
+
+def float_samples(data: Any) -> array.array:
+    """A float32 buffer's samples as an array.array, copied. Anything that isn't float32
+    is refused rather than reinterpreted."""
+    view = memoryview(data)
+    if view.format not in FLOAT32 or not view.c_contiguous:
+        raise TypeError(f"expected contiguous float32 samples, not {view.format!r}")
+    samples = array.array("f")
+    samples.frombytes(view.cast("B") if view.nbytes else b"")
+    return samples
+
+
+def s16_to_float(pcm: Any, scale: float = 32768.0) -> array.array:
+    """Signed 16-bit audio as float32 samples, divided by scale."""
+    out = floats(memoryview(pcm).nbytes // 2)
+    s16_to_f32(pcm, out, scale)
+    return out
+
+
+def float_to_s16(samples: Any, scale: float, *, truncate: bool = False, symmetric: bool = False) -> bytes:
+    """Float32 audio as signed 16-bit bytes; see f32_to_s16."""
+    out = bytearray(memoryview(samples).nbytes // 2)
+    f32_to_s16(samples, out, scale, truncate=truncate, symmetric=symmetric)
+    return bytes(out)

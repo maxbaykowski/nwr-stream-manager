@@ -9,7 +9,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 
 from .config import IQ_SAMPLE_RATE
 from .encoder import EncoderError, PcmResampler
@@ -231,7 +230,8 @@ class OpusEncoder:
         self.frame_samples = round(self.encode_sample_rate * WEBRTC_FRAME_SECONDS)
         self.resampler = PcmResampler(input_sample_rate, self.encode_sample_rate)
         self.closed = False
-        self._pending_samples = np.array([], dtype=np.int16)
+        # 16-bit samples not yet a whole frame.
+        self._pending = bytearray()
         self._configure_ctypes()
         self._encoder = self._create_encoder()
         self.bitrate_kbps = 0
@@ -290,17 +290,14 @@ class OpusEncoder:
     def encode(self, pcm_s16le: bytes) -> list[bytes]:
         if self.closed:
             raise OpusSupportError("Opus encoder is closed")
-        pcm_s16le = self.resampler.process(pcm_s16le)
-        samples = np.frombuffer(pcm_s16le, dtype="<i2")
-        if len(self._pending_samples):
-            samples = np.concatenate((self._pending_samples, samples))
+        self._pending += self.resampler.process(pcm_s16le)
         packets: list[bytes] = []
-        frame_samples = self.frame_samples
-        for offset in range(0, len(samples) - frame_samples + 1, frame_samples):
-            frame = np.ascontiguousarray(samples[offset : offset + frame_samples])
-            packets.append(self._encode_frame(frame))
-        consumed = len(packets) * frame_samples
-        self._pending_samples = np.ascontiguousarray(samples[consumed:])
+        frame_bytes = self.frame_samples * 2
+        used = 0
+        while len(self._pending) - used >= frame_bytes:
+            packets.append(self._encode_frame(self._pending, used))
+            used += frame_bytes
+        del self._pending[:used]
         return packets
 
     def close(self) -> None:
@@ -309,12 +306,13 @@ class OpusEncoder:
         self.closed = True
         self.opus.opus_encoder_destroy(self._encoder)
 
-    def _encode_frame(self, frame: np.ndarray) -> bytes:
+    def _encode_frame(self, pcm: bytearray, offset: int) -> bytes:
+        """One frame of the 16-bit samples, from offset bytes in."""
         output = (ctypes.c_ubyte * WEBRTC_MAX_OPUS_PACKET_BYTES)()
-        pointer = frame.ctypes.data_as(ctypes.POINTER(self.opus.opus_int16))
+        frame = (self.opus.opus_int16 * self.frame_samples).from_buffer_copy(pcm, offset)
         result = self.opus.opus_encode(
             self._encoder,
-            pointer,
+            frame,
             self.frame_samples,
             output,
             WEBRTC_MAX_OPUS_PACKET_BYTES,

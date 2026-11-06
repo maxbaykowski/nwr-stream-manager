@@ -79,6 +79,42 @@ class NativeConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "writable"):
             self.native.s16_to_f32(bytes(4), bytes(8), 32768.0)
 
+    def test_recordings_become_the_same_16_bit_and_8_bit_iq(self) -> None:
+        # I/Q recording downloads, which clip to -1 to 1 first.
+        floats = (self.rng.standard_normal(40_000) * 0.8).astype("<f4")
+        floats[:4] = [1.5, -1.5, 0.5 / 32767, 0.5 / 127.5 - 1.0]
+        clipped = np.clip(floats, -1.0, 1.0)
+        self.assertEqual(
+            self.native.float_to_s16(floats.tobytes(), 32767.0, symmetric=True),
+            np.round(clipped * 32767.0).astype("<i2").tobytes(),
+        )
+        out = bytearray(floats.size)
+        self.native.f32_to_u8(floats.tobytes(), out)
+        self.assertEqual(bytes(out), np.round(clipped * 127.5 + 127.5).astype(np.uint8).tobytes())
+
+    def test_an_announcement_becomes_the_same_mono(self) -> None:
+        for channels in (1, 2, 3):
+            with self.subTest(channels=channels):
+                samples = (self.rng.standard_normal((5_000, channels)) * 0.6).astype(np.float32)
+                samples[0, 0] = np.inf
+                samples[1, 0] = np.nan
+                mono = self.native.floats(5_000)
+                self.native.f32_downmix(samples.tobytes(), mono, channels)
+                expected = np.nan_to_num(samples.mean(axis=1), nan=0.0, posinf=0.0, neginf=0.0)
+                np.testing.assert_array_equal(np.asarray(mono), expected)
+                self.assertEqual(
+                    self.native.float_to_s16(mono, 32767.0, symmetric=True),
+                    (np.clip(expected, -1.0, 1.0) * 32767.0).round().astype("<i2").tobytes(),
+                )
+
+    def test_samples_of_another_type_are_refused_rather_than_misread(self) -> None:
+        with self.assertRaises(TypeError):
+            self.native.float_to_s16(np.zeros(4, dtype=np.float64), 32767.0)
+        with self.assertRaises(TypeError):
+            self.native.s16_to_float(array.array("i", [0, 0]))
+        with self.assertRaises(TypeError):
+            self.native.float_samples(np.zeros(4, dtype=np.float64))
+
     def test_buffers_that_overlap_are_refused(self) -> None:
         shared = bytearray(64)
         with self.assertRaisesRegex(ValueError, "refused"):

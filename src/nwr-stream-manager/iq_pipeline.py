@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import logging
 import math
 import queue
@@ -9,8 +10,6 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any
-
-import numpy as np
 
 from .config import IQ_SAMPLE_RATE
 from .constants import (
@@ -43,7 +42,7 @@ from .dsp import (
     DEFAULT_ALIAS_ATTENUATION_DB,
     IqChannelizer,
     IqDcBlocker,
-    rtl_u8_to_complex64,
+    iq_to_complex64,
     update_decimator_alias_filter,
 )
 from .models import IqFileSourceConfig, IqSampleBatch
@@ -84,10 +83,12 @@ def alias_filter_attenuation_db(base_attenuation_db: float, strength: int | floa
 
 
 def iq_batch_byte_count(batch: RtlSampleBatch | IqSampleBatch) -> int:
-    data = batch.data
-    if isinstance(data, np.ndarray):
-        return int(data.nbytes)
-    return len(data)
+    return memoryview(batch.data).nbytes
+
+
+def iq_sample_count(data) -> int:
+    """How many I/Q pairs float32 I/Q holds."""
+    return memoryview(data).nbytes // 8
 
 
 def iq_batch_sample_count_from_bytes(byte_count: int, source: Any) -> int:
@@ -241,9 +242,9 @@ class IqFileCaptureSource:
                         continue
                     if float_count % 2:
                         raw = raw[: (float_count - 1) * 4]
-                    values = np.frombuffer(raw, dtype="<f4")
-                    iq = (values[0::2] + 1j * values[1::2]).astype(np.complex64, copy=False)
-                    if iq.size == 0:
+                    iq = array.array("f")
+                    iq.frombytes(raw)
+                    if not iq:
                         continue
                     self._offer(
                         IqSampleBatch(
@@ -254,7 +255,7 @@ class IqFileCaptureSource:
                     )
                     with self.stats_lock:
                         self.current_sample_offset = handle.tell() // 8
-                    next_emit_at += float(iq.size) / float(self.config.sample_rate)
+                    next_emit_at += float(len(iq) // 2) / float(self.config.sample_rate)
                     delay = next_emit_at - time.monotonic()
                     if delay > 0:
                         self.stop_event.wait(delay)
@@ -340,13 +341,13 @@ class IqFileCaptureSource:
     def _record_offered_item(self, item: IqSampleBatch) -> None:
         with self.stats_lock:
             self.offered_batches += 1
-            self.offered_bytes += item.data.nbytes
+            self.offered_bytes += iq_batch_byte_count(item)
             self.last_offer_at = time.monotonic()
 
     def _record_dropped_item(self, item: IqSampleBatch) -> None:
         with self.stats_lock:
             self.dropped_batches += 1
-            self.dropped_bytes += item.data.nbytes
+            self.dropped_bytes += iq_batch_byte_count(item)
 
 
 class RawRtlFanout:
@@ -669,7 +670,7 @@ class ProcessedIqFanout:
     def _reset_processing(self) -> None:
         """Forget processing state when the source switches to a different SDR or file."""
 
-    def _process(self, source_batch, iq: np.ndarray) -> tuple[np.ndarray, int]:
+    def _process(self, source_batch, iq: ComplexArray) -> tuple[ComplexArray, int]:
         """Return the processed samples and their sample rate."""
         raise NotImplementedError
 
@@ -705,12 +706,12 @@ class ProcessedIqFanout:
                     cleared,
                 )
             iq = iq_batch_complex(source_batch)
-            if iq.size == 0:
+            if len(iq) == 0:
                 continue
             process_started_at = time.monotonic()
             output, output_rate = self._process(source_batch, iq)
             process_seconds = time.monotonic() - process_started_at
-            batch_seconds = float(iq.size) / float(max(1, source_batch.sample_rate))
+            batch_seconds = float(len(iq)) / float(max(1, source_batch.sample_rate))
             if process_seconds > batch_seconds and process_started_at - last_slow_batch_log_at >= 10.0:
                 last_slow_batch_log_at = process_started_at
                 LOG.warning(
@@ -723,9 +724,9 @@ class ProcessedIqFanout:
                 )
             with self.subscribers_lock:
                 self.read_batches += 1
-                self.read_samples += int(iq.size)
+                self.read_samples += len(iq)
                 self.output_rate = int(output_rate)
-            if output.size == 0:
+            if len(output) == 0:
                 continue
             batch = IqSampleBatch(
                 data=output,
@@ -740,7 +741,7 @@ class ProcessedIqFanout:
         with self.subscribers_lock:
             subscribers = list(self.subscribers)
             self.output_batches += 1
-            self.output_samples += int(batch.data.size)
+            self.output_samples += iq_sample_count(batch.data)
             self.last_output_at = time.monotonic()
         for subscriber in subscribers:
             try:
@@ -782,9 +783,9 @@ class ProcessedIqFanout:
             if subscriber not in self.subscribers:
                 return
             self.subscriber_drops[subscriber] = self.subscriber_drops.get(subscriber, 0) + 1
-            self.subscriber_drop_samples[subscriber] = self.subscriber_drop_samples.get(subscriber, 0) + int(batch.data.size)
+            self.subscriber_drop_samples[subscriber] = self.subscriber_drop_samples.get(subscriber, 0) + iq_sample_count(batch.data)
             self.total_dropped_batches += 1
-            self.total_dropped_samples += int(batch.data.size)
+            self.total_dropped_samples += iq_sample_count(batch.data)
             name = self.subscriber_names.get(subscriber, "subscriber")
             drops = self.subscriber_drops[subscriber]
             now = time.monotonic()
@@ -819,7 +820,7 @@ class CleanIqFanout(ProcessedIqFanout):
     def _reset_processing(self) -> None:
         self.dc_blocker = None
 
-    def _process(self, source_batch, iq: np.ndarray) -> tuple[np.ndarray, int]:
+    def _process(self, source_batch, iq: ComplexArray) -> tuple[ComplexArray, int]:
         sample_rate = int(source_batch.sample_rate)
         if self.dc_blocker is None or self.dc_blocker.sample_rate != sample_rate:
             self.dc_blocker = IqDcBlocker(sample_rate)
@@ -859,7 +860,7 @@ class IntermediateIqFanout(ProcessedIqFanout):
         self.decimator_key = None
         self.decimator_alias_filter_strength = None
 
-    def _process(self, source_batch, iq: np.ndarray) -> tuple[np.ndarray, int]:
+    def _process(self, source_batch, iq: ComplexArray) -> tuple[ComplexArray, int]:
         with self.subscribers_lock:
             alias_filter_strength = self.alias_filter_strength
         output_rate = int(INTERMEDIATE_IQ_SAMPLE_RATE if self.output_rate is None else self.output_rate)
@@ -1428,10 +1429,7 @@ def drain_queue_to_latest(source: queue.Queue, first_item: Any) -> Any:
 
 
 def iq_batch_complex(batch: RtlSampleBatch | IqSampleBatch) -> ComplexArray:
-    data = batch.data
-    if isinstance(data, np.ndarray):
-        return data.astype(np.complex64, copy=False)
-    return rtl_u8_to_complex64(data)
+    return iq_to_complex64(batch.data)
 
 
 def validate_iq_recording_sample_rate(raw: Any) -> int:

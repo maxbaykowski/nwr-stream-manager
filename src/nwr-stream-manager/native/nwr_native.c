@@ -25,15 +25,18 @@
 
 /* Raised whenever a function's arguments or results change, so a stale build is refused
  * rather than called wrongly. */
-#define NWR_NATIVE_ABI 2
+#define NWR_NATIVE_ABI 3
 
 #define NWR_OK 0
 #define NWR_ERROR (-1)
 
+/* How nwr_f32_to_s16 converts, combined with |. */
 enum {
-    NWR_ROUND_NEAREST = 0, /* to the nearest, halves to even */
-    NWR_ROUND_TRUNCATE = 1 /* toward zero */
+    NWR_ROUND_TRUNCATE = 1, /* toward zero; without it, to the nearest, halves to even */
+    NWR_CLIP_SYMMETRIC = 2  /* clipped to -32767 rather than -32768, as a signal clipped to
+                               -1.0 to 1.0, then scaled by 32767, is */
 };
+#define NWR_F32_TO_S16_FLAGS (NWR_ROUND_TRUNCATE | NWR_CLIP_SYMMETRIC)
 
 /* 1.5 * 2^23. Adding then subtracting it rounds a float smaller than 2^22 to a whole number,
  * to the nearest with halves to even, in plain float arithmetic: the same as rint(), but
@@ -73,24 +76,24 @@ int nwr_u8_iq_to_f32(const uint8_t *restrict in, size_t in_bytes, float *restric
 }
 
 /* Float audio to signed 16-bit: count samples, multiplied by scale, clipped to the 16-bit
- * range, then rounded the given way. Something that isn't a number becomes silence. */
+ * range, then rounded the way flags say. Something that isn't a number becomes silence. */
 int nwr_f32_to_s16(const float *restrict in, size_t in_count, int16_t *restrict out, size_t out_count, size_t count,
-                   float scale, int rounding)
+                   float scale, int flags)
 {
     if (count == 0) {
         return NWR_OK;
     }
     if (in == NULL || out == NULL || count > SIZE_MAX / sizeof(float) || in_count < count || out_count < count
-        || overlaps(in, count * sizeof(float), out, count * sizeof(int16_t))
-        || (rounding != NWR_ROUND_NEAREST && rounding != NWR_ROUND_TRUNCATE)) {
+        || overlaps(in, count * sizeof(float), out, count * sizeof(int16_t)) || (flags & ~NWR_F32_TO_S16_FLAGS) != 0) {
         return NWR_ERROR;
     }
+    const float low = (flags & NWR_CLIP_SYMMETRIC) ? -32767.0f : -32768.0f;
     /* One loop for each way of rounding, so neither has a decision inside it. */
-    if (rounding == NWR_ROUND_NEAREST) {
+    if ((flags & NWR_ROUND_TRUNCATE) == 0) {
         for (size_t i = 0; i < count; i++) {
             float value = in[i] * scale;
             value = value > 32767.0f ? 32767.0f : value;
-            value = value < -32768.0f ? -32768.0f : value;
+            value = value < low ? low : value;
             value = value == value ? value : 0.0f; /* not a number */
             value = (value + NWR_ROUNDING_CONSTANT) - NWR_ROUNDING_CONSTANT;
             out[i] = (int16_t)(int32_t)value;
@@ -99,10 +102,61 @@ int nwr_f32_to_s16(const float *restrict in, size_t in_count, int16_t *restrict 
         for (size_t i = 0; i < count; i++) {
             float value = in[i] * scale;
             value = value > 32767.0f ? 32767.0f : value;
-            value = value < -32768.0f ? -32768.0f : value;
+            value = value < low ? low : value;
             value = value == value ? value : 0.0f;
             out[i] = (int16_t)(int32_t)value; /* a conversion to a whole number truncates */
         }
+    }
+    return NWR_OK;
+}
+
+/* Float I/Q from -1 to 1 to unsigned 8-bit, the RTL-SDR's own format: count values, clipped
+ * to -1 to 1, then 0 to 255 with 127.5 as zero, rounded to the nearest with halves to even.
+ * Something that isn't a number becomes zero (128). */
+int nwr_f32_to_u8(const float *restrict in, size_t in_count, uint8_t *restrict out, size_t out_count, size_t count)
+{
+    if (count == 0) {
+        return NWR_OK;
+    }
+    if (in == NULL || out == NULL || count > SIZE_MAX / sizeof(float) || in_count < count || out_count < count
+        || overlaps(in, count * sizeof(float), out, count)) {
+        return NWR_ERROR;
+    }
+    for (size_t i = 0; i < count; i++) {
+        float value = in[i];
+        value = value > 1.0f ? 1.0f : value;
+        value = value < -1.0f ? -1.0f : value;
+        value = value == value ? value : 0.0f;
+        value = value * 127.5f + 127.5f;
+        value = (value + NWR_ROUNDING_CONSTANT) - NWR_ROUNDING_CONSTANT;
+        out[i] = (uint8_t)(int32_t)value;
+    }
+    return NWR_OK;
+}
+
+/* Interleaved float audio of any number of channels to mono: frames frames of channels
+ * samples each, averaged. An average that isn't a finite number (from a sample that's
+ * infinite or not a number) becomes silence. */
+int nwr_f32_downmix(const float *restrict in, size_t in_count, float *restrict out, size_t out_count, size_t frames,
+                    size_t channels)
+{
+    if (frames == 0) {
+        return NWR_OK;
+    }
+    if (in == NULL || out == NULL || channels == 0 || channels > SIZE_MAX / sizeof(float) / frames
+        || in_count < frames * channels || out_count < frames
+        || overlaps(in, frames * channels * sizeof(float), out, frames * sizeof(float))) {
+        return NWR_ERROR;
+    }
+    const float divisor = (float)channels;
+    for (size_t frame = 0; frame < frames; frame++) {
+        const float *samples = in + frame * channels;
+        float sum = samples[0];
+        for (size_t channel = 1; channel < channels; channel++) {
+            sum += samples[channel];
+        }
+        float mean = sum / divisor;
+        out[frame] = mean - mean == 0.0f ? mean : 0.0f; /* infinite or not a number */
     }
     return NWR_OK;
 }

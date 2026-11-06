@@ -20,8 +20,8 @@ import struct
 import subprocess
 import wave
 
-import numpy as np
 
+from . import native
 from .config import IQ_SAMPLE_RATE
 from .encoder import PcmResampler
 from .fallback_audio import MAX_FALLBACK_AUDIO_SECONDS
@@ -117,19 +117,20 @@ def prepare_custom_fallback_audio(data: bytes, sample_rate: int = IQ_SAMPLE_RATE
     samples, source_rate = decoded.samples, decoded.sample_rate
     if not _supported_format(decoded.format_code):
         raise CustomFallbackAudioError(UNSUPPORTED_FILE_MESSAGE)
-    if len(samples) > limit_seconds * source_rate:
+    if decoded.frames > limit_seconds * source_rate:
         raise CustomFallbackAudioError("The announcement is longer than one minute. Choose one that is one minute or shorter.")
-    if _cut_short(data, decoded.format_code, decoded.declared_frames, len(samples)):
+    if _cut_short(data, decoded.format_code, decoded.declared_frames, decoded.frames):
         raise CustomFallbackAudioError(
             "The file is incomplete: it ends before its audio does, as if it was not fully downloaded or copied. "
             "Choose a complete MP3, OGG or WAV file."
         )
-    mono = np.nan_to_num(samples.mean(axis=1), nan=0.0, posinf=0.0, neginf=0.0)
-    pcm = (np.clip(mono, -1.0, 1.0) * 32767.0).round().astype("<i2").tobytes()
+    mono = native.floats(decoded.frames)
+    native.f32_downmix(samples, mono, decoded.channels)
+    pcm = native.float_to_s16(mono, 32767.0, symmetric=True)
     resampler = PcmResampler(source_rate, sample_rate)
     pcm = resampler.process(pcm) + resampler.flush()
     pcm = pcm[: int(MAX_CUSTOM_FALLBACK_SECONDS * sample_rate) * 2]
-    if not pcm or not np.any(np.frombuffer(pcm, dtype="<i2")):
+    if not pcm or pcm.count(0) == len(pcm):
         raise CustomFallbackAudioError("The announcement is silent. Choose one with something to hear.")
     if find_same_tones(pcm, sample_rate):
         raise CustomFallbackAudioError(

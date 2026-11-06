@@ -44,6 +44,7 @@ Connections
 
 from __future__ import annotations
 
+import array
 import hashlib
 import hmac
 import ipaddress
@@ -66,8 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-import numpy as np
-
+from . import native
 from .network_dial import create_connection, own_tailnet_address, own_tailnet_peers
 
 
@@ -613,40 +613,34 @@ class FrameConnection:
                 self.io_lock.release()
 
 
-def complex_to_cs16(samples: np.ndarray) -> bytes:
-    samples = np.asarray(samples, dtype=np.complex64)
-    interleaved = np.empty(samples.size * 2, dtype=np.float32)
-    interleaved[0::2] = samples.real
-    interleaved[1::2] = samples.imag
-    np.multiply(interleaved, CS16_SCALE, out=interleaved)
-    np.clip(interleaved, -32768.0, 32767.0, out=interleaved)
-    return np.rint(interleaved).astype("<i2").tobytes()
+def complex_to_cs16(samples) -> bytes:
+    """Float32 I/Q (complex64, or float32 I then Q) as the wire's signed 16-bit I/Q."""
+    return native.float_to_s16(samples, CS16_SCALE)
 
 
-def cs16_to_complex(payload: bytes | memoryview) -> np.ndarray:
-    raw = np.frombuffer(payload, dtype="<i2")
-    usable = raw.size - (raw.size % 2)
-    scaled = raw[:usable].astype(np.float32) / CS16_SCALE
-    return (scaled[0::2] + 1j * scaled[1::2]).astype(np.complex64)
+def cs16_to_complex(payload: bytes | memoryview) -> array.array:
+    """The wire's signed 16-bit I/Q as float32 I then Q; a stray half pair is left out."""
+    usable = len(payload) - len(payload) % 4
+    return native.s16_to_float(payload[:usable], CS16_SCALE)
 
 
 @dataclass
 class RemoteIqBatch:
     """Matches the attributes the stream pipeline reads from local batches."""
 
-    data: np.ndarray
+    data: array.array  # float32 I then Q
     sample_rate: int
     center_frequency_hz: int
     captured_at: float = field(default_factory=time.monotonic)
     source_generation: int = 0
 
 
-def encode_iq_frame(sequence: int, sample_rate: int, center_frequency_hz: int, generation: int, samples: np.ndarray) -> bytes:
+def encode_iq_frame(sequence: int, sample_rate: int, center_frequency_hz: int, generation: int, samples) -> bytes:
     header = IQ_HEADER.pack(sequence, int(sample_rate), int(center_frequency_hz), time.time(), int(generation) & 0xFFFFFFFF)
     return header + complex_to_cs16(samples)
 
 
-def decode_iq_frame(payload: bytes) -> tuple[int, int, int, float, int, np.ndarray]:
+def decode_iq_frame(payload: bytes) -> tuple[int, int, int, float, int, array.array]:
     if len(payload) < IQ_HEADER.size:
         raise RemoteSdrProtocolError("IQ frame is too short")
     sequence, sample_rate, center, host_time, generation = IQ_HEADER.unpack_from(payload)
@@ -2292,7 +2286,7 @@ class RemoteIqFanout:
                         with self.jitter_condition:
                             if batch.source_generation == self.generation:
                                 self.received_batches += 1
-                                self.jitter.push(batch, samples.size / max(1, sample_rate))
+                                self.jitter.push(batch, len(samples) / 2 / max(1, sample_rate))
                                 self.jitter_condition.notify_all()
             except Exception as exc:
                 if not self.stop_event.is_set():

@@ -7,13 +7,12 @@ or claimed type. Files are read from memory, never written to disk first.
 
 from __future__ import annotations
 
+import array
 import ctypes
 import ctypes.util
 import threading
 from typing import NamedTuple
 
-import numpy as np
-from numpy.typing import NDArray
 
 SNDFILE_SONAMES = ("libsndfile.so.1", "libsndfile.so")
 SFM_READ = 0x10
@@ -62,12 +61,17 @@ class SfVirtualIo(ctypes.Structure):
 
 
 class DecodedAudio(NamedTuple):
-    samples: NDArray[np.float32]  # (frames, channels), from -1.0 to 1.0
+    samples: array.array  # float32 from -1.0 to 1.0, each frame's channels in turn
     sample_rate: int
     channels: int
     format_code: int
     # How many frames the file says it holds, which a damaged file may not.
     declared_frames: int
+
+    @property
+    def frames(self) -> int:
+        """How many frames were decoded."""
+        return len(self.samples) // self.channels
 
 
 class SndfileError(ValueError):
@@ -157,19 +161,19 @@ def decode_audio(data: bytes, max_seconds: float) -> DecodedAudio:
         if channels <= 0 or sample_rate <= 0:
             raise SndfileError("the file has no audio channels")
         max_frames = int(max_seconds * sample_rate) + 1
-        chunks = []
+        samples = array.array("f")
         frames = 0
-        chunk_frames = 65_536
+        # The same size of buffer however many channels the file says it has.
+        chunk_frames = max(1, 262_144 // channels)
+        buffer = (ctypes.c_float * (chunk_frames * channels))()
         while frames <= max_frames:
-            buffer = np.empty((chunk_frames, channels), dtype=np.float32)
-            read = library.sf_readf_float(handle, buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), chunk_frames)
+            read = library.sf_readf_float(handle, buffer, chunk_frames)
             if read <= 0:
                 break
-            chunks.append(buffer[:read])
+            samples.frombytes(memoryview(buffer).cast("B")[: min(read, chunk_frames) * channels * 4])
             frames += read
         if library.sf_error(handle):
             raise SndfileError(library.sf_strerror(handle).decode("utf-8", "replace"))
     finally:
         library.sf_close(handle)
-    samples = np.concatenate(chunks) if chunks else np.empty((0, channels), dtype=np.float32)
     return DecodedAudio(samples, sample_rate, channels, int(info.format), int(info.frames))

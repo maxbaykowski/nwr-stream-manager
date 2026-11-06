@@ -54,9 +54,10 @@ class IqFileSourceTests(unittest.TestCase):
 
         self.assertEqual(batch.sample_rate, 192_000)
         self.assertEqual(batch.center_frequency_hz, self.web_control.NWR_CENTER_FREQUENCY_HZ)
-        self.assertEqual(batch.data.dtype, np.complex64)
-        self.assertGreaterEqual(batch.data.size, 2)
-        np.testing.assert_allclose(batch.data[:2], np.array([1.0 + 0.5j, -0.25 + 0.75j], dtype=np.complex64))
+        self.assertEqual(batch.data.typecode, "f")  # float32 I then Q
+        iq = np.frombuffer(batch.data, dtype=np.complex64)
+        self.assertGreaterEqual(iq.size, 2)
+        np.testing.assert_allclose(iq[:2], np.array([1.0 + 0.5j, -0.25 + 0.75j], dtype=np.complex64))
 
     def test_iq_file_source_seek_uses_sample_rate_and_aligns_to_cf32_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

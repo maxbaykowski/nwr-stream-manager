@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import array
 import logging
 from dataclasses import replace
 
-import numpy as np
 
+from . import native
 from .config import IQ_SAMPLE_RATE
 from .constants import STREAM_FRAME_SECONDS
 from .encoder import PcmResampler
@@ -18,51 +19,34 @@ LOG = logging.getLogger(__name__)
 
 
 class FloatFrameBuffer:
+    """Float32 audio in pieces of any length, out in frames of frame_samples."""
+
+    # Each sample is this many float32s: complex I/Q is two.
+    values_per_sample = 1
+
     def __init__(self, frame_samples: int) -> None:
         self.frame_samples = frame_samples
-        self.pending = np.empty(0, dtype=np.float32)
-        self.offset = 0
+        self.pending = array.array("f")
 
     def clear(self) -> None:
-        self.pending = np.empty(0, dtype=np.float32)
-        self.offset = 0
+        self.pending = array.array("f")
 
-    def push(self, samples: np.ndarray):
-        samples = samples.astype(np.float32, copy=False)
-        if self.offset:
-            self.pending = self.pending[self.offset :]
-            self.offset = 0
-        self.pending = samples if len(self.pending) == 0 else np.concatenate((self.pending, samples))
-        while len(self.pending) - self.offset >= self.frame_samples:
-            frame = self.pending[self.offset : self.offset + self.frame_samples]
-            self.offset += self.frame_samples
-            yield frame
-        if self.offset and self.offset >= len(self.pending):
-            self.clear()
+    def push(self, samples):
+        """Takes any float32 buffer; gives each whole frame as an array.array("f")."""
+        self.pending.extend(native.float_samples(samples))
+        frame_values = self.frame_samples * self.values_per_sample
+        used = 0
+        while len(self.pending) - used >= frame_values:
+            yield self.pending[used : used + frame_values]
+            used += frame_values
+        if used:
+            del self.pending[:used]
 
 
-class ComplexFrameBuffer:
-    def __init__(self, frame_samples: int) -> None:
-        self.frame_samples = frame_samples
-        self.pending = np.empty(0, dtype=np.complex64)
-        self.offset = 0
+class ComplexFrameBuffer(FloatFrameBuffer):
+    """Complex I/Q, interleaved float32 I then Q, out in frames of frame_samples I/Q pairs."""
 
-    def clear(self) -> None:
-        self.pending = np.empty(0, dtype=np.complex64)
-        self.offset = 0
-
-    def push(self, samples: np.ndarray):
-        samples = samples.astype(np.complex64, copy=False)
-        if self.offset:
-            self.pending = self.pending[self.offset :]
-            self.offset = 0
-        self.pending = samples if len(self.pending) == 0 else np.concatenate((self.pending, samples))
-        while len(self.pending) - self.offset >= self.frame_samples:
-            frame = self.pending[self.offset : self.offset + self.frame_samples]
-            self.offset += self.frame_samples
-            yield frame
-        if self.offset and self.offset >= len(self.pending):
-            self.clear()
+    values_per_sample = 2
 
 
 def load_web_fallback_audio(sample_rate: int = IQ_SAMPLE_RATE):
@@ -109,7 +93,5 @@ def next_web_fallback_frame(audio, state: WebFallbackPlaybackState, loop_delay_s
     return bytes(output)
 
 
-def pcm_s16le_to_float32(pcm: bytes) -> np.ndarray:
-    if not pcm:
-        return np.empty(0, dtype=np.float32)
-    return (np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0).astype(np.float32, copy=False)
+def pcm_s16le_to_float32(pcm: bytes) -> array.array:
+    return native.s16_to_float(pcm, 32768.0)

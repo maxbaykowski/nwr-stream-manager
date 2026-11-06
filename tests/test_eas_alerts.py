@@ -2634,6 +2634,21 @@ class EasAlertTests(unittest.TestCase):
         self.assertEqual(len(frames), 1)
         np.testing.assert_array_equal(frames[0], np.array([3.0, 4.0, 5.0, 6.0], dtype=np.float32))
 
+    def test_frame_buffers_carry_samples_across_pushes(self) -> None:
+        buffer = self.web_control.FloatFrameBuffer(3)
+        audio = np.arange(10, dtype=np.float32)
+        frames = [list(frame) for piece in (audio[:2], audio[2:7], audio[7:]) for frame in buffer.push(piece)]
+        self.assertEqual(frames, [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]])
+        with self.assertRaises(TypeError):
+            list(buffer.push(np.zeros(3, dtype=np.float64)))
+
+        iq = self.web_control.ComplexFrameBuffer(2)
+        frames = list(iq.push(np.array([1 + 2j, 3 + 4j, 5 + 6j], dtype=np.complex64)))
+        self.assertEqual(len(frames), 1)
+        np.testing.assert_array_equal(np.frombuffer(frames[0], dtype=np.complex64), [1 + 2j, 3 + 4j])
+        frames = list(iq.push(np.array([7 + 8j], dtype=np.complex64)))
+        np.testing.assert_array_equal(np.frombuffer(frames[0], dtype=np.complex64), [5 + 6j, 7 + 8j])
+
     def test_fallback_frame_uses_audio_sample_rate(self) -> None:
         audio = types.SimpleNamespace(
             pcm=b"\x01\x00" * self.web_control.STREAM_FRAME_SAMPLES,

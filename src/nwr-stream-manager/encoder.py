@@ -5,9 +5,7 @@ import ctypes.util
 import random
 from typing import Protocol
 
-import numpy as np
-from numpy.typing import NDArray
-
+from . import native
 from .config import IQ_SAMPLE_RATE, IcecastConfig
 from .soxr_native import SoxrStream
 
@@ -208,9 +206,7 @@ class PcmResampler:
         return self._resample(b"", last=True)
 
     def _resample(self, pcm: bytes, last: bool) -> bytes:
-        samples = np.frombuffer(pcm, dtype="<i2")
-        output = self.stream.process(samples, last=last)
-        return output.astype("<i2", copy=False).tobytes()
+        return self.stream.process(pcm, last=last).tobytes()
 
 
 LAME_MONO = 3  # MPEG_mode MONO
@@ -289,15 +285,14 @@ class Mp3Encoder:
         return self._encode_pcm(pcm)
 
     def _encode_pcm(self, pcm: bytes) -> bytes:
-        samples = np.frombuffer(pcm, dtype="<i2")
-        if samples.size == 0:
+        count = len(pcm) // 2
+        if count == 0:
             return b""
-        samples = np.ascontiguousarray(samples, dtype=np.int16)
+        # LAME only reads the samples, so it's given the bytes where they are.
+        samples = bytes(pcm[: count * 2])
         # LAME's own worst case for one call: 1.25 bytes per sample plus 7200.
-        output = ctypes.create_string_buffer(samples.size + samples.size // 4 + 7200)
-        written = self.lame.lame_encode_buffer(
-            self.gfp, samples.ctypes.data, samples.ctypes.data, samples.size, output, len(output)
-        )
+        output = ctypes.create_string_buffer(count + count // 4 + 7200)
+        written = self.lame.lame_encode_buffer(self.gfp, samples, samples, count, output, len(output))
         if written < 0:
             raise EncoderError(f"LAME MP3 encoding failed with error {written}")
         return output.raw[:written]
@@ -514,14 +509,12 @@ class OggVorbisEncoder:
         return self._encode_resampled_pcm(pcm)
 
     def _encode_resampled_pcm(self, pcm: bytes) -> bytes:
-        samples = _pcm_s16le_to_float(pcm)
-        buffer = self.libvorbis.vorbis_analysis_buffer(
-            ctypes.byref(self.vd), len(samples)
-        )
-        channel = buffer[0]
-        channel_view = np.ctypeslib.as_array(channel, shape=(len(samples),))
-        channel_view[:] = samples
-        self.libvorbis.vorbis_analysis_wrote(ctypes.byref(self.vd), len(samples))
+        count = len(pcm) // 2
+        buffer = self.libvorbis.vorbis_analysis_buffer(ctypes.byref(self.vd), count)
+        # libvorbis's own buffer for the channel, which it has made room in for count samples.
+        channel = (ctypes.c_float * count).from_address(ctypes.addressof(buffer[0].contents))
+        native.s16_to_f32(pcm[: count * 2], channel, 32768.0)
+        self.libvorbis.vorbis_analysis_wrote(ctypes.byref(self.vd), count)
         return self._drain_packets()
 
     def flush(self) -> bytes:
@@ -579,11 +572,6 @@ class OggVorbisEncoder:
         while self.libogg.ogg_stream_flush(ctypes.byref(self.os), ctypes.byref(page)):
             output.extend(_page_bytes(page))
         return bytes(output)
-
-
-def _pcm_s16le_to_float(pcm: bytes) -> NDArray[np.float32]:
-    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
-    return samples / 32768.0
 
 
 def _page_bytes(page) -> bytes:

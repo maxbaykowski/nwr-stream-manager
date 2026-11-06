@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import array
 import re
 import struct
 from pathlib import Path
 
-import numpy as np
 
 from .config import IQ_SAMPLE_RATE, parse_audio_config
 from .rtl import DEFAULT_RTL_SAMPLE_RATE, RTL_ASYNC_BUFFER_SECONDS
@@ -105,7 +105,7 @@ STREAM_FRAME_SECONDS = 0.02
 STREAM_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * STREAM_FRAME_SECONDS)
 STREAM_FRAME_BYTES = STREAM_FRAME_SAMPLES * 2
 STREAM_SILENCE_FRAME = b"\x00" * STREAM_FRAME_BYTES
-STREAM_SILENCE_FLOAT_FRAME = np.zeros(STREAM_FRAME_SAMPLES, dtype=np.float32)
+STREAM_SILENCE_FLOAT_FRAME = array.array("f", bytes(4 * STREAM_FRAME_SAMPLES))
 LIVE_AUDIO_BINARY_MAGIC = b"NWA1"
 LIVE_AUDIO_BINARY_HEADER = struct.Struct("!4sBBHII")
 LIVE_AUDIO_CODEC_OPUS = 1

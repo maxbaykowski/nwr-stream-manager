@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import logging
 import queue
 import threading
@@ -10,8 +11,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
-import numpy as np
 
+from . import native
 from .alsa import (
     AlsaSharedInputConfig,
     AlsaSharedPlaybackTap,
@@ -78,7 +79,7 @@ from .stream_config import (
     soundcard_tap_config_from_soundcard,
     stream_outputs,
 )
-from .simulated_station import mix_test_mode_iq_crossfade, SyntheticNwrTestModeSource
+from .simulated_station import mix_test_mode_iq_crossfade, SyntheticNwrTestModeSource, crossfade_ramp
 
 
 LOG = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ class SharedSoundcardOutputManager:
                 session.stop()
                 self.sessions.pop(old["stable_id"], None)
 
-    def push_float(self, output_id: str, samples: np.ndarray, owner: Any = None) -> None:
+    def push_float(self, output_id: str, samples, owner: Any = None) -> None:
         with self.lock:
             old = self.outputs.get(str(output_id))
             if old is not None and owner is not None and old.get("owner") is not owner:
@@ -646,7 +647,7 @@ class IcecastStreamWorker:
         test_demodulator = NfmDemodulator()
         test_frame_buffer = FloatFrameBuffer(STREAM_FRAME_SAMPLES)
         real_test_iq_frame_buffer = ComplexFrameBuffer(STREAM_FRAME_SAMPLES)
-        real_test_iq_frames: deque[np.ndarray] = deque()
+        real_test_iq_frames: deque[array.array] = deque()
         test_crossfade_state = "off"
         test_crossfade_position = 0
         test_crossfade_samples = max(1, int(round(STREAM_TEST_MODE_CROSSFADE_SECONDS * IQ_SAMPLE_RATE)))
@@ -725,46 +726,34 @@ class IcecastStreamWorker:
             for real_iq_frame in real_test_iq_frame_buffer.push(channel_iq):
                 real_test_iq_frames.append(real_iq_frame)
 
-        def next_real_test_iq_frame() -> np.ndarray:
+        def next_real_test_iq_frame() -> array.array:
             while not real_test_iq_frames:
                 try:
                     batch = self.queue.get_nowait()
                 except queue.Empty:
-                    return np.zeros(STREAM_FRAME_SAMPLES, dtype=np.complex64)
+                    return native.floats(2 * STREAM_FRAME_SAMPLES)
                 batch = drain_queue_to_latest(self.queue, batch)
                 append_real_test_frames(batch)
             return real_test_iq_frames.popleft()
 
-        def test_crossfade_weights(count: int, source: SyntheticNwrTestModeSource) -> tuple[np.ndarray | float, np.ndarray | float, bool]:
+        def test_crossfade_weights(count: int, source: SyntheticNwrTestModeSource) -> tuple[Any, Any, bool]:
             nonlocal test_crossfade_state
             nonlocal test_crossfade_position
             if test_crossfade_state == "enter":
                 start = test_crossfade_position
                 stop = min(test_crossfade_samples, start + count)
-                ramp = np.linspace(
-                    start / test_crossfade_samples,
-                    stop / test_crossfade_samples,
-                    count,
-                    endpoint=False,
-                    dtype=np.float32,
-                )
+                fade_in, fade_out = crossfade_ramp(start, stop, test_crossfade_samples, count)
                 test_crossfade_position = stop
                 if stop >= test_crossfade_samples:
                     test_crossfade_state = "active"
-                return (1.0 - ramp), ramp, False
+                return fade_out, fade_in, False
             if test_crossfade_state == "exit":
                 start = test_crossfade_position
                 stop = min(test_crossfade_samples, start + count)
-                ramp = np.linspace(
-                    start / test_crossfade_samples,
-                    stop / test_crossfade_samples,
-                    count,
-                    endpoint=False,
-                    dtype=np.float32,
-                )
+                fade_in, fade_out = crossfade_ramp(start, stop, test_crossfade_samples, count)
                 test_crossfade_position = stop
                 complete = stop >= test_crossfade_samples
-                return ramp, (1.0 - ramp), complete
+                return fade_in, fade_out, complete
             if source.stop_ready:
                 test_crossfade_state = "exit"
                 test_crossfade_position = 0
@@ -1077,7 +1066,7 @@ class IcecastStreamWorker:
             )
             return encoder_group
 
-    def _write_pcm(self, pcm: bytes, float_samples: np.ndarray | None = None) -> None:
+    def _write_pcm(self, pcm: bytes, float_samples=None) -> None:
         for encoder_group in list(self.encoder_groups.values()):
             if encoder_group.has_outputs():
                 queue_latest(encoder_group.pcm_queue, pcm)

@@ -35,6 +35,7 @@ from .constants import (
     STREAM_TEST_MODE_TONE_PEAK,
     STREAM_TEST_MODE_TRANSMIT_EQ_POINTS,
 )
+from .dsp import as_complex64
 from .encoder import PcmResampler
 from .nfm import NfmModulator
 from .packaged_audio import read_packaged_audio
@@ -132,14 +133,21 @@ def condition_test_mode_tone_audio(samples: np.ndarray) -> np.ndarray:
     )
 
 
+def crossfade_ramp(start: int, stop: int, total: int, count: int) -> tuple[np.ndarray, np.ndarray]:
+    """count weights rising evenly from start / total toward stop / total, and the same
+    weights falling: the fade-in and fade-out of a crossfade's next piece."""
+    ramp = np.linspace(start / total, stop / total, count, endpoint=False, dtype=np.float32)
+    return ramp, (1.0 - ramp)
+
+
 def mix_test_mode_iq_crossfade(
     real_iq: np.ndarray,
     test_iq: np.ndarray,
     real_weight: np.ndarray | float,
     test_weight: np.ndarray | float,
 ) -> np.ndarray:
-    real = np.asarray(real_iq, dtype=np.complex64)
-    test = np.asarray(test_iq, dtype=np.complex64)
+    real = as_complex64(real_iq)
+    test = as_complex64(test_iq)
     mixed = (real * real_weight + test * test_weight).astype(np.complex64, copy=False)
     if mixed.size == 0:
         return mixed

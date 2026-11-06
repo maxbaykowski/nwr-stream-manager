@@ -16,8 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 
+from . import native
 from .config import IQ_SAMPLE_RATE
 from .constants import (
     ALIAS_FILTER_STRENGTH_DEFAULT,
@@ -198,7 +198,7 @@ class IqRecorderWorker:
                     except queue.Empty:
                         continue
                     iq = iq_batch_complex(batch)
-                    if iq.size == 0:
+                    if len(iq) == 0:
                         continue
                     if self.config.mode == IQ_RECORDER_MODE_STREAM:
                         if self.config.target_frequency_hz is None:
@@ -271,11 +271,11 @@ class IqRecorderWorker:
                                 )
                                 decimator_alias_filter_strength = alias_filter_strength
                             recorded_iq = decimator.process(iq)
-                    if recorded_iq.size == 0:
+                    if len(recorded_iq) == 0:
                         continue
                     data = complex64_to_interleaved_f32(recorded_iq)
                     output.write(data)
-                    self._add_written(int(recorded_iq.size), len(data))
+                    self._add_written(len(recorded_iq), len(data))
                 else:
                     self._set_finished("stopped")
         except Exception as exc:
@@ -767,12 +767,13 @@ def convert_iq_recording_chunks(source, fmt: str, header: bytes = b"", trailer: 
             yield raw[:usable]
             time.sleep(IQ_DOWNLOAD_YIELD_SECONDS)
             continue
-        floats = np.frombuffer(raw[:usable], dtype="<f4")
-        clipped = np.clip(floats, -1.0, 1.0)
+        floats = raw[:usable]
         if fmt == "s16":
-            yield np.round(clipped * 32767.0).astype("<i2").tobytes()
+            yield native.float_to_s16(floats, 32767.0, symmetric=True)
         else:
-            yield np.round(clipped * 127.5 + 127.5).astype(np.uint8).tobytes()
+            converted = bytearray(usable // 4)
+            native.f32_to_u8(floats, converted)
+            yield bytes(converted)
         time.sleep(IQ_DOWNLOAD_YIELD_SECONDS)
     if carry:
         raise ValueError("I/Q recording file ended with a partial float32 sample")

@@ -40,6 +40,30 @@ def rtl_u8_to_complex64(chunk: bytes | bytearray | memoryview) -> ComplexArray:
     return iq
 
 
+_FLOAT_FORMATS = ("f", "<f", "=f")
+
+
+def as_complex64(data) -> ComplexArray:
+    """I/Q as complex64 for the DSP here: a numpy array as it is, and any other float32
+    buffer, such as an array.array("f") of I then Q, read where it is."""
+    if isinstance(data, np.ndarray):
+        return data.astype(np.complex64, copy=False)
+    view = memoryview(data)
+    if view.format not in _FLOAT_FORMATS:
+        raise TypeError(f"expected float32 I/Q, not {view.format!r}")
+    if view.nbytes == 0:
+        return np.empty(0, dtype=np.complex64)
+    return np.frombuffer(data, dtype=np.complex64)
+
+
+def iq_to_complex64(data) -> ComplexArray:
+    """A batch's I/Q as complex64: bytes are the RTL-SDR's own 8-bit samples; anything
+    else is float32 I/Q (see as_complex64)."""
+    if isinstance(data, (bytes, bytearray)) or (isinstance(data, memoryview) and data.format in ("B", "b", "c")):
+        return rtl_u8_to_complex64(data)
+    return as_complex64(data)
+
+
 def complex64_to_interleaved_f32(samples: ComplexArray) -> bytes:
     interleaved = np.empty(samples.size * 2, dtype="<f4")
     interleaved[0::2] = samples.real

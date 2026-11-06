@@ -17,6 +17,7 @@ most that. A file cut short is still read up to its last whole page.
 
 from __future__ import annotations
 
+import array
 import ctypes
 import json
 import logging
@@ -35,7 +36,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-import numpy as np
 
 from .config import IQ_SAMPLE_RATE
 from .encoder import PcmResampler
@@ -172,9 +172,10 @@ class ArchiveOpusEncoder:
         self.lookahead = int(lookahead.value)
         self.output = ctypes.create_string_buffer(1500)
 
-    def encode(self, frame: np.ndarray) -> bytes:
-        frame = np.ascontiguousarray(frame, dtype=np.int16)
-        length = self.opus.opus_encode(self.encoder, frame.ctypes.data, ARCHIVE_FRAME_SAMPLES, self.output, len(self.output))
+    def encode(self, frame) -> bytes:
+        """One frame of 16-bit samples, from any buffer holding at least that many."""
+        samples = (ctypes.c_int16 * ARCHIVE_FRAME_SAMPLES).from_buffer_copy(frame)
+        length = self.opus.opus_encode(self.encoder, samples, ARCHIVE_FRAME_SAMPLES, self.output, len(self.output))
         if length < 0:
             raise StreamArchiveError(f"Opus encoding failed ({length})")
         return self.output.raw[:length]
@@ -192,16 +193,18 @@ class ArchiveOpusDecoder:
         self.decoder = self.opus.opus_decoder_create(ARCHIVE_SAMPLE_RATE, 1, ctypes.byref(error))
         if error.value != 0 or not self.decoder:
             raise StreamArchiveError(f"Opus decoder couldn't start ({error.value})")
-        self.pcm = np.zeros(5760, dtype=np.int16)
+        self.pcm = (ctypes.c_int16 * 5760)()
 
-    def decode(self, packet: bytes) -> np.ndarray:
-        count = self.opus.opus_decode(self.decoder, packet, len(packet), self.pcm.ctypes.data, len(self.pcm), 0)
+    def decode(self, packet: bytes) -> array.array:
+        count = self.opus.opus_decode(self.decoder, packet, len(packet), self.pcm, len(self.pcm), 0)
         if count < 0:
             # A damaged packet: keep time going with the decoder's own concealment.
-            count = self.opus.opus_decode(self.decoder, None, 0, self.pcm.ctypes.data, ARCHIVE_FRAME_SAMPLES, 0)
+            count = self.opus.opus_decode(self.decoder, None, 0, self.pcm, ARCHIVE_FRAME_SAMPLES, 0)
             if count < 0:
-                return np.zeros(ARCHIVE_FRAME_SAMPLES, dtype=np.int16)
-        return self.pcm[:count].copy()
+                return _zeros(ARCHIVE_FRAME_SAMPLES)
+        samples = array.array("h")
+        samples.frombytes(memoryview(self.pcm).cast("B")[: count * 2])
+        return samples
 
     def close(self) -> None:
         if self.decoder:
@@ -767,7 +770,7 @@ class StreamArchiveWriter:
         self.input_samples += count
         audio = self.resampler.process(pcm)
         if audio:
-            self._encode(np.frombuffer(audio, dtype="<i2"))
+            self._encode(audio)
 
     def _start_segment(self, anchor: float) -> None:
         self._segment = True
@@ -776,7 +779,7 @@ class StreamArchiveWriter:
         self.input_samples = 0
         self.resampler = PcmResampler(self.input_sample_rate, ARCHIVE_SAMPLE_RATE)
         self.encoder = ArchiveOpusEncoder()
-        self.pending = np.zeros(0, dtype=np.int16)
+        self.pending = bytearray()  # 16-bit samples not yet a whole frame
         self.archived_samples = 0  # 16 kHz samples sent to the encoder
         self.packet_index = 0
         self.segment_id = ""
@@ -836,14 +839,15 @@ class StreamArchiveWriter:
             start += self.encoder.lookahead
         return max(0, decoded_end - start)
 
-    def _encode(self, samples: np.ndarray) -> None:
-        self.pending = np.concatenate((self.pending, samples)) if len(self.pending) else samples
-        self.archived_samples += len(samples)
-        frames = len(self.pending) // ARCHIVE_FRAME_SAMPLES
+    def _encode(self, pcm: bytes) -> None:
+        """16-bit samples, at 16 kHz."""
+        self.pending += pcm
+        self.archived_samples += len(pcm) // 2
+        frame_bytes = ARCHIVE_FRAME_SAMPLES * 2
+        frames = len(self.pending) // frame_bytes
         for index in range(frames):
-            frame = self.pending[index * ARCHIVE_FRAME_SAMPLES : (index + 1) * ARCHIVE_FRAME_SAMPLES]
-            self._add_packet(self.encoder.encode(frame))
-        self.pending = self.pending[frames * ARCHIVE_FRAME_SAMPLES :].copy()
+            self._add_packet(self.encoder.encode(self.pending[index * frame_bytes : (index + 1) * frame_bytes]))
+        del self.pending[: frames * frame_bytes]
 
     def _add_packet(self, packet: bytes) -> None:
         # A new hour starts a new file, carrying on with the same encoder.
@@ -887,17 +891,15 @@ class StreamArchiveWriter:
         try:
             tail = self.resampler.flush()
             if tail:
-                self._encode(np.frombuffer(tail, dtype="<i2"))
+                self._encode(tail)
             real_end = self.archived_samples
             # Push the last samples out of the encoder: the rest of the frame, then one more.
-            padding = (-len(self.pending)) % ARCHIVE_FRAME_SAMPLES + ARCHIVE_FRAME_SAMPLES
-            self.pending = np.concatenate((self.pending, np.zeros(padding, dtype=np.int16)))
-            frames = len(self.pending) // ARCHIVE_FRAME_SAMPLES
-            for index in range(frames):
-                frame = self.pending[index * ARCHIVE_FRAME_SAMPLES : (index + 1) * ARCHIVE_FRAME_SAMPLES]
-                self.file.add(self.encoder.encode(frame))
+            frame_bytes = ARCHIVE_FRAME_SAMPLES * 2
+            self.pending += bytes((-len(self.pending)) % frame_bytes + frame_bytes)
+            for index in range(len(self.pending) // frame_bytes):
+                self.file.add(self.encoder.encode(self.pending[index * frame_bytes : (index + 1) * frame_bytes]))
                 self.packet_index += 1
-            self.pending = np.zeros(0, dtype=np.int16)
+            self.pending = bytearray()
             self._close_file(real_end)
         finally:
             self.encoder.close()
@@ -976,7 +978,7 @@ def _piece_packets(directory: Path, piece: _Piece) -> Iterator[tuple[int, bytes]
             continue  # deleted since: it's silent
 
 
-def export_pcm(directory: Path, entries: list[ArchiveFile], start_ms: int, end_ms: int) -> Iterator[np.ndarray]:
+def export_pcm(directory: Path, entries: list[ArchiveFile], start_ms: int, end_ms: int) -> Iterator[array.array]:
     """The archived audio from start to end, 16 kHz, decoded straight across each segment's
     files, with silence for any time nothing was archived. Exactly (end - start) long."""
     total = round((end_ms - start_ms) * ARCHIVE_SAMPLE_RATE / 1000)
@@ -996,7 +998,7 @@ def export_pcm(directory: Path, entries: list[ArchiveFile], start_ms: int, end_m
         yield from _silence(total - position)
 
 
-def _piece_pcm(directory: Path, piece: _Piece, skip: int, limit: int) -> Iterator[np.ndarray]:
+def _piece_pcm(directory: Path, piece: _Piece, skip: int, limit: int) -> Iterator[array.array]:
     """The piece's samples from skip on, up to limit of them, with silence for any file
     that's missing so the audio after it keeps its place."""
     count = max(0, min(limit, piece.end_sample - piece.start_sample - skip))
@@ -1030,10 +1032,14 @@ def _piece_pcm(directory: Path, piece: _Piece, skip: int, limit: int) -> Iterato
         yield from _silence(count - given)
 
 
-def _silence(count: int) -> Iterator[np.ndarray]:
+def _zeros(count: int) -> array.array:
+    return array.array("h", bytes(2 * count))
+
+
+def _silence(count: int) -> Iterator[array.array]:
     while count > 0:
         size = min(count, ARCHIVE_SAMPLE_RATE * 10)
-        yield np.zeros(size, dtype=np.int16)
+        yield _zeros(size)
         count -= size
 
 
@@ -1050,7 +1056,7 @@ def export_wav(directory: Path, entries: list[ArchiveFile], start_ms: int, end_m
         yield header
         buffer = bytearray()
         for pcm in export_pcm(directory, entries, start_ms, end_ms):
-            buffer += pcm.astype("<i2").tobytes()
+            buffer += pcm.tobytes()
             if len(buffer) >= 256 * 1024:
                 yield bytes(buffer)
                 buffer.clear()
@@ -1095,7 +1101,7 @@ def export_mp3(directory: Path, entries: list[ArchiveFile], start_ms: int, end_m
         try:
             buffer = bytearray()
             for pcm in export_pcm(directory, entries, start_ms, end_ms):
-                buffer += encoder.encode(pcm.astype("<i2").tobytes())
+                buffer += encoder.encode(pcm.tobytes())
                 if len(buffer) >= 64 * 1024:
                     header = header or bytes(buffer[:4])
                     piece = bytes(buffer[: size - sent])
@@ -1237,7 +1243,7 @@ def playback_skips(parts: list[PlaybackPart]) -> list[tuple[int, int, int]]:
     return skips
 
 
-def _playback_pcm(directory: Path, parts: list[PlaybackPart], first: int) -> Iterator[np.ndarray]:
+def _playback_pcm(directory: Path, parts: list[PlaybackPart], first: int) -> Iterator[array.array]:
     for part in parts:
         if part.position + part.samples <= first:
             continue
@@ -1287,7 +1293,7 @@ def _playback_block(directory: Path, parts: list[PlaybackPart], block: int) -> b
     made = bytearray()
     try:
         for pcm in pcm_chunks:
-            made += encoder.encode(pcm.astype("<i2").tobytes())
+            made += encoder.encode(pcm.tobytes())
             if len(made) >= wanted:
                 break
         else:
@@ -1323,7 +1329,7 @@ def _silence_packet() -> bytes:
     if _SILENCE_PACKET is None:
         encoder = ArchiveOpusEncoder()
         try:
-            zeros = np.zeros(ARCHIVE_FRAME_SAMPLES, dtype=np.int16)
+            zeros = bytes(2 * ARCHIVE_FRAME_SAMPLES)
             for _ in range(20):
                 packet = encoder.encode(zeros)
             _SILENCE_PACKET = packet

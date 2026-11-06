@@ -506,11 +506,30 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         samples = ((rng.random(4096) - 0.5) + 1j * (rng.random(4096) - 0.5)).astype(np.complex64)
         decoded = self.remote.cs16_to_complex(self.remote.complex_to_cs16(samples))
 
-        self.assertEqual(decoded.dtype, np.complex64)
+        self.assertEqual(decoded.typecode, "f")  # float32 I then Q
+        decoded = np.frombuffer(decoded, dtype=np.complex64)
         self.assertLessEqual(float(np.max(np.abs(decoded - samples))), 1.0 / self.remote.CS16_SCALE)
+
+    def test_cs16_matches_the_numpy_it_replaced(self) -> None:
+        rng = np.random.default_rng(2)
+        samples = (1.2 * (rng.standard_normal(4096) + 1j * rng.standard_normal(4096))).astype(np.complex64)
+        samples[:3] = [0.5 / 32767 + 1.5j / 32767, -2.5 / 32767, np.nan]
+        interleaved = samples.view(np.float32) * np.float32(self.remote.CS16_SCALE)
+        expected = np.rint(np.nan_to_num(np.clip(interleaved, -32768.0, 32767.0))).astype("<i2").tobytes()
+        self.assertEqual(self.remote.complex_to_cs16(samples), expected)
+        raw = np.frombuffer(expected, dtype="<i2")
+        np.testing.assert_array_equal(
+            np.frombuffer(self.remote.cs16_to_complex(expected + b"\x01\x00"), dtype=np.float32),
+            raw.astype(np.float32) / np.float32(self.remote.CS16_SCALE),
+        )
+
+    def test_complex128_is_refused_rather_than_misread(self) -> None:
+        with self.assertRaises(TypeError):
+            self.remote.complex_to_cs16(np.zeros(4, dtype=np.complex128))
 
     def test_cs16_clips_instead_of_wrapping(self) -> None:
         decoded = self.remote.cs16_to_complex(self.remote.complex_to_cs16(np.array([2 - 2j], dtype=np.complex64)))
+        decoded = np.frombuffer(decoded, dtype=np.complex64)
 
         self.assertAlmostEqual(float(decoded[0].real), 1.0, places=3)
         self.assertAlmostEqual(float(decoded[0].imag), -1.0, places=3)
@@ -1071,10 +1090,10 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         batch = subscriber.get(timeout=5.0)
         self.assertEqual(batch.sample_rate, 24_000)
         self.assertEqual(batch.center_frequency_hz, 162_550_000)
-        self.assertEqual(batch.data.dtype, np.complex64)
-        self.assertAlmostEqual(float(np.mean(np.abs(batch.data))), 0.5, places=3)
-        spectrum = np.abs(np.fft.fft(batch.data))
-        peak_hz = np.fft.fftfreq(batch.data.size, 1 / 24_000)[int(np.argmax(spectrum))]
+        iq = np.frombuffer(batch.data, dtype=np.complex64)
+        self.assertAlmostEqual(float(np.mean(np.abs(iq))), 0.5, places=3)
+        spectrum = np.abs(np.fft.fft(iq))
+        peak_hz = np.fft.fftfreq(iq.size, 1 / 24_000)[int(np.argmax(spectrum))]
         self.assertAlmostEqual(peak_hz, 1_000.0, delta=60.0)
 
         generation = batch.source_generation
@@ -1104,11 +1123,11 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         first = subscriber.get(timeout=10.0)
         prebuffer_seconds = time.monotonic() - started
 
-        audio_seconds = first.data.size / first.sample_rate
+        audio_seconds = len(first.data) / 2 / first.sample_rate
         window_started = time.monotonic()
         while time.monotonic() - window_started < 2.0:
             batch = subscriber.get(timeout=5.0)
-            audio_seconds += batch.data.size / batch.sample_rate
+            audio_seconds += len(batch.data) / 2 / batch.sample_rate
         elapsed = time.monotonic() - window_started
 
         self.assertGreaterEqual(prebuffer_seconds, 0.45)  # the fake host sends 2x real time
@@ -1176,7 +1195,7 @@ class RemoteSdrProtocolTests(unittest.TestCase):
         batch = subscriber.get(timeout=5.0)
         self.assertEqual(batch.sample_rate, 192_000)
         self.assertEqual(batch.center_frequency_hz, 162_475_000)
-        self.assertEqual(batch.data.size, 192_000 // 50)
+        self.assertEqual(len(batch.data), 2 * 192_000 // 50)
 
     def test_stopping_a_feed_closes_the_host_source(self) -> None:
         self.pair()

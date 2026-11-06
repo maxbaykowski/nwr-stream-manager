@@ -51,7 +51,7 @@ class SoxrNativeTests(unittest.TestCase):
                     package = soxr.ResampleStream(24_000, output_rate, 1, dtype=dtype)
                     native = self.soxr_native.SoxrStream(24_000, output_rate, dtype)
                     expected = self._stream_through(lambda x, last: package.resample_chunk(x, last=last), data, sizes)
-                    actual = self._stream_through(lambda x, last: native.process(x, last=last), data, sizes)
+                    actual = self._stream_through(lambda x, last: np.asarray(native.process(x, last=last)), data, sizes)
 
                     # Same pieces at the same time, so nothing downstream sees a timing change.
                     self.assertEqual([part.size for part in actual], [part.size for part in expected])
@@ -72,12 +72,34 @@ class SoxrNativeTests(unittest.TestCase):
 
         np.testing.assert_array_equal(first.process(pcm, last=True), second.process(pcm, last=True))
 
+    def test_takes_plain_buffers_and_gives_array_arrays(self) -> None:
+        import array
+
+        stream = self.soxr_native.SoxrStream(24_000, 16_000, "int16")
+        output = stream.process(bytes(4800), last=True)
+        self.assertIsInstance(output, array.array)
+        self.assertEqual(output.typecode, "h")
+        self.assertEqual(len(output), 1600)
+        self.assertFalse(any(output))
+
+    def test_samples_of_another_type_are_refused_rather_than_misread(self) -> None:
+        stream = self.soxr_native.SoxrStream(24_000, 16_000, "float32")
+        with self.assertRaises(TypeError):
+            stream.process(np.zeros(480, dtype=np.float64))
+
+    def test_closing_frees_libsoxr_once(self) -> None:
+        stream = self.soxr_native.SoxrStream(24_000, 16_000, "float32")
+        stream.close()
+        stream.close()
+        with self.assertRaises(RuntimeError):
+            stream.process(np.zeros(480, dtype=np.float32))
+
     def test_resamples_a_tone_cleanly_and_flushes_the_rest(self) -> None:
         stream = self.soxr_native.SoxrStream(24_000, 22_050, "float32")
         tone = (0.5 * np.sin(2 * np.pi * 1000.0 * np.arange(24_000) / 24_000)).astype(np.float32)
 
-        parts = [stream.process(tone[index : index + 480]) for index in range(0, tone.size, 480)]
-        parts.append(stream.process(np.zeros(0, dtype=np.float32), last=True))
+        parts = [np.asarray(stream.process(tone[index : index + 480])) for index in range(0, tone.size, 480)]
+        parts.append(np.asarray(stream.process(np.zeros(0, dtype=np.float32), last=True)))
         output = np.concatenate(parts).astype(np.float64)
 
         self.assertEqual(output.size, 22_050)
